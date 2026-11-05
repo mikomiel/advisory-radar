@@ -1,0 +1,18 @@
+# Gitleaks configuration for advisory-radar.
+# Public repo: any real secret fails CI. Placeholders in docs/examples are
+# allowlisted explicitly.
+title = "advisory-radar gitleaks config"
+
+[allowlist]
+  description = "Documentation placeholders and this config itself"
+  paths = [
+    '''README\.md''',
+    '''examples/''',
+    '''\.gitleaks\.toml''',
+    '''scripts/check_no_estate_identifiers\.py''',
+  ]
+  regexes = [
+    # placeholder webhook/token shapes used in documentation only
+    '''(?i)(webhook|token|secret|password|api[_-]?key)\s*[:=]\s*["']?(your[-_]|xxx|example|changeme|placeholder)''',
+    '''https://discord\.com/api/webhooks/000000000000000000/xxxxxxxx''',
+  ]

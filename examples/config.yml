@@ -1,0 +1,46 @@
+# Example configuration for advisory-radar.
+# Copy to config/config.yml on your volume and edit. Secrets are referenced
+# via ${ENV_VAR} and never stored in this file.
+
+# How often sources are polled (ISO 8601 duration-ish; default 15m).
+poll_interval: 15m
+
+# Where state is kept inside the container (default /data/state.db).
+state_path: /data/state.db
+
+sources:
+  - id: nodejs-security
+    type: rss
+    url: https://nodejs.org/en/feed/vulnerability.xml
+  # - id: my-watch
+  #   type: changedetection
+  #   url: https://changedetection.example.com
+  #   api_key: ${CHANGEDETECTION_API_KEY}
+  # - id: inbox
+  #   type: webhook   # receives POST /webhooks/generic at runtime
+
+watchlist:
+  # Product names/aliases your deployment runs; advisories naming only
+  # unlisted products are filtered out.
+  products:
+    - nodejs
+    - postgresql
+    - nginx
+  excluded_products: []
+
+notifiers:
+  - id: discord
+    type: discord_webhook
+    url: ${DISCORD_WEBHOOK_URL}
+  # - id: apprise
+  #   type: apprise
+  #   url: http://apprise:8000
+  #   key: alerts
+  #   password: ${APPRISE_PASSWORD}
+
+# Web UI listen address inside the container.
+web:
+  host: 0.0.0.0
+  port: 8080
+  # Session auth token; set via env, never in this file.
+  auth_token: ${ADVISORY_RADAR_AUTH_TOKEN}
