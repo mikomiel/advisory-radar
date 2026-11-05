@@ -6,7 +6,12 @@ readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "MIT" }
 authors = [{ name = "Mikołaj Mielczarek" }]
-dependencies = []
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+advisory-radar = "advisory_radar.cli:main"
 
 [dependency-groups]
 dev = [

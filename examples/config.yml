@@ -12,12 +12,10 @@ sources:
   - id: nodejs-security
     type: rss
     url: https://nodejs.org/en/feed/vulnerability.xml
-  # - id: my-watch
-  #   type: changedetection
-  #   url: https://changedetection.example.com
-  #   api_key: ${CHANGEDETECTION_API_KEY}
-  # - id: inbox
-  #   type: webhook   # receives POST /webhooks/generic at runtime
+  # - id: freshrss
+  #   type: freshrss
+  #   url: https://freshrss.example.com
+  #   token: ${FRESHRSS_TOKEN}
 
 watchlist:
   # Product names/aliases your deployment runs; advisories naming only
@@ -37,6 +35,9 @@ notifiers:
   #   url: http://apprise:8000
   #   key: alerts
   #   password: ${APPRISE_PASSWORD}
+  # - id: hooks
+  #   type: webhook
+  #   url: https://hooks.example.com/advisory-radar
 
 # Web UI listen address inside the container.
 web:
