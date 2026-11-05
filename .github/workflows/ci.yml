@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -42,5 +43,8 @@ jobs:
 
       - name: Secret scan
         uses: gitleaks/gitleaks-action@v2
+        env:
+          # gitleaks needs the token to scan pull-request diffs (v2 breaking change)
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           config: .gitleaks.toml
