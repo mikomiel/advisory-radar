@@ -54,6 +54,8 @@ class Config:
     state_path: Path = Path("data/state.json")
     hidden_source_hosts: frozenset[str] = frozenset()
     adobe_commerce: bool = False
+    web_host: str = "0.0.0.0"
+    web_port: int = 8080
     raw: dict = field(default_factory=dict)
 
 
@@ -108,6 +110,11 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
     _require(match is not None, f"poll_interval must look like 15m/30s/12h, got {poll!r}")
     seconds = int(match.group(1)) * {"s": 1, "m": 60, "h": 3600}[match.group(2)]
 
+    web = document.get("web") or {}
+    _require(isinstance(web, dict), "web must be a mapping")
+    web_host = str(web.get("host", "0.0.0.0"))
+    web_port = web.get("port", 8080)
+    _require(isinstance(web_port, int) and 1 <= web_port <= 65535, f"web.port must be 1..65535, got {web_port!r}")
     watchlist = document.get("watchlist")
     watchlist_path = Path(watchlist) if isinstance(watchlist, str) else None
     hidden = frozenset(document.get("hidden_source_hosts") or [])
@@ -119,6 +126,8 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
         state_path=Path(document.get("state_path", "data/state.json")),
         hidden_source_hosts=hidden,
         adobe_commerce=bool(document.get("adobe_commerce", False)),
+        web_host=web_host,
+        web_port=int(web_port),
         raw=document,
     )
 

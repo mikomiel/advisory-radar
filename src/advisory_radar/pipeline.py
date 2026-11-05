@@ -106,19 +106,20 @@ def run_pass(
     delivered = core.deliver(state, notifiers, http, now)
     save_state(cfg.state_path, state)
     newly_parked = len(state["parked"]) - parked_before
-    LOG.info(
-        "pass: %d sent, %d parked, %d pending",
-        queued - len(state["pending"]) - newly_parked,
-        newly_parked,
-        len(state["pending"]),
-    )
+    sent = queued - len(state["pending"]) - newly_parked
+    LOG.info("pass: %d sent, %d parked, %d pending", sent, newly_parked, len(state["pending"]))
     if state["parked"]:
         LOG.warning(
             "%d message(s) parked, newest %s; run release-parked or drop-parked",
             len(state["parked"]),
             core._audit_ids(state["parked"][-1]),
         )
-    return 0 if delivered and not state["parked"] and not gap and adobe_ok and source_ok else 1
+    code = 0 if delivered and not state["parked"] and not gap and adobe_ok and source_ok else 1
+    if not dry_run:
+        runs = state.setdefault("runs", [])
+        runs.append({"at": now, "sent": sent, "parked": newly_parked, "pending": len(state["pending"]), "code": code})
+        del runs[:-200]
+    return code
 
 
 def state_cache(stored: dict | None) -> dict:

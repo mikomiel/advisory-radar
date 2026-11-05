@@ -89,11 +89,27 @@ def main(
             LOG.info("test-notify: %s", ", ".join(f"{n.id}={s}" for n, s in zip(notifiers, statuses, strict=True)))
             return 0 if notifiers and all(200 <= s < 300 for s in statuses) else 1
         if args.command == "run":
-            while True:
-                code = pipeline.run_pass(cfg, sources, notifiers, http=http, clock=clock, sleep=sleep)
-                sleep(cfg.poll_interval_seconds)
-                if code:
-                    LOG.warning("pass exited %d; continuing on schedule", code)
+            import threading
+
+            from .web import create_app
+
+            def one_pass() -> int:
+                return pipeline.run_pass(cfg, sources, notifiers, http=http, clock=clock, sleep=sleep)
+
+            app = create_app(cfg, environment, run_pass=one_pass, sources=sources, notifiers=notifiers)
+
+            def scheduler() -> None:
+                while True:
+                    code = one_pass()
+                    if code:
+                        LOG.warning("pass exited %d; continuing on schedule", code)
+                    sleep(cfg.poll_interval_seconds)
+
+            threading.Thread(target=scheduler, daemon=True).start()
+            import uvicorn
+
+            LOG.info("web UI on http://%s:%d", cfg.web_host, cfg.web_port)
+            uvicorn.run(app, host=cfg.web_host, port=cfg.web_port, log_level="warning")
         return pipeline.run_pass(
             cfg, sources, notifiers, http=http, clock=clock, sleep=sleep, dry_run=args.command == "dry-run"
         )
