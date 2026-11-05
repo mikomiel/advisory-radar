@@ -74,3 +74,7 @@ vulnerabilities.
 ## License
 
 [MIT](LICENSE)
+
+## Status
+
+Bootstrap complete; CI and review app smoke-tested on this PR.
