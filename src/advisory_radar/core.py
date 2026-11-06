@@ -645,9 +645,9 @@ class Intel:
                 # measurement: accepting it would make the requested CVE look like "no score".
                 return None
             for row in data:
-                if row.get("epss") is None and row.get("percentile") is None:
-                    # A row for the CVE with no numbers is malformed: "no score" is expressed by the CVE being
-                    # absent from the response, never by an empty row.
+                if row.get("epss") is None:
+                    # A row for the CVE without its exploitation-probability score is malformed: "no score" is
+                    # expressed by the CVE being absent from the response, never by a partial row.
                     return None
                 score = _bounded(row.get("epss"), 0.0, 1.0)
                 percentile = _bounded(row.get("percentile"), 0.0, 1.0)
@@ -1649,7 +1649,8 @@ def reevaluate(state: dict, intel: Intel, kev: frozenset[str], kev_known: bool, 
     for cve in due:
         current = facts[cve]
         entry = watch[cve]
-        deciding = critical_reason(current, kev_known and cve in kev)
+        # Membership is positive evidence on its own; kev_known only gates the *absence*-based suppression.
+        deciding = critical_reason(current, cve in kev)
         if cve in deferred and not deciding:
             # No request was made and nothing independently decisive is known: try again next pass rather
             # than waiting a whole day. KEV or SSVC evidence still escalates now.

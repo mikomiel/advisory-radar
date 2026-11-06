@@ -2288,3 +2288,42 @@ def test_a_stale_kev_cache_does_not_authorize_suppression():
         cves, known = load_kev(lambda *a: (500, {}, b""), cache, save=False)
     assert cves == frozenset({"CVE-2026-1111"}), "cached hits still promote"
     assert known is False, "an outage must not let the old catalog's silence suppress a CVE"
+
+
+# ---------------------------------------------------------------------------
+# Thirty-eighth review round
+
+
+def test_a_cached_kev_hit_escalates_without_a_fresh_catalog():
+    """kev_known=False marks an unrefreshed catalog; membership is still positive evidence."""
+    state = core.new_state()
+    cve = "CVE-2026-3333"
+    state["watch"][cve] = {
+        "since": NOW - 3 * 86400,
+        "last_eval": NOW - 2 * 86400,
+        "level": "warning",
+        "kev_only": True,
+        "title": "t",
+        "link": "https://vendor.example.com/a",
+    }
+
+    class Intel:
+        def cves(self, cves, force=False, deferred=None):
+            return {name: core.CveFacts(None, None, None, None, False) for name in cves}
+
+    core.reevaluate(state, Intel(), frozenset({cve}), False, NOW, "")
+    queued = [entry for entry in state["pending"] if entry["kind"] == "escalation"]
+    assert queued and queued[0]["tag"] == "critical"
+
+
+def test_a_percentile_only_epss_row_is_a_failed_measurement():
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda s: None)
+
+        def _get(self, url):
+            if "api.first.org" in url:
+                return 200, {"data": [{"cve": "CVE-2026-1234", "percentile": "0.9"}]}
+            return 404, None
+
+    assert Intel().cves(["CVE-2026-1234"])["CVE-2026-1234"].complete is False
