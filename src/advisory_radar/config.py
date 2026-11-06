@@ -22,7 +22,7 @@ class ConfigError(ValueError):
     pass
 
 
-def _expand(value: object, env: dict[str, str], resolved: list[str] | None = None) -> object:
+def _expand(value: object, env: dict[str, str], resolved: list[str] | None = None, *, lenient: bool = False) -> object:
     if isinstance(value, str):
 
         def replace(match: re.Match[str]) -> str:
@@ -37,6 +37,8 @@ def _expand(value: object, env: dict[str, str], resolved: list[str] | None = Non
                     return contents
                 raise ConfigError(f"${{{name}_FILE}}: no readable file (env {name}_FILE={path!r})")
             if name not in env:
+                if lenient:
+                    return match.group(0)  # state-only commands never build the plugin that would use it
                 raise ConfigError(f"${{{name}}} is not set in the environment")
             if resolved is not None:
                 resolved.append(env[name])
@@ -44,9 +46,9 @@ def _expand(value: object, env: dict[str, str], resolved: list[str] | None = Non
 
         return _ENV_RE.sub(replace, value)
     if isinstance(value, list):
-        return [_expand(item, env, resolved) for item in value]
+        return [_expand(item, env, resolved, lenient=lenient) for item in value]
     if isinstance(value, dict):
-        return {key: _expand(item, env, resolved) for key, item in value.items()}
+        return {key: _expand(item, env, resolved, lenient=lenient) for key, item in value.items()}
     return value
 
 
@@ -110,7 +112,7 @@ def _require(condition: bool, message: str) -> None:
         raise ConfigError(message)
 
 
-def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
+def load_config(path: Path, env: dict[str, str] | None = None, *, lenient: bool = False) -> Config:
     env = os.environ if env is None else env
     try:
         document = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -146,7 +148,7 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
     document.update(enabled)
     secret_names = tuple(sorted(set(_ENV_RE.findall(yaml.safe_dump(document)))))
     resolved: list[str] = []
-    document = _expand(document, env, resolved)
+    document = _expand(document, env, resolved, lenient=lenient)
     document.pop("secret_names_source", None)
     secret_values = tuple(sorted({value for value in resolved if value}))
     # Built plugins read the expanded entries; the structural checks above used the raw ones.

@@ -57,13 +57,16 @@ def main(
     args = _parser().parse_args(argv)
     if not LOG.handlers and not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="advisory-radar: %(message)s", stream=sys.stderr)
+    state_only = args.command in {"release-parked", "drop-parked"}
     try:
-        cfg = load_config(args.config, environment)
+        cfg = load_config(args.config, environment, lenient=state_only)
     except ConfigError as exc:
         LOG.error("config: %s", exc)
         return 1
     redactor = pipeline.attach_redaction(secret_values(cfg))
     try:
+        # These only touch the state document: no source or notifier is built, so an unrelated plugin with a
+        # missing credential cannot block recovery of an existing parked queue.
         try:
             sources, notifiers = pipeline.build_plugins(cfg, environment)
         except (ValueError, KeyError) as exc:

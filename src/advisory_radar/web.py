@@ -10,9 +10,10 @@ frontend build step.
 from __future__ import annotations
 
 import html
+import os
 import time
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
@@ -70,6 +71,11 @@ def last_pass_code(state: dict) -> int:
     return int(runs[-1].get("code", -1)) if runs else -1
 
 
+def _insecure_cookies(env: Mapping[str, str]) -> bool:
+    """Whether the plaintext-cookie opt-out is set (development only; the default is a Secure cookie)."""
+    return env.get("ADVISORY_RADAR_INSECURE_COOKIES", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def create_app(
     cfg: Config, env: dict[str, str], *, run_pass: Callable[..., int] | None = None, sources=None, notifiers=None
 ) -> FastAPI:
@@ -108,7 +114,15 @@ def create_app(
         token = (form.get("token") or [""])[0]
         if token and token == env.get("ADVISORY_RADAR_AUTH_TOKEN", ""):
             response = RedirectResponse("/", status_code=303)
-            response.set_cookie("advisory_radar_session", auth.login_cookie(), httponly=True, samesite="lax")
+            # Secure by default: without it a browser may send a seven-day session over plaintext HTTP to the
+            # same host. ADVISORY_RADAR_INSECURE_COOKIES=1 opts out, for a plain-HTTP development instance only.
+            response.set_cookie(
+                "advisory_radar_session",
+                auth.login_cookie(),
+                httponly=True,
+                samesite="lax",
+                secure=not _insecure_cookies(os.environ),
+            )
             return response
         return page(
             "Login",

@@ -1922,13 +1922,28 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
         return True
     seen: dict = stored["seen"]
     unseen = [bulletin for bulletin in bulletins if bulletin.apsb not in seen]
-    # A bulletin that left the list takes its retry entry with it, so the map is never larger than the list.
+    # Outstanding work: a bulletin first seen but not yet delivered (detail page failed, or it exceeded the
+    # per-pass budget) is remembered here, so a rotation that drops it from the next response cannot lose it.
+    stored_backlog = stored.get("backlog")
+    backlog: dict[str, dict] = (
+        {
+            apsb: dict(record)
+            for apsb, record in stored_backlog.items()
+            if isinstance(record, dict) and isinstance(record.get("cves"), list) and isinstance(record.get("url"), str)
+        }
+        if isinstance(stored_backlog, dict)
+        else {}
+    )
+    for bulletin in unseen:
+        backlog.setdefault(
+            bulletin.apsb,
+            {"cves": list(bulletin.cves), "url": bulletin.url, "priority": bulletin.priority},
+        )
     stored_retry = stored.get("retry")
     previous = stored_retry if isinstance(stored_retry, dict) else {}
-    waiting = {bulletin.apsb for bulletin in unseen}
-    retry: dict[str, int] = {
-        apsb: first for apsb, first in previous.items() if isinstance(first, int) and apsb in waiting
-    }
+    retry: dict[str, int] = {apsb: first for apsb, first in previous.items() if isinstance(first, int)}
+    for apsb in backlog:
+        backlog[apsb]["first"] = retry.get(apsb, now)
     # Retries come first and share the per-pass budget with the bulletins first seen now.
     fresh = sorted(
         unseen,
@@ -1939,7 +1954,14 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
     )
     # Record this pass's window, which the next pass compares against for the cut-off check.
     state["adobe"]["window"] = sorted({bulletin.apsb for bulletin in bulletins})
-    fresh = fresh[:MAX_ADOBE_NEW]
+    # The backlog is the work list: this pass's unseen bulletins first, then anything still outstanding from an
+    # earlier window. Bounded so a permanently broken bulletin cannot grow the state without limit.
+    by_apsb = {bulletin.apsb: bulletin for bulletin in unseen}
+    outstanding = [
+        by_apsb.get(apsb) or adobe.Bulletin(apsb, record.get("priority"), tuple(record["cves"]), record["url"])
+        for apsb, record in sorted(backlog.items(), key=lambda pair: (pair[1].get("first", now), pair[0]))
+    ][: MAX_ADOBE_NEW * 4]
+    fresh = outstanding[:MAX_ADOBE_NEW]
     followed = 0
     queued = 0
     for bulletin in bulletins:
@@ -1960,6 +1982,7 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
         detail = _adobe_detail(http, bulletin.apsb)
         if detail is None:
             first = retry.setdefault(bulletin.apsb, now)
+            backlog.setdefault(bulletin.apsb, {"cves": list(bulletin.cves), "url": bulletin.url})["first"] = first
             if now - first < ADOBE_DETAIL_RETRY_SECONDS:
                 LOG.warning(
                     "adobe commerce: %s waits for its detail page (first failed %d s ago); retried next pass",
@@ -1971,6 +1994,7 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
                 "adobe commerce: %s has no detail page after %d s; its message says so", bulletin.apsb, now - first
             )
         retry.pop(bulletin.apsb, None)
+        backlog.pop(bulletin.apsb, None)  # delivered: no longer outstanding
         cves = list(dict.fromkeys((*bulletin.cves, *(cve.cve for cve in detail.cves))) if detail else bulletin.cves)
         exploited = adobe_exploited(cves, detail, kev, kev_known)
         state["pending"].append(_adobe_new_message(bulletin, detail, exploited))
@@ -1980,11 +2004,15 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
         stored["retry"] = retry
     else:
         stored.pop("retry", None)
+    if backlog:
+        stored["backlog"] = backlog
+    else:
+        stored.pop("backlog", None)
     LOG.info(
-        "adobe commerce: %d bulletin(s) in the list, %d new queued, %d waiting for details, %d KEV follow-up(s) queued",
+        "adobe commerce: %d bulletin(s) in the list, %d new queued, %d outstanding, %d KEV follow-up(s) queued",
         len(bulletins),
         queued,
-        len(retry),
+        len(backlog),
         followed,
     )
     return True

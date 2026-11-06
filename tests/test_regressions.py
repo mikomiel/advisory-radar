@@ -2490,3 +2490,54 @@ def test_re_evaluation_runs_before_classification(tmp_path):
     finally:
         core.reevaluate, core.classify_new = original_reevaluate, original_classify
     assert order and order[0] == "reevaluate", "due watches are measured before new items are classified"
+
+
+# ---------------------------------------------------------------------------
+# Forty-second review round
+
+
+def test_an_adobe_bulletin_outstanding_from_an_earlier_window_is_still_delivered():
+    import advisory_radar.adobe as adobe_module
+
+    state = core.new_state()
+    state["adobe"] = {
+        "window": ["APSB26-01"],
+        "seen": {},
+        "retry": {"APSB26-01": NOW - 60},
+        "backlog": {
+            "APSB26-01": {
+                "cves": ["CVE-2026-1"],
+                "url": "https://helpx.adobe.com/x",
+                "first": NOW - 60,
+            }
+        },
+    }
+    # the next response no longer lists APSB26-01 at all
+    core._adobe_list = lambda http, stored: (adobe_module.Bulletin("APSB26-02", None, ("CVE-2026-2",), "u"),)
+    core._adobe_detail = lambda http, apsb: adobe_module.Detail((), (), (), "", False)
+    try:
+        assert core.adobe_pass(state, lambda *a: (200, {}, b""), frozenset(), True, NOW) is True
+        queued = [entry for entry in state["pending"] if "APSB26-01" in entry.get("ids", "")]
+        assert queued, "a bulletin that rotated out of the list is still owed its message"
+    finally:
+        del core._adobe_list
+        del core._adobe_detail
+
+
+def test_parked_queue_can_be_dropped_without_notifier_credentials(tmp_path):
+    from advisory_radar import cli
+    from advisory_radar.state import load_state_document
+
+    state_path = tmp_path / "state.json"
+    state = core.new_state()
+    state["parked"] = [{"kind": "alert", "tag": "warning", "title": "t", "body": "b", "ids": ["CVE-2026-1"]}]
+    core.save_state(state_path, state)
+    path = tmp_path / "c.yml"
+    path.write_text(
+        "sources: []\n"
+        "notifiers:\n  - id: n\n    type: discord_webhook\n    url: ${DISCORD_WEBHOOK_URL}\n"
+        f"state_path: {state_path}\n"
+    )
+    code = cli.main(["--config", str(path), "drop-parked"], env={})  # the referenced variable is missing
+    assert code == 0, "a state-only command must not need plugin credentials"
+    assert not load_state_document(state_path, core.STATE_SCHEMA, "state").get("parked")
