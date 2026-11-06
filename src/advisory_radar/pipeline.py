@@ -205,21 +205,22 @@ def _run_pass(
         if window is not None:
             windows[source.id] = [item.guid for item in window.items]
         if source.kind == "webhook":
+            # An entry is done once every identity it can be known by is claimed: the ids its text names, and the
+            # source-scoped identity used for an entry that names none. Both namespaces must match what
+            # classification records, or a delivered entry stays in the inbox forever.
             inbox = state.get("webhook_inbox", {}).get(source.id, [])
             claimed = core._claimed(state)
-            kept = [
-                entry
-                for entry in inbox
-                if not all(
-                    identifier in claimed
-                    for identifier in core.extract_ids(
-                        str(entry.get("title", "")), str(entry.get("summary", "")), str(entry.get("link", ""))
-                    )
-                    or (f"src:{entry.get('guid', '')}",)
-                )
-            ]
+            kept = []
+            for entry in inbox:
+                # The identity classification records for an id-less item: guids are namespaced per source,
+                # so the claim is `src:{source}:{guid}`.
+                identities = core.extract_ids(
+                    str(entry.get("title", "")), str(entry.get("summary", "")), str(entry.get("link", ""))
+                ) or (f"src:{source.id}:{entry.get('guid', '')}",)
+                if not all(identifier in claimed for identifier in identities):
+                    kept.append(entry)
             if kept:
-                state.setdefault("webhook_inbox", {}).setdefault(source.id, kept)
+                state.setdefault("webhook_inbox", {})[source.id] = kept
             else:
                 state.get("webhook_inbox", {}).pop(source.id, None)
 

@@ -88,7 +88,7 @@ class TestFactsParsing:
                 }
             ]
         }
-        assert core.nvd_facts(document) == (5.0, False)
+        assert core.nvd_facts(document) == (5.0, False, False)
 
     def test_remote_unauth_token_exact(self):
         assert core.remote_unauth("CVSS:3.1/AV:N/AC:L/PR:N/UI:N")

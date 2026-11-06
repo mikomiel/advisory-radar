@@ -9,10 +9,13 @@ frontend build step.
 
 from __future__ import annotations
 
+import hmac
 import html
+import json
+import os
 import time
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
@@ -70,11 +73,18 @@ def last_pass_code(state: dict) -> int:
     return int(runs[-1].get("code", -1)) if runs else -1
 
 
+def _insecure_cookies(env: Mapping[str, str]) -> bool:
+    """Whether the plaintext-cookie opt-out is set (development only; the default is a Secure cookie)."""
+    return env.get("ADVISORY_RADAR_INSECURE_COOKIES", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def create_app(
     cfg: Config, env: dict[str, str], *, run_pass: Callable[..., int] | None = None, sources=None, notifiers=None
 ) -> FastAPI:
     app = FastAPI(title="advisory-radar", docs_url=None, redoc_url=None)
     auth = Auth(env.get("ADVISORY_RADAR_AUTH_TOKEN", ""))
+    #: Inbound webhooks are open to a configured source id only; an unconfigured signal is refused, not stored.
+    webhook_sources = {source.id for source in (sources or []) if getattr(source, "kind", "") == "webhook"}
 
     token = env.get("ADVISORY_RADAR_AUTH_TOKEN", "")
     if not token:
@@ -106,9 +116,19 @@ def create_app(
 
         form = urllib.parse.parse_qs((await request.body()).decode("utf-8", "replace"))
         token = (form.get("token") or [""])[0]
-        if token and token == env.get("ADVISORY_RADAR_AUTH_TOKEN", ""):
+        expected = env.get("ADVISORY_RADAR_AUTH_TOKEN", "")
+        # constant-time compare: a byte-by-byte comparison leaks how much of the token matched
+        if token and expected and hmac.compare_digest(token.encode(), expected.encode()):
             response = RedirectResponse("/", status_code=303)
-            response.set_cookie("advisory_radar_session", auth.login_cookie(), httponly=True, samesite="lax")
+            # Secure by default: without it a browser may send a seven-day session over plaintext HTTP to the
+            # same host. ADVISORY_RADAR_INSECURE_COOKIES=1 opts out, for a plain-HTTP development instance only.
+            response.set_cookie(
+                "advisory_radar_session",
+                auth.login_cookie(),
+                httponly=True,
+                samesite="lax",
+                secure=not _insecure_cookies(os.environ),
+            )
             return response
         return page(
             "Login",
@@ -253,30 +273,58 @@ def create_app(
         ]
         return PlainTextResponse("\n".join(lines) + "\n")
 
+    #: Webhook inbox bounds: an unauthenticated or abusive caller must not be able to grow the state without
+    #: limit, and the body is read bounded rather than trusted to be small.
+    WEBHOOK_BODY_LIMIT = 64 * 1024
+    WEBHOOK_INBOX_LIMIT = 500
+
     @app.post("/webhooks/{source_id}")
     async def webhook_intake(source_id: str, request: Request):
         """Inbound webhook (generic JSON or changedetection.io native payload).
 
-        When ADVISORY_RADAR_WEBHOOK_SECRET is set, the request must carry
-        ``Authorization: Bearer <secret>``.
+        Fails closed: ingestion is disabled unless ``ADVISORY_RADAR_WEBHOOK_SECRET`` is set *and* ``source_id``
+        names a configured webhook source. The request must carry ``Authorization: Bearer <secret>``.
+
+        The state transaction runs in a worker thread: a file lock, a read and an fsync write must never block
+        the event loop the scheduler and /healthz share, and the lock is taken non-blockingly so a running pass
+        answers 503 rather than stalling the request.
         """
+        from starlette.concurrency import run_in_threadpool
+
         from . import core as _core
         from .sources import webhook_item_from_payload
-        from .state import load_state_document, save_state, state_lock
+        from .state import LockBusy, load_state_document, save_state, state_lock
 
         secret = env.get("ADVISORY_RADAR_WEBHOOK_SECRET", "")
-        if secret and request.headers.get("authorization") != f"Bearer {secret}":
+        if not secret or source_id not in webhook_sources:
+            return JSONResponse({"error": "webhook ingestion is not configured"}, status_code=404)
+        provided = request.headers.get("authorization", "")
+        if not hmac.compare_digest(provided.encode(), f"Bearer {secret}".encode()):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        payload = await request.json()
+        body = await request.body()
+        if len(body) > WEBHOOK_BODY_LIMIT:
+            return JSONResponse({"error": "payload too large"}, status_code=413)
+        try:
+            payload = json.loads(body or b"null")
+        except ValueError:
+            return JSONResponse({"error": "payload is not JSON"}, status_code=400)
         entry = webhook_item_from_payload(payload)
         if entry is None:
             return JSONResponse({"error": "payload has no title"}, status_code=422)
-        if entry.get("explicit_ids"):
-            entry.pop("explicit_ids")  # ids are re-extracted from text at classify time
-        with state_lock(cfg.state_path):
-            state = load_state_document(cfg.state_path, _core.STATE_SCHEMA, "advisory state") or _core.new_state()
-            state.setdefault("webhook_inbox", {}).setdefault(source_id, []).append(entry)
-            save_state(cfg.state_path, state)
+        entry.pop("explicit_ids", None)  # ids are re-extracted from text at classify time
+
+        def store() -> None:
+            with state_lock(cfg.state_path, blocking=False):
+                state = load_state_document(cfg.state_path, _core.STATE_SCHEMA, "advisory state") or _core.new_state()
+                inbox = state.setdefault("webhook_inbox", {}).setdefault(source_id, [])
+                inbox.append(entry)
+                del inbox[:-WEBHOOK_INBOX_LIMIT]
+                save_state(cfg.state_path, state)
+
+        try:
+            await run_in_threadpool(store)
+        except LockBusy:
+            return JSONResponse({"error": "busy, retry"}, status_code=503, headers={"Retry-After": "30"})
         return JSONResponse({"queued": entry["guid"]})
 
     @app.get("/api/state", response_class=JSONResponse)

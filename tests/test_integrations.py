@@ -74,10 +74,17 @@ def test_webhook_intake_and_source_roundtrip(tmp_path):
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
     cfg = load_config(cfg_path, {})
-    app = create_app(cfg, {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_WEBHOOK_SECRET": "s3cret"})
+    app = create_app(
+        cfg,
+        {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_WEBHOOK_SECRET": "s3cret"},
+        sources=[WebhookSource("wh")],
+    )
     client = TestClient(app)
-    # no secret -> 401
+    # an unconfigured source id is refused outright, before any authentication is considered
+    assert client.post("/webhooks/other", json={"title": "x"}).status_code == 404
+    # a configured source without the bearer secret is unauthorized, and writes nothing
     assert client.post("/webhooks/wh", json={"title": "x"}).status_code == 401
+    assert not (tmp_path / "state.json").exists()
     response = client.post(
         "/webhooks/wh",
         json={"title": "Vendor advisory CVE-2026-7777", "text": "fixes CVE-2026-7777", "url": "https://v.example/a"},
@@ -116,3 +123,70 @@ def test_notifier_payload_shapes():
     assert ntfy_call[1].endswith("/alerts") and ntfy_call[2]["Title"] == "CRITICAL: X"
     gotify_call = next(c for c in calls if "gotify" in c[1])
     assert "token=tok" in gotify_call[1]
+
+
+def test_every_built_in_is_configurable_through_yaml(tmp_path):
+    """A builder key the config parser rejects is an integration nobody can configure."""
+    from advisory_radar.config import load_config
+    from advisory_radar.pipeline import build_plugins
+
+    configs = {
+        "changedetection": "sources:\n  - id: c\n    type: changedetection\n    url: https://cd.example.com\n"
+        "    api_key: k\n    tag: advisories\n",
+        "ntfy": "notifiers:\n  - id: n\n    type: ntfy\n    url: https://ntfy.example.com\n    topic: alerts\n"
+        "    priority: 4\n",
+        "gotify": "notifiers:\n  - id: g\n    type: gotify\n    url: https://gotify.example.com\n    token: t\n"
+        "    priority: 5\n",
+        "smtp": "notifiers:\n  - id: s\n    type: smtp\n    host: smtp.example.com\n    port: 587\n"
+        "    from: radar@example.com\n    to: ops@example.com\n    username: u\n    password: p\n"
+        "    use_tls: true\n",
+    }
+    for name, body in configs.items():
+        path = tmp_path / f"{name}.yml"
+        state = tmp_path / f"{name}.json"
+        path.write_text(body + f"state_path: {state}\n")
+        cfg = load_config(path, {})
+        assert build_plugins(cfg, {}) is not None, name
+
+
+def test_a_delivered_webhook_entry_leaves_the_inbox(tmp_path):
+    """Both an id-bearing and an id-less entry must be cleaned up, or the inbox grows forever."""
+    from advisory_radar import core, pipeline
+    from advisory_radar.config import load_config
+    from advisory_radar.sources import WebhookSource
+    from advisory_radar.state import load_state_document
+
+    path = tmp_path / "c.yml"
+    path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
+    cfg = load_config(path, {})
+    state = core.new_state()
+    state["webhook_inbox"] = {
+        "wh": [
+            {"guid": "with-id", "title": "CVE-2026-1111 fixed", "summary": "", "link": "https://v.example/a"},
+            {"guid": "no-ids", "title": "routine maintenance", "summary": "", "link": "https://v.example/b"},
+        ]
+    }
+    core.save_state(cfg.state_path, state)
+
+    sent = []
+
+    class Recorder:
+        id = "rec"
+
+        def send(self, entry, http):
+            sent.append(entry)
+            return 200
+
+    # two passes: the first classifies and delivers, the second sees the entries claimed and drops them
+    for _ in range(2):
+        pipeline.run_pass(
+            cfg,
+            [WebhookSource("wh")],
+            [Recorder()],
+            http=lambda *a: (404, {}, b""),
+            clock=lambda: 1_700_000_000.0,
+            sleep=lambda s: None,
+        )
+    state = load_state_document(cfg.state_path, core.STATE_SCHEMA, "state")
+    # the point is the cleanup: whatever the classification decided, the entry has been accounted for
+    assert not state.get("webhook_inbox", {}).get("wh"), "a handled entry is removed from the inbox"

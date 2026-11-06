@@ -510,25 +510,31 @@ def _nvd_record_matches(document: dict, cve: str) -> bool:
     return True
 
 
-def nvd_facts(document: dict) -> tuple[float | None, bool]:
-    """``parse_nvd`` plus whether a metric giving that score is remote and unauthenticated (same source)."""
+def nvd_facts(document: dict) -> tuple[float | None, bool, bool]:
+    """``parse_nvd`` plus whether that score is remote/unauthenticated (same source) and whether a supported
+    metric was present but unreadable: a partially readable metrics list is not a measurement."""
     vulnerabilities = document.get("vulnerabilities")
     first = vulnerabilities[0] if isinstance(vulnerabilities, list) and vulnerabilities else None
     cve = first.get("cve") if isinstance(first, dict) else None
     metrics = cve.get("metrics") if isinstance(cve, dict) else None
     primary: list[tuple[float, bool]] = []
     other: list[tuple[float, bool]] = []
+    malformed = False
     for entries in metrics.values() if isinstance(metrics, dict) else []:
         for entry in entries if isinstance(entries, list) else []:
             data = entry.get("cvssData") if isinstance(entry, dict) else None
             if not isinstance(data, dict):
+                malformed = True
                 continue
             score = _bounded(data.get("baseScore"), 0.0, 10.0)
-            if score is not None:
-                (primary if entry.get("type") == "Primary" else other).append(
-                    (score, remote_unauth(data.get("vectorString")))
-                )
-    return _best(primary or other)
+            if score is None:
+                malformed = True
+                continue
+            (primary if entry.get("type") == "Primary" else other).append(
+                (score, remote_unauth(data.get("vectorString")))
+            )
+    score, remote = _best(primary or other)
+    return score, remote, malformed
 
 
 def _number(value: object) -> float | None:
@@ -642,7 +648,9 @@ class Intel:
         # failed lookup, never "no score".
         if not isinstance(document, dict) or not _nvd_record_matches(document, cve):
             return False, None, False
-        return (True, *nvd_facts(document))
+        score, remote, malformed = nvd_facts(document)
+        # A supported metric that could not be read means the severity was not measured in full: fail closed.
+        return (not malformed, score, remote)
 
     def _epss(self, cves: Sequence[str]) -> dict[str, tuple[float | None, float | None]] | None:
         scores: dict[str, tuple[float | None, float | None]] = {}

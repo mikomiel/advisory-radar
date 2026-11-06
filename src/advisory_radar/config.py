@@ -72,8 +72,29 @@ class Config:
     secret_values: tuple[str, ...] = ()
 
 
-_SOURCE_KEYS = {"id", "type", "url", "token", "user", "enabled"}
-_NOTIFIER_KEYS = {"id", "type", "url", "key", "password", "headers", "enabled"}
+#: Every key a built-in source or notifier builder reads. A key the builder needs but this set rejects is an
+#: integration nobody can configure, so the two are kept together and `tests/test_integrations.py` loads one
+#: complete YAML per built-in through ``load_config`` and ``build_plugins``.
+_SOURCE_KEYS = {"id", "type", "url", "token", "user", "api_key", "tag", "enabled"}
+_NOTIFIER_KEYS = {
+    "id",
+    "type",
+    "url",
+    "key",
+    "password",
+    "headers",
+    "enabled",
+    # gotify / smtp / ntfy fields
+    "token",
+    "topic",
+    "priority",
+    "host",
+    "port",
+    "from",
+    "to",
+    "username",
+    "use_tls",
+}
 _TOP_KEYS = {
     "sources",
     "notifiers",
