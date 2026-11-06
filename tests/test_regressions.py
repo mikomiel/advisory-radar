@@ -574,3 +574,63 @@ def test_dry_run_reports_a_window_gap(tmp_path):
         dry_run=True,
     )
     assert code == 1
+
+
+# ---------------------------------------------------------------------------
+# Sixth review round
+
+
+def test_a_config_error_never_echoes_a_secret(tmp_path):
+    from advisory_radar.config import ConfigError
+
+    path = tmp_path / "c.yml"
+    path.write_text("sources: []\nnotifiers: []\npoll_interval: ${SECRET_INTERVAL}\nstate_path: /tmp/x.json\n")
+    with pytest.raises(ConfigError) as caught:
+        load_config(path, {"SECRET_INTERVAL": "sup3rsecretvalue"})
+    assert "sup3rsecretvalue" not in str(caught.value)
+
+
+def test_an_unrepresentable_feed_date_does_not_abort_a_pass(tmp_path):
+    cfg = config(tmp_path)
+    crazy = (
+        b'<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>'
+        b"<link>https://feeds.example.com/</link>"
+        b"<item><title>weird date advisory</title><link>https://vendor.example.com/x</link>"
+        b"<guid>gx</guid><description>notes</description><pubDate>Wed, 21 Oct 9999 10:00:00 +0000</pubDate>"
+        b"</item></channel></rss>"
+    )
+    feeds = {"https://feeds.example.com/a": crazy}
+    notifier = Notifier()
+    code = pipeline.run_pass(
+        cfg,
+        [RssSource("s1", "https://feeds.example.com/a")],
+        [notifier],
+        http=http_for(feeds),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code in (0, 1)
+    assert notifier.sent, "the item must still be rendered and delivered"
+
+
+def test_stopping_the_server_does_not_run_another_pass(tmp_path, monkeypatch):
+    """`run` returns after uvicorn stops; it must not fall through to an extra pass."""
+    from advisory_radar import cli
+
+    cfg_path = tmp_path / "c.yml"
+    cfg_path.write_text(
+        "sources:\n  - id: s\n    type: rss\n    url: https://feeds.example.com/a\n"
+        "notifiers: []\nstate_path: " + str(tmp_path / "state.json") + "\n"
+    )
+    calls = []
+
+    def fake_run(app, host=None, port=None, log_level=None):
+        raise SystemExit(0)  # simulate a graceful stop
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+    monkeypatch.setattr(cli.pipeline, "run_pass", lambda *a, **k: calls.append(1) or 0)
+    import contextlib
+
+    with contextlib.suppress(SystemExit):
+        cli.main(["run", "--config", str(cfg_path)])
+    assert len(calls) <= 1, "shutdown must not start an extra pass"

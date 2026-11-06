@@ -98,21 +98,30 @@ def main(
 
             app = create_app(cfg, environment, run_pass=one_pass, sources=sources, notifiers=notifiers)
 
+            stopping = threading.Event()
+
             def scheduler() -> None:
-                while True:
+                while not stopping.is_set():
                     try:
                         code = one_pass()
                         if code:
                             LOG.warning("pass exited %d; continuing on schedule", code)
                     except Exception:  # the schedule must survive any single bad pass
                         LOG.exception("pass raised; continuing on schedule")
-                    sleep(cfg.poll_interval_seconds)
+                    stopping.wait(cfg.poll_interval_seconds)
 
-            threading.Thread(target=scheduler, daemon=True).start()
+            thread = threading.Thread(target=scheduler, daemon=True)
+            thread.start()
             import uvicorn
 
             LOG.info("web UI on http://%s:%d", cfg.web_host, cfg.web_port)
-            uvicorn.run(app, host=cfg.web_host, port=cfg.web_port, log_level="warning")
+            try:
+                uvicorn.run(app, host=cfg.web_host, port=cfg.web_port, log_level="warning")
+            finally:
+                # Shutdown is not a reason to fetch and notify again: stop the schedule and leave.
+                stopping.set()
+                thread.join(timeout=5)
+            return 0
         return pipeline.run_pass(
             cfg, sources, notifiers, http=http, clock=clock, sleep=sleep, dry_run=args.command == "dry-run"
         )

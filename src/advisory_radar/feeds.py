@@ -102,7 +102,7 @@ def parse_feed(body: bytes) -> FeedExport:
                 title,
                 link,
                 summary,
-                published if type(published) is int else None,
+                published if type(published) is int and _plausible(published) else None,
                 _text(origin.get("title")),
                 source_url.strip() if isinstance(source_url, str) else "",
             )
@@ -133,6 +133,16 @@ _RSS = "{http://purl.org/rss/1.0/}"
 
 def _text_of(node: ET.Element | None) -> str:
     return clean_text("".join(node.itertext())) if node is not None else ""
+
+
+#: A feed date outside this window is treated as absent: a stray huge integer must not survive to
+#: rendering, where ``datetime.fromtimestamp`` would raise.
+EARLIEST_EPOCH = 631152000  # 1990-01-01
+LATEST_EPOCH = 4102444800  # 2100-01-01
+
+
+def _plausible(epoch: int) -> bool:
+    return EARLIEST_EPOCH <= epoch <= LATEST_EPOCH
 
 
 def _published_of(node: ET.Element | None) -> int | None:

@@ -124,14 +124,14 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
 
     poll = document.get("poll_interval", "15m")
     match = re.fullmatch(r"(\d+)([smh])", str(poll))
-    _require(match is not None, f"poll_interval must look like 15m/30s/12h, got {poll!r}")
+    _require(match is not None, "poll_interval must look like 15m, 30s or 12h")
     seconds = int(match.group(1)) * {"s": 1, "m": 60, "h": 3600}[match.group(2)]
 
     web = document.get("web") or {}
     _require(isinstance(web, dict), "web must be a mapping")
     web_host = str(web.get("host", "0.0.0.0"))
     web_port = web.get("port", 8080)
-    _require(isinstance(web_port, int) and 1 <= web_port <= 65535, f"web.port must be 1..65535, got {web_port!r}")
+    _require(isinstance(web_port, int) and 1 <= web_port <= 65535, "web.port must be an integer in 1..65535")
     watchlist = document.get("watchlist")
     _require(
         watchlist is None or isinstance(watchlist, str),
