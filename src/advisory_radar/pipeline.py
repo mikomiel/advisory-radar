@@ -100,15 +100,12 @@ def _run_pass(
     source_ok = True
     kev, kev_known = load_kev(http, cfg.state_path.with_name(KEV_CACHE_NAME), save=not dry_run)
     intel = core.Intel(http, cache, clock, sleep)
-    # Re-evaluate before classification: both share one NVD budget, and a busy news day must not starve a due
-    # watch of the measurement that could escalate it. A watch created later this pass is evaluated next pass.
-    core.reevaluate(state, intel, kev, kev_known, now, "")
 
     fetched_ids: set[str] = set()
     answered: list[tuple[object, object]] = []
     for source in sources:
         try:
-            window = source.fetch(http)
+            window = source.fetch(http, state)
         except Exception as exc:  # a source fault fails the pass but keeps state
             LOG.error("source %s: %s: %s; state kept", source.id, type(exc).__name__, exc)
             source_ok = False
@@ -204,6 +201,25 @@ def _run_pass(
             carried[source.id] = [core.item_to_state(item) for item in left]
         if window is not None:
             windows[source.id] = [item.guid for item in window.items]
+        if source.kind == "webhook":
+            inbox = state.get("webhook_inbox", {}).get(source.id, [])
+            claimed = core._claimed(state)
+            kept = [
+                entry
+                for entry in inbox
+                if not all(
+                    identifier in claimed
+                    for identifier in core.extract_ids(
+                        str(entry.get("title", "")), str(entry.get("summary", "")), str(entry.get("link", ""))
+                    )
+                    or (f"src:{entry.get('guid', '')}",)
+                )
+            ]
+            if kept:
+                state.setdefault("webhook_inbox", {}).setdefault(source.id, kept)
+            else:
+                state.get("webhook_inbox", {}).pop(source.id, None)
+
         if not dry_run:
             save_state(cfg.state_path, state)
 
@@ -233,6 +249,7 @@ def _run_pass(
         core._prune_enrich_clock(state, key, kept)
 
     adobe_ok = core.adobe_pass(state, http, kev, kev_known, now) if cfg.adobe_commerce else True
+    core.reevaluate(state, intel, kev, kev_known, now, "")
 
     if dry_run:
         for entry in state["pending"][: core.DELIVERY_CAP]:

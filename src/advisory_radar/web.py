@@ -253,6 +253,32 @@ def create_app(
         ]
         return PlainTextResponse("\n".join(lines) + "\n")
 
+    @app.post("/webhooks/{source_id}")
+    async def webhook_intake(source_id: str, request: Request):
+        """Inbound webhook (generic JSON or changedetection.io native payload).
+
+        When ADVISORY_RADAR_WEBHOOK_SECRET is set, the request must carry
+        ``Authorization: Bearer <secret>``.
+        """
+        from . import core as _core
+        from .sources import webhook_item_from_payload
+        from .state import load_state_document, save_state, state_lock
+
+        secret = env.get("ADVISORY_RADAR_WEBHOOK_SECRET", "")
+        if secret and request.headers.get("authorization") != f"Bearer {secret}":
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        payload = await request.json()
+        entry = webhook_item_from_payload(payload)
+        if entry is None:
+            return JSONResponse({"error": "payload has no title"}, status_code=422)
+        if entry.get("explicit_ids"):
+            entry.pop("explicit_ids")  # ids are re-extracted from text at classify time
+        with state_lock(cfg.state_path):
+            state = load_state_document(cfg.state_path, _core.STATE_SCHEMA, "advisory state") or _core.new_state()
+            state.setdefault("webhook_inbox", {}).setdefault(source_id, []).append(entry)
+            save_state(cfg.state_path, state)
+        return JSONResponse({"queued": entry["guid"]})
+
     @app.get("/api/state", response_class=JSONResponse)
     def api_state(request: Request):
         if not require_auth(request):

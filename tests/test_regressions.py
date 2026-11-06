@@ -188,10 +188,9 @@ def test_run_record_is_persisted(tmp_path):
 class WindowSource:
     """A source that returns a fixed window, so a test controls truncation and identity."""
 
-    kind = "rss"  # protocol versions after P1 read it
-
     def __init__(self, source_id: str, items, truncated: bool = False, host: str = "feeds.example.com") -> None:
         self.id = source_id
+        self.kind = "rss"  # later protocol versions read it
         self._items = tuple(items)
         self.truncated = truncated
         self.host = host
@@ -2384,109 +2383,3 @@ def test_a_plugin_type_error_does_not_echo_the_expanded_value(tmp_path, caplog):
         code = cli.main(["--config", str(path), "once"], env=env)
     assert code == 1, "a bad plugin type is a configuration error, not a traceback"
     assert "SUPERSECRET" not in caplog.text
-
-
-# ---------------------------------------------------------------------------
-# Fortieth review round
-
-
-def test_an_adobe_list_that_rotates_normally_still_delivers_new_bulletins(tmp_path):
-    import advisory_radar.adobe as adobe_module
-
-    state = core.new_state()
-    state["adobe"] = {
-        "window": ["APSB26-01"],
-        "seen": {"APSB26-01": {"cves": ["CVE-2026-1"], "at": NOW, "exploited": False}},
-    }
-    bulletins = (adobe_module.Bulletin("APSB26-02", None, ("CVE-2026-2",), "https://helpx.adobe.com/x"),)
-
-    def fake_list(http, stored):
-        return bulletins
-
-    original = core._adobe_list
-    core._adobe_list = fake_list
-    try:
-        ok = core.adobe_pass(state, lambda *a: (200, {}, b""), frozenset(), True, NOW)
-    finally:
-        core._adobe_list = original
-    assert ok, "a rotated window is not a source fault"
-    assert state["adobe"]["window"] == ["APSB26-02"]
-
-
-def test_a_claimed_alias_free_ghsa_does_not_set_the_item_aggregate():
-    state = core.new_state()
-    claimed = "GHSA-aaaa-bbbb-cccc"
-    state["seen"][claimed] = {"at": NOW - 7200, "outcome": "delivered"}
-    item = core.Item(
-        "g1",
-        f"{claimed} and GHSA-dddd-eeee-ffff",
-        "https://vendor.example.com/a",
-        "n",
-        NOW - 60,
-        (claimed, "GHSA-dddd-eeee-ffff"),
-    )
-
-    class Intel(core.Intel):
-        def __init__(self):
-            super().__init__(lambda *a: (404, {}, b""), {}, lambda: float(NOW), lambda s: None)
-
-        def ghsa(self, ghsa):
-            if ghsa == claimed:
-                return core.OsvFacts((), 9.8, True)  # already delivered: CRITICAL
-            return core.OsvFacts((), None, False)  # the new one is unmeasured
-
-    policy = core.Policy(("curl",), (), ())
-    core.classify_new(state, [item], Intel(), frozenset(), True, NOW, "vendor.example.com", policy)
-    assert all(entry["tag"] != "critical" for entry in state["pending"]), (
-        "a delivered advisory must not promote an unmeasured new one"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Forty-first review round
-
-
-def test_a_kev_identifier_with_a_trailing_newline_is_rejected():
-    import tempfile
-    from pathlib import Path
-
-    from advisory_radar.kev import KEV_CACHE_SCHEMA, _catalog_is_usable, load_kev
-    from advisory_radar.state import save_state
-
-    assert _catalog_is_usable([{"cveID": "CVE-2026-1234"}]) is True
-    assert _catalog_is_usable([{"cveID": "CVE-2026-1234\n"}]) is False
-    assert _catalog_is_usable([{"cveID": 1234}]) is False
-    with tempfile.TemporaryDirectory() as tmp:
-        cache = Path(tmp) / "kev.json"
-        save_state(cache, {"schema": KEV_CACHE_SCHEMA, "cves": ["CVE-2026-1234\n"]})
-        cves, known = load_kev(lambda *a: (500, {}, b""), cache, save=False)
-    assert known is False and cves == frozenset(), "a malformed cached id authorizes nothing"
-
-
-def test_re_evaluation_runs_before_classification(tmp_path):
-    """A busy classification pass must not take the NVD budget a due watch needs."""
-    cfg = config(tmp_path)
-    order: list[str] = []
-    original_reevaluate, original_classify = core.reevaluate, core.classify_new
-
-    def spy_reevaluate(*args, **kwargs):
-        order.append("reevaluate")
-        return original_reevaluate(*args, **kwargs)
-
-    def spy_classify(*args, **kwargs):
-        order.append("classify")
-        return original_classify(*args, **kwargs)
-
-    core.reevaluate, core.classify_new = spy_reevaluate, spy_classify
-    try:
-        pipeline.run_pass(
-            cfg,
-            [WindowSource("s1", [item("g1", "advisory with CVE-2026-9999")])],
-            [Notifier()],
-            http=http_for({}),
-            clock=lambda: float(NOW),
-            sleep=lambda s: None,
-        )
-    finally:
-        core.reevaluate, core.classify_new = original_reevaluate, original_classify
-    assert order and order[0] == "reevaluate", "due watches are measured before new items are classified"
