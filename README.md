@@ -17,9 +17,12 @@ docker compose up -d
 podman play kube deploy/podman/advisory-radar.yaml
 ```
 
-Then open http://localhost:8080 and add your first source. Configuration lives
-in `config/` on the mounted volume (see `examples/config.yml`); secrets come
-from environment variables or `<NAME>_FILE` files, never from committed files.
+Then open http://localhost:8080 (sign in with `ADVISORY_RADAR_AUTH_TOKEN`) for the
+dashboard, alert history, parked queue, run log and config overview. `/healthz`
+and `/metrics` (Prometheus text) are unauthenticated for probes and scrapers.
+Configuration lives in `config/` on the mounted volume (see `examples/config.yml`);
+secrets come from environment variables or `<NAME>_FILE` files, never from
+committed files.
 
 ```yaml
 # examples/config.yml (abridged)
