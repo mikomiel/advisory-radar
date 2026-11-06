@@ -704,11 +704,13 @@ def test_two_ids_that_expand_to_one_value_are_refused(tmp_path):
 
     path = tmp_path / "c.yml"
     path.write_text(
-        "sources: []\nnotifiers:\n  - id: ${A}\n    type: webhook\n    url: https://x.example/y\n"
-        "  - id: ${B}\n    type: webhook\n    url: https://x.example/z\n"
+        "sources: []\nnotifiers:\n  - id: a${X}\n    type: webhook\n    url: https://x.example/y\n"
+        "  - id: a${Y}\n    type: webhook\n    url: https://x.example/z\n"
     )
-    with pytest.raises(ConfigError):
-        load_config(path, {"A": "same", "B": "same"})
+    with pytest.raises(ConfigError, match="expand to the same value"):
+        load_config(path, {"X": "same", "Y": "same"})
+    # and the same configuration with distinct expansions is accepted
+    assert load_config(path, {"X": "one", "Y": "two"}).notifiers[0]["id"] == "aone"
 
 
 def test_an_overflowing_metric_is_unknown_not_fatal(tmp_path):
@@ -1037,3 +1039,64 @@ def test_a_disabled_plugin_does_not_need_its_secret(tmp_path):
     )
     cfg = load_config(path, {})  # must not raise
     assert [entry["id"] for entry in cfg.notifiers] == ["active-channel"]
+
+
+# ---------------------------------------------------------------------------
+# Fifteenth review round
+
+
+def test_an_aliased_ghsa_does_not_override_its_cve(monkeypatch):
+    """A GHSA that aliases a CVE speaks through that CVE's authoritative score, not on its own."""
+    facts = {"CVE-2026-1111": core.CveFacts(7.5, None, None, None, True)}
+    verdict = core.judge(
+        ["CVE-2026-1111"],
+        facts,
+        frozenset(),
+        True,
+        9.8,
+        True,
+        osv_fallbacks={"CVE-2026-1111": 9.8},
+        independent_ghsa_cvss=None,
+    )
+    assert verdict.tag == "warning", "an aliased GHSA must not force critical"
+
+
+def test_an_alias_free_critical_ghsa_alone_is_critical():
+    verdict = core.judge([], {}, frozenset(), True, 9.8, True, osv_fallbacks={}, independent_ghsa_cvss=9.8)
+    assert verdict.tag == "critical", "a CRITICAL advisory with no CVE alias is critical by itself"
+
+
+def test_an_alias_free_ghsa_cannot_be_hidden_by_a_low_cve():
+    facts = {"CVE-2026-2222": core.CveFacts(2.0, None, 0.001, 0.1, True)}
+    verdict = core.judge(
+        ["CVE-2026-2222"], facts, frozenset(), True, 9.8, True, osv_fallbacks={}, independent_ghsa_cvss=9.8
+    )
+    assert verdict.tag == "critical"
+
+
+def test_freshrss_uses_the_configured_user():
+    from advisory_radar.feeds import fetch_feed
+
+    seen = {}
+
+    def http(method, url, headers, body):
+        seen["url"] = url
+        return 200, {}, b'{"items": []}'
+
+    fetch_feed(http, "https://rss.example.com", "tok", "joasia")
+    from urllib.parse import parse_qs, urlsplit
+
+    query = parse_qs(urlsplit(seen["url"]).query)
+    assert query["user"] == ["joasia"], "a shared query belongs to the account that owns it"
+
+
+def test_the_freshrss_user_comes_from_configuration(tmp_path):
+    from advisory_radar.sources import build_source
+
+    source = build_source({"id": "fr", "type": "freshrss", "url": "https://rss.example.com", "token": "t"}, {"T": "t"})
+    assert source.user == "admin"
+    source = build_source(
+        {"id": "fr", "type": "freshrss", "url": "https://rss.example.com", "token": "t", "user": "joasia"},
+        {"T": "t"},
+    )
+    assert source.user == "joasia"

@@ -928,7 +928,7 @@ def judge(
     osv_cvss: float | None,
     osv_complete: bool = True,
     osv_fallbacks: Mapping[str, float] | None = None,
-    ghsas_without_cves: bool = False,
+    independent_ghsa_cvss: float | None = None,
 ) -> Verdict:
     """Item verdict from the CVEs it names; the CVE that decides is the one shown.
 
@@ -937,6 +937,10 @@ def judge(
     """
     incomplete_note = "Incomplete severity data; treated as unknown."
     if not cves:
+        # With no CVE named, every OSV score here belongs to an advisory that has no CVE alias, so its
+        # severity decides on its own: a CRITICAL label is critical, not merely a warning.
+        if osv_cvss is not None and osv_cvss >= CRITICAL_CVSS:
+            return Verdict("critical", (), metrics_line(osv_cvss, None, None, None, False, approximate=True), "")
         if osv_complete and osv_cvss is not None and osv_cvss < LOW_BELOW:
             return Verdict("suppressed", (), metrics_line(osv_cvss, None, None, None, False, approximate=True), "")
         line = (
@@ -968,9 +972,10 @@ def judge(
             # Sent as a warning, so the watch records it as sent: a later re-score is not a second warning.
             tag = "warning"
             levels = tuple((cve, "warning") for cve, _ in levels)
-    if osv_cvss is not None and ghsas_without_cves:
-        # An alias-free GHSA carries its own severity: a LOW CVE beside it must not hide it.
-        if osv_cvss >= CRITICAL_CVSS:
+    if independent_ghsa_cvss is not None:
+        # An alias-free GHSA carries its own severity: a LOW CVE beside it must not hide it, and an aliased
+        # GHSA (whose score is already represented by its CVE) must not override the CVE's own score.
+        if independent_ghsa_cvss >= CRITICAL_CVSS:
             tag = "critical"
         elif tag == "suppressed":
             tag = "warning"
@@ -1321,14 +1326,19 @@ def classify_new(
         osv_complete = True
         #: CVE -> the score of the GHSA that aliases it, so one advisory's LOW cannot judge another's CVE.
         osv_fallbacks: dict[str, float] = {}
+        independent_ghsa_cvss: float | None = None
         for ghsa in ghsas:
             osv = intel.ghsa(ghsa)
             osv_complete = osv_complete and osv.complete
             cves += [cve for cve in osv.cves if cve not in cves]
             if osv.cvss is not None:
                 osv_cvss = max(osv_cvss or 0.0, osv.cvss)
-                for alias in osv.cves:
-                    osv_fallbacks[alias] = max(osv_fallbacks.get(alias, 0.0), osv.cvss)
+                if osv.cves:
+                    for alias in osv.cves:
+                        osv_fallbacks[alias] = max(osv_fallbacks.get(alias, 0.0), osv.cvss)
+                else:
+                    # The advisory has no CVE alias, so its label is its only severity evidence.
+                    independent_ghsa_cvss = max(independent_ghsa_cvss or 0.0, osv.cvss)
         vendor_ids = [identifier for identifier in explicit if identifier.startswith(("PSA-", "DSA-"))]
         # Every explicit identifier is an identity: an unclaimed GHSA must not be hidden behind a CVE that
         # an earlier message already claimed.
@@ -1355,7 +1365,7 @@ def classify_new(
             osv_cvss,
             osv_complete and not unenriched,
             osv_fallbacks=osv_fallbacks,
-            ghsas_without_cves=bool(ghsas) and not any(osv_fallbacks.get(ghsa) for ghsa in ghsas),
+            independent_ghsa_cvss=independent_ghsa_cvss,
         )
         if unenriched and verdict.tag == "warning":
             verdict = replace(verdict, note=ENRICH_FAILED_NOTE)

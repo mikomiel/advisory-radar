@@ -43,13 +43,14 @@ class RssSource:
 class FreshRssSource:
     """A FreshRSS shared query exported as GReader JSON (``f=greader``)."""
 
-    def __init__(self, source_id: str, base_url: str, token: str) -> None:
+    def __init__(self, source_id: str, base_url: str, token: str, user: str = "admin") -> None:
         self.id = source_id
         self.base_url = base_url
         self.token = token
+        self.user = user
 
     def fetch(self, http: Http) -> SourceWindow:
-        export = feeds.fetch_feed(http, self.base_url, self.token)
+        export = feeds.fetch_feed(http, self.base_url, self.token, self.user)
         return SourceWindow(self.id, _items(export), export.truncated, _host(self.base_url))
 
 
@@ -57,7 +58,7 @@ class FreshRssSource:
 #: ``${VAR}`` placeholders resolved by config.load_config at load time.
 SOURCE_BUILDERS = {
     "rss": lambda cfg, env: RssSource(cfg["id"], cfg["url"]),
-    "freshrss": lambda cfg, env: FreshRssSource(cfg["id"], cfg["url"], cfg["token"]),
+    "freshrss": lambda cfg, env: FreshRssSource(cfg["id"], cfg["url"], cfg["token"], cfg.get("user", "admin")),
 }
 
 

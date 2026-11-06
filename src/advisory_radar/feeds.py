@@ -110,8 +110,9 @@ def parse_feed(body: bytes) -> FeedExport:
     return FeedExport(tuple(items), bool(document.get("continuation")) or len(entries) >= FEED_ITEMS)
 
 
-def fetch_feed(http: Http, base_url: str, token: str) -> FeedExport:
-    query = urllib.parse.urlencode({"user": "admin", "t": token, "f": "greader", "nb": FEED_ITEMS})
+def fetch_feed(http: Http, base_url: str, token: str, user: str = "admin") -> FeedExport:
+    """A FreshRSS shared query is owned by one account, so the user is part of the request."""
+    query = urllib.parse.urlencode({"user": user, "t": token, "f": "greader", "nb": FEED_ITEMS})
     url = f"{base_url.rstrip('/')}/api/query.php?{query}"
     status, _, body = http("GET", url, {"Accept": "application/json"}, None)
     if status != 200:

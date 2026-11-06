@@ -68,7 +68,7 @@ class Config:
     secret_values: tuple[str, ...] = ()
 
 
-_SOURCE_KEYS = {"id", "type", "url", "token", "enabled"}
+_SOURCE_KEYS = {"id", "type", "url", "token", "user", "enabled"}
 _NOTIFIER_KEYS = {"id", "type", "url", "key", "password", "headers", "enabled"}
 _TOP_KEYS = {
     "sources",
@@ -114,12 +114,6 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
         _require(isinstance(entry.get("enabled", True), bool), f"{entry['id']}: enabled must be a bool")
     ids = [entry["id"] for entry in (*sources, *notifiers)]
     _require(len(ids) == len(set(ids)), f"duplicate plugin ids: {ids}")
-    # State keys join the source id and the item's guid with ":", so a colon in an id could collide with
-    # another source's id+guid pair.
-    _require(
-        all(re.fullmatch(r"[A-Za-z0-9._-]+", entry["id"]) for entry in (*sources, *notifiers)),
-        "plugin ids may use only letters, digits, dot, dash and underscore",
-    )
     # A disabled plugin is not built, so its ${...} references are not resolved either: turning a channel
     # off must be enough to drop its credential requirement.
     enabled = {
@@ -136,6 +130,12 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
     sources = document.get("sources") or []
     notifiers = document.get("notifiers") or []
     expanded_ids = [entry["id"] for entry in (*sources, *notifiers)]
+    # State keys join the source id and the item's guid with ":", so a colon in an id could collide with
+    # another source's id+guid pair. The id is validated after expansion, when it is the value in use.
+    _require(
+        all(re.fullmatch(r"[A-Za-z0-9._-]+", identifier) for identifier in expanded_ids),
+        "plugin ids may use only letters, digits, dot, dash and underscore",
+    )
     _require(
         len(expanded_ids) == len(set(expanded_ids)),
         "two plugin ids expand to the same value; ids must stay unique after ${...} expansion",
