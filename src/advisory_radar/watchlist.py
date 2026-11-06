@@ -75,7 +75,7 @@ def load_policy(path: Path = WATCHLIST) -> Policy:
         ids.add(identifier)
     packages = _strings(document["debian_source_packages"])
     excluded = _strings(document["excluded_products"], empty=True)
-    if any(not re.fullmatch(r"[a-z0-9][a-z0-9.+-]*\*?", package) for package in packages):
+    if any(not re.fullmatch(r"\*|[a-z0-9][a-z0-9.+-]*\*?", package) for package in packages):
         raise SourceError("watchlist package pattern is invalid")
     return Policy(packages, excluded, tuple(products))
 

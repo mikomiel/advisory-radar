@@ -61,11 +61,23 @@ def save_state(path: Path, state: dict) -> None:
         raise
 
 
+class LockBusy(RuntimeError):
+    """The state lock is held elsewhere (another pass or another process)."""
+
+
 @contextlib.contextmanager
-def state_lock(state_path: Path) -> Generator[None]:
-    """Exclusive lock beside the state file, held for a whole pass or operator action."""
+def state_lock(state_path: Path, *, blocking: bool = True) -> Generator[None]:
+    """Exclusive lock beside the state file, held for a whole pass or operator action.
+
+    ``blocking=False`` raises :class:`LockBusy` instead of waiting, so an HTTP handler can answer
+    409 rather than stalling until a long pass finishes.
+    """
     state_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor = os.open(state_path.with_suffix(".lock"), os.O_CREAT | os.O_WRONLY, 0o600)
     with os.fdopen(descriptor, "w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        try:
+            fcntl.flock(handle, flags)
+        except BlockingIOError as exc:
+            raise LockBusy(str(state_path)) from exc
         yield

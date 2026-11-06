@@ -57,6 +57,8 @@ class Config:
     web_host: str = "0.0.0.0"
     web_port: int = 8080
     raw: dict = field(default_factory=dict)
+    #: ``${NAME}`` references read from the file *before* expansion, for log redaction.
+    secret_names: tuple[str, ...] = ()
 
 
 _SOURCE_KEYS = {"id", "type", "url", "token", "enabled"}
@@ -88,15 +90,16 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
         raise ConfigError(f"{path} is not a mapping")
     unknown = set(document) - _TOP_KEYS
     _require(not unknown, f"unknown top-level keys in {path}: {sorted(unknown)}")
-    document = _expand(document, env)
-
+    # Structure is validated on the *unexpanded* document: an entry whose id is missing must not put an
+    # expanded password into the error message, and the secret names must be read before expansion
+    # replaces them with their values.
     sources = document.get("sources") or []
     notifiers = document.get("notifiers") or []
     _require(isinstance(sources, list) and isinstance(notifiers, list), "sources/notifiers must be lists")
     for entry in (*sources, *notifiers):
         _require(
             isinstance(entry, dict) and isinstance(entry.get("id"), str) and entry["id"],
-            f"every source/notifier needs a string id: {entry!r}",
+            "every source/notifier needs a string id",
         )
         _require(isinstance(entry.get("type"), str), f"{entry['id']}: missing type")
         extra = set(entry) - (_SOURCE_KEYS if entry in sources else _NOTIFIER_KEYS)
@@ -104,6 +107,11 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
         _require(isinstance(entry.get("enabled", True), bool), f"{entry['id']}: enabled must be a bool")
     ids = [entry["id"] for entry in (*sources, *notifiers)]
     _require(len(ids) == len(set(ids)), f"duplicate plugin ids: {ids}")
+    secret_names = tuple(sorted(set(_ENV_RE.findall(yaml.safe_dump(document)))))
+    document = _expand(document, env)
+    # Built plugins read the expanded entries; the structural checks above used the raw ones.
+    sources = document.get("sources") or []
+    notifiers = document.get("notifiers") or []
 
     poll = document.get("poll_interval", "15m")
     match = re.fullmatch(r"(\d+)([smh])", str(poll))
@@ -129,11 +137,14 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
         web_host=web_host,
         web_port=int(web_port),
         raw=document,
+        secret_names=secret_names,
     )
 
 
 def collect_secrets(config: Config, env: dict[str, str] | None = None) -> list[str]:
-    """Every ${NAME} the config references, so the CLI can redact them from logs."""
-    env = os.environ if env is None else env
-    names = set(_ENV_RE.findall(yaml.safe_dump(config.raw)))
-    return sorted(names)
+    """Every ${NAME} the config referenced, so the CLI can redact its value from logs.
+
+    The names come from the file as written: ``Config.raw`` already holds expanded values, so scanning
+    it would find nothing to redact.
+    """
+    return list(config.secret_names)

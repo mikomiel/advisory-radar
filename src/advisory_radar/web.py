@@ -67,6 +67,12 @@ def create_app(
     app = FastAPI(title="advisory-radar", docs_url=None, redoc_url=None)
     auth = Auth(env.get("ADVISORY_RADAR_AUTH_TOKEN", ""))
 
+    token = env.get("ADVISORY_RADAR_AUTH_TOKEN", "")
+    if not token:
+        # The session cookie is signed with this token; an empty key is a public key, so anyone could
+        # mint a cookie for a protected endpoint.
+        raise ValueError("ADVISORY_RADAR_AUTH_TOKEN must be set to serve the web UI")
+
     def require_auth(request: Request) -> bool:
         return auth.valid(request)
 
@@ -124,7 +130,7 @@ def create_app(
     def run_now(request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
-        code = run_pass() if run_pass is not None else -1
+        code = run_pass(lock_blocking=False) if run_pass is not None else -1
         return RedirectResponse(f"/?ran={code}", status_code=303)
 
     @app.get("/alerts", response_class=HTMLResponse)

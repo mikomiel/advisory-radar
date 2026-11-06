@@ -14,7 +14,7 @@ from .kev import load_kev
 from .notifiers import build_notifier
 from .plugins import Source
 from .sources import build_source
-from .state import SourceError, load_state_document, save_state
+from .state import LockBusy, SourceError, load_state_document, save_state, state_lock
 from .watchlist import load_policy
 
 LOG = logging.getLogger("advisory_radar")
@@ -35,8 +35,35 @@ def run_pass(
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
     dry_run: bool = False,
+    lock_blocking: bool = True,
 ) -> int:
-    """Exit 0 when every owed message landed (or none was owed); 1 on any fault, with state kept."""
+    """Run one pass under the state lock: exit 0 when every owed message landed, 1 on any fault.
+
+    The lock is held for the whole read/classify/deliver/write transaction, so the scheduler, the web
+    UI's "run now" and a CLI ``once`` can never deliver the same pending message twice or overwrite each
+    other's state. ``lock_blocking=False`` returns 1 immediately when another pass holds it.
+    """
+    if dry_run:
+        return _run_pass(cfg, sources, notifiers, http=http, clock=clock, sleep=sleep, dry_run=True)
+    try:
+        with state_lock(cfg.state_path, blocking=lock_blocking):
+            return _run_pass(cfg, sources, notifiers, http=http, clock=clock, sleep=sleep, dry_run=False)
+    except LockBusy:
+        LOG.warning("another pass holds the state lock; skipped this run")
+        return 1
+
+
+def _run_pass(
+    cfg: Config,
+    sources: list[Source],
+    notifiers: list,
+    *,
+    http: Http,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+    dry_run: bool,
+) -> int:
+    """The pass itself; ``run_pass`` owns the state lock around it."""
     now = int(clock())
     try:
         stored = load_state_document(cfg.state_path, core.STATE_SCHEMA, "advisory state")
@@ -52,6 +79,7 @@ def run_pass(
     gap = False
     source_ok = True
     windows = _source_windows(stored) if stored is not None else {}
+    live_guids: set[str] = set()
     state = core.new_state() if stored is None else stored
     state.setdefault("parked", [])
     core._prune(state, now)
@@ -75,8 +103,7 @@ def run_pass(
             )
             gap = True
         windows[source.id] = [item.guid for item in window.items]
-        for key in ("enrich_retry", "enrich_pending"):
-            core._prune_enrich_clock(state, key, {item.guid for item in window.items})
+        live_guids.update(item.guid for item in window.items)
         items = [item for item in window.items if core.passes_filter(item, policy)]
         if stored is None:
             candidates = core.seed(state, items, now)
@@ -92,6 +119,11 @@ def run_pass(
         if not dry_run:
             save_state(cfg.state_path, state)
 
+    # Prune once, against every window fetched this pass: a per-source prune erased the other sources'
+    # retry clocks, so a persistent enrichment failure never reached its deadline.
+    for key in ("enrich_retry", "enrich_pending"):
+        core._prune_enrich_clock(state, key, live_guids)
+
     adobe_ok = core.adobe_pass(state, http, kev, kev_known, now) if cfg.adobe_commerce else True
     core.reevaluate(state, intel, kev, kev_known, now, "")
 
@@ -103,7 +135,14 @@ def run_pass(
 
     save_state(cfg.state_path, state)  # pending is durable before the first POST
     queued, parked_before = len(state["pending"]), len(state["parked"])
-    delivered = core.deliver(state, notifiers, http, now)
+    if not notifiers and state["pending"]:
+        LOG.error(
+            "no enabled notifiers: %d message(s) stay pending until one is configured",
+            len(state["pending"]),
+        )
+        delivered = False
+    else:
+        delivered = core.deliver(state, notifiers, http, now)
     save_state(cfg.state_path, state)
     newly_parked = len(state["parked"]) - parked_before
     sent = queued - len(state["pending"]) - newly_parked
@@ -115,10 +154,10 @@ def run_pass(
             core._audit_ids(state["parked"][-1]),
         )
     code = 0 if delivered and not state["parked"] and not gap and adobe_ok and source_ok else 1
-    if not dry_run:
-        runs = state.setdefault("runs", [])
-        runs.append({"at": now, "sent": sent, "parked": newly_parked, "pending": len(state["pending"]), "code": code})
-        del runs[:-200]
+    runs = state.setdefault("runs", [])
+    runs.append({"at": now, "sent": sent, "parked": newly_parked, "pending": len(state["pending"]), "code": code})
+    del runs[:-200]
+    save_state(cfg.state_path, state)  # the run record is part of the state, so it must be saved
     return code
 
 

@@ -1716,6 +1716,8 @@ def deliver(state: dict, notifiers: Sequence, http: Http, now: int) -> bool:
     at the head and stops the pass. A message that already failed MAX_DELIVERY_ATTEMPTS times is never posted
     again, so a full parked list cannot turn into a duplicate post on every pass.
     """
+    if not notifiers:  # an empty notifier list must never mark a message delivered
+        return False
     for entry in list(state["pending"][:DELIVERY_CAP]):
         entry.setdefault("first_attempt_at", now)
         if entry.get("attempts", 0) >= MAX_DELIVERY_ATTEMPTS:  # only a full parked list leaves one here

@@ -93,8 +93,10 @@ def main(
 
             from .web import create_app
 
-            def one_pass() -> int:
-                return pipeline.run_pass(cfg, sources, notifiers, http=http, clock=clock, sleep=sleep)
+            def one_pass(lock_blocking: bool = True) -> int:
+                return pipeline.run_pass(
+                    cfg, sources, notifiers, http=http, clock=clock, sleep=sleep, lock_blocking=lock_blocking
+                )
 
             app = create_app(cfg, environment, run_pass=one_pass, sources=sources, notifiers=notifiers)
 

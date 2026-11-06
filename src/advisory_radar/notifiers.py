@@ -78,9 +78,9 @@ def _secret(env: dict, cfg: dict, key: str) -> str:
 #: Config ``type`` -> builder(config dict, env) -> Notifier
 NOTIFIER_BUILDERS = {
     "apprise": lambda cfg, env: AppriseNotifier(
-        cfg["id"], cfg["url"], cfg.get("key", "alerts"), _secret(env, cfg, "password_env")
+        cfg["id"], cfg["url"], cfg.get("key", "alerts"), cfg.get("password", "")
     ),
-    "discord_webhook": lambda cfg, env: DiscordWebhookNotifier(cfg["id"], _secret(env, cfg, "url_env")),
+    "discord_webhook": lambda cfg, env: DiscordWebhookNotifier(cfg["id"], cfg["url"]),
     "webhook": lambda cfg, env: WebhookNotifier(cfg["id"], cfg["url"], cfg.get("headers") or {}),
 }
 
