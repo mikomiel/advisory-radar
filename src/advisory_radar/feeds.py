@@ -39,6 +39,37 @@ class FeedExport:
     truncated: bool
 
 
+#: Tags that end a run of text. Joining their neighbours without a space would merge words and hide a
+#: watchlist product alias ("libfoo" + "fixed" -> "libfoofixed").
+_BLOCK_TAGS = frozenset(
+    {
+        "p",
+        "div",
+        "br",
+        "li",
+        "ul",
+        "ol",
+        "tr",
+        "td",
+        "th",
+        "table",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "section",
+        "article",
+        "header",
+        "footer",
+        "blockquote",
+        "pre",
+        "hr",
+    }
+)
+
+
 class _TextExtractor(html.parser.HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -46,6 +77,14 @@ class _TextExtractor(html.parser.HTMLParser):
 
     def handle_data(self, data: str) -> None:
         self.parts.append(data)
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in _BLOCK_TAGS:
+            self.parts.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in _BLOCK_TAGS:
+            self.parts.append(" ")
 
 
 def clean_text(value: str) -> str:

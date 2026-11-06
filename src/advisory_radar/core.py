@@ -99,6 +99,9 @@ MAX_REEVAL = 10
 #: looked up in CVE.org/NVD; the rest are unscored, so the item can never be suppressed. KEV is a local set and
 #: stays complete; EPSS is one cheap batch call per EPSS_BATCH ids.
 MAX_ITEM_CVE_LOOKUPS = 10
+#: OSV lookups one item may spend. A feed item naming hundreds of GHSAs must not hold the pass (and the
+#: state lock) for hours; the rest stay unmeasured, so the item can be a warning but never suppressed.
+MAX_ITEM_GHSA_LOOKUPS = 5
 EPSS_BATCH = 100
 MAX_SHOWN_IDS = 10
 #: A feed name is operator-chosen text; this keeps it from eating the budget the excerpt shrinks into.
@@ -977,7 +980,9 @@ def judge(
         # GHSA (whose score is already represented by its CVE) must not override the CVE's own score.
         if independent_ghsa_cvss >= CRITICAL_CVSS:
             tag = "critical"
-        elif tag == "suppressed":
+        elif tag == "suppressed" and independent_ghsa_cvss >= LOW_BELOW:
+            # Both components are measured and both are LOW: keep the suppression. Only a second advisory
+            # above the LOW floor is news.
             tag = "warning"
     chosen = facts[shown]
     cvss = chosen.cvss if chosen.cvss is not None else osv_cvss
@@ -1327,7 +1332,9 @@ def classify_new(
         #: CVE -> the score of the GHSA that aliases it, so one advisory's LOW cannot judge another's CVE.
         osv_fallbacks: dict[str, float] = {}
         independent_ghsa_cvss: float | None = None
-        for ghsa in ghsas:
+        if len(ghsas) > MAX_ITEM_GHSA_LOOKUPS:
+            osv_complete = False  # the rest were not looked up, so nothing here is a complete measurement
+        for ghsa in ghsas[:MAX_ITEM_GHSA_LOOKUPS]:
             osv = intel.ghsa(ghsa)
             osv_complete = osv_complete and osv.complete
             cves += [cve for cve in osv.cves if cve not in cves]

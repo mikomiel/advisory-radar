@@ -1100,3 +1100,54 @@ def test_the_freshrss_user_comes_from_configuration(tmp_path):
         {"T": "t"},
     )
     assert source.user == "joasia"
+
+
+# ---------------------------------------------------------------------------
+# Sixteenth review round
+
+
+def test_an_item_with_many_ghsas_cannot_monopolise_the_pass(monkeypatch):
+    looked: list[str] = []
+
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda s: None)
+
+        def ghsa(self, ghsa):
+            looked.append(ghsa)
+            return core.OsvFacts((), None, True)
+
+    state = core.new_state()
+    many = core.Item(
+        "g1",
+        "bulk advisory",
+        "https://vendor.example.com/a",
+        "notes",
+        NOW - 60,
+        tuple(f"GHSA-aaaa-bbbb-{index:04d}" for index in range(200)),
+    )
+    policy = core.Policy(("curl",), (), ())
+    core.classify_new(state, [many], Intel(), frozenset(), True, NOW, "vendor.example.com", policy)
+    assert len(looked) <= core.MAX_ITEM_GHSA_LOOKUPS, "OSV lookups per item are bounded"
+    # the unmeasured remainder keeps the item out of the suppressed bucket
+    assert all(entry["tag"] != "suppressed" for entry in state["pending"])
+
+
+def test_two_measured_low_advisories_stay_suppressed():
+    facts = {"CVE-2026-3333": core.CveFacts(2.0, None, 0.001, 0.1, True)}
+    verdict = core.judge(
+        ["CVE-2026-3333"], facts, frozenset(), True, 3.9, True, osv_fallbacks={}, independent_ghsa_cvss=3.9
+    )
+    assert verdict.tag == "suppressed", "LOW + LOW is not news"
+    high = core.judge(
+        ["CVE-2026-3333"], facts, frozenset(), True, 7.5, True, osv_fallbacks={}, independent_ghsa_cvss=7.5
+    )
+    assert high.tag == "warning"
+
+
+def test_block_level_html_keeps_word_boundaries():
+    from advisory_radar.feeds import clean_text
+
+    assert clean_text("<p>libfoo</p><p>fixed a bug</p>") == "libfoo fixed a bug"
+    text = clean_text("<div><b>libfoo</b><br>remote code execution</div>")
+    assert "libfoo remote" in text
