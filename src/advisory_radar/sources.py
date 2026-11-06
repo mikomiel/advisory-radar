@@ -87,7 +87,9 @@ class ChangedetectionSource:
         watches = document if isinstance(document, dict) else None
         if watches is None:
             raise RuntimeError("changedetection.io response is not a watch map")
-        seen = state.setdefault("changedetection", {}).setdefault(self.id, {})
+        seen = state.get("changedetection", {}).get(self.id, {})
+        # Cursors are *not* advanced here: a fetch whose candidates never reach pending/carry would lose them.
+        pending_cursors: dict[str, int] = {}
         items: list[Item] = []
         for uuid, watch in watches.items():
             if not isinstance(watch, dict) or not isinstance(uuid, str):
@@ -100,7 +102,7 @@ class ChangedetectionSource:
             changed = int(changed)
             if seen.get(uuid, 0) >= changed:
                 continue
-            seen[uuid] = changed
+            pending_cursors[uuid] = changed
             title = str(watch.get("title") or watch.get("page_title") or uuid)
             link = str(watch.get("link") or watch.get("url") or "")
             summary = f"Page changed (last_changed={changed})."
@@ -117,7 +119,16 @@ class ChangedetectionSource:
                     link,
                 )
             )
+        self._pending_cursors = pending_cursors
         return SourceWindow(self.id, tuple(items), False, _host(self.url))
+
+    def commit(self, state: dict) -> None:
+        """Advance the cursors only once the pipeline has captured this window's candidates."""
+        cursors = getattr(self, "_pending_cursors", None)
+        if not cursors:
+            return
+        state.setdefault("changedetection", {}).setdefault(self.id, {}).update(cursors)
+        self._pending_cursors = {}
 
 
 class WebhookSource:

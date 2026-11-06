@@ -204,6 +204,11 @@ def _run_pass(
             carried[source.id] = [core.item_to_state(item) for item in left]
         if window is not None:
             windows[source.id] = [item.guid for item in window.items]
+        # A source that tracks a cursor advances it only now: the same write carries the candidates, so a crash
+        # between fetch and classification cannot skip an advisory forever.
+        commit = getattr(source, "commit", None)
+        if commit is not None:
+            commit(state)
         if source.kind == "webhook":
             # An entry is done once every identity it can be known by is claimed: the ids its text names, and the
             # source-scoped identity used for an entry that names none. Both namespaces must match what

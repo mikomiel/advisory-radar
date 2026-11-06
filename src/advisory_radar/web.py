@@ -73,6 +73,10 @@ def last_pass_code(state: dict) -> int:
     return int(runs[-1].get("code", -1)) if runs else -1
 
 
+class InboxFull(Exception):
+    """A webhook source's inbox is at capacity; the sender must retry, nothing is discarded."""
+
+
 def _insecure_cookies(env: Mapping[str, str]) -> bool:
     """Whether the plaintext-cookie opt-out is set (development only; the default is a Secure cookie)."""
     return env.get("ADVISORY_RADAR_INSECURE_COOKIES", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -317,14 +321,21 @@ def create_app(
             with state_lock(cfg.state_path, blocking=False):
                 state = load_state_document(cfg.state_path, _core.STATE_SCHEMA, "advisory state") or _core.new_state()
                 inbox = state.setdefault("webhook_inbox", {}).setdefault(source_id, [])
+                # A full inbox refuses the new entry rather than dropping an accepted one: an acknowledged
+                # advisory must never be discarded unprocessed.
+                if len(inbox) >= WEBHOOK_INBOX_LIMIT:
+                    raise InboxFull
                 inbox.append(entry)
-                del inbox[:-WEBHOOK_INBOX_LIMIT]
                 save_state(cfg.state_path, state)
 
         try:
             await run_in_threadpool(store)
         except LockBusy:
             return JSONResponse({"error": "busy, retry"}, status_code=503, headers={"Retry-After": "30"})
+        except InboxFull:
+            return JSONResponse(
+                {"error": "inbox full, retry after the next pass"}, status_code=429, headers={"Retry-After": "60"}
+            )
         return JSONResponse({"queued": entry["guid"]})
 
     @app.get("/api/state", response_class=JSONResponse)

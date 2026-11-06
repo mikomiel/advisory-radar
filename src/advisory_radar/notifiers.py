@@ -90,14 +90,20 @@ class NtfyNotifier:
         self.priority = priority
 
     def send(self, entry: dict, http: Http) -> int:
-        body = f"{entry['title']}\n{entry['body']}".encode()[:3500]
-        status, _, _ = http(
-            "POST",
+        # JSON publishing, not Title/X-Title headers: http.client encodes header values as Latin-1, so an em
+        # dash or CJK title in a header fails on every retry and the message parks. The JSON body is UTF-8.
+        return _post_json(
+            http,
             self.url,
-            {"Title": entry["title"][:100], "Priority": str(self.priority), "Tags": entry["tag"]},
-            body,
+            {},
+            {
+                "topic": self.url.rsplit("/", 1)[-1],
+                "title": entry["title"][:250],
+                "message": f"{entry['title']}\n{entry['body']}"[:3500],
+                "priority": self.priority,
+                "tags": [entry["tag"]],
+            },
         )
-        return status
 
 
 class GotifyNotifier:
@@ -134,7 +140,8 @@ class SmtpNotifier:
         to: list[str],
         username: str | None,
         password: str | None,
-        use_tls: bool,
+        starttls: bool,
+        implicit_tls: bool,
     ) -> None:
         self.id = notifier_id
         self.host = host
@@ -143,7 +150,8 @@ class SmtpNotifier:
         self.to = to
         self.username = username
         self.password = password
-        self.use_tls = use_tls
+        self.starttls = starttls
+        self.implicit_tls = implicit_tls
 
     def send(self, entry: dict, http: Http) -> int:
         import smtplib
@@ -154,14 +162,21 @@ class SmtpNotifier:
         message["From"] = self.from_addr
         message["To"] = ", ".join(self.to)
         message.set_content(entry["body"])
+        import ssl
+
+        # A validating context: without it smtplib does not check the server's certificate, and an
+        # interception would hand over the configured credentials and silently swallow the message.
+        context = ssl.create_default_context()
         try:
-            if self.use_tls:
-                with smtplib.SMTP_SSL(self.host, self.port, timeout=30) as smtp:
+            if self.implicit_tls:  # port 465: TLS from the first byte
+                with smtplib.SMTP_SSL(self.host, self.port, timeout=30, context=context) as smtp:
                     self._login(smtp)
                     smtp.send_message(message)
             else:
                 with smtplib.SMTP(self.host, self.port, timeout=30) as smtp:
-                    smtp.starttls()
+                    if self.starttls:  # port 587: plain greeting, then an upgrade
+                        smtp.starttls(context=context)
+                        smtp.ehlo()
                     self._login(smtp)
                     smtp.send_message(message)
             return 200
@@ -171,6 +186,13 @@ class SmtpNotifier:
     def _login(self, smtp) -> None:
         if self.username:
             smtp.login(self.username, self.password or "")
+
+
+def _bool(value: object) -> bool:
+    """A YAML boolean, accepting the string forms an environment expansion produces (``"false"`` is truthy)."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 #: Config ``type`` -> builder(config dict, env) -> Notifier. Secret fields are
@@ -190,7 +212,9 @@ NOTIFIER_BUILDERS = {
         [a.strip() for a in str(cfg["to"]).split(",") if a.strip()],
         cfg.get("username"),
         cfg.get("password"),
-        bool(cfg.get("use_tls", True)),
+        # `use_tls: true` is STARTTLS on the submission port (587); implicit TLS (465) is `implicit_tls: true`.
+        starttls=_bool(cfg.get("use_tls", True)),
+        implicit_tls=_bool(cfg.get("implicit_tls", False)),
     ),
 }
 

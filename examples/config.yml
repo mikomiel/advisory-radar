@@ -51,7 +51,7 @@ notifiers:
   #   type: smtp
   #   host: smtp.example.com
   #   port: 587
-  #   use_tls: true
+  #   use_tls: true        # STARTTLS on the submission port (587)
   #   from: radar@example.com
   #   to: admin@example.com
   #   username: radar@example.com

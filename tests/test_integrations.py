@@ -50,6 +50,8 @@ def test_changedetection_source_emits_only_new_changes():
     state: dict = {}
     first = source.fetch(cd_http_factory(WATCHES_V1), state)
     assert [i.guid for i in first.items] == ["cd:uuid-1:900"]
+    assert not state.get("changedetection"), "fetch alone must not advance the cursor"
+    source.commit(state)  # the pipeline commits after classification
     again = source.fetch(cd_http_factory(WATCHES_V1), state)
     assert again.items == ()  # unchanged -> nothing new
     second = source.fetch(cd_http_factory(WATCHES_V2), state)
@@ -120,7 +122,10 @@ def test_notifier_payload_shapes():
     matrix_call = next(c for c in calls if "matrix" in c[1])
     assert json.loads(matrix_call[3])["msgtype"] == "m.text"
     ntfy_call = next(c for c in calls if "ntfy" in c[1])
-    assert ntfy_call[1].endswith("/alerts") and ntfy_call[2]["Title"] == "CRITICAL: X"
+    # JSON body, not a Title header: a header cannot carry a non-Latin-1 title
+    published = json.loads(ntfy_call[3])
+    assert ntfy_call[1].endswith("/alerts") and published["title"] == "CRITICAL: X"
+    assert published["topic"] == "alerts" and published["priority"] == 3
     gotify_call = next(c for c in calls if "gotify" in c[1])
     assert "token=tok" in gotify_call[1]
 
@@ -190,3 +195,100 @@ def test_a_delivered_webhook_entry_leaves_the_inbox(tmp_path):
     state = load_state_document(cfg.state_path, core.STATE_SCHEMA, "state")
     # the point is the cleanup: whatever the classification decided, the entry has been accounted for
     assert not state.get("webhook_inbox", {}).get("wh"), "a handled entry is removed from the inbox"
+
+
+def test_a_non_latin1_title_is_delivered_by_ntfy():
+    """An em dash in a header would fail on every retry; the JSON body carries it."""
+    calls = []
+
+    def http(method, url, headers, body):
+        calls.append((url, dict(headers), body))
+        return 200, {}, b""
+
+    entry = {"title": "CRITICAL: fixed — 修正", "body": "b", "tag": "critical"}
+    assert NtfyNotifier("n", "https://ntfy.example", "alerts").send(entry, http) == 200
+    body = calls[0][2]
+    assert isinstance(body, bytes)
+    decoded = json.loads(body.decode("utf-8"))
+    assert decoded["title"] == "CRITICAL: fixed — 修正"
+    assert not any("Title" in name for name in calls[0][1])
+
+
+def test_smtp_verifies_the_server_certificate():
+    """Both TLS paths must use a validating context, or the login is handed to an interceptor."""
+    import smtplib
+    import ssl
+
+    from advisory_radar.notifiers import SmtpNotifier
+
+    init_contexts: list[object] = []
+    starttls_contexts: list[object] = []
+
+    class FakeSMTP:
+        def __init__(self, host, port, timeout=None, context=None):
+            init_contexts.append(context)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def starttls(self, context=None):
+            starttls_contexts.append(context)
+
+        def ehlo(self):
+            return None
+
+        def login(self, user, password):
+            return None
+
+        def send_message(self, message):
+            return None
+
+    original_smtp, original_ssl = smtplib.SMTP, smtplib.SMTP_SSL
+    smtplib.SMTP, smtplib.SMTP_SSL = FakeSMTP, FakeSMTP
+    try:
+        submission = SmtpNotifier("s", "h", 587, "a@example.com", ["b@example.com"], "u", "p", True, False)
+        assert submission.send({"title": "t", "body": "b"}, lambda *a: (0, {}, b"")) == 200
+        implicit = SmtpNotifier("s", "h", 465, "a@example.com", ["b@example.com"], "u", "p", False, True)
+        assert implicit.send({"title": "t", "body": "b"}, lambda *a: (0, {}, b"")) == 200
+    finally:
+        smtplib.SMTP, smtplib.SMTP_SSL = original_smtp, original_ssl
+    assert starttls_contexts and all(isinstance(c, ssl.SSLContext) for c in starttls_contexts), (
+        "STARTTLS must be given a validating context"
+    )
+    assert any(isinstance(c, ssl.SSLContext) for c in init_contexts), "implicit TLS must be given a validating context"
+
+
+def test_a_full_webhook_inbox_refuses_rather_than_discards(tmp_path):
+    """An acknowledged, unprocessed advisory must never be dropped to make room."""
+    import json as _json
+
+    from fastapi.testclient import TestClient
+
+    from advisory_radar.config import load_config
+    from advisory_radar.state import load_state_document
+    from advisory_radar.web import create_app
+
+    path = tmp_path / "c.yml"
+    path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
+    cfg = load_config(path, {})
+    app = create_app(
+        cfg,
+        {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_WEBHOOK_SECRET": "s"},
+        sources=[WebhookSource("wh")],
+    )
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer s"}
+    for index in range(500):
+        response = client.post("/webhooks/wh", json={"title": f"advisory {index}"}, headers=headers)
+        assert response.status_code == 200
+    refused = client.post("/webhooks/wh", json={"title": "one too many"}, headers=headers)
+    assert refused.status_code == 429, "a full inbox refuses the new entry"
+    state = load_state_document(
+        cfg.state_path, __import__("advisory_radar.core", fromlist=["STATE_SCHEMA"]).STATE_SCHEMA, "state"
+    )
+    inbox = state["webhook_inbox"]["wh"]
+    assert len(inbox) == 500
+    assert inbox[0]["title"] == "advisory 0", "the first accepted entry is still there"
