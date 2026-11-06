@@ -94,6 +94,7 @@ _NOTIFIER_KEYS = {
     "to",
     "username",
     "use_tls",
+    "implicit_tls",
 }
 _TOP_KEYS = {
     "sources",

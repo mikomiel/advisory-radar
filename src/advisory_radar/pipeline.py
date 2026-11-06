@@ -165,7 +165,14 @@ def _run_pass(
             items = []
         else:
             host = window.host
-            items = [item for item in window.items if core.passes_filter(item, policy)]
+            items = []
+            for item in window.items:
+                if core.passes_filter(item, policy):
+                    items.append(item)
+                elif source.kind == "webhook":
+                    # An out-of-scope webhook entry gets a terminal disposition, so the inbox can release it
+                    # instead of letting irrelevant entries fill the capacity that real advisories need.
+                    state["seen"].setdefault(f"src:{source.id}:{item.guid}", {"at": now, "outcome": "filtered"})
         # Items carried from an earlier pass come first: the window they arrived in is already gone.
         earlier = [core.item_from_state(row) for row in carried.pop(source.id, [])]
         # The policy may have changed while these waited: scope applies at classification time, not arrival.

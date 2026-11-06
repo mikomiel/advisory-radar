@@ -124,7 +124,7 @@ def test_notifier_payload_shapes():
     ntfy_call = next(c for c in calls if "ntfy" in c[1])
     # JSON body, not a Title header: a header cannot carry a non-Latin-1 title
     published = json.loads(ntfy_call[3])
-    assert ntfy_call[1].endswith("/alerts") and published["title"] == "CRITICAL: X"
+    assert ntfy_call[1] == "https://ntfy.example" and published["title"] == "CRITICAL: X"
     assert published["topic"] == "alerts" and published["priority"] == 3
     gotify_call = next(c for c in calls if "gotify" in c[1])
     assert "token=tok" in gotify_call[1]
@@ -244,7 +244,7 @@ def test_smtp_verifies_the_server_certificate():
             return None
 
         def send_message(self, message):
-            return None
+            return {}
 
     original_smtp, original_ssl = smtplib.SMTP, smtplib.SMTP_SSL
     smtplib.SMTP, smtplib.SMTP_SSL = FakeSMTP, FakeSMTP
@@ -291,3 +291,85 @@ def test_a_full_webhook_inbox_refuses_rather_than_discards(tmp_path):
     inbox = state["webhook_inbox"]["wh"]
     assert len(inbox) == 500
     assert inbox[0]["title"] == "advisory 0", "the first accepted entry is still there"
+
+
+def test_an_oversized_login_body_is_refused_before_buffering(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from advisory_radar.config import load_config
+    from advisory_radar.web import LOGIN_BODY_LIMIT, create_app
+
+    path = tmp_path / "c.yml"
+    path.write_text(f"sources: []\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
+    cfg = load_config(path, {})
+    client = TestClient(create_app(cfg, {"ADVISORY_RADAR_AUTH_TOKEN": "t"}))
+    big = b"token=" + b"x" * (LOGIN_BODY_LIMIT + 1)
+    assert client.post("/login", content=big).status_code == 413
+
+
+def test_a_config_spelling_error_does_not_disable_smtp_tls(tmp_path):
+    """A misspelled boolean must be rejected: silently meaning "off" would authenticate in plaintext."""
+    import pytest
+
+    from advisory_radar.config import load_config
+    from advisory_radar.pipeline import build_plugins
+
+    path = tmp_path / "c.yml"
+    path.write_text(
+        "sources: []\nnotifiers:\n  - id: s\n    type: smtp\n    host: h\n    from: a@example.com\n"
+        "    to: b@example.com\n    use_tls: ${SMTP_TLS}\n" + f"state_path: {tmp_path}/state.json\n"
+    )
+    with pytest.raises((ValueError, KeyError)):
+        build_plugins(load_config(path, {"SMTP_TLS": "treu"}), {"SMTP_TLS": "treu"})
+
+
+def test_implicit_tls_is_a_configurable_key(tmp_path):
+    from advisory_radar.config import load_config
+    from advisory_radar.pipeline import build_plugins
+
+    path = tmp_path / "c.yml"
+    path.write_text(
+        "sources: []\nnotifiers:\n  - id: s\n    type: smtp\n    host: h\n    port: 465\n"
+        "    from: a@example.com\n    to: b@example.com\n    implicit_tls: true\n"
+        + f"state_path: {tmp_path}/state.json\n"
+    )
+    sources, notifiers = build_plugins(load_config(path, {}), {})
+    assert notifiers[0].implicit_tls is True
+
+
+def test_a_partial_smtp_refusal_is_not_a_delivery():
+    import smtplib
+
+    from advisory_radar.notifiers import SmtpNotifier
+
+    class FakeSMTP:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def starttls(self, context=None):
+            return None
+
+        def ehlo(self):
+            return None
+
+        def login(self, user, password):
+            return None
+
+        def send_message(self, message):
+            return {"refused@example.com": (550, b"no such user")}
+
+    original = smtplib.SMTP
+    smtplib.SMTP = FakeSMTP
+    try:
+        notifier = SmtpNotifier("s", "h", 587, "a@example.com", ["b@example.com"], None, None, True, False)
+        assert notifier.send({"title": "t", "body": "b"}, lambda *a: (0, {}, b"")) == 0, (
+            "a refused recipient means the alert must stay pending"
+        )
+    finally:
+        smtplib.SMTP = original

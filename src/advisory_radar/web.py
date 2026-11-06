@@ -73,6 +73,29 @@ def last_pass_code(state: dict) -> int:
     return int(runs[-1].get("code", -1)) if runs else -1
 
 
+#: A login form is a handful of bytes; an unauthenticated request must not be able to make us buffer more.
+LOGIN_BODY_LIMIT = 8 * 1024
+
+
+class BodyTooLarge(Exception):
+    """The request body exceeded the endpoint's limit; it is refused before it is fully read."""
+
+
+async def _body(request: Request, limit: int) -> bytes:
+    """Read a request body with a hard limit, streaming, so a chunked request cannot pre-allocate memory."""
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        raise BodyTooLarge
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            raise BodyTooLarge
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 class InboxFull(Exception):
     """A webhook source's inbox is at capacity; the sender must retry, nothing is discarded."""
 
@@ -118,7 +141,11 @@ def create_app(
         # parse the urlencoded body by hand: no python-multipart dependency
         import urllib.parse
 
-        form = urllib.parse.parse_qs((await request.body()).decode("utf-8", "replace"))
+        try:
+            raw = await _body(request, LOGIN_BODY_LIMIT)
+        except BodyTooLarge:
+            return PlainTextResponse("payload too large", status_code=413)
+        form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
         token = (form.get("token") or [""])[0]
         expected = env.get("ADVISORY_RADAR_AUTH_TOKEN", "")
         # constant-time compare: a byte-by-byte comparison leaks how much of the token matched
@@ -305,8 +332,9 @@ def create_app(
         provided = request.headers.get("authorization", "")
         if not hmac.compare_digest(provided.encode(), f"Bearer {secret}".encode()):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        body = await request.body()
-        if len(body) > WEBHOOK_BODY_LIMIT:
+        try:
+            body = await _body(request, WEBHOOK_BODY_LIMIT)
+        except BodyTooLarge:
             return JSONResponse({"error": "payload too large"}, status_code=413)
         try:
             payload = json.loads(body or b"null")

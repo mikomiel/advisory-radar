@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import urllib.parse
 
 from .http import Http
+
+LOG = logging.getLogger(__name__)
 
 
 def _post_json(http: Http, url: str, headers: dict[str, str], payload: dict) -> int:
@@ -86,7 +89,10 @@ class NtfyNotifier:
 
     def __init__(self, notifier_id: str, url: str, topic: str, priority: int = 3) -> None:
         self.id = notifier_id
-        self.url = url.rstrip("/") + "/" + topic
+        # The structured publish API posts to the server root with the topic in the document; posting the JSON
+        # to /<topic> would publish it as message text.
+        self.url = url.rstrip("/")
+        self.topic = topic
         self.priority = priority
 
     def send(self, entry: dict, http: Http) -> int:
@@ -97,7 +103,7 @@ class NtfyNotifier:
             self.url,
             {},
             {
-                "topic": self.url.rsplit("/", 1)[-1],
+                "topic": self.topic,
                 "title": entry["title"][:250],
                 "message": f"{entry['title']}\n{entry['body']}"[:3500],
                 "priority": self.priority,
@@ -171,14 +177,20 @@ class SmtpNotifier:
             if self.implicit_tls:  # port 465: TLS from the first byte
                 with smtplib.SMTP_SSL(self.host, self.port, timeout=30, context=context) as smtp:
                     self._login(smtp)
-                    smtp.send_message(message)
+                    refused = smtp.send_message(message)
             else:
                 with smtplib.SMTP(self.host, self.port, timeout=30) as smtp:
                     if self.starttls:  # port 587: plain greeting, then an upgrade
                         smtp.starttls(context=context)
                         smtp.ehlo()
                     self._login(smtp)
-                    smtp.send_message(message)
+                    refused = smtp.send_message(message)
+            # send_message returns {} on full success and a refusal per rejected recipient: a partial send is
+            # not a delivery, and acknowledging it would drop the alert from pending.
+            if refused:
+                count = len(refused) if isinstance(refused, dict) else 1
+                LOG.warning("smtp: %d recipient(s) refused the message", count)
+                return 0
             return 200
         except (OSError, smtplib.SMTPException):
             return 0
@@ -188,11 +200,20 @@ class SmtpNotifier:
             smtp.login(self.username, self.password or "")
 
 
-def _bool(value: object) -> bool:
-    """A YAML boolean, accepting the string forms an environment expansion produces (``"false"`` is truthy)."""
+def _bool(value: object, name: str) -> bool:
+    """A YAML boolean, accepting the documented string spellings an environment expansion produces.
+
+    ``bool("false")`` is ``True`` and an unrecognised spelling would otherwise silently mean "off" - which for
+    ``use_tls`` would authenticate over a plaintext connection, so an unknown value is rejected.
+    """
     if isinstance(value, bool):
         return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(f"{name} must be true or false")
 
 
 #: Config ``type`` -> builder(config dict, env) -> Notifier. Secret fields are
@@ -213,8 +234,8 @@ NOTIFIER_BUILDERS = {
         cfg.get("username"),
         cfg.get("password"),
         # `use_tls: true` is STARTTLS on the submission port (587); implicit TLS (465) is `implicit_tls: true`.
-        starttls=_bool(cfg.get("use_tls", True)),
-        implicit_tls=_bool(cfg.get("implicit_tls", False)),
+        starttls=_bool(cfg.get("use_tls", True), "use_tls"),
+        implicit_tls=_bool(cfg.get("implicit_tls", False), "implicit_tls"),
     ),
 }
 
