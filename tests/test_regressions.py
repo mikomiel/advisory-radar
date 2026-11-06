@@ -2052,12 +2052,54 @@ def test_the_config_page_does_not_print_a_source_token(tmp_path):
 
     path = tmp_path / "c.yml"
     path.write_text(
-        "sources:\n  - id: s\n    type: rss\n    url: https://user:pw@feeds.example.com/rss?token=SECRET123\n"
+        "sources:\n  - id: s\n    type: rss\n"
+        "    url: https://user:pw@feeds.example.com/private/SECRET123/rss?token=SECRET456\n"
         "notifiers: []\nstate_path: " + str(tmp_path / "state.json") + "\n"
     )
     cfg = load_config(path, {})
     client = TestClient(create_app(cfg, {"ADVISORY_RADAR_AUTH_TOKEN": "t"}))
     client.post("/login", data={"token": "t"}, follow_redirects=False)
     body = client.get("/config").text
-    assert "SECRET123" not in body and "pw@" not in body
+    assert "SECRET123" not in body and "SECRET456" not in body and "pw@" not in body
     assert "feeds.example.com" in body
+
+
+# ---------------------------------------------------------------------------
+# Thirty-third review round
+
+
+def test_every_cve_in_a_large_advisory_is_watched():
+    facts = {
+        f"CVE-2026-{2000 + index}": core.CveFacts(None, None, None, None, False, skipped=True) for index in range(25)
+    }
+    verdict = core.judge(list(facts), facts, frozenset(), True, None, True, osv_fallbacks={})
+    assert len(verdict.levels) == 25, "every claimed CVE needs a watch entry"
+    assert set(verdict.skipped) == set(facts), "the unmeasured ones are flagged KEV-only"
+
+
+def test_a_kev_addition_escalates_a_capped_out_cve(tmp_path):
+    (tmp_path / "watchlist.json").write_text(
+        json.dumps({"schema": KIND, "debian_source_packages": ["curl"], "excluded_products": [], "products": []})
+    )
+    cfg = config(tmp_path)
+    state = core.new_state()
+    later = "CVE-2026-9999"
+    state["watch"][later] = {
+        "since": NOW - 2 * 86400,
+        "last_eval": NOW - 2 * 86400,
+        "level": "warning",
+        "kev_only": True,
+        "title": "big advisory",
+        "link": "https://vendor.example.com/a",
+    }
+    from advisory_radar.state import save_state
+
+    save_state(cfg.state_path, state)
+
+    class Intel:
+        def cves(self, cves, force=False):
+            raise AssertionError("a KEV-only watch must not spend an enrichment request")
+
+    core.reevaluate(state, Intel(), frozenset({later}), True, NOW, "")
+    queued = [entry for entry in state["pending"] if entry["kind"] == "escalation"]
+    assert queued and queued[0]["cves"] == [later], "a KEV addition escalates a watch that was never enriched"

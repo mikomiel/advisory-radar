@@ -58,11 +58,11 @@ class Auth:
 
 
 def _public_url(url: str) -> str:
-    """The scheme and host only: a source URL can carry a token or userinfo, and this page is a UI export."""
+    """The origin only: a source URL can carry a token in its userinfo, query *or path*."""
     parts = urllib.parse.urlsplit(url)
     if not parts.scheme or not parts.hostname:
-        return url.split("?", 1)[0]
-    return f"{parts.scheme}://{parts.hostname}{parts.path}"
+        return ""
+    return f"{parts.scheme}://{parts.hostname}"
 
 
 def last_pass_code(state: dict) -> int:

@@ -962,6 +962,9 @@ class Verdict:
     levels: tuple[tuple[str, str], ...]
     line: str
     note: str
+    #: CVEs that were never enriched in this pass (past the lookup cap). They are watched for KEV only, which
+    #: costs no request, so a later KEV addition still escalates them.
+    skipped: tuple[str, ...] = ()
 
 
 def _cvss_floor(facts: CveFacts) -> float:
@@ -1024,20 +1027,11 @@ def judge(
         for cve in cves
     }
     # An unscored CVE (past the lookup cap) is not watched unless a critical signal names it.
-    # CVEs past the per-item lookup cap are unmeasured, but they are still named by the advisory: keep them
-    # watched (bounded) so a later KEV addition can escalate them. Without this their identifiers are claimed
-    # by the first message and no later pass ever looks at them again.
-    watched: list[tuple[str, str]] = []
-    skipped_watched = 0
-    for cve, (level, _) in judged.items():
-        if facts[cve].skipped and level != "critical":
-            if skipped_watched >= MAX_ITEM_CVE_LOOKUPS:
-                continue
-            skipped_watched += 1
-            watched.append((cve, "warning"))
-            continue
-        watched.append((cve, level))
-    levels = tuple(watched)
+    # Every CVE the advisory names is watched. CVEs past the per-item lookup cap were not enriched here, so
+    # they are watched for KEV only (a local set, no request): their identifiers are claimed by this message,
+    # and without a watch entry a later KEV addition could never escalate them.
+    levels = tuple((cve, level) for cve, (level, _) in judged.items())
+    skipped_cves = tuple(cve for cve, fact in facts.items() if fact.skipped)
     critical = [cve for cve in cves if judged[cve][0] == "critical"]
     if critical:
         shown = min(critical, key=lambda cve: ("kev", "ssvc", "remote", "epss").index(judged[cve][1] or "epss"))
@@ -1087,7 +1081,7 @@ def judge(
         note = "An advisory in this item without a CVE id decides the severity."
     if tag == "warning" and (not osv_complete or any(not facts[cve].complete for cve in cves)):
         note = incomplete_note
-    return Verdict(tag, levels, line, note)
+    return Verdict(tag, levels, line, note, skipped_cves)
 
 
 # --------------------------------------------------------------------------
@@ -1259,12 +1253,14 @@ def _delivered(state: dict, entry: dict, now: int, outcome: str = "delivered") -
     if entry["kind"] == "new":
         for identifier in entry["ids"]:
             state["seen"].setdefault(identifier, {"at": now, "outcome": outcome})
+        kev_only = set(entry.get("kev_only") or ())
         for cve, level in entry["levels"].items() if outcome == "delivered" else ():
             # A message the operator dropped was never sent, so no later escalation may refer to it as sent.
             state["watch"][cve] = {
                 "since": now,
                 "last_eval": now,
                 "level": level,
+                "kev_only": cve in kev_only,
                 "title": entry["source"],
                 "link": entry["link"],
             }
@@ -1533,6 +1529,7 @@ def classify_new(
                     "ids": ids,
                     "cves": new_cves,
                     "levels": dict(verdict.levels),
+                    "kev_only": list(verdict.skipped),
                     "scores": scores,
                     "source": heading,
                     "link": item.link,
@@ -1603,12 +1600,22 @@ def reevaluate(state: dict, intel: Intel, kev: frozenset[str], kev_known: bool, 
     """
     watch: dict = state["watch"]
     due = sorted(
-        (cve for cve, entry in watch.items() if now - entry["last_eval"] >= REEVAL_INTERVAL),
+        (
+            cve
+            for cve, entry in watch.items()
+            if now - entry["last_eval"] >= REEVAL_INTERVAL and not entry.get("kev_only")
+        ),
         key=lambda cve: (watch[cve]["last_eval"], cve),
     )[:MAX_REEVAL]
-    if not due:
+    if not due and not any(entry.get("kev_only") for entry in watch.values()):
         return
-    facts = intel.cves(due, force=True)
+    kev_only_due = [
+        cve for cve, entry in watch.items() if entry.get("kev_only") and now - entry["last_eval"] >= REEVAL_INTERVAL
+    ]
+    facts = intel.cves(due, force=True) if due else {}
+    for cve in kev_only_due:
+        facts.setdefault(cve, CveFacts(None, None, None, None, False))
+    due = [*due, *kev_only_due]
     for cve in due:
         current = facts[cve]
         entry = watch[cve]
