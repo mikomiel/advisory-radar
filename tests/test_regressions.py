@@ -1151,3 +1151,37 @@ def test_block_level_html_keeps_word_boundaries():
     assert clean_text("<p>libfoo</p><p>fixed a bug</p>") == "libfoo fixed a bug"
     text = clean_text("<div><b>libfoo</b><br>remote code execution</div>")
     assert "libfoo remote" in text
+
+
+# ---------------------------------------------------------------------------
+# Seventeenth review round
+
+
+def test_a_pass_with_no_notifiers_and_nothing_owed_succeeds(tmp_path):
+    cfg = config(tmp_path, notifiers=False)
+    code = pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [])],
+        [],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 0, "an empty queue with no notifiers is not a delivery failure"
+    assert core.deliver(core.new_state(), [], http_for({}), NOW) is True
+
+
+def test_a_claimed_cve_beside_a_new_ghsa_does_not_let_the_ghsa_speak_for_it():
+    """The GHSA aliases a CVE that is not judged here, so its label is not independent evidence."""
+    verdict = core.judge(
+        [],
+        {},
+        frozenset(),
+        True,
+        9.8,
+        True,
+        osv_fallbacks={},
+        independent_ghsa_cvss=None,
+        osv_scores_are_aliased=True,
+    )
+    assert verdict.tag == "warning", "an aliased advisory must not escalate on its own label"

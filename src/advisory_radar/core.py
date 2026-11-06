@@ -932,6 +932,7 @@ def judge(
     osv_complete: bool = True,
     osv_fallbacks: Mapping[str, float] | None = None,
     independent_ghsa_cvss: float | None = None,
+    osv_scores_are_aliased: bool = False,
 ) -> Verdict:
     """Item verdict from the CVEs it names; the CVE that decides is the one shown.
 
@@ -940,6 +941,11 @@ def judge(
     """
     incomplete_note = "Incomplete severity data; treated as unknown."
     if not cves:
+        if osv_scores_are_aliased:
+            # Every scored advisory aliases a CVE that is not being judged here (it was already claimed), so
+            # the OSV label is not independent evidence about this item: keep it visible as unknown.
+            line = metrics_line(osv_cvss, None, None, None, False, approximate=True)
+            return Verdict("warning", (), line, incomplete_note)
         # With no CVE named, every OSV score here belongs to an advisory that has no CVE alias, so its
         # severity decides on its own: a CRITICAL label is critical, not merely a warning.
         if osv_cvss is not None and osv_cvss >= CRITICAL_CVSS:
@@ -1332,6 +1338,7 @@ def classify_new(
         #: CVE -> the score of the GHSA that aliases it, so one advisory's LOW cannot judge another's CVE.
         osv_fallbacks: dict[str, float] = {}
         independent_ghsa_cvss: float | None = None
+        scored_only_via_aliases = False
         if len(ghsas) > MAX_ITEM_GHSA_LOOKUPS:
             osv_complete = False  # the rest were not looked up, so nothing here is a complete measurement
         for ghsa in ghsas[:MAX_ITEM_GHSA_LOOKUPS]:
@@ -1341,9 +1348,11 @@ def classify_new(
             if osv.cvss is not None:
                 osv_cvss = max(osv_cvss or 0.0, osv.cvss)
                 if osv.cves:
+                    scored_only_via_aliases = True
                     for alias in osv.cves:
                         osv_fallbacks[alias] = max(osv_fallbacks.get(alias, 0.0), osv.cvss)
                 else:
+                    scored_only_via_aliases = False
                     # The advisory has no CVE alias, so its label is its only severity evidence.
                     independent_ghsa_cvss = max(independent_ghsa_cvss or 0.0, osv.cvss)
         vendor_ids = [identifier for identifier in explicit if identifier.startswith(("PSA-", "DSA-"))]
@@ -1373,6 +1382,7 @@ def classify_new(
             osv_complete and not unenriched,
             osv_fallbacks=osv_fallbacks,
             independent_ghsa_cvss=independent_ghsa_cvss,
+            osv_scores_are_aliased=scored_only_via_aliases,
         )
         if unenriched and verdict.tag == "warning":
             verdict = replace(verdict, note=ENRICH_FAILED_NOTE)
@@ -1832,7 +1842,7 @@ def deliver(
     again, so a full parked list cannot turn into a duplicate post on every pass.
     """
     if not notifiers:  # an empty notifier list must never mark a message delivered
-        return False
+        return not state["pending"]
     for entry in list(state["pending"][:DELIVERY_CAP]):
         entry.setdefault("first_attempt_at", now)
         if entry.get("attempts", 0) >= MAX_DELIVERY_ATTEMPTS:  # only a full parked list leaves one here
