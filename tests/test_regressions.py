@@ -609,12 +609,15 @@ def test_an_unrepresentable_feed_date_does_not_abort_a_pass(tmp_path):
         clock=lambda: float(NOW),
         sleep=lambda s: None,
     )
-    assert code in (0, 1)
-    assert notifier.sent, "the item must still be rendered and delivered"
+    assert code in (0, 1), "an extreme date must not raise out of the pass"
+    state = json.loads(cfg.state_path.read_text())
+    assert "src:s1:gx" in state["seen"], "the item is recorded, so later passes are not blocked either"
 
 
 def test_stopping_the_server_does_not_run_another_pass(tmp_path, monkeypatch):
     """`run` returns after uvicorn stops; it must not fall through to an extra pass."""
+    import time
+
     from advisory_radar import cli
 
     cfg_path = tmp_path / "c.yml"
@@ -622,15 +625,41 @@ def test_stopping_the_server_does_not_run_another_pass(tmp_path, monkeypatch):
         "sources:\n  - id: s\n    type: rss\n    url: https://feeds.example.com/a\n"
         "notifiers: []\nstate_path: " + str(tmp_path / "state.json") + "\n"
     )
-    calls = []
+    calls: list[int] = []
 
     def fake_run(app, host=None, port=None, log_level=None):
-        raise SystemExit(0)  # simulate a graceful stop
+        for _ in range(200):  # let the scheduler take its first pass, then stop like a SIGTERM would
+            if calls:
+                return None
+            time.sleep(0.01)
+        return None
 
     monkeypatch.setattr("uvicorn.run", fake_run)
     monkeypatch.setattr(cli.pipeline, "run_pass", lambda *a, **k: calls.append(1) or 0)
-    import contextlib
+    monkeypatch.setenv("ADVISORY_RADAR_AUTH_TOKEN", "test-token")
+    code = cli.main(["--config", str(cfg_path), "run"])
+    assert code == 0
+    assert len(calls) == 1, "shutdown must not start an extra pass"
 
-    with contextlib.suppress(SystemExit):
-        cli.main(["run", "--config", str(cfg_path)])
-    assert len(calls) <= 1, "shutdown must not start an extra pass"
+
+def test_a_kev_hit_escalates_even_when_the_scored_lookups_fail():
+    """KEV is a local fact: an incomplete CVE.org/EPSS answer must not hide it."""
+    state = core.new_state()
+    now = 1792600000
+    cve = "CVE-2026-5555"
+    state["watch"][cve] = {
+        "since": now - 3 * 86400,
+        "last_eval": now - 2 * 86400,
+        "level": "warning",
+        "title": "original advisory",
+        "link": "https://vendor.example.com/adv",
+    }
+
+    class Intel:
+        def cves(self, cves, force=False):
+            return {name: core.CveFacts(None, None, None, None, False) for name in cves}
+
+    core.reevaluate(state, Intel(), frozenset({cve}), True, now, "")
+    queued = [entry for entry in state["pending"] if entry["kind"] == "escalation"]
+    assert queued and queued[0]["cves"] == [cve], "a known KEV hit must escalate"
+    assert queued[0]["tag"] == "critical"

@@ -1422,12 +1422,13 @@ def reevaluate(state: dict, intel: Intel, kev: frozenset[str], kev_known: bool, 
     facts = intel.cves(due, force=True)
     for cve in due:
         current = facts[cve]
-        if not current.complete:
+        entry = watch[cve]
+        if not current.complete and not (kev_known and cve in kev):
             # Retried after the next daily interval rather than on every pass: otherwise a handful of CVEs
             # whose lookups keep failing would hold the whole batch and every later watch would starve.
-            watch[cve]["last_eval"] = now
+            # A KEV hit is a local fact and does not need the failed lookups.
+            entry["last_eval"] = now
             continue
-        entry = watch[cve]
         entry["last_eval"] = now
         level, reason = level_of(current, cve in kev, kev_known)
         held = reason == "remote" and not _score_is_new(entry)

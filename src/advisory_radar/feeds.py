@@ -151,13 +151,13 @@ def _published_of(node: ET.Element | None) -> int | None:
     raw = (node.text or "").strip()
     if not raw:
         return None
-    try:
-        return int(parsedate_to_datetime(raw).timestamp())
-    except (TypeError, ValueError, OverflowError):
+    for parse in (parsedate_to_datetime, datetime.datetime.fromisoformat):
         try:
-            return int(datetime.datetime.fromisoformat(raw).timestamp())
-        except ValueError:
-            return None
+            epoch = int(parse(raw).timestamp())
+        except (TypeError, ValueError, OverflowError):
+            continue
+        return epoch if _plausible(epoch) else None  # a year-10000 date must not reach the renderer
+    return None
 
 
 def parse_rss(body: bytes) -> FeedExport:
