@@ -167,7 +167,13 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
         f"watchlist must be a path to a watchlist file, got {type(watchlist).__name__}",
     )
     watchlist_path = Path(watchlist) if isinstance(watchlist, str) else None
-    hidden = frozenset(document.get("hidden_source_hosts") or [])
+    raw_hidden = document.get("hidden_source_hosts")
+    if raw_hidden is not None:
+        _require(
+            isinstance(raw_hidden, list) and all(isinstance(host, str) and host for host in raw_hidden),
+            "hidden_source_hosts must be a list of non-empty host names",
+        )
+    hidden = frozenset(raw_hidden or [])
     return Config(
         sources=tuple(entry for entry in sources if entry.get("enabled", True)),
         notifiers=tuple(entry for entry in notifiers if entry.get("enabled", True)),

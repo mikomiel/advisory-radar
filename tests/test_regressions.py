@@ -1709,3 +1709,57 @@ def test_carried_candidates_progress_while_their_source_fails(tmp_path):
     assert any("captured advisory" in entry["title"] for entry in notifier.sent), (
         "a source outage must not freeze already captured candidates"
     )
+
+
+# ---------------------------------------------------------------------------
+# Twenty-seventh review round
+
+
+def test_a_mixed_valid_and_malformed_epss_batch_fails():
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda s: None)
+
+        def _get(self, url):
+            if "api.first.org" in url:
+                return 200, {"data": [{"cve": "CVE-2026-1111", "epss": "0.5"}, {"nope": 1}]}
+            return 404, None
+
+    facts = Intel().cves(["CVE-2026-1111", "CVE-2026-2222"])
+    assert facts["CVE-2026-1111"].complete is False, "one malformed row fails the whole measurement"
+
+
+def test_hidden_source_hosts_must_be_a_list(tmp_path):
+    from advisory_radar.config import ConfigError
+
+    path = tmp_path / "c.yml"
+    path.write_text("sources: []\nnotifiers: []\nhidden_source_hosts: rsshub.internal\n")
+    with pytest.raises(ConfigError, match="hidden_source_hosts"):
+        load_config(path, {})
+    ok = tmp_path / "ok.yml"
+    ok.write_text("sources: []\nnotifiers: []\nhidden_source_hosts:\n  - rsshub.internal\n")
+    assert load_config(ok, {}).hidden_source_hosts == frozenset({"rsshub.internal"})
+
+
+def test_a_disabled_source_does_not_deliver_its_carry(tmp_path):
+    cfg = config(tmp_path)
+    state = core.new_state()
+    state["seeded"] = {"s1": True, "s2": True}
+    state["carry"] = {
+        "gone": [
+            core.item_to_state(core.Item("g1", "orphaned advisory", "https://vendor.example.com/a", "n", NOW - 60, ()))
+        ]
+    }
+    from advisory_radar.state import save_state
+
+    save_state(cfg.state_path, state)
+    notifier = Notifier()
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", []), WindowSource("s2", [])],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert not notifier.sent, "a source that is no longer configured must not push its carry"

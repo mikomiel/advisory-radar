@@ -614,11 +614,9 @@ class Intel:
             data = document.get("data") if isinstance(document, dict) else None
             if status != 200 or not isinstance(data, list):
                 return None
-            usable = 0
+            if data and any(not isinstance(row, dict) or not isinstance(row.get("cve"), str) for row in data):
+                return None  # a batch with an unusable row is a failed measurement, not a partial answer
             for row in data:
-                if not isinstance(row, dict) or not isinstance(row.get("cve"), str):
-                    continue
-                usable += 1
                 score = _bounded(row.get("epss"), 0.0, 1.0)
                 percentile = _bounded(row.get("percentile"), 0.0, 1.0)
                 if (row.get("epss") is not None and score is None) or (
@@ -628,9 +626,6 @@ class Intel:
                     # "no score" would let a LOW CVSS suppress an advisory that was never really measured.
                     return None
                 scores[row["cve"].upper()] = (score, percentile)
-            if data and not usable:
-                # A populated response whose rows are all unusable is a failed measurement, not "no score".
-                return None
         return scores
 
     def cves(self, cves: Sequence[str], *, force: bool = False, lookup_limit: int | None = None) -> dict[str, CveFacts]:

@@ -189,9 +189,10 @@ def _run_pass(
     # A source that failed (or whose window was untrusted) must not freeze work already captured from it:
     # those candidates are complete and can be classified under the current policy.
     answered_now = {source.id for source, _ in answered}
+    enabled_ids = {source.id for source in sources}
     for source_id in list(carried):
-        if source_id in answered_now:
-            continue
+        if source_id in answered_now or source_id not in enabled_ids:
+            continue  # a disabled source never reaches the notifiers through carry either
         held = [core.item_from_state(row) for row in carried.pop(source_id, [])]
         held = [item for item in held if core.passes_filter(item, policy)]
         if not held:
