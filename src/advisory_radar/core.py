@@ -1286,6 +1286,16 @@ def classify_new(
     ordered = sorted(items, key=lambda candidate: candidate.published or 0)
     for position, item in enumerate(ordered):
         room = min(DELIVERY_CAP, start + share) if share else DELIVERY_CAP
+        if item.published is not None and now - item.published > BACKLOG_AGE and item.guid not in trusted:
+            # History is decided before capacity: a full queue must not push an old item into carry, where
+            # the next pass would treat it as recent.
+            first_sight = item.explicit or (f"src:{item.guid}",)
+            unclaimed = [identifier for identifier in first_sight if identifier not in claimed]
+            for identifier in unclaimed:
+                seen[identifier] = {"at": now, "outcome": "backlog"}
+            claimed.update(unclaimed)
+            backlog += bool(unclaimed)
+            continue
         if len(pending) >= room or classified >= MAX_CLASSIFY:
             left = ordered[position:]
             if left:

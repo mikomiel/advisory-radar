@@ -1557,3 +1557,59 @@ def test_a_carried_item_follows_the_current_watchlist(tmp_path):
         sleep=lambda s: None,
     )
     assert not notifier.sent, "an excluded product must not be delivered from carry either"
+
+
+# ---------------------------------------------------------------------------
+# Twenty-fourth review round
+
+
+def test_a_window_is_saved_together_with_its_classification(tmp_path, monkeypatch):
+    """A checkpoint after source A must not persist source B's new window before B was classified."""
+    cfg = config(tmp_path)
+    snapshots = []
+    import advisory_radar.pipeline as pipeline_module
+
+    real_save = pipeline_module.save_state
+
+    def recording(state_path, state):
+        real_save(state_path, state)
+        snapshots.append(json.loads(json.dumps(state)))
+
+    monkeypatch.setattr(pipeline_module, "save_state", recording)
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [item("a1", "first source")]), WindowSource("s2", [item("b1", "second source")])],
+        [Notifier()],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert snapshots, "the pass saved state"
+    first = snapshots[0]
+    assert "s2" not in first["windows"], "s2's window must not advance before s2 is classified"
+    final = snapshots[-1]
+    assert set(final["windows"]) == {"s1", "s2"}
+
+
+def test_saturation_does_not_carry_a_historical_item_as_news(tmp_path):
+    cfg = config(tmp_path)
+    state = core.new_state()
+    state["seeded"] = {"s1": True}  # already bootstrapped: the seed pass is not what decides this
+    from advisory_radar.state import save_state
+
+    save_state(cfg.state_path, state)
+    notifier = Notifier(500)  # the queue stays full, so classification stops early
+    fresh = [item(f"f{index}", f"fresh {index}") for index in range(core.DELIVERY_CAP)]
+    stale = core.Item("old", "old advisory", "https://vendor.example.com/old", "notes", NOW - 30 * 86400, ())
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", fresh + [stale])],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    state = json.loads(cfg.state_path.read_text())
+    carried = {row["guid"] for row in state.get("carry", {}).get("s1", [])}
+    assert "old" not in carried, "history is recorded as backlog, never carried as a current candidate"
+    assert state["seen"]["src:s1:old"]["outcome"] == "backlog"

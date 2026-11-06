@@ -93,6 +93,7 @@ def _run_pass(
     # Both of these must come from the state document that is actually written: a detached dict never
     # reaches disk, so the first window was lost and the 24h cache was never persisted.
     windows = _source_windows(state)
+    stored_windows = dict(windows)  # what the previous pass observed, for the gap check
     cache = state.setdefault("cache", {})
     live_guids: set[str] = set()
     gap = False
@@ -115,7 +116,7 @@ def _run_pass(
             window.truncated,
             window.host,
         )
-        previous = windows.get(source.id)
+        previous = stored_windows.get(source.id)
         # Only a source that knows its own page size can prove it returned a complete window (a FreshRSS
         # export, a changedetection watch). An RSS/Atom feed is bounded by its publisher, so a rotation
         # there is undetectable; see README, "Sources".
@@ -131,8 +132,9 @@ def _run_pass(
             gap = True
             continue
         fetched_ids.add(source.id)
-        windows[source.id] = [item.guid for item in window.items]
         live_guids.update(item.guid for item in window.items)
+        # The window is written together with the results below: advancing it here would let a checkpoint
+        # after another source persist this one's new window before its candidates were classified.
         answered.append((source, window))
 
     # Classify in a rotating order: with more sources than DELIVERY_CAP, a fixed order would let the first
@@ -180,6 +182,7 @@ def _run_pass(
         )
         if left:
             carried[source.id] = [core.item_to_state(item) for item in left]
+        windows[source.id] = [item.guid for item in window.items]
         if not dry_run:
             save_state(cfg.state_path, state)
 
