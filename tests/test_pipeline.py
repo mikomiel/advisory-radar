@@ -44,9 +44,10 @@ FEED = b"""<?xml version="1.0"?><rss version="2.0"><channel><title>T</title><lin
 </channel></rss>"""
 
 CVE_ORG = {
+    "cveMetadata": {"cveId": "CVE-2026-4242", "state": "PUBLISHED"},
     "containers": {
         "cna": {"metrics": [{"cvssV3_1": {"baseScore": 9.8, "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N"}}]}
-    }
+    },
 }
 EPSS = {"data": [{"cve": "CVE-2026-4242", "epss": "0.50", "percentile": "0.99"}]}
 KEV = {"catalogVersion": "1", "vulnerabilities": []}

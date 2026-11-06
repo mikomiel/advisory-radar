@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import html
 import time
+import urllib.parse
 from collections.abc import Callable
 
 from fastapi import FastAPI, Request
@@ -54,6 +55,14 @@ class Auth:
         except BadSignature:
             return False
         return time.time() - float(data.get("t", 0)) < 7 * 86400
+
+
+def _public_url(url: str) -> str:
+    """The scheme and host only: a source URL can carry a token or userinfo, and this page is a UI export."""
+    parts = urllib.parse.urlsplit(url)
+    if not parts.scheme or not parts.hostname:
+        return url.split("?", 1)[0]
+    return f"{parts.scheme}://{parts.hostname}{parts.path}"
 
 
 def last_pass_code(state: dict) -> int:
@@ -194,7 +203,8 @@ def create_app(
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         src = "".join(
-            f"<li><b>{esc(s['id'])}</b> ({esc(s.get('type', ''))}) — {esc(s.get('url', ''))}</li>" for s in cfg.sources
+            f"<li><b>{esc(s['id'])}</b> ({esc(s.get('type', ''))}) — {esc(_public_url(s.get('url', '')))}</li>"
+            for s in cfg.sources
         )
         ntf = "".join(f"<li><b>{esc(n['id'])}</b> ({esc(n.get('type', ''))})</li>" for n in cfg.notifiers)
         body = (

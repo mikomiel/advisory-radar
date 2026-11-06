@@ -613,8 +613,9 @@ class Intel:
             return False, None, None, False
         metadata = document.get("cveMetadata")
         identifier = metadata.get("cveId") if isinstance(metadata, dict) else None
-        if isinstance(identifier, str) and identifier.upper() != cve.upper():
-            return False, None, None, False  # another CVE's record is not evidence about this one
+        if not isinstance(identifier, str) or identifier.upper() != cve.upper():
+            # A missing or different identity is not evidence about the requested CVE (an error body has none).
+            return False, None, None, False
         return (True, *cve_org_facts(document))
 
     def _nvd(self, cve: str) -> tuple[bool, float | None, bool]:
@@ -871,6 +872,9 @@ class Intel:
             return OsvFacts((), None, False)
         if not isinstance(document, dict):
             return OsvFacts((), None, False)
+        identifier = document.get("id")
+        if not isinstance(identifier, str) or identifier.upper() != ghsa.upper():
+            return OsvFacts((), None, False)  # another advisory's record is not evidence about this one
         aliases = document.get("aliases")
         cves = tuple(
             dict.fromkeys(
@@ -1020,7 +1024,20 @@ def judge(
         for cve in cves
     }
     # An unscored CVE (past the lookup cap) is not watched unless a critical signal names it.
-    levels = tuple((cve, level) for cve, (level, _) in judged.items() if not facts[cve].skipped or level == "critical")
+    # CVEs past the per-item lookup cap are unmeasured, but they are still named by the advisory: keep them
+    # watched (bounded) so a later KEV addition can escalate them. Without this their identifiers are claimed
+    # by the first message and no later pass ever looks at them again.
+    watched: list[tuple[str, str]] = []
+    skipped_watched = 0
+    for cve, (level, _) in judged.items():
+        if facts[cve].skipped and level != "critical":
+            if skipped_watched >= MAX_ITEM_CVE_LOOKUPS:
+                continue
+            skipped_watched += 1
+            watched.append((cve, "warning"))
+            continue
+        watched.append((cve, level))
+    levels = tuple(watched)
     critical = [cve for cve in cves if judged[cve][0] == "critical"]
     if critical:
         shown = min(critical, key=lambda cve: ("kev", "ssvc", "remote", "epss").index(judged[cve][1] or "epss"))

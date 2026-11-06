@@ -237,7 +237,10 @@ def test_intelligence_cache_is_persisted(tmp_path):
 
     def http(method, url, headers, body):
         if "cveawg.mitre.org" in url:
-            body = {"containers": {"cna": {"metrics": [{"cvssV3_1": {"baseScore": 9.8}}]}}}
+            body = {
+                "cveMetadata": {"cveId": "CVE-2026-4242", "state": "PUBLISHED"},
+                "containers": {"cna": {"metrics": [{"cvssV3_1": {"baseScore": 9.8}}]}},
+            }
             return 200, {}, json.dumps(body).encode()
         if "api.first.org" in url:
             return 200, {}, json.dumps({"data": []}).encode()
@@ -721,7 +724,10 @@ def test_an_overflowing_metric_is_unknown_not_fatal(tmp_path):
 
     def http(method, url, headers, body):
         if "cveawg.mitre.org" in url:
-            body = {"containers": {"cna": {"metrics": [{"cvssV3_1": {"baseScore": huge}}]}}}
+            body = {
+                "cveMetadata": {"cveId": "CVE-2026-4242", "state": "PUBLISHED"},
+                "containers": {"cna": {"metrics": [{"cvssV3_1": {"baseScore": huge}}]}},
+            }
             return 200, {}, json.dumps(body).encode()
         if "api.first.org" in url:
             return 200, {}, json.dumps({"data": []}).encode()
@@ -1998,3 +2004,60 @@ def test_php_enrichment_keeps_both_cves_and_ghsas():
     core.classify_new(state, [release_item], FakeIntel(), frozenset(), True, NOW, "www.php.net", policy)
     assert "GHSA-aaaa-bbbb-cccc" in looked, "a PHP release names both ids and both must be used"
     assert any(entry["tag"] == "critical" for entry in state["pending"]), "the alias-free CRITICAL GHSA decides"
+
+
+# ---------------------------------------------------------------------------
+# Thirty-second review round
+
+
+def test_a_capped_out_cve_is_still_watched():
+    facts = {
+        f"CVE-2026-{1000 + index}": core.CveFacts(None, None, None, None, False, skipped=True) for index in range(12)
+    }
+    verdict = core.judge(list(facts), facts, frozenset(), True, None, True, osv_fallbacks={})
+    watched = dict(verdict.levels)
+    assert len(watched) <= core.MAX_ITEM_CVE_LOOKUPS + 12, "watching skipped CVEs stays bounded"
+    assert any(level == "warning" for level in watched.values()), (
+        "a capped-out CVE must still be watched, or a later KEV addition would never escalate it"
+    )
+
+
+def test_a_malformed_cve_org_record_is_a_failed_lookup():
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda s: None)
+
+        def _get(self, url):
+            return 200, {"error": "unavailable"}
+
+    assert Intel()._cve_org("CVE-2026-1234")[0] is False
+
+
+def test_an_osv_record_for_another_advisory_is_not_used():
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda s: None)
+
+        def _get(self, url):
+            return 200, {"id": "GHSA-9999-9999-9999", "database_specific": {"severity": "LOW"}}
+
+    facts = Intel().ghsa("GHSA-aaaa-bbbb-cccc")
+    assert facts.complete is False and facts.cvss is None
+
+
+def test_the_config_page_does_not_print_a_source_token(tmp_path):
+    from starlette.testclient import TestClient
+
+    from advisory_radar.web import create_app
+
+    path = tmp_path / "c.yml"
+    path.write_text(
+        "sources:\n  - id: s\n    type: rss\n    url: https://user:pw@feeds.example.com/rss?token=SECRET123\n"
+        "notifiers: []\nstate_path: " + str(tmp_path / "state.json") + "\n"
+    )
+    cfg = load_config(path, {})
+    client = TestClient(create_app(cfg, {"ADVISORY_RADAR_AUTH_TOKEN": "t"}))
+    client.post("/login", data={"token": "t"}, follow_redirects=False)
+    body = client.get("/config").text
+    assert "SECRET123" not in body and "pw@" not in body
+    assert "feeds.example.com" in body
