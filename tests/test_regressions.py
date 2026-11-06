@@ -472,3 +472,105 @@ def test_a_vendor_feed_keeps_its_advisory_link():
         "https://nodejs.org/en/feed",
     )
     assert "https://nodejs.org/en/blog/vulnerability/x" in (title + body)
+
+
+# ---------------------------------------------------------------------------
+# Fifth review round
+
+
+def test_a_notifier_redirect_is_not_a_successful_delivery(tmp_path):
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from advisory_radar.http import urllib_http
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if self.path == "/hook":
+                self.send_response(302)
+                self.send_header("Location", "/login")
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, _, _ = urllib_http("POST", f"http://127.0.0.1:{server.server_port}/hook", {}, b"{}")
+    finally:
+        server.shutdown()
+    assert status == 302, "a redirect must be reported as such, not followed into a 200"
+
+
+def test_a_failing_watch_does_not_starve_the_next_one():
+    state = core.new_state()
+    now = 1792600000
+    failing = [f"CVE-2026-{1000 + index}" for index in range(core.MAX_REEVAL)]
+    healthy = "CVE-2026-9999"
+    for cve in (*failing, healthy):
+        state["watch"][cve] = {"since": now - 10 * 86400, "last_eval": now - 2 * 86400, "level": "warning"}
+
+    class Intel:
+        def cves(self, cves, force=False):
+            facts = {cve: core.CveFacts(None, None, None, None, False) for cve in cves}
+            if healthy in cves:
+                facts[healthy] = core.CveFacts(None, None, None, None, True)
+            return facts
+
+    core.reevaluate(state, Intel(), frozenset(), True, now, "")
+    core.reevaluate(state, Intel(), frozenset(), True, now, "")
+    assert state["watch"][healthy]["last_eval"] == now, "a failing batch must not block a healthy watch"
+
+
+def test_a_source_that_fails_on_the_first_pass_is_seeded_when_it_recovers(tmp_path):
+    cfg = config(tmp_path)
+    notifier = Notifier()
+    old = core.Item("g9", "old historical advisory", "https://vendor.example.com/old", "notes", NOW - 2 * 86400, ())
+    first = pipeline.run_pass(
+        cfg,
+        [WindowSource("s2", [item("g1", "fresh")]), FailingSource("s1", [])],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert first == 1
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s2", [item("g1", "fresh")]), WindowSource("s1", [old])],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW + 60),
+        sleep=lambda s: None,
+    )
+    state = json.loads(cfg.state_path.read_text())
+    assert "src:s1:g9" in state["seen"], "a recovering source's history must be seeded, not delivered"
+    assert not any("old historical" in entry["title"] for entry in notifier.sent)
+
+
+def test_dry_run_reports_a_window_gap(tmp_path):
+    cfg = config(tmp_path)
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [item("g1", "first")], truncated=True)],
+        [Notifier()],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    code = pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [item("g2", "second")], truncated=True)],
+        [Notifier()],
+        http=http_for({}),
+        clock=lambda: float(NOW + 60),
+        sleep=lambda s: None,
+        dry_run=True,
+    )
+    assert code == 1

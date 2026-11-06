@@ -1415,7 +1415,7 @@ def reevaluate(state: dict, intel: Intel, kev: frozenset[str], kev_known: bool, 
     watch: dict = state["watch"]
     due = sorted(
         (cve for cve, entry in watch.items() if now - entry["last_eval"] >= REEVAL_INTERVAL),
-        key=lambda cve: watch[cve]["last_eval"],
+        key=lambda cve: (watch[cve]["last_eval"], cve),
     )[:MAX_REEVAL]
     if not due:
         return
@@ -1423,7 +1423,10 @@ def reevaluate(state: dict, intel: Intel, kev: frozenset[str], kev_known: bool, 
     for cve in due:
         current = facts[cve]
         if not current.complete:
-            continue  # Retried on the next pass; a failed lookup changes nothing.
+            # Retried after the next daily interval rather than on every pass: otherwise a handful of CVEs
+            # whose lookups keep failing would hold the whole batch and every later watch would starve.
+            watch[cve]["last_eval"] = now
+            continue
         entry = watch[cve]
         entry["last_eval"] = now
         level, reason = level_of(current, cve in kev, kev_known)

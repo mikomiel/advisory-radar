@@ -25,12 +25,24 @@ MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 HTTP_TIMEOUT = 30
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """A redirect is a final status, not a hop: a login page answering 200 must never count as delivery,
+    and an Authorization header must never be forwarded to another origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102 - urllib hook
+        return None
+
+
+#: Built once: the opener owns no per-call state, and building it per request would leak connections.
+_OPENER = urllib.request.build_opener(_NoRedirects)
+
+
 def urllib_http(
     method: str, url: str, headers: Mapping[str, str], body: bytes | None
 ) -> tuple[int, dict[str, str], bytes]:
     request = urllib.request.Request(url, data=body, headers={"User-Agent": USER_AGENT, **headers}, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+        with _OPENER.open(request, timeout=HTTP_TIMEOUT) as response:
             return response.status, dict(response.headers), response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         try:

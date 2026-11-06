@@ -132,8 +132,12 @@ def _run_pass(
         windows[source.id] = [item.guid for item in window.items]
         live_guids.update(item.guid for item in window.items)
         items = [item for item in window.items if core.passes_filter(item, policy)]
-        if stored is None:
+        seeded = state.setdefault("seeded", {})
+        if source.id not in seeded:
+            # Bootstrap is per source: a source that failed on the first pass must still be seeded when it
+            # recovers, or its history would be delivered as news.
             candidates = core.seed(state, items, now)
+            seeded[source.id] = True
             LOG.info(
                 "first run on %s: %d older item(s) marked delivered, %d recent item(s) queued",
                 source.id,
@@ -161,7 +165,7 @@ def _run_pass(
         for entry in state["pending"][: core.DELIVERY_CAP]:
             print(f"[dry-run] tag={entry['tag']}\n{entry['title']}\n{entry['body']}")
         LOG.info("dry run: nothing sent, no state written")
-        return 0 if source_ok and adobe_ok else 1
+        return 0 if source_ok and adobe_ok and not gap else 1
 
     save_state(cfg.state_path, state)  # pending is durable before the first POST
     queued, parked_before = len(state["pending"]), len(state["parked"])
