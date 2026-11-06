@@ -100,6 +100,9 @@ def _run_pass(
     source_ok = True
     kev, kev_known = load_kev(http, cfg.state_path.with_name(KEV_CACHE_NAME), save=not dry_run)
     intel = core.Intel(http, cache, clock, sleep)
+    # Re-evaluate before classification: both share one NVD budget, and a busy news day must not starve a due
+    # watch of the measurement that could escalate it. A watch created later this pass is evaluated next pass.
+    core.reevaluate(state, intel, kev, kev_known, now, "")
 
     fetched_ids: set[str] = set()
     answered: list[tuple[object, object]] = []
@@ -230,7 +233,6 @@ def _run_pass(
         core._prune_enrich_clock(state, key, kept)
 
     adobe_ok = core.adobe_pass(state, http, kev, kev_known, now) if cfg.adobe_commerce else True
-    core.reevaluate(state, intel, kev, kev_known, now, "")
 
     if dry_run:
         for entry in state["pending"][: core.DELIVERY_CAP]:

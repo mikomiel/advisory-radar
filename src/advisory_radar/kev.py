@@ -23,7 +23,12 @@ def _catalog_is_usable(rows: list) -> bool:
     """Every row must name a CVE: a reshaped response must fail closed, not wipe the cache to empty."""
     if not rows:
         return False
-    return all(isinstance(row, dict) and KEV_ID_RE.match(str(row.get("cveID", "")).upper()) for row in rows)
+    return all(
+        isinstance(row, dict)
+        and isinstance(row.get("cveID"), str)
+        and KEV_ID_RE.fullmatch(row["cveID"].upper()) is not None
+        for row in rows
+    )
 
 
 def load_kev(http: Http, cache_path: Path, *, save: bool) -> tuple[frozenset[str], bool]:
@@ -36,7 +41,7 @@ def load_kev(http: Http, cache_path: Path, *, save: bool) -> tuple[frozenset[str
     if (
         not isinstance(cached_cves, list)
         or not cached_cves
-        or any(not isinstance(cve, str) or not KEV_ID_RE.match(cve.upper()) for cve in cached_cves)
+        or any(not isinstance(cve, str) or KEV_ID_RE.fullmatch(cve.upper()) is None for cve in cached_cves)
     ):
         cached = {}  # a damaged or empty cache must not masquerade as a known empty catalog
     headers = {"Accept": "application/json"}
