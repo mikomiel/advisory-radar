@@ -29,7 +29,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -1262,6 +1262,7 @@ def classify_new(
     policy: Policy,
     *,
     share: int | None = None,
+    trusted: Collection[str] = (),
 ) -> list[Item]:
     """Queue the items nobody has seen, oldest first, until the delivery cap or the lookup budget is reached.
 
@@ -1299,7 +1300,8 @@ def classify_new(
         # fresh item from another feed is a duplicate. Age alone decides: an old item that also names an
         # already-claimed id is still backlog, and only its unclaimed ids are recorded.
         first_sight = list(explicit or (f"src:{item.guid}",))
-        if item.published is not None and now - item.published > BACKLOG_AGE:
+        # A carried item was recent when it first arrived, so age must not turn it into history later.
+        if item.published is not None and now - item.published > BACKLOG_AGE and item.guid not in trusted:
             unclaimed = [identifier for identifier in first_sight if identifier not in claimed]
             for identifier in unclaimed:
                 seen[identifier] = {"at": now, "outcome": "backlog"}

@@ -146,6 +146,9 @@ def _run_pass(
         items = [item for item in window.items if core.passes_filter(item, policy)]
         # Items carried from an earlier pass come first: the window they arrived in is already gone.
         earlier = [core.item_from_state(row) for row in carried.pop(source.id, [])]
+        # The policy may have changed while these waited: scope applies at classification time, not arrival.
+        earlier = [item for item in earlier if core.passes_filter(item, policy)]
+        trusted = {item.guid for item in earlier}
         if earlier:
             known = {item.guid for item in items}
             items = [item for item in earlier if item.guid not in known] + items
@@ -173,6 +176,7 @@ def _run_pass(
             window.host,
             policy,
             share=max(1, core.DELIVERY_CAP // max(1, len(answered))),
+            trusted=trusted,
         )
         if left:
             carried[source.id] = [core.item_to_state(item) for item in left]
@@ -188,9 +192,19 @@ def _run_pass(
 
     # Prune once, against every window fetched this pass, and only for sources that answered: a source
     # outage must not wipe that source's retry deadlines.
+    # Carried candidates keep their retry clocks: they are no longer in any window but are still owed a pass.
+    carried_guids = {
+        str(row.get("guid"))
+        for rows in (state.get("carry") or {}).values()
+        if isinstance(rows, list)
+        for row in rows
+        if isinstance(row, dict)
+    }
     for key in ("enrich_retry", "enrich_pending"):
         kept = {
-            guid for guid in (state.get(key) or {}) if guid.split(":", 1)[0] not in fetched_ids or guid in live_guids
+            guid
+            for guid in (state.get(key) or {})
+            if guid.split(":", 1)[0] not in fetched_ids or guid in live_guids or guid in carried_guids
         }
         core._prune_enrich_clock(state, key, kept)
 

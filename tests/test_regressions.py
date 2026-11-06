@@ -1452,3 +1452,108 @@ def test_a_deferred_enrichment_item_is_carried(tmp_path, monkeypatch):
     left = core.classify_new(state, [dsa], Intel(), frozenset(), True, NOW, "lists.debian.org", policy)
     assert [entry.guid for entry in left] == ["g1"], "a deferred item is returned for the next pass"
     assert state["enrich_retry"]["g1"] == NOW
+
+
+# ---------------------------------------------------------------------------
+# Twenty-third review round
+
+
+def test_a_carried_advisory_is_not_turned_into_backlog_by_its_age(tmp_path):
+    """It was recent when it arrived; an outage must not age it into history."""
+    cfg = config(tmp_path)
+    notifier = Notifier()
+    state = {
+        "schema": core.STATE_SCHEMA,
+        "seen": {},
+        "pending": [],
+        "parked": [],
+        "watch": {},
+        "cache": {},
+        "windows": {},
+        "seeded": {"s1": True},
+        "carry": {
+            "s1": [
+                core.item_to_state(
+                    core.Item("g1", "carried advisory", "https://vendor.example.com/a", "notes", NOW - 3600, ())
+                )
+            ]
+        },
+    }
+    from advisory_radar.state import save_state
+
+    save_state(cfg.state_path, state)
+    later = NOW + core.BACKLOG_AGE + 300  # delivery only recovers after the backlog window
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [])],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(later),
+        sleep=lambda s: None,
+    )
+    assert any("carried advisory" in entry["title"] for entry in notifier.sent), (
+        "a carried item must still be delivered, not recorded as backlog"
+    )
+
+
+def test_a_carried_item_keeps_its_enrichment_retry_clock(tmp_path):
+    """A DSA waiting out its tracker retry is carried; rotating the feed must not delete its deadline."""
+    cfg = config(tmp_path)
+    dsa = core.Item(
+        "g1", "DSA-6558-1 curl - security update", "https://lists.debian.org/x", "notes", NOW - 3600, ("DSA-6558-1",)
+    )
+    # the tracker answers 404, so the item starts its retry clock and is carried
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [dsa], host="lists.debian.org")],
+        [Notifier()],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    state = json.loads(cfg.state_path.read_text())
+    assert state.get("carry", {}).get("s1"), "the deferred DSA is carried"
+    assert "s1:g1" in state.get("enrich_retry", {}), "it starts a retry clock"
+    # the feed rotates the item out; the clock must survive the prune
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [], host="lists.debian.org")],
+        [Notifier()],
+        http=http_for({}),
+        clock=lambda: float(NOW + 60),
+        sleep=lambda s: None,
+    )
+    state = json.loads(cfg.state_path.read_text())
+    assert "s1:g1" in state.get("enrich_retry", {}), "a carried item keeps its retry deadline"
+
+
+def test_a_carried_item_follows_the_current_watchlist(tmp_path):
+    cfg = config(tmp_path)
+    (tmp_path / "watchlist.json").write_text(
+        json.dumps(
+            {
+                "schema": KIND,
+                "debian_source_packages": ["curl"],
+                "excluded_products": ["legacy"],
+                "products": [{"id": "libfoo", "aliases": ["libfoo"], "domains": ["libfoo.example"]}],
+            }
+        )
+    )
+    notifier = Notifier()
+    state = core.new_state()
+    state["seeded"] = {"s1": True}
+    state["carry"] = {
+        "s1": [core.item_to_state(core.Item("g1", "legacy advisory", "https://vendor.example.com/a", "", NOW - 60, ()))]
+    }
+    from advisory_radar.state import save_state
+
+    save_state(cfg.state_path, state)
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [])],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert not notifier.sent, "an excluded product must not be delivered from carry either"
