@@ -57,8 +57,7 @@ turns critical, and never re-sends what you already received.
 `main` is protected: a pull request needs **one approving review** and a green `ci`
 run. `.github/workflows/automerge.yml` then does the merging itself: an approved
 pull request whose checks are green is squash-merged (with `--match-head-commit`,
-so a head that moved is refused) when `ci` finishes, on a 30-minute sweep, or on
-demand. Branch deletion follows the repository's *automatically delete head
+so a head that moved is refused) when `ci` finishes or on a 30-minute sweep. Branch deletion follows the repository's *automatically delete head
 branches* setting.
 
 The workflow only runs from the default branch — `workflow_run` and `schedule`,

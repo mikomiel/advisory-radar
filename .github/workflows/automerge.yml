@@ -110,6 +110,14 @@ jobs:
             # status reports .state, and a queued/in-progress one has neither a conclusion nor a state of
             # success. Anything other than SUCCESS/NEUTRAL/SKIPPED skips the merge - pending included, so an
             # additional check cannot start failing after we merged.
+            # statusCheckRollup is bounded (100 contexts); at that size an omitted check could be the failing
+            # one, so refuse to merge rather than trust an incomplete list.
+            contexts=$(jq -r '.statusCheckRollup | length' <<<"$meta")
+            if [ "$contexts" -ge 100 ]; then
+              echo "skip #$pr: $contexts check contexts - the rollup may be truncated, cannot verify completeness"
+              continue
+            fi
+
             not_green=$(jq -r --argjson _ 0 '[.statusCheckRollup[]
               | (.conclusion // .state // "PENDING")
               | select(. != "SUCCESS" and . != "NEUTRAL" and . != "SKIPPED")] | length' <<<"$meta")
