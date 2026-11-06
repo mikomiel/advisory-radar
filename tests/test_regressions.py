@@ -194,7 +194,7 @@ class WindowSource:
         self.truncated = truncated
         self.host = host
 
-    def fetch(self, http):
+    def fetch(self, http, state=None):  # the state-aware protocol is a superset of fetch(http)
         from advisory_radar.plugins import SourceWindow
 
         return SourceWindow(self.id, self._items, self.truncated, self.host)
