@@ -1301,3 +1301,46 @@ def test_a_ghsa_decided_verdict_renders_the_ghsa_evidence():
     assert verdict.tag == "critical"
     assert "OSV GHSA severity" in verdict.line, "the deciding evidence must be shown, not the unrelated CVE score"
     assert "without a CVE id" in verdict.note
+
+
+# ---------------------------------------------------------------------------
+# Twentieth review round
+
+
+def test_epss_requests_are_bounded_per_call():
+    calls = []
+
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda s: None)
+
+        def _get(self, url):
+            calls.append(url)
+            if "api.first.org" in url:
+                return 200, {"data": []}
+            return 404, None
+
+    facts = Intel().cves([f"CVE-2026-{index:05d}" for index in range(5000)])
+    epss_calls = [url for url in calls if "api.first.org" in url]
+    assert len(epss_calls) <= core.MAX_EPSS_IDS // 100 + 1, "EPSS work per call is bounded"
+    assert any(fact.skipped for fact in facts.values()), "ids past the budget are unmeasured, not complete"
+
+
+def test_confirmed_ssvc_active_escalates_through_an_epss_outage():
+    state = core.new_state()
+    cve = "CVE-2026-6666"
+    state["watch"][cve] = {
+        "since": NOW - 3 * 86400,
+        "last_eval": NOW - 2 * 86400,
+        "level": "warning",
+        "title": "original",
+        "link": "https://vendor.example.com/a",
+    }
+
+    class Intel:
+        def cves(self, cves, force=False):
+            return {name: core.CveFacts(None, "active", None, None, False) for name in cves}
+
+    core.reevaluate(state, Intel(), frozenset(), True, NOW, "")
+    queued = [entry for entry in state["pending"] if entry["kind"] == "escalation"]
+    assert queued and queued[0]["tag"] == "critical", "SSVC active decides without EPSS"

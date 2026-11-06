@@ -102,6 +102,9 @@ MAX_ITEM_CVE_LOOKUPS = 10
 #: OSV lookups one item may spend. A feed item naming hundreds of GHSAs must not hold the pass (and the
 #: state lock) for hours; the rest stay unmeasured, so the item can be a warning but never suppressed.
 MAX_ITEM_GHSA_LOOKUPS = 5
+#: CVEs one classification call may send to EPSS. An item naming a hundred thousand ids must not turn
+#: into a thousand sequential requests while the pass holds the state lock.
+MAX_EPSS_IDS = 200
 EPSS_BATCH = 100
 MAX_SHOWN_IDS = 10
 #: A feed name is operator-chosen text; this keeps it from eating the budget the excerpt shrinks into.
@@ -622,7 +625,7 @@ class Intel:
         return scores
 
     def cves(self, cves: Sequence[str], *, force: bool = False, lookup_limit: int | None = None) -> dict[str, CveFacts]:
-        """Facts per CVE. Only the first ``lookup_limit`` uncached CVEs go to CVE.org/NVD; EPSS covers all."""
+        """Facts per CVE. Only the first ``lookup_limit`` uncached CVEs go to CVE.org/NVD; EPSS is capped."""
         facts: dict[str, CveFacts] = {}
         missing: list[str] = []
         for cve in cves:
@@ -641,8 +644,12 @@ class Intel:
                 )
         if not missing:
             return facts
-        epss = self._epss(missing)
+        epss = self._epss(missing[:MAX_EPSS_IDS])
         for position, cve in enumerate(missing):
+            if position >= MAX_EPSS_IDS:
+                # Past the budget this id was not measured at all: unknown, never suppressed.
+                facts[cve] = CveFacts(None, None, None, None, False, skipped=True)
+                continue
             score, percentile = (None, None) if epss is None else epss.get(cve, (None, None))
             if lookup_limit is not None and position >= lookup_limit:
                 facts[cve] = CveFacts(None, None, score, percentile, False, skipped=True)
@@ -1521,7 +1528,10 @@ def reevaluate(state: dict, intel: Intel, kev: frozenset[str], kev_known: bool, 
     for cve in due:
         current = facts[cve]
         entry = watch[cve]
-        if not current.complete and not (kev_known and cve in kev):
+        deciding = critical_reason(current, kev_known and cve in kev)
+        if not current.complete and not deciding:
+            # A failed lookup changes nothing unless an independently sufficient signal (KEV, SSVC active,
+            # or a remote-unauthenticated CVSS >= 9.0) already decides the level.
             # Retried after the next daily interval rather than on every pass: otherwise a handful of CVEs
             # whose lookups keep failing would hold the whole batch and every later watch would starve.
             # A KEV hit is a local fact and does not need the failed lookups.
