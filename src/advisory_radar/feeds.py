@@ -172,7 +172,9 @@ _RSS = "{http://purl.org/rss/1.0/}"
 
 
 def _text_of(node: ET.Element | None) -> str:
-    return clean_text("".join(node.itertext())) if node is not None else ""
+    # Joined with a space: an XHTML block boundary ("<p>libfoo</p><p>fixed</p>") must not merge the words,
+    # and clean_text collapses the doubled spaces this introduces inside inline markup.
+    return clean_text(" ".join(node.itertext())) if node is not None else ""
 
 
 #: A feed date outside this window is treated as absent: a stray huge integer must not survive to

@@ -517,8 +517,13 @@ def _bounded(value: object, low: float, high: float) -> float | None:
 
 
 def _cve_age(cve: str) -> tuple[int, int]:
+    """(year, number) for ordering; a suffix too long to be an integer is treated as number 0.
+
+    ``CVE_RE`` accepts any number of digits, and ``int()`` refuses absurd lengths: sorting untrusted ids must
+    not raise inside classification.
+    """
     _, year, number = cve.split("-")
-    return int(year), int(number)
+    return int(year), int(number) if len(number) <= 18 else 0
 
 
 def parse_nodejs_page(text: str) -> NodejsRelease:
@@ -941,6 +946,16 @@ def judge(
     """
     incomplete_note = "Incomplete severity data; treated as unknown."
     if not cves:
+        if independent_ghsa_cvss is not None:
+            # An alias-free advisory carries its own severity, whatever else the item mentions.
+            if independent_ghsa_cvss >= CRITICAL_CVSS:
+                return Verdict(
+                    "critical", (), metrics_line(independent_ghsa_cvss, None, None, None, False, approximate=True), ""
+                )
+            if osv_complete and independent_ghsa_cvss < LOW_BELOW:
+                return Verdict(
+                    "suppressed", (), metrics_line(independent_ghsa_cvss, None, None, None, False, approximate=True), ""
+                )
         if osv_scores_are_aliased:
             # Every scored advisory aliases a CVE that is not being judged here (it was already claimed), so
             # the OSV label is not independent evidence about this item: keep it visible as unknown.
@@ -1338,7 +1353,8 @@ def classify_new(
         #: CVE -> the score of the GHSA that aliases it, so one advisory's LOW cannot judge another's CVE.
         osv_fallbacks: dict[str, float] = {}
         independent_ghsa_cvss: float | None = None
-        scored_only_via_aliases = False
+        aliased_scored = False
+        independent_scored = False
         if len(ghsas) > MAX_ITEM_GHSA_LOOKUPS:
             osv_complete = False  # the rest were not looked up, so nothing here is a complete measurement
         for ghsa in ghsas[:MAX_ITEM_GHSA_LOOKUPS]:
@@ -1348,12 +1364,12 @@ def classify_new(
             if osv.cvss is not None:
                 osv_cvss = max(osv_cvss or 0.0, osv.cvss)
                 if osv.cves:
-                    scored_only_via_aliases = True
+                    aliased_scored = True
                     for alias in osv.cves:
                         osv_fallbacks[alias] = max(osv_fallbacks.get(alias, 0.0), osv.cvss)
                 else:
-                    scored_only_via_aliases = False
                     # The advisory has no CVE alias, so its label is its only severity evidence.
+                    independent_scored = True
                     independent_ghsa_cvss = max(independent_ghsa_cvss or 0.0, osv.cvss)
         vendor_ids = [identifier for identifier in explicit if identifier.startswith(("PSA-", "DSA-"))]
         # Every explicit identifier is an identity: an unclaimed GHSA must not be hidden behind a CVE that
@@ -1382,7 +1398,7 @@ def classify_new(
             osv_complete and not unenriched,
             osv_fallbacks=osv_fallbacks,
             independent_ghsa_cvss=independent_ghsa_cvss,
-            osv_scores_are_aliased=scored_only_via_aliases,
+            osv_scores_are_aliased=aliased_scored and not independent_scored,
         )
         if unenriched and verdict.tag == "warning":
             verdict = replace(verdict, note=ENRICH_FAILED_NOTE)

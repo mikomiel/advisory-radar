@@ -1185,3 +1185,70 @@ def test_a_claimed_cve_beside_a_new_ghsa_does_not_let_the_ghsa_speak_for_it():
         osv_scores_are_aliased=True,
     )
     assert verdict.tag == "warning", "an aliased advisory must not escalate on its own label"
+
+
+# ---------------------------------------------------------------------------
+# Eighteenth review round
+
+
+def test_an_independent_critical_ghsa_wins_regardless_of_identifier_order():
+    for independent_first in (True, False):
+        verdict = core.judge(
+            [],
+            {},
+            frozenset(),
+            True,
+            9.8,
+            True,
+            osv_fallbacks={},
+            independent_ghsa_cvss=9.8 if independent_first else None,
+            osv_scores_are_aliased=not independent_first,
+        )
+        expected = "critical" if independent_first else "warning"
+        assert verdict.tag == expected
+
+
+def test_atom_xhtml_keeps_word_boundaries_through_filtering():
+    from advisory_radar.feeds import parse_rss
+
+    atom = (
+        b'<feed xmlns="http://www.w3.org/2005/Atom">'
+        b'<link rel="alternate" href="https://aggregator.example/feed"/>'
+        b"<entry><id>urn:1</id><title>Security update</title>"
+        b'<content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">'
+        b"<p>libfoo</p><p>fixed a vulnerability</p></div></content></entry></feed>"
+    )
+    export = parse_rss(atom)
+    assert "libfoo fixed" in export.items[0].summary
+    watch = {
+        "schema": KIND,
+        "debian_source_packages": ["curl"],
+        "excluded_products": [],
+        "products": [{"id": "libfoo", "aliases": ["libfoo"], "domains": ["libfoo.example"]}],
+    }
+    import json as _json
+
+    policy = load_policy_from(_json.dumps(watch), pytest.importorskip("pathlib").Path)
+    assert core.passes_filter(export.items[0], policy) is True
+
+
+def load_policy_from(text, path_module):
+
+    import os
+    import tempfile
+
+    from advisory_radar.watchlist import load_policy
+
+    fd, name = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+    try:
+        return load_policy(path_module(name))
+    finally:
+        os.unlink(name)
+
+
+def test_an_absurd_cve_suffix_does_not_raise():
+    cve = "CVE-2026-" + "9" * 5000
+    assert core._cve_age(cve) == (2026, 0)
+    assert core.parse_nodejs_page(f"security releases {cve}") is not None
