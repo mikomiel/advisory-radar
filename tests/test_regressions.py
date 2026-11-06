@@ -1923,3 +1923,78 @@ def test_a_busy_source_cannot_starve_a_failed_sources_carry(tmp_path):
     assert any("captured from s2" in title for title in sent_titles), (
         "a failed source's captured advisory must not starve behind a busy one"
     )
+
+
+# ---------------------------------------------------------------------------
+# Thirty-first review round
+
+
+def test_an_unrelated_nvd_record_is_a_failed_lookup():
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda s: None)
+
+        def _get(self, url):
+            if "services.nvd.nist.gov" in url:
+                record = {"id": "CVE-2026-9999", "metrics": {"cvssMetricV31": [{"cvssData": {"baseScore": 2.0}}]}}
+                return 200, {"vulnerabilities": [{"cve": record}]}
+            if "api.first.org" in url:
+                return 200, {"data": [{"cve": "CVE-2026-1234", "epss": "0.5", "percentile": "0.9"}]}
+            return 404, None
+
+    assert Intel().cves(["CVE-2026-1234"])["CVE-2026-1234"].complete is False, (
+        "another CVE's score must never become this CVE's measurement"
+    )
+
+
+def test_an_unrelated_cve_org_record_is_a_failed_lookup():
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda s: None)
+
+        def _get(self, url):
+            if "cveawg.mitre.org" in url:
+                return 200, {"cveMetadata": {"cveId": "CVE-2026-9999"}, "containers": {}}
+            return 404, None
+
+    assert Intel()._cve_org("CVE-2026-1234")[0] is False
+
+
+def test_php_enrichment_keeps_both_cves_and_ghsas():
+    from advisory_radar.core import Intel
+
+    class FakeIntel(Intel):
+        def __init__(self):
+            super().__init__(lambda *a: (404, {}, b""), {}, lambda: 0.0, lambda s: None)
+
+        def php_cves(self, slug):
+            class Release:
+                cves = ("CVE-2026-1111",)
+                ghsas = ("GHSA-aaaa-bbbb-cccc",)
+                versions = ()
+                detail = ""
+
+            return Release()
+
+    state = core.new_state()
+    policy = core.Policy(("curl",), (), ())
+    release_item = core.Item(
+        "g1",
+        "PHP 8.4.26 released!",
+        "https://www.php.net/archive/2026.php",
+        "notes",
+        NOW - 60,
+        (),
+        "PHP",
+        "https://www.php.net/",
+    )
+    looked: list[str] = []
+
+    def ghsa(self, identifier):
+        looked.append(identifier)
+        return core.OsvFacts((), 9.8, True)
+
+    FakeIntel.ghsa = ghsa
+    core.classify_new(state, [release_item], FakeIntel(), frozenset(), True, NOW, "www.php.net", policy)
+    assert "GHSA-aaaa-bbbb-cccc" in looked, "a PHP release names both ids and both must be used"
+    assert any(entry["tag"] == "critical" for entry in state["pending"]), "the alias-free CRITICAL GHSA decides"

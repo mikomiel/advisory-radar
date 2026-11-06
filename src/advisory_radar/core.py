@@ -482,6 +482,21 @@ def parse_nvd(document: dict) -> float | None:
     return nvd_facts(document)[0]
 
 
+def _nvd_record_matches(document: dict, cve: str) -> bool:
+    """The response must describe the requested CVE: an unrelated record would be false evidence."""
+    vulnerabilities = document.get("vulnerabilities")
+    if not isinstance(vulnerabilities, list) or not vulnerabilities:
+        return False
+    for entry in vulnerabilities:
+        record = entry.get("cve") if isinstance(entry, dict) else None
+        if not isinstance(record, dict):
+            return False
+        identifier = record.get("id")
+        if not isinstance(identifier, str) or identifier.upper() != cve.upper():
+            return False
+    return True
+
+
 def nvd_facts(document: dict) -> tuple[float | None, bool]:
     """``parse_nvd`` plus whether a metric giving that score is remote and unauthenticated (same source)."""
     vulnerabilities = document.get("vulnerabilities")
@@ -596,6 +611,10 @@ class Intel:
             return True, None, None, False
         if not isinstance(document, dict):
             return False, None, None, False
+        metadata = document.get("cveMetadata")
+        identifier = metadata.get("cveId") if isinstance(metadata, dict) else None
+        if isinstance(identifier, str) and identifier.upper() != cve.upper():
+            return False, None, None, False  # another CVE's record is not evidence about this one
         return (True, *cve_org_facts(document))
 
     def _nvd(self, cve: str) -> tuple[bool, float | None, bool]:
@@ -603,8 +622,9 @@ class Intel:
         status, document = self._get(NVD_URL + cve)
         if status == 404:
             return True, None, False
-        # A 200 must carry the NVD envelope: an error body or {} is a failed lookup, never "no score".
-        if not isinstance(document, dict) or not isinstance(document.get("vulnerabilities"), list):
+        # A 200 must carry the NVD envelope for *this* CVE: an error body, {} or another CVE's record is a
+        # failed lookup, never "no score".
+        if not isinstance(document, dict) or not _nvd_record_matches(document, cve):
             return False, None, False
         return (True, *nvd_facts(document))
 
@@ -1390,7 +1410,7 @@ def classify_new(
                     retry.pop(item.guid, None)  # one clock per item: the day replaces an earlier fault's 2 h
             else:
                 release = intel.php_cves_on(day) if day else intel.php_cves(php) if php else None
-                found = None if release is None else release.cves or release.ghsas
+                found = None if release is None else list(dict.fromkeys([*release.cves, *release.ghsas]))
             if found is None:
                 if _enrichment_wait(clock, item.guid, now, limit):
                     deferred.append(item)  # waiting on its retry clock: carried so the feed cannot drop it
