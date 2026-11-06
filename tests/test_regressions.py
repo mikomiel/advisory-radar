@@ -993,3 +993,47 @@ def test_a_zero_poll_interval_is_refused(tmp_path):
     path.write_text("sources: []\nnotifiers: []\npoll_interval: 0s\n")
     with pytest.raises(ConfigError):
         load_config(path, {})
+
+
+# ---------------------------------------------------------------------------
+# Fourteenth review round
+
+
+def test_an_unclaimed_ghsa_survives_a_claimed_cve(tmp_path):
+    """A new GHSA must not be swallowed by a CVE an earlier message already claimed."""
+    cfg = config(tmp_path)
+    state = core.new_state()
+    state["seen"]["CVE-2026-1234"] = {"at": NOW - 3600, "outcome": "delivered"}
+    from advisory_radar.state import save_state
+
+    save_state(cfg.state_path, state)
+    entry = core.Item(
+        "g1",
+        "CVE-2026-1234 and GHSA-aaaa-bbbb-cccc in one advisory",
+        "https://vendor.example.com/a",
+        "notes",
+        NOW - 60,
+        ("CVE-2026-1234", "GHSA-aaaa-bbbb-cccc"),
+    )
+    notifier = Notifier()
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [entry])],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert notifier.sent, "the unclaimed GHSA is a reason to notify"
+
+
+def test_a_disabled_plugin_does_not_need_its_secret(tmp_path):
+    path = tmp_path / "c.yml"
+    path.write_text(
+        "sources: []\n"
+        "notifiers:\n"
+        "  - id: disabled-channel\n    type: discord_webhook\n    url: ${MISSING_SECRET}\n    enabled: false\n"
+        "  - id: active-channel\n    type: webhook\n    url: https://hooks.example.com/x\n"
+    )
+    cfg = load_config(path, {})  # must not raise
+    assert [entry["id"] for entry in cfg.notifiers] == ["active-channel"]

@@ -928,6 +928,7 @@ def judge(
     osv_cvss: float | None,
     osv_complete: bool = True,
     osv_fallbacks: Mapping[str, float] | None = None,
+    ghsas_without_cves: bool = False,
 ) -> Verdict:
     """Item verdict from the CVEs it names; the CVE that decides is the one shown.
 
@@ -967,6 +968,12 @@ def judge(
             # Sent as a warning, so the watch records it as sent: a later re-score is not a second warning.
             tag = "warning"
             levels = tuple((cve, "warning") for cve, _ in levels)
+    if osv_cvss is not None and ghsas_without_cves:
+        # An alias-free GHSA carries its own severity: a LOW CVE beside it must not hide it.
+        if osv_cvss >= CRITICAL_CVSS:
+            tag = "critical"
+        elif tag == "suppressed":
+            tag = "warning"
     chosen = facts[shown]
     cvss = chosen.cvss if chosen.cvss is not None else osv_cvss
     line = metrics_line(
@@ -1323,7 +1330,9 @@ def classify_new(
                 for alias in osv.cves:
                     osv_fallbacks[alias] = max(osv_fallbacks.get(alias, 0.0), osv.cvss)
         vendor_ids = [identifier for identifier in explicit if identifier.startswith(("PSA-", "DSA-"))]
-        identity = cves or ghsas or vendor_ids or [f"src:{item.guid}"]
+        # Every explicit identifier is an identity: an unclaimed GHSA must not be hidden behind a CVE that
+        # an earlier message already claimed.
+        identity = list(dict.fromkeys([*cves, *ghsas, *vendor_ids])) or [f"src:{item.guid}"]
         ids = list(dict.fromkeys([*explicit, *identity, *own]))
         if all(identifier in claimed for identifier in identity):
             # Remember the alias so the next pass skips the OSV lookup, or the tracker or ChangeLog fetch. Another
@@ -1346,6 +1355,7 @@ def classify_new(
             osv_cvss,
             osv_complete and not unenriched,
             osv_fallbacks=osv_fallbacks,
+            ghsas_without_cves=bool(ghsas) and not any(osv_fallbacks.get(ghsa) for ghsa in ghsas),
         )
         if unenriched and verdict.tag == "warning":
             verdict = replace(verdict, note=ENRICH_FAILED_NOTE)

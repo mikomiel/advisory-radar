@@ -120,9 +120,17 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
         all(re.fullmatch(r"[A-Za-z0-9._-]+", entry["id"]) for entry in (*sources, *notifiers)),
         "plugin ids may use only letters, digits, dot, dash and underscore",
     )
+    # A disabled plugin is not built, so its ${...} references are not resolved either: turning a channel
+    # off must be enough to drop its credential requirement.
+    enabled = {
+        key: [entry for entry in document.get(key) or [] if entry.get("enabled", True)]
+        for key in ("sources", "notifiers")
+    }
+    document.update(enabled)
     secret_names = tuple(sorted(set(_ENV_RE.findall(yaml.safe_dump(document)))))
     resolved: list[str] = []
     document = _expand(document, env, resolved)
+    document.pop("secret_names_source", None)
     secret_values = tuple(sorted({value for value in resolved if value}))
     # Built plugins read the expanded entries; the structural checks above used the raw ones.
     sources = document.get("sources") or []
