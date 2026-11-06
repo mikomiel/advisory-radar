@@ -52,6 +52,18 @@ turns critical, and never re-sends what you already received.
 - Docker and Podman deployment (compose file + quadlet/kube YAML), `/healthz` and `/metrics`
 - Secrets via environment / `_FILE` only; redaction filter on logs; fail-closed source errors
 
+## Review and merge automation
+
+`main` is protected: a pull request needs **one approving review** and a green `ci`
+run. `.github/workflows/automerge.yml` then does the merging itself — an approved
+pull request whose checks are green is squash-merged and its branch deleted, on
+the approval event, when `ci` finishes, and on a 30-minute sweep. Nothing merges
+without an approval, and a failing check stops it.
+
+The reviewer is the Gandalf GitHub App, which posts its review through the
+`external_github_review` route. Contributors can of course review each other;
+the point is that no human has to click merge.
+
 ## Development
 
 ```bash
