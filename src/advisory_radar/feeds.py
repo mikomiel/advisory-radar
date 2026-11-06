@@ -225,7 +225,9 @@ def parse_rss(body: bytes) -> FeedExport:
             title = _text_of(node.find("title"))
             if not guid or not title:
                 raise RssError("feed entry has no usable id or title")
-            summary = _text_of(node.find("description"))
+            summary = _text_of(node.find("description")) or _text_of(
+                node.find("{http://purl.org/rss/1.0/modules/content/}encoded")
+            )
             items.append(
                 FeedEntry(guid, title, link, summary, _published_of(node.find("pubDate")), channel_title, channel_link)
             )

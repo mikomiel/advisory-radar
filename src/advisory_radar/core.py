@@ -617,6 +617,10 @@ class Intel:
             if data and any(not isinstance(row, dict) or not isinstance(row.get("cve"), str) for row in data):
                 return None  # a batch with an unusable row is a failed measurement, not a partial answer
             for row in data:
+                if row.get("epss") is None and row.get("percentile") is None:
+                    # A row for the CVE with no numbers is malformed: "no score" is expressed by the CVE being
+                    # absent from the response, never by an empty row.
+                    return None
                 score = _bounded(row.get("epss"), 0.0, 1.0)
                 percentile = _bounded(row.get("percentile"), 0.0, 1.0)
                 if (row.get("epss") is not None and score is None) or (

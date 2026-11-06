@@ -1763,3 +1763,36 @@ def test_a_disabled_source_does_not_deliver_its_carry(tmp_path):
         sleep=lambda s: None,
     )
     assert not notifier.sent, "a source that is no longer configured must not push its carry"
+
+
+# ---------------------------------------------------------------------------
+# Twenty-eighth review round
+
+
+def test_an_epss_row_without_numbers_is_a_failure():
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda s: None)
+
+        def _get(self, url):
+            if "api.first.org" in url:
+                return 200, {"data": [{"cve": "CVE-2026-1234"}]}
+            return 404, None
+
+    assert Intel().cves(["CVE-2026-1234"])["CVE-2026-1234"].complete is False
+
+
+def test_an_rss_cve_in_content_encoded_is_classified_and_watched(tmp_path):
+    from advisory_radar.feeds import parse_rss
+
+    feed = (
+        b'<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">'
+        b"<channel><title>T</title><link>https://vendor.example.com/</link>"
+        b"<item><title>Security update</title><guid>advisory-1</guid>"
+        b"<content:encoded><![CDATA[Fixes CVE-2026-1234.]]></content:encoded></item>"
+        b"</channel></rss>"
+    )
+    export = parse_rss(feed)
+    entry = export.items[0]
+    assert "CVE-2026-1234" in entry.summary, "the full content must be read, not just the description"
+    assert "CVE-2026-1234" in core.extract_ids(entry.title, entry.summary, entry.link)
