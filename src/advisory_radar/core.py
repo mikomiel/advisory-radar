@@ -614,14 +614,18 @@ class Intel:
             data = document.get("data") if isinstance(document, dict) else None
             if status != 200 or not isinstance(data, list):
                 return None
-            scores |= {
-                row["cve"].upper(): (
-                    _bounded(row.get("epss"), 0.0, 1.0),
-                    _bounded(row.get("percentile"), 0.0, 1.0),
-                )
-                for row in data
-                if isinstance(row, dict) and isinstance(row.get("cve"), str)
-            }
+            for row in data:
+                if not isinstance(row, dict) or not isinstance(row.get("cve"), str):
+                    continue
+                score = _bounded(row.get("epss"), 0.0, 1.0)
+                percentile = _bounded(row.get("percentile"), 0.0, 1.0)
+                if (row.get("epss") is not None and score is None) or (
+                    row.get("percentile") is not None and percentile is None
+                ):
+                    # A row that matched but carries an unusable number is a failed measurement. Caching it as
+                    # "no score" would let a LOW CVSS suppress an advisory that was never really measured.
+                    return None
+                scores[row["cve"].upper()] = (score, percentile)
         return scores
 
     def cves(self, cves: Sequence[str], *, force: bool = False, lookup_limit: int | None = None) -> dict[str, CveFacts]:
@@ -1297,10 +1301,22 @@ def classify_new(
             backlog += bool(unclaimed)
             continue
         if len(pending) >= room or classified >= MAX_CLASSIFY:
-            left = ordered[position:]
-            if left:
-                LOG.info("%d item(s) left unclassified this pass; carried to the next one", len(left))
-            return left + deferred
+            # The tail still gets the history decision: carrying an old item would make the next pass treat
+            # it as recent merely because it came from carry.
+            carryable: list[Item] = []
+            for rest in ordered[position:]:
+                first = list(rest.explicit or (f"src:{rest.guid}",))
+                if rest.published is not None and now - rest.published > BACKLOG_AGE and rest.guid not in trusted:
+                    unclaimed_rest = [identifier for identifier in first if identifier not in claimed]
+                    for identifier in unclaimed_rest:
+                        seen[identifier] = {"at": now, "outcome": "backlog"}
+                    claimed.update(unclaimed_rest)
+                    backlog += bool(unclaimed_rest)
+                    continue
+                carryable.append(rest)
+            if carryable:
+                LOG.info("%d item(s) left unclassified this pass; carried to the next one", len(carryable))
+            return carryable + deferred
         if f"src:{item.guid}" in claimed:
             continue  # Already seen under its own guid, before a PSA/CVE id was read from it.
         explicit = item.explicit

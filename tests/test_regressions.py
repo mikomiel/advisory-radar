@@ -1613,3 +1613,47 @@ def test_saturation_does_not_carry_a_historical_item_as_news(tmp_path):
     carried = {row["guid"] for row in state.get("carry", {}).get("s1", [])}
     assert "old" not in carried, "history is recorded as backlog, never carried as a current candidate"
     assert state["seen"]["src:s1:old"]["outcome"] == "backlog"
+
+
+# ---------------------------------------------------------------------------
+# Twenty-fifth review round
+
+
+def test_the_carried_tail_still_gets_the_history_decision(tmp_path):
+    cfg = config(tmp_path)
+    state = core.new_state()
+    state["seeded"] = {"s1": True}
+    from advisory_radar.state import save_state
+
+    save_state(cfg.state_path, state)
+    notifier = Notifier(500)  # the queue fills and stays full
+    undated = [
+        core.Item(f"u{index}", f"undated {index}", "https://vendor.example.com/u", "n", None, ()) for index in range(6)
+    ]
+    old = core.Item("old", "old advisory", "https://vendor.example.com/old", "notes", NOW - 30 * 86400, ())
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", undated + [old])],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    state = json.loads(cfg.state_path.read_text())
+    carried = {row["guid"] for row in state.get("carry", {}).get("s1", [])}
+    assert "old" not in carried, "a historical item in the tail is backlog, never carry"
+    assert state["seen"]["src:s1:old"]["outcome"] == "backlog"
+
+
+def test_a_malformed_epss_row_is_not_a_complete_measurement(tmp_path):
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda s: None)
+
+        def _get(self, url):
+            if "api.first.org" in url:
+                return 200, {"data": [{"cve": "CVE-2026-1234", "epss": "not-a-number", "percentile": "0.5"}]}
+            return 404, None
+
+    facts = Intel().cves(["CVE-2026-1234"])
+    assert facts["CVE-2026-1234"].complete is False, "an unusable number is a failed measurement"
