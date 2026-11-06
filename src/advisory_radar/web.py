@@ -9,6 +9,7 @@ frontend build step.
 
 from __future__ import annotations
 
+import hmac
 import html
 import os
 import time
@@ -112,7 +113,9 @@ def create_app(
 
         form = urllib.parse.parse_qs((await request.body()).decode("utf-8", "replace"))
         token = (form.get("token") or [""])[0]
-        if token and token == env.get("ADVISORY_RADAR_AUTH_TOKEN", ""):
+        expected = env.get("ADVISORY_RADAR_AUTH_TOKEN", "")
+        # constant-time compare: a byte-by-byte comparison leaks how much of the token matched
+        if token and expected and hmac.compare_digest(token.encode(), expected.encode()):
             response = RedirectResponse("/", status_code=303)
             # Secure by default: without it a browser may send a seven-day session over plaintext HTTP to the
             # same host. ADVISORY_RADAR_INSECURE_COOKIES=1 opts out, for a plain-HTTP development instance only.
