@@ -63,3 +63,10 @@ container needs:
 | plus one per referenced secret | e.g. `DISCORD_WEBHOOK_URL`, `APPRISE_PASSWORD`, `FRESHRSS_TOKEN` |
 
 Volumes: `/config` (read-only) and `/data` (state + KEV cache).
+
+## Multi-arch images
+
+Releases publish `linux/amd64` and `linux/arm64`, so the same tag runs on a
+normal x86 server, a Raspberry Pi and Apple Silicon. Build locally with
+`docker buildx build --platform linux/arm64 -t advisory-radar .` if you need a
+single-arch image.

@@ -263,7 +263,6 @@ def test_smtp_verifies_the_server_certificate():
 
 def test_a_full_webhook_inbox_refuses_rather_than_discards(tmp_path):
     """An acknowledged, unprocessed advisory must never be dropped to make room."""
-    import json as _json
 
     from fastapi.testclient import TestClient
 

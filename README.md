@@ -12,9 +12,11 @@ configuration.
 ## Quickstart
 
 ```bash
+# Until the first tagged release is on GHCR, build locally:
+docker build -t ghcr.io/mikomiel/advisory-radar:latest .
 docker compose up -d
-# or with Podman:
-podman play kube deploy/podman/advisory-radar.yaml
+# or with Podman: install deploy/podman/advisory-radar.container as a quadlet
+# (see docs/deployment.md)
 ```
 
 Then open http://localhost:8080 (sign in with `ADVISORY_RADAR_AUTH_TOKEN`) for the

@@ -40,6 +40,20 @@ jobs:
       - name: No internal identifiers (estate guard)
         run: uv run python scripts/check_no_estate_identifiers.py
 
+      - name: Workflow YAML parses
+        run: |
+          uv run python - <<'PYX'
+          import pathlib, sys, yaml
+          bad = []
+          for path in sorted(pathlib.Path(".github/workflows").glob("*.yml")):
+              try:
+                  yaml.safe_load(path.read_text())
+              except Exception as exc:
+                  bad.append(f"{path}: {exc}")
+          print("\\n".join(bad) or f"{len(list(pathlib.Path('.github/workflows').glob('*.yml')))} workflow file(s) OK")
+          sys.exit(1 if bad else 0)
+          PYX
+
       - name: Container image builds and starts
         # A build alone would not have caught a virtualenv relocated to a different path or a data
         # directory the container user cannot write; this starts the image and asks it for /healthz.

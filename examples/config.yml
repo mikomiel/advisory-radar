@@ -61,5 +61,4 @@ notifiers:
 web:
   host: 0.0.0.0
   port: 8080
-  # Session auth token; set via env, never in this file.
-  auth_token: ${ADVISORY_RADAR_AUTH_TOKEN}
+  # The session auth token is env-only: ADVISORY_RADAR_AUTH_TOKEN.
