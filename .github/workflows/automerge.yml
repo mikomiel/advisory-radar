@@ -68,7 +68,9 @@ jobs:
             # The configured reviewer's own latest review decides, and only if it approved this exact head.
             # Read over REST: .user.type distinguishes an App bot from a human account of the same name, and
             # .user.login keeps the "[bot]" suffix that the GraphQL shape drops.
-            reviews=$(gh api --paginate "repos/$REPO/pulls/$pr/reviews")
+            # jq -s 'add': --paginate emits one JSON array per page, and selecting the latest review per page
+            # would return several answers (an eligible approval on a later page would look like a mismatch).
+            reviews=$(gh api --paginate "repos/$REPO/pulls/$pr/reviews?per_page=100" | jq -s -c 'add')
             reviewer_state=$(jq -r --arg reviewer "$REVIEWER_LOGIN" --arg type "$REVIEWER_TYPE" '
               [.[] | select(.user.login == $reviewer and .user.type == $type)]
               | sort_by(.submitted_at) | last | .state // ""' <<<"$reviews")
