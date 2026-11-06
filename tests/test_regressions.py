@@ -1843,3 +1843,83 @@ def test_the_rendered_score_belongs_to_the_shown_cve():
     assert "CVE-2026-1111" in verdict.line and "3.9" not in verdict.line, (
         "the GHSA score belongs to CVE-2026-2222; showing it beside CVE-2026-1111 would be false evidence"
     )
+
+
+# ---------------------------------------------------------------------------
+# Thirtieth review round
+
+
+def test_a_malformed_nvd_response_is_a_failed_lookup():
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda s: None)
+
+        def _get(self, url):
+            if "services.nvd.nist.gov" in url:
+                return 200, {"error": "unavailable"}
+            if "api.first.org" in url:
+                return 200, {"data": [{"cve": "CVE-2026-1234", "epss": "0.5", "percentile": "0.9"}]}
+            return 404, None
+
+    assert Intel().cves(["CVE-2026-1234"])["CVE-2026-1234"].complete is False
+
+
+def test_a_mixed_case_hidden_host_still_hides_the_url():
+    from advisory_radar.config import load_config
+
+    path = Path(__file__).parent / "_hidden.yml"
+    path.write_text("sources: []\nnotifiers: []\nhidden_source_hosts:\n  - RSSHub.Internal\n")
+    try:
+        cfg = load_config(path, {})
+    finally:
+        path.unlink()
+    assert cfg.hidden_source_hosts == frozenset({"rsshub.internal"})
+    core.HIDDEN_SOURCE_HOSTS = cfg.hidden_source_hosts
+    try:
+        title, body = core.render(
+            "critical",
+            "CVE-2026-1111",
+            ["CVE-2026-1111"],
+            "9.8",
+            "",
+            "https://RSSHub.Internal/private-query?token=abc",
+            "notes",
+            NOW,
+            "rsshub.internal",
+            "Feed",
+            "https://RSSHub.Internal/private-query?token=abc",
+        )
+        assert "private-query" not in title + body, "a hidden host must not leak its URL, whatever the case"
+    finally:
+        core.HIDDEN_SOURCE_HOSTS = frozenset()
+
+
+def test_a_busy_source_cannot_starve_a_failed_sources_carry(tmp_path):
+    cfg = config(tmp_path)
+    notifier = Notifier()
+    state = core.new_state()
+    state["seeded"] = {"s1": True, "s2": True}
+    state["carry"] = {
+        "s2": [
+            core.item_to_state(core.Item("of1", "captured from s2", "https://vendor.example.com/o", "n", NOW - 60, ()))
+        ]
+    }
+    from advisory_radar.state import save_state
+
+    save_state(cfg.state_path, state)
+    busy = [item(f"a{index}", f"busy {index}") for index in range(12)]
+    sent_titles: list[str] = []
+    for _ in range(4):
+        notifier.sent.clear()
+        pipeline.run_pass(
+            cfg,
+            [WindowSource("s1", busy), FailingSource("s2", [])],
+            [notifier],
+            http=http_for({}),
+            clock=lambda: float(NOW),
+            sleep=lambda s: None,
+        )
+        sent_titles.extend(entry["title"] for entry in notifier.sent)
+    assert any("captured from s2" in title for title in sent_titles), (
+        "a failed source's captured advisory must not starve behind a busy one"
+    )

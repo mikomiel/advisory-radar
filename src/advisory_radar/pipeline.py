@@ -137,15 +137,30 @@ def _run_pass(
         # after another source persist this one's new window before its candidates were classified.
         answered.append((source, window))
 
-    # Classify in a rotating order: with more sources than DELIVERY_CAP, a fixed order would let the first
-    # ones fill the queue every pass and leave the last ones permanently unclassified.
-    if len(answered) > 1:
-        turn = int(state.get("classify_turn", 0)) % len(answered)
-        answered = answered[turn:] + answered[:turn]
-        state["classify_turn"] = turn + 1
     carried = state.setdefault("carry", {})
-    for source, window in answered:
-        items = [item for item in window.items if core.passes_filter(item, policy)]
+    enabled_ids = {source.id for source in sources}
+    answered_now = {source.id for source, _ in answered}
+    # Only a source that still exists may push work through carry.
+    for stale in [sid for sid in carried if sid not in enabled_ids]:
+        carried.pop(stale, None)
+
+    # One work list for fairness: freshly fetched sources and sources whose only remaining work is carried
+    # candidates. A busy healthy source must not take every slot while a failed source's captured candidates
+    # wait, so both kinds share the rotation and the per-source share.
+    units: list[tuple[object, object]] = [(source, window) for source, window in answered]
+    units += [(source, None) for source in sources if source.id not in answered_now and carried.get(source.id)]
+    if len(units) > 1:
+        turn = int(state.get("classify_turn", 0)) % len(units)
+        units = units[turn:] + units[:turn]
+        state["classify_turn"] = turn + 1
+
+    for source, window in units:
+        if window is None:
+            host = ""
+            items = []
+        else:
+            host = window.host
+            items = [item for item in window.items if core.passes_filter(item, policy)]
         # Items carried from an earlier pass come first: the window they arrived in is already gone.
         earlier = [core.item_from_state(row) for row in carried.pop(source.id, [])]
         # The policy may have changed while these waited: scope applies at classification time, not arrival.
@@ -175,42 +190,15 @@ def _run_pass(
             kev,
             kev_known,
             now,
-            window.host,
+            host,
             policy,
-            share=max(1, core.DELIVERY_CAP // max(1, len(answered))),
+            share=max(1, core.DELIVERY_CAP // max(1, len(units))),
             trusted=trusted,
         )
         if left:
             carried[source.id] = [core.item_to_state(item) for item in left]
-        windows[source.id] = [item.guid for item in window.items]
-        if not dry_run:
-            save_state(cfg.state_path, state)
-
-    # A source that failed (or whose window was untrusted) must not freeze work already captured from it:
-    # those candidates are complete and can be classified under the current policy.
-    answered_now = {source.id for source, _ in answered}
-    enabled_ids = {source.id for source in sources}
-    for source_id in list(carried):
-        if source_id in answered_now or source_id not in enabled_ids:
-            continue  # a disabled source never reaches the notifiers through carry either
-        held = [core.item_from_state(row) for row in carried.pop(source_id, [])]
-        held = [item for item in held if core.passes_filter(item, policy)]
-        if not held:
-            continue
-        left = core.classify_new(
-            state,
-            held,
-            intel,
-            kev,
-            kev_known,
-            now,
-            "",
-            policy,
-            share=max(1, core.DELIVERY_CAP // max(1, len(sources))),
-            trusted={item.guid for item in held},
-        )
-        if left:
-            carried[source_id] = [core.item_to_state(item) for item in left]
+        if window is not None:
+            windows[source.id] = [item.guid for item in window.items]
         if not dry_run:
             save_state(cfg.state_path, state)
 

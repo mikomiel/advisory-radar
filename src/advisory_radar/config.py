@@ -173,7 +173,7 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
             isinstance(raw_hidden, list) and all(isinstance(host, str) and host for host in raw_hidden),
             "hidden_source_hosts must be a list of non-empty host names",
         )
-    hidden = frozenset(raw_hidden or [])
+    hidden = frozenset(host.lower() for host in (raw_hidden or []))  # compared against a lowercased URL host
     return Config(
         sources=tuple(entry for entry in sources if entry.get("enabled", True)),
         notifiers=tuple(entry for entry in notifiers if entry.get("enabled", True)),

@@ -603,7 +603,8 @@ class Intel:
         status, document = self._get(NVD_URL + cve)
         if status == 404:
             return True, None, False
-        if not isinstance(document, dict):
+        # A 200 must carry the NVD envelope: an error body or {} is a failed lookup, never "no score".
+        if not isinstance(document, dict) or not isinstance(document.get("vulnerabilities"), list):
             return False, None, False
         return (True, *nvd_facts(document))
 
