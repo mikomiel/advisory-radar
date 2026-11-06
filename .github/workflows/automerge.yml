@@ -4,6 +4,17 @@
 # "the reviewer approved *this exact head commit*" + "the required ci check is green on that commit".
 # GitHub's branch protection validates both again at merge time; this script only decides *whether to ask*.
 #
+# A human decision is required for every change that widens what this automation can reach: a PR touching
+# SENSITIVE_PATHS below is never merged here. That is not advisory - the early exit is the enforcement, and
+# the repository has exactly one human account, which cannot approve its own pull requests, so a
+# "require code owner approval" rule would deadlock maintenance instead of adding a second check.
+#
+# Enforcement rests on two halves. This file decides from the immutable $base...$head comparison and re-reads
+# both refs immediately before merging; branch protection's required status check is **strict** ("require
+# branches to be up to date"), so GitHub itself refuses a head whose base advanced. Neither half alone is
+# enough: the workflow cannot see a base advance that GitHub would accept, and strict alone does not know
+# which paths are sensitive.
+#
 # Safety rules this file must keep (see docs in the PR that added it):
 #   * never check out or execute pull-request / workflow_run head code - this job only reads PR metadata;
 #   * the approving review must be at the current head SHA, by the configured reviewer identity;
@@ -39,6 +50,9 @@ env:
   # the "[bot]" suffix, the actor type and a stable numeric id: a human account with the same name cannot pass.
   REVIEWER_LOGIN: ecomwizards-gandalf[bot]
   REVIEWER_TYPE: Bot
+  #: Anything that widens what this workflow can reach: the workflows themselves, this file, and the
+  #: published artifact with its packaging. A PR matching this is never auto-merged.
+  SENSITIVE_PATHS: '^\.github/|^Dockerfile$|^docker-compose\.yml$|^deploy/|^pyproject\.toml$|^\.gitleaks\.toml$|^tests/' 
   REQUIRED_CHECK: ci
 
 jobs:
@@ -69,7 +83,7 @@ jobs:
 
           for pr in "${candidates[@]}"; do
             meta=$(gh pr view "$pr" --repo "$REPO" \
-              --json headRefOid,mergeable,reviews,statusCheckRollup)
+              --json headRefOid,baseRefOid,mergeable,reviews,statusCheckRollup,changedFiles)
 
             head=$(jq -r '.headRefOid' <<<"$meta")
             mergeable=$(jq -r '.mergeable' <<<"$meta")
@@ -126,8 +140,41 @@ jobs:
               continue
             fi
 
+            # A change to what the automation can reach needs a person: workflow edits, this file, the
+            # published artifact and its packaging. Such a PR is left for a human merge, always.
+            #
+            # The file list comes from the immutable comparison of the two SHAs, never from the pull request's
+            # mutable state: /pulls/{n}/files follows the branch, so a head that moved A -> B -> A could show
+            # B's harmless files while A merges. Both sides of a rename count (previous_filename).
+            base=$(jq -r '.baseRefOid' <<<"$meta")
+            # The comparison carries its file list on the first page only; following pages paginate commits
+            # without a `files` array. One request, then the completeness check below covers the cap.
+            files=$(gh api "repos/$REPO/compare/$base...$head" | jq -c '.files // []')
+            listed=$(jq 'length' <<<"$files")
+            declared=$(jq -r '.changedFiles // 0' <<<"$meta")
+            if [ "$listed" -lt "$declared" ]; then
+              # compare caps its file list (300); a shorter list means the guard cannot see everything.
+              echo "skip #$pr: comparison lists $listed of $declared changed files, cannot verify the guard"
+              continue
+            fi
+            touched=$(jq -r '.[] | .filename, (.previous_filename // empty)' <<<"$files")
+            sensitive=$(printf '%s\n' "$touched" | grep -E "$SENSITIVE_PATHS" || true)
+            if [ -n "$sensitive" ]; then
+              echo "skip #$pr: needs a human merge, it touches: $(echo "$sensitive" | tr '\n' ' ')"
+              continue
+            fi
+
             # Merge now rather than installing a standing auto-merge order: a later push would move the
             # head past the review this check just validated.
+            # The guard above compared $base...$head. If the base advanced since, that comparison no longer
+            # describes this merge, so re-read and refuse. Branch protection's "require branches to be up to
+            # date" (strict) is the server-side half of this: GitHub itself refuses a head behind the base.
+            current=$(gh pr view "$pr" --repo "$REPO" --json headRefOid,baseRefOid)
+            if [ "$(jq -r '.baseRefOid' <<<"$current")" != "$base" ] || [ "$(jq -r '.headRefOid' <<<"$current")" != "$head" ]; then
+              echo "skip #$pr: base or head moved during the check; a fresh run decides"
+              continue
+            fi
+
             # --match-head-commit: if the head moved between the checks above and this call, GitHub refuses
             # instead of merging a commit the reviewer never saw.
             if gh pr merge "$pr" --repo "$REPO" --squash --match-head-commit "$head"; then

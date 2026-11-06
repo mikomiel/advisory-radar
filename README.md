@@ -82,8 +82,39 @@ turns critical, and never re-sends what you already received.
 
 ## Review and merge automation
 
-`main` is protected: a pull request needs **one approving review** and a green `ci`
-run. `.github/workflows/automerge.yml` then does the merging itself: an approved
+`main` is protected: a pull request needs **an approving review from the review App**
+and a green `ci` run. The workflow below then performs the merge itself.
+
+**A person merges anything that widens what the automation can reach.** A pull request
+touching `.github/` (including the workflows and this automation), `Dockerfile`,
+`docker-compose.yml`, `deploy/`, `pyproject.toml`, `.gitleaks.toml` or `tests/` is
+never auto-merged — the workflow skips it and a human merges it. The repository has
+one human account, which cannot approve its own pull requests, so a "require code
+owner approval" rule would deadlock maintenance instead of adding a check. The path
+guard therefore means "a person merges these", not "a second person approved them".
+
+**The day this repository is shared, turn on one branch-protection rule.**
+
+```
+gh api -X PATCH repos/mikomiel/advisory-radar/branches/main/protection/required_pull_request_reviews \
+  -F required_approving_review_count=1 -F dismiss_stale_reviews=true
+```
+
+What we know about that rule here, rather than what it is supposed to do: when it was
+enabled on 2026-11-06, the review App approved pull request #9 at its exact head and
+GitHub still reported `reviewDecision: REVIEW_REQUIRED` and `mergeStateStatus: BLOCKED`
+— the App's approval did not satisfy it, and only a person's approval would have. That
+is why the rule is off today: this repository has one human account, it authors every
+pull request, and GitHub does not let an author approve their own pull request, so the
+rule blocked all maintenance. The day other people can open pull requests that deadlock
+disappears and the rule is the right one.
+
+If a future GitHub change lets an App approval satisfy the rule, the stricter
+configuration is *Require review from Code Owners* with a `.github/CODEOWNERS` entry for
+a second human account or a team with another member — which is also what genuine
+two-person review needs, and what this repository cannot express with one account.
+
+`.github/workflows/automerge.yml` then does the merging itself: an approved
 pull request whose checks are green is squash-merged (with `--match-head-commit`,
 so a head that moved is refused) when `ci` finishes or on a 30-minute sweep. Branch deletion follows the repository's *automatically delete head
 branches* setting.
