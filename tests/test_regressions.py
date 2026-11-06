@@ -520,7 +520,7 @@ def test_a_failing_watch_does_not_starve_the_next_one():
         state["watch"][cve] = {"since": now - 10 * 86400, "last_eval": now - 2 * 86400, "level": "warning"}
 
     class Intel:
-        def cves(self, cves, force=False):
+        def cves(self, cves, force=False, deferred=None):
             facts = {cve: core.CveFacts(None, None, None, None, False) for cve in cves}
             if healthy in cves:
                 facts[healthy] = core.CveFacts(None, None, None, None, True)
@@ -659,7 +659,7 @@ def test_a_kev_hit_escalates_even_when_the_scored_lookups_fail():
     }
 
     class Intel:
-        def cves(self, cves, force=False):
+        def cves(self, cves, force=False, deferred=None):
             return {name: core.CveFacts(None, None, None, None, False) for name in cves}
 
     core.reevaluate(state, Intel(), frozenset({cve}), True, now, "")
@@ -1344,7 +1344,7 @@ def test_confirmed_ssvc_active_escalates_through_an_epss_outage():
     }
 
     class Intel:
-        def cves(self, cves, force=False):
+        def cves(self, cves, force=False, deferred=None):
             return {name: core.CveFacts(None, "active", None, None, False) for name in cves}
 
     core.reevaluate(state, Intel(), frozenset(), True, NOW, "")
@@ -2097,9 +2097,78 @@ def test_a_kev_addition_escalates_a_capped_out_cve(tmp_path):
     save_state(cfg.state_path, state)
 
     class Intel:
-        def cves(self, cves, force=False):
+        def cves(self, cves, force=False, deferred=None):
             raise AssertionError("a KEV-only watch must not spend an enrichment request")
 
     core.reevaluate(state, Intel(), frozenset({later}), True, NOW, "")
     queued = [entry for entry in state["pending"] if entry["kind"] == "escalation"]
     assert queued and queued[0]["cves"] == [later], "a KEV addition escalates a watch that was never enriched"
+
+
+# ---------------------------------------------------------------------------
+# Thirty-fourth review round
+
+
+def test_an_environment_false_does_not_enable_adobe(tmp_path):
+    from advisory_radar.config import ConfigError
+
+    path = tmp_path / "c.yml"
+    path.write_text("sources: []\nnotifiers: []\nadobe_commerce: ${ADOBE}\n")
+    assert load_config(path, {"ADOBE": "false"}).adobe_commerce is False
+    assert load_config(path, {"ADOBE": "true"}).adobe_commerce is True
+    with pytest.raises(ConfigError):
+        load_config(path, {"ADOBE": "perhaps"})
+
+
+def test_a_deferred_nvd_lookup_does_not_advance_the_daily_clock():
+    state = core.new_state()
+    cve = "CVE-2026-7777"
+    state["watch"][cve] = {
+        "since": NOW - 3 * 86400,
+        "last_eval": NOW - 2 * 86400,
+        "level": "warning",
+        "title": "t",
+        "link": "https://vendor.example.com/a",
+    }
+
+    class Intel:
+        def cves(self, cves, force=False, deferred=None):
+            (deferred if deferred is not None else set()).update(cves)  # budget ran out: no request made
+            return {name: core.CveFacts(None, None, None, None, False) for name in cves}
+
+    core.reevaluate(state, Intel(), frozenset(), True, NOW, "")
+    assert state["watch"][cve]["last_eval"] == NOW - 2 * 86400, "a deferred lookup is not an attempt"
+
+
+def test_suppressing_a_new_cve_keeps_an_earlier_record(tmp_path):
+    cfg = config(tmp_path)
+    state = core.new_state()
+    state["seen"]["CVE-2026-1111"] = {"at": NOW - 7200, "outcome": "delivered"}
+    from advisory_radar.state import save_state
+
+    save_state(cfg.state_path, state)
+    item_with_both = core.Item(
+        "g1",
+        "CVE-2026-1111 and CVE-2026-2222",
+        "https://vendor.example.com/a",
+        "n",
+        NOW - 60,
+        ("CVE-2026-1111", "CVE-2026-2222"),
+    )
+
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(lambda *a: (404, {}, b""), {}, lambda: float(NOW), lambda s: None)
+
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [item_with_both])],
+        [Notifier()],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    state = json.loads(cfg.state_path.read_text())
+    assert state["seen"]["CVE-2026-1111"] == {"at": NOW - 7200, "outcome": "delivered"}, (
+        "an already-delivered CVE keeps its history"
+    )

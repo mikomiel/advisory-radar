@@ -654,8 +654,20 @@ class Intel:
                 scores[row["cve"].upper()] = (score, percentile)
         return scores
 
-    def cves(self, cves: Sequence[str], *, force: bool = False, lookup_limit: int | None = None) -> dict[str, CveFacts]:
-        """Facts per CVE. Only the first ``lookup_limit`` uncached CVEs go to CVE.org/NVD; EPSS is capped."""
+    def cves(
+        self,
+        cves: Sequence[str],
+        *,
+        force: bool = False,
+        lookup_limit: int | None = None,
+        deferred: set[str] | None = None,
+    ) -> dict[str, CveFacts]:
+        """Facts per CVE. Only the first ``lookup_limit`` uncached CVEs go to CVE.org/NVD; EPSS is capped.
+
+        ``deferred`` collects the CVEs on which the NVD budget ran out before a request: those were not
+        measured, so a caller that schedules the next attempt must not count them as tried.
+        """
+        deferred = set() if deferred is None else deferred
         facts: dict[str, CveFacts] = {}
         missing: list[str] = []
         for cve in cves:
@@ -690,7 +702,10 @@ class Intel:
                     self._nvd_left -= 1
                     complete, cvss, remote = self._nvd(cve)
                 else:
+                    # No request was made: this is a deferral, not a measurement. Re-evaluation uses it to
+                    # avoid advancing its daily clock on a CVE it never actually checked.
                     complete = False
+                    deferred.add(cve)
             complete = complete and epss is not None
             facts[cve] = CveFacts(cvss, ssvc, score, percentile, complete, remote_unauth=remote)
             if complete:
@@ -1277,7 +1292,8 @@ def _suppressed(
     state: dict, ids: Sequence[str], verdict: Verdict, item: Item, scores: Mapping[str, float | None], now: int
 ) -> None:
     for identifier in ids:
-        state["seen"][identifier] = {"at": now, "outcome": "suppressed"}
+        # An identifier that was already notified keeps its history: this message is about the new CVEs.
+        state["seen"].setdefault(identifier, {"at": now, "outcome": "suppressed"})
     for cve, level in verdict.levels:
         state["watch"][cve] = {
             "since": now,
@@ -1612,7 +1628,8 @@ def reevaluate(state: dict, intel: Intel, kev: frozenset[str], kev_known: bool, 
     kev_only_due = [
         cve for cve, entry in watch.items() if entry.get("kev_only") and now - entry["last_eval"] >= REEVAL_INTERVAL
     ]
-    facts = intel.cves(due, force=True) if due else {}
+    deferred: set[str] = set()
+    facts = intel.cves(due, force=True, deferred=deferred) if due else {}
     for cve in kev_only_due:
         facts.setdefault(cve, CveFacts(None, None, None, None, False))
     due = [*due, *kev_only_due]
@@ -1620,6 +1637,8 @@ def reevaluate(state: dict, intel: Intel, kev: frozenset[str], kev_known: bool, 
         current = facts[cve]
         entry = watch[cve]
         deciding = critical_reason(current, kev_known and cve in kev)
+        if cve in deferred:
+            continue  # no request was made: try again next pass instead of waiting a whole day
         if not current.complete and not deciding:
             # A failed lookup changes nothing unless an independently sufficient signal (KEV, SSVC active,
             # or a remote-unauthenticated CVSS >= 9.0) already decides the level.

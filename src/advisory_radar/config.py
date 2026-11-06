@@ -82,6 +82,27 @@ _TOP_KEYS = {
 }
 
 
+#: Spellings accepted for a boolean option that came from the environment (expansion yields strings).
+_TRUE_WORDS = frozenset({"true", "yes", "on", "1"})
+_FALSE_WORDS = frozenset({"false", "no", "off", "0", ""})
+
+
+def _bool_option(value: object, name: str) -> bool:
+    """A boolean option: a real bool, or one of the documented spellings.
+
+    ``bool("false")`` is ``True``, so an environment-expanded value must never be coerced directly.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _TRUE_WORDS:
+            return True
+        if lowered in _FALSE_WORDS:
+            return False
+    raise ConfigError(f"{name} must be a boolean (true/false), got {value!r}")
+
+
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise ConfigError(message)
@@ -181,7 +202,7 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
         poll_interval_seconds=seconds,
         state_path=state_path,
         hidden_source_hosts=hidden,
-        adobe_commerce=bool(document.get("adobe_commerce", False)),
+        adobe_commerce=_bool_option(document.get("adobe_commerce", False), "adobe_commerce"),
         web_host=web_host,
         web_port=int(web_port),
         raw=document,
