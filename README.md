@@ -55,13 +55,18 @@ turns critical, and never re-sends what you already received.
 ## Review and merge automation
 
 `main` is protected: a pull request needs **one approving review** and a green `ci`
-run. `.github/workflows/automerge.yml` then does the merging itself — an approved
-pull request whose checks are green is squash-merged immediately (with
-`--match-head-commit`, so a head that moved is refused), on the approval event,
-when `ci` finishes, and on a 30-minute sweep. Branch deletion follows the
-repository's *automatically delete head branches* setting. Nothing merges without
-an approval from the configured reviewer at the exact head, and any check that is
-not terminal-success stops it.
+run. `.github/workflows/automerge.yml` then does the merging itself: an approved
+pull request whose checks are green is squash-merged (with `--match-head-commit`,
+so a head that moved is refused) when `ci` finishes, on a 30-minute sweep, or on
+demand. Branch deletion follows the repository's *automatically delete head
+branches* setting.
+
+The workflow only runs from the default branch — `workflow_run`, `schedule` and
+`workflow_dispatch`, never `pull_request*` — because those events execute the
+pull request's own copy of the workflow. The trade-off is latency: a merge lands
+within ~30 minutes of the approval, not at the instant of the review. Nothing
+merges without an approval from the configured reviewer at the exact head, and
+any check that is not terminal-success stops it.
 
 The reviewer is the Gandalf GitHub App, which posts its review through the
 `external_github_review` route. Contributors can of course review each other;

@@ -11,14 +11,17 @@
 #   * branch protection must dismiss stale approvals on new commits (set on main, not by this file).
 name: automerge
 
+# Only trusted-default-branch triggers. `pull_request_review` is deliberately absent: that event runs the
+# workflow definition from the pull request itself, so a same-repository PR could rewrite this script and
+# trigger it with a comment-only review, executing attacker-controlled code with a write token. `workflow_run`,
+# `schedule` and `workflow_dispatch` always run the default branch's definition. The cost is latency: a merge
+# happens at the next `ci` completion, the next sweep, or on demand - never within the reviewed PR.
 on:
-  pull_request_review:
-    types: [submitted]
   workflow_run:
     workflows: [ci]
     types: [completed]
   schedule:
-    - cron: "*/30 * * * *"   # sweep: pick up approvals whose event we missed
+    - cron: "*/30 * * * *"   # sweep: pick up approvals
   workflow_dispatch:
 
 permissions:
@@ -48,8 +51,8 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          # Paginated to completion (gh follows the pages itself): a limit applied before filtering would hide
-          # an eligible PR that happens to sit beyond the first page.
+          # gh paginates internally up to this bound, which is far above any realistic queue; the comment is a
+          # bound, not "to completion".
           mapfile -t candidates < <(gh pr list --repo "$REPO" --state open --base main --limit 1000 \
             --json number,reviewDecision,mergeable,isDraft \
             --jq '.[] | select(.isDraft == false and .reviewDecision == "APPROVED") | .number')
