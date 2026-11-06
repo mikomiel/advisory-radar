@@ -141,8 +141,14 @@ def _run_pass(
         turn = int(state.get("classify_turn", 0)) % len(answered)
         answered = answered[turn:] + answered[:turn]
         state["classify_turn"] = turn + 1
+    carried = state.setdefault("carry", {})
     for source, window in answered:
         items = [item for item in window.items if core.passes_filter(item, policy)]
+        # Items carried from an earlier pass come first: the window they arrived in is already gone.
+        earlier = [core.item_from_state(row) for row in carried.pop(source.id, [])]
+        if earlier:
+            known = {item.guid for item in items}
+            items = [item for item in earlier if item.guid not in known] + items
         seeded = state.setdefault("seeded", {})
         if source.id not in seeded:
             # Bootstrap is per source: a source that failed on the first pass must still be seeded when it
@@ -157,7 +163,7 @@ def _run_pass(
             )
         else:
             candidates = items
-        core.classify_new(
+        left = core.classify_new(
             state,
             candidates,
             intel,
@@ -168,6 +174,10 @@ def _run_pass(
             policy,
             share=max(1, core.DELIVERY_CAP // max(1, len(answered))),
         )
+        if left:
+            carried[source.id] = [core.item_to_state(item) for item in left]
+        if not carried:
+            state.pop("carry", None)
         if not dry_run:
             save_state(cfg.state_path, state)
 

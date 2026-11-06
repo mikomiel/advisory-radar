@@ -158,8 +158,9 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
     _require(isinstance(web_port, int) and 1 <= web_port <= 65535, "web.port must be an integer in 1..65535")
     state_path = Path(document.get("state_path", "data/state.json"))
     _require(
-        state_path.name != "kev.json",
-        "state_path must not be named kev.json: that is the KEV cache's filename beside the state file",
+        state_path.name not in {"kev.json", "state.lock"},
+        "state_path must not be named kev.json or state.lock: those are the cache and sidecar filenames "
+        "beside the state file",
     )
     watchlist = document.get("watchlist")
     _require(

@@ -1262,11 +1262,14 @@ def classify_new(
     policy: Policy,
     *,
     share: int | None = None,
-) -> None:
+) -> list[Item]:
     """Queue the items nobody has seen, oldest first, until the delivery cap or the lookup budget is reached.
 
     ``share`` bounds how much of the pending room one source may take, so a busy first source cannot fill the
     queue and leave later sources unclassified pass after pass.
+
+    Returns the candidates left unclassified. The caller must carry them to the next pass: the feed window
+    advances past them, so without that they can rotate out of the export unrecorded.
     """
     seen: dict = state["seen"]
     pending: list[dict] = state["pending"]
@@ -1278,10 +1281,14 @@ def classify_new(
     waiting: dict[str, int] = state.setdefault("enrich_pending", {})
     classified = 0
     backlog = 0
-    for item in sorted(items, key=lambda candidate: candidate.published or 0):
+    ordered = sorted(items, key=lambda candidate: candidate.published or 0)
+    for position, item in enumerate(ordered):
         room = min(DELIVERY_CAP, start + share) if share else DELIVERY_CAP
         if len(pending) >= room or classified >= MAX_CLASSIFY:
-            break
+            left = ordered[position:]
+            if left:
+                LOG.info("%d item(s) left unclassified this pass; carried to the next one", len(left))
+            return left
         if f"src:{item.guid}" in claimed:
             continue  # Already seen under its own guid, before a PSA/CVE id was read from it.
         explicit = item.explicit
@@ -1463,6 +1470,7 @@ def classify_new(
         state.pop("enrich_retry", None)
     if not waiting:
         state.pop("enrich_pending", None)
+    return []
 
 
 def _enrichment_wait(retry: dict[str, int], guid: str, now: int, limit: int = ENRICH_RETRY_SECONDS) -> bool:
@@ -1855,6 +1863,36 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
     return True
 
 
+def item_to_state(item: Item) -> dict:
+    """A candidate carried to the next pass; a rotating feed would otherwise drop it unrecorded."""
+    return {
+        "guid": item.guid,
+        "title": item.title,
+        "link": item.link,
+        "summary": item.summary,
+        "published": item.published,
+        "explicit": list(item.explicit),
+        "source_title": item.source_title,
+        "source_url": item.source_url,
+    }
+
+
+def item_from_state(row: object) -> Item:
+    data = row if isinstance(row, dict) else {}
+    published = data.get("published")
+    explicit = data.get("explicit")
+    return Item(
+        str(data.get("guid", "")),
+        str(data.get("title", "")),
+        str(data.get("link", "")),
+        str(data.get("summary", "")),
+        published if type(published) is int else None,
+        tuple(str(value) for value in explicit) if isinstance(explicit, list) else (),
+        str(data.get("source_title", "")),
+        str(data.get("source_url", "")),
+    )
+
+
 # --------------------------------------------------------------------------
 # Delivery
 
@@ -2001,7 +2039,9 @@ def seed(state: dict, items: Sequence[Item], now: int) -> list[Item]:
     """First run: everything older than the seed window is marked delivered; the rest is returned to be queued."""
     recent = []
     for item in items:
-        if item.published is not None and now - item.published <= SEED_WINDOW:
+        # An undated item is unknown, not old: a valid RSS feed may omit dates, and consuming its current
+        # advisories as history would silently drop them.
+        if item.published is None or now - item.published <= SEED_WINDOW:
             recent.append(item)
             continue
         for identifier in item.explicit or (f"src:{item.guid}",):

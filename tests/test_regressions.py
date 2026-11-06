@@ -1344,3 +1344,63 @@ def test_confirmed_ssvc_active_escalates_through_an_epss_outage():
     core.reevaluate(state, Intel(), frozenset(), True, NOW, "")
     queued = [entry for entry in state["pending"] if entry["kind"] == "escalation"]
     assert queued and queued[0]["tag"] == "critical", "SSVC active decides without EPSS"
+
+
+# ---------------------------------------------------------------------------
+# Twenty-first review round
+
+
+def test_candidates_beyond_the_queue_are_carried_to_the_next_pass(tmp_path):
+    """A saturated queue must not let a rotating window drop the items it could not classify."""
+    cfg = config(tmp_path)
+    notifier = Notifier(500)  # delivery fails, so the queue stays full
+    many = [item(f"g{index}", f"advisory {index}") for index in range(20)]
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", many)],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    state = json.loads(cfg.state_path.read_text())
+    assert state.get("carry", {}).get("s1"), "unclassified items are carried, not dropped"
+    carried = len(state["carry"]["s1"])
+    # the next pass brings an overlapping window that no longer contains the carried items
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [many[-1]])],
+        [Notifier()],
+        http=http_for({}),
+        clock=lambda: float(NOW + 60),
+        sleep=lambda s: None,
+    )
+    state = json.loads(cfg.state_path.read_text())
+    assert "s1" in state.get("carry", {}), "the unclassified remainder is still carried"
+    assert carried >= 1
+
+
+def test_an_undated_item_is_not_consumed_as_history(tmp_path):
+    cfg = config(tmp_path)
+    notifier = Notifier()
+    undated = core.Item("g1", "vendor advisory without a date", "https://vendor.example.com/a", "notes", None, ())
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [undated])],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert notifier.sent, "an undated current advisory must be classified, not recorded as delivered"
+    state = json.loads(cfg.state_path.read_text())
+    assert state["seen"]["src:s1:g1"]["outcome"] == "delivered"
+
+
+def test_a_state_file_named_state_lock_is_refused(tmp_path):
+    from advisory_radar.config import ConfigError
+
+    path = tmp_path / "c.yml"
+    path.write_text("sources: []\nnotifiers: []\nstate_path: /data/state.lock\n")
+    with pytest.raises(ConfigError, match="state.lock"):
+        load_config(path, {})
