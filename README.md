@@ -6,7 +6,7 @@ enrich every finding with CVE.org / NVD CVSS, EPSS, CISA KEV and OSV, decide a
 severity per CVE, and deliver one deduplicated alert per new advisory to the
 channels you configure (Discord, Matrix, ntfy, Gotify, Apprise, generic webhook,
 SMTP). A built-in web UI shows alerts, sources, notifiers, the parked queue and
-run history. One container, one process, SQLite state, YAML + environment
+run history. One container, one process, JSON state on a volume, YAML + environment
 configuration.
 
 ## Quickstart
@@ -31,8 +31,22 @@ notifiers:
   - id: discord
     type: discord_webhook
     url: ${DISCORD_WEBHOOK_URL}
-watchlist:
-  products: [nodejs, postgresql, nginx]
+# optional: scope alerts to what you run (see below)
+watchlist: ./config/watchlist.json
+```
+
+`watchlist.json` is optional. Without it every advisory that arrives is judged;
+with it, only items that match one of your products (a name alias in the text or
+a link on one of its domains) are considered, and `excluded_products` drops the
+ones you do not run. Package patterns filter Debian DSA titles.
+
+```json
+{
+  "schema": "security-watchlist.v1",
+  "debian_source_packages": ["curl", "openssl"],
+  "excluded_products": ["legacy-app"],
+  "products": [{"id": "nodejs", "aliases": ["node.js"], "domains": ["nodejs.org"]}]
+}
 ```
 
 ## Why
@@ -48,7 +62,7 @@ turns critical, and never re-sends what you already received.
 - Enrichment plugins: CVE.org, NVD, FIRST EPSS, CISA KEV, OSV, Debian security tracker
 - Notifier plugins: Discord, Matrix, ntfy, Gotify, Apprise, generic webhook, SMTP
 - Severity decision per CVE with re-evaluation window and one escalation per level
-- Web UI + REST API, in-process scheduler (default every 15 min), SQLite state
+- Web UI + REST API, in-process scheduler (default every 15 min), atomic JSON state on a volume
 - Docker and Podman deployment (compose file + quadlet/kube YAML), `/healthz` and `/metrics`
 - Secrets via environment / `_FILE` only; redaction filter on logs; fail-closed source errors
 

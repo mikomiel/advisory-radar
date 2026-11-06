@@ -102,9 +102,12 @@ def main(
 
             def scheduler() -> None:
                 while True:
-                    code = one_pass()
-                    if code:
-                        LOG.warning("pass exited %d; continuing on schedule", code)
+                    try:
+                        code = one_pass()
+                        if code:
+                            LOG.warning("pass exited %d; continuing on schedule", code)
+                    except Exception:  # the schedule must survive any single bad pass
+                        LOG.exception("pass raised; continuing on schedule")
                     sleep(cfg.poll_interval_seconds)
 
             threading.Thread(target=scheduler, daemon=True).start()

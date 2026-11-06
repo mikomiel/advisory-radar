@@ -12,7 +12,7 @@ from .config import Config
 from .http import Http, RedactFilter, urllib_http
 from .kev import load_kev
 from .notifiers import build_notifier
-from .plugins import Source
+from .plugins import Source, SourceWindow
 from .sources import build_source
 from .state import LockBusy, SourceError, load_state_document, save_state, state_lock
 from .watchlist import load_policy
@@ -20,6 +20,20 @@ from .watchlist import load_policy
 LOG = logging.getLogger("advisory_radar")
 
 KEV_CACHE_NAME = "kev.json"
+
+
+def _namespaced(item: core.Item, source_id: str) -> core.Item:
+    """Give an item a source-scoped guid: two feeds may both publish guid ``1`` for unrelated advisories."""
+    return core.Item(
+        f"{source_id}:{item.guid}",
+        item.title,
+        item.link,
+        item.summary,
+        item.published,
+        item.explicit,
+        item.source_title,
+        item.source_url,
+    )
 
 
 def _source_windows(state: dict) -> dict:
@@ -73,16 +87,18 @@ def _run_pass(
     policy = load_policy(cfg.watchlist_path) if cfg.watchlist_path else _default_policy()
     core.HIDDEN_SOURCE_HOSTS = cfg.hidden_source_hosts
 
-    kev, kev_known = load_kev(http, cfg.state_path.with_name(KEV_CACHE_NAME), save=not dry_run)
-    intel = core.Intel(http, state_cache(stored), clock, sleep)
-
-    gap = False
-    source_ok = True
-    windows = _source_windows(stored) if stored is not None else {}
-    live_guids: set[str] = set()
     state = core.new_state() if stored is None else stored
     state.setdefault("parked", [])
     core._prune(state, now)
+    # Both of these must come from the state document that is actually written: a detached dict never
+    # reaches disk, so the first window was lost and the 24h cache was never persisted.
+    windows = _source_windows(state)
+    cache = state.setdefault("cache", {})
+    live_guids: set[str] = set()
+    gap = False
+    source_ok = True
+    kev, kev_known = load_kev(http, cfg.state_path.with_name(KEV_CACHE_NAME), save=not dry_run)
+    intel = core.Intel(http, cache, clock, sleep)
 
     for source in sources:
         try:
@@ -93,6 +109,12 @@ def _run_pass(
             if stored is None:
                 return 1  # a first run has nothing to persist safely
             continue
+        window = SourceWindow(
+            source.id,
+            tuple(_namespaced(item, source.id) for item in window.items),
+            window.truncated,
+            window.host,
+        )
         previous = windows.get(source.id)
         if window.truncated and previous is not None and not set(previous) & {item.guid for item in window.items}:
             LOG.error(

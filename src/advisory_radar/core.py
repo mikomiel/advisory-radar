@@ -228,7 +228,10 @@ def extract_ids(*texts: str) -> tuple[str, ...]:
 
 
 def _host(url: str) -> str:
-    return (urllib.parse.urlsplit(url).hostname or "").lower()
+    try:
+        return (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:  # a malformed feed link must never stop a pass
+        return ""
 
 
 def dsa_id(title: str) -> str | None:
@@ -267,7 +270,10 @@ def nodejs_slug(title: str, link: str) -> str | None:
     say ``Security Releases``. The query, the fragment and the scheme are ignored, and the page is fetched from
     ``NODEJS_VULN_URL`` plus the slug, never from the link.
     """
-    parts = urllib.parse.urlsplit(link)
+    try:
+        parts = urllib.parse.urlsplit(link)
+    except ValueError:  # a malformed link is simply not a nodejs.org post
+        return None
     match = NODEJS_PATH_RE.fullmatch(parts.path) if (parts.hostname or "").lower() == NODEJS_HOST else None
     return match.group(1) if match and NODEJS_SECURITY_TITLE_RE.search(title) else None
 
@@ -307,9 +313,30 @@ def headline(title: str, summary: str) -> tuple[str, str]:
     return title, summary
 
 
+def _matches_product(text: str, host: str, product) -> bool:
+    """A product matches when the link is on one of its domains or its name appears in the text."""
+    if host and any(host == domain or host.endswith("." + domain) for domain in product.domains):
+        return True
+    lowered = text.lower()
+    for alias in (product.id, *product.aliases):
+        if re.search(r"(?<![a-z0-9])" + re.escape(alias.lower()) + r"(?![a-z0-9])", lowered):
+            return True
+    return False
+
+
 def passes_filter(item: Item, policy: Policy) -> bool:
-    """Debian publishes every package; nginx.org mixes news with security notes."""
+    """Debian publishes every package; nginx.org mixes news with security notes.
+
+    A configured watchlist is a scope, not a label: an item that matches no configured product is
+    dropped, and an item that matches an excluded product is dropped even without a product list.
+    """
     host = _host(item.link)
+    text = f"{item.title} {item.summary} {item.source_title}"
+    matched = {product.id for product in policy.products if _matches_product(text, host, product)}
+    if matched & set(policy.excluded_products):
+        return False
+    if policy.products and not matched:
+        return False
     if host == "lists.debian.org" or item.title.startswith("DSA-"):
         match = DSA_RE.match(item.title)
         if not match:
