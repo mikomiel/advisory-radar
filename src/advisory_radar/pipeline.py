@@ -100,6 +100,7 @@ def _run_pass(
     kev, kev_known = load_kev(http, cfg.state_path.with_name(KEV_CACHE_NAME), save=not dry_run)
     intel = core.Intel(http, cache, clock, sleep)
 
+    fetched_ids: set[str] = set()
     for source in sources:
         try:
             window = source.fetch(http)
@@ -116,6 +117,9 @@ def _run_pass(
             window.host,
         )
         previous = windows.get(source.id)
+        # Only a source that knows its own page size can prove it returned a complete window (a FreshRSS
+        # export, a changedetection watch). An RSS/Atom feed is bounded by its publisher, so a rotation
+        # there is undetectable; see README, "Sources".
         if window.truncated and previous is not None and not set(previous) & {item.guid for item in window.items}:
             LOG.error(
                 "source %s: window gap: the window is full (%d entries) and shares none with the previous "
@@ -124,6 +128,7 @@ def _run_pass(
                 len(window.items),
             )
             gap = True
+        fetched_ids.add(source.id)
         windows[source.id] = [item.guid for item in window.items]
         live_guids.update(item.guid for item in window.items)
         items = [item for item in window.items if core.passes_filter(item, policy)]
@@ -141,10 +146,13 @@ def _run_pass(
         if not dry_run:
             save_state(cfg.state_path, state)
 
-    # Prune once, against every window fetched this pass: a per-source prune erased the other sources'
-    # retry clocks, so a persistent enrichment failure never reached its deadline.
+    # Prune once, against every window fetched this pass, and only for sources that answered: a source
+    # outage must not wipe that source's retry deadlines.
     for key in ("enrich_retry", "enrich_pending"):
-        core._prune_enrich_clock(state, key, live_guids)
+        kept = {
+            guid for guid in (state.get(key) or {}) if guid.split(":", 1)[0] not in fetched_ids or guid in live_guids
+        }
+        core._prune_enrich_clock(state, key, kept)
 
     adobe_ok = core.adobe_pass(state, http, kev, kev_known, now) if cfg.adobe_commerce else True
     core.reevaluate(state, intel, kev, kev_known, now, "")

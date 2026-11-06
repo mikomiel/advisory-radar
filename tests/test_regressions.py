@@ -310,3 +310,94 @@ def test_first_run_window_is_saved_and_gap_detected(tmp_path):
         sleep=lambda s: None,
     )
     assert second == 1, "a full window disjoint from the previous one must report a gap"
+
+
+# ---------------------------------------------------------------------------
+# Third review round
+
+
+class EchoNotifier(Notifier):
+    def __init__(self, status: int = 200) -> None:
+        super().__init__(status)
+        self.calls = 0
+
+    def send(self, entry, http):
+        self.calls += 1
+        return super().send(entry, http)
+
+
+class ExplodingNotifier(Notifier):
+    id = "boom"
+
+    def send(self, entry, http):
+        raise RuntimeError("bad url")
+
+
+class FailingSource(WindowSource):
+    def fetch(self, http, state=None):
+        raise RuntimeError("feed down")
+
+
+def test_a_non_string_watchlist_is_refused(tmp_path):
+    path = tmp_path / "c.yml"
+    path.write_text("sources: []\nnotifiers: []\nwatchlist:\n  products: [x]\n")
+    from advisory_radar.config import ConfigError
+
+    with pytest.raises(ConfigError):
+        load_config(path, {})
+
+
+def test_an_excluded_product_is_matched_without_a_product_definition(tmp_path):
+    watch = tmp_path / "w.json"
+    watch.write_text(
+        json.dumps(
+            {
+                "schema": KIND,
+                "debian_source_packages": ["curl"],
+                "excluded_products": ["legacy-app"],
+                "products": [{"id": "nodejs", "aliases": ["node.js"], "domains": ["nodejs.org"]}],
+            }
+        )
+    )
+    policy = load_policy(watch)
+    assert core.passes_filter(item("g1", "nodejs advisory"), policy) is True
+    assert core.passes_filter(item("g2", "legacy-app advisory"), policy) is False
+    assert core.passes_filter(item("g3", "nodejs and legacy-app"), policy) is False
+
+
+def test_a_raising_notifier_is_a_failed_attempt_not_a_crash(tmp_path):
+    cfg = config(tmp_path)
+    working = EchoNotifier()
+    feeds = {"https://feeds.example.com/a": feed("g1", "CVE-2026-4242 thing")}
+    for _ in range(2):
+        pipeline.run_pass(
+            cfg,
+            [RssSource("s1", "https://feeds.example.com/a")],
+            [working, ExplodingNotifier()],
+            http=http_for(feeds),
+            clock=lambda: float(NOW),
+            sleep=lambda s: None,
+        )
+    assert working.calls == 1, "a retry must not re-send to the notifier that already had it"
+    state = json.loads(cfg.state_path.read_text())
+    assert state["pending"] and state["pending"][0]["attempts"] == 2
+
+
+def test_a_source_outage_keeps_that_sources_retry_clocks(tmp_path):
+    cfg = config(tmp_path)
+    state = core.new_state()
+    state["enrich_retry"] = {"s1:g1": 1, "s2:g2": 2}
+    from advisory_radar.state import save_state
+
+    save_state(cfg.state_path, state)
+    pipeline.run_pass(
+        cfg,
+        [FailingSource("s1", []), WindowSource("s2", [item("g2", "second")])],
+        [Notifier()],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    reloaded = json.loads(cfg.state_path.read_text())
+    assert "s1:g1" in reloaded["enrich_retry"], "an outage must not erase the retry deadline"
+    assert "s2:g2" in reloaded["enrich_retry"]

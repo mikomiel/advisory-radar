@@ -124,6 +124,10 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
     web_port = web.get("port", 8080)
     _require(isinstance(web_port, int) and 1 <= web_port <= 65535, f"web.port must be 1..65535, got {web_port!r}")
     watchlist = document.get("watchlist")
+    _require(
+        watchlist is None or isinstance(watchlist, str),
+        f"watchlist must be a path to a watchlist file, got {type(watchlist).__name__}",
+    )
     watchlist_path = Path(watchlist) if isinstance(watchlist, str) else None
     hidden = frozenset(document.get("hidden_source_hosts") or [])
     return Config(

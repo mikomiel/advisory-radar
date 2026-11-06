@@ -49,6 +49,15 @@ ones you do not run. Package patterns filter Debian DSA titles.
 }
 ```
 
+### Gap detection
+
+A source that knows its own page size (a FreshRSS export, a changedetection
+watch) reports a truncated window, and the pass fails loudly when a full window
+shares nothing with the previous one — that is how silently missed advisories
+surface. An RSS/Atom feed is bounded by its publisher instead, so a skipped item
+there cannot be detected; poll those feeds often enough that rotation is
+unlikely.
+
 ## Why
 
 Vendor security feeds are noisy; the interesting question is "does this affect

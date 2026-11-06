@@ -37,7 +37,7 @@ from .feeds import FeedExport
 from .feeds import parse_feed as parse_greader
 from .http import MESSAGE_LIMIT, Http, inert, parse_json
 from .state import SourceError, load_state_document, save_state
-from .watchlist import Policy
+from .watchlist import Policy, Product
 
 LOG = logging.getLogger("advisory_radar")
 
@@ -332,9 +332,14 @@ def passes_filter(item: Item, policy: Policy) -> bool:
     """
     host = _host(item.link)
     text = f"{item.title} {item.summary} {item.source_title}"
-    matched = {product.id for product in policy.products if _matches_product(text, host, product)}
-    if matched & set(policy.excluded_products):
-        return False
+    by_id = {product.id: product for product in policy.products}
+    for excluded in policy.excluded_products:
+        product = by_id.get(excluded)
+        if product is None:  # an exclusion may name a product the scope does not define
+            product = Product(excluded, (), (), False)
+        if _matches_product(text, host, product):
+            return False
+    matched = {product_id for product_id, product in by_id.items() if _matches_product(text, host, product)}
     if policy.products and not matched:
         return False
     if host == "lists.debian.org" or item.title.startswith("DSA-"):
@@ -1751,8 +1756,22 @@ def deliver(state: dict, notifiers: Sequence, http: Http, now: int) -> bool:
             if _park(state, entry, entry.get("last_status", 0), now):
                 continue
             return False
-        statuses = [notifier.send(entry, http) for notifier in notifiers]
+        already = set(entry.get("sent_to") or ())
+        statuses = []
+        for notifier in notifiers:
+            if notifier.id in already:  # a retry only re-sends to the channels that have not had it
+                statuses.append(200)
+                continue
+            try:
+                status = notifier.send(entry, http)
+            except Exception as exc:  # a broken notifier is a failed attempt, never a crash or a duplicate
+                LOG.error("notifier %s raised %s: %s", notifier.id, type(exc).__name__, exc)
+                status = 0
+            if 200 <= status < 300:
+                already.add(notifier.id)
+            statuses.append(status)
         if all(200 <= status < 300 for status in statuses):
+            entry.pop("sent_to", None)
             state["pending"].remove(entry)
             _delivered(state, entry, now)
             LOG.info(
@@ -1765,6 +1784,7 @@ def deliver(state: dict, notifiers: Sequence, http: Http, now: int) -> bool:
             )
             continue
         status = max(statuses)  # 0 is a network error and the worst outcome
+        entry["sent_to"] = sorted(already)
         entry["attempts"] = entry.get("attempts", 0) + 1
         entry["last_status"] = status
         if entry["attempts"] >= MAX_DELIVERY_ATTEMPTS or now - entry["first_attempt_at"] > PARK_AFTER:
