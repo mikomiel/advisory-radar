@@ -176,10 +176,11 @@ def _run_pass(
         )
         if left:
             carried[source.id] = [core.item_to_state(item) for item in left]
-        if not carried:
-            state.pop("carry", None)
         if not dry_run:
             save_state(cfg.state_path, state)
+
+    if not carried:
+        state.pop("carry", None)  # only after every source has written into the attached dict
 
     if stored is None and not fetched_ids and not cfg.adobe_commerce:
         LOG.error("no source could be read on the first pass; nothing to persist")

@@ -73,7 +73,7 @@ def state_lock(state_path: Path, *, blocking: bool = True) -> Generator[None]:
     409 rather than stalling until a long pass finishes.
     """
     state_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    descriptor = os.open(state_path.with_suffix(".lock"), os.O_CREAT | os.O_WRONLY, 0o600)
+    descriptor = os.open(state_path.with_name(state_path.name + ".lock"), os.O_CREAT | os.O_WRONLY, 0o600)
     with os.fdopen(descriptor, "w") as handle:
         flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
         try:

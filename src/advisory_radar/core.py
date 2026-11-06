@@ -1281,6 +1281,7 @@ def classify_new(
     waiting: dict[str, int] = state.setdefault("enrich_pending", {})
     classified = 0
     backlog = 0
+    deferred: list[Item] = []
     ordered = sorted(items, key=lambda candidate: candidate.published or 0)
     for position, item in enumerate(ordered):
         room = min(DELIVERY_CAP, start + share) if share else DELIVERY_CAP
@@ -1288,7 +1289,7 @@ def classify_new(
             left = ordered[position:]
             if left:
                 LOG.info("%d item(s) left unclassified this pass; carried to the next one", len(left))
-            return left
+            return left + deferred
         if f"src:{item.guid}" in claimed:
             continue  # Already seen under its own guid, before a PSA/CVE id was read from it.
         explicit = item.explicit
@@ -1338,6 +1339,7 @@ def classify_new(
                 else bool(php and intel.changelog_read(php)) or bool(node and intel.nodejs_read(node))
             )
             if intel.tracker_left <= 0 and not read:
+                deferred.append(item)  # out of fetch budget: retried next pass, so it must be carried
                 continue
             clock, limit = retry, ENRICH_RETRY_SECONDS
             if dsa:
@@ -1355,6 +1357,7 @@ def classify_new(
                 found = None if release is None else release.cves or release.ghsas
             if found is None:
                 if _enrichment_wait(clock, item.guid, now, limit):
+                    deferred.append(item)  # waiting on its retry clock: carried so the feed cannot drop it
                     continue
                 retry.pop(item.guid, None)
                 waiting.pop(item.guid, None)
@@ -1470,7 +1473,7 @@ def classify_new(
         state.pop("enrich_retry", None)
     if not waiting:
         state.pop("enrich_pending", None)
-    return []
+    return deferred
 
 
 def _enrichment_wait(retry: dict[str, int], guid: str, now: int, limit: int = ENRICH_RETRY_SECONDS) -> bool:

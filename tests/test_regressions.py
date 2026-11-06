@@ -1397,10 +1397,54 @@ def test_an_undated_item_is_not_consumed_as_history(tmp_path):
     assert state["seen"]["src:s1:g1"]["outcome"] == "delivered"
 
 
-def test_a_state_file_named_state_lock_is_refused(tmp_path):
-    from advisory_radar.config import ConfigError
-
+def test_any_state_filename_gets_its_own_lock_file(tmp_path):
+    """The sidecar appends its suffix, so a *.lock state file cannot be its own lock."""
     path = tmp_path / "c.yml"
-    path.write_text("sources: []\nnotifiers: []\nstate_path: /data/state.lock\n")
-    with pytest.raises(ConfigError, match="state.lock"):
-        load_config(path, {})
+    path.write_text("sources: []\nnotifiers: []\nstate_path: /data/alerts.lock\n")
+    load_config(path, {})
+    from advisory_radar.state import state_lock
+
+    fresh = tmp_path / "alerts.lock"
+    with state_lock(fresh):
+        assert not fresh.exists(), "acquiring the lock must not create the state file"
+    assert (tmp_path / "alerts.lock.lock").exists()
+
+
+# ---------------------------------------------------------------------------
+# Twenty-second review round
+
+
+def test_the_carry_map_survives_a_source_that_finishes_first(tmp_path):
+    """The first source emptying its share must not detach the map the second source writes into."""
+    cfg = config(tmp_path)
+    notifier = Notifier(500)  # the queue stays full: nothing is delivered
+    first = [item("a1", "first source advisory")]
+    many = [item(f"b{index}", f"second source advisory {index}") for index in range(12)]
+    pipeline.run_pass(
+        cfg, [WindowSource("s1", first), WindowSource("s2", many)], [notifier], http=http_for({}),
+        clock=lambda: float(NOW), sleep=lambda s: None,
+    )
+    state = json.loads(cfg.state_path.read_text())
+    assert "s2" in state.get("carry", {}), "the overflowing source's items are retained"
+
+
+def test_a_deferred_enrichment_item_is_carried(tmp_path, monkeypatch):
+    """An item waiting on its enrichment retry clock must survive the window rotating out."""
+    config(tmp_path)
+    dsa = core.Item(
+        "g1", "DSA-6558-1 curl - security update", "https://lists.debian.org/x", "notes", NOW - 3600, ("DSA-6558-1",)
+    )
+
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: float(NOW), lambda s: None)
+            self.tracker_left = 1
+
+        def dsa_cves(self, dsa):
+            return None  # the tracker page fails, so the item waits
+
+    state = core.new_state()
+    policy = core.Policy(("curl",), (), ())
+    left = core.classify_new(state, [dsa], Intel(), frozenset(), True, NOW, "lists.debian.org", policy)
+    assert [entry.guid for entry in left] == ["g1"], "a deferred item is returned for the next pass"
+    assert state["enrich_retry"]["g1"] == NOW
