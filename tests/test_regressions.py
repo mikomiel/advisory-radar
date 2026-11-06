@@ -2193,3 +2193,51 @@ def test_a_boolean_error_does_not_echo_the_value(tmp_path):
     with pytest.raises(ConfigError) as caught:
         load_config(path, {"SECRET": "s3cr3t-value"})
     assert "s3cr3t-value" not in str(caught.value)
+
+
+# ---------------------------------------------------------------------------
+# Thirty-sixth review round
+
+
+def test_an_epss_row_for_another_cve_is_a_failed_measurement():
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda s: None)
+
+        def _get(self, url):
+            if "api.first.org" in url:
+                return 200, {"data": [{"cve": "CVE-2026-9999", "epss": "0.5", "percentile": "0.9"}]}
+            return 404, None
+
+    assert Intel().cves(["CVE-2026-1234"])["CVE-2026-1234"].complete is False
+
+
+def test_independent_low_evidence_wins_over_a_mixed_aggregate():
+    """An alias-free HIGH score must not be promoted by another advisory's CRITICAL aggregate."""
+    verdict = core.judge(
+        [],
+        {},
+        frozenset(),
+        True,
+        9.0,
+        True,
+        osv_fallbacks={},
+        independent_ghsa_cvss=8.9,
+        osv_scores_are_aliased=False,
+    )
+    assert verdict.tag == "warning", "the independent score decides, and HIGH is not critical"
+
+
+def test_inline_xhtml_stays_adjacent():
+    from advisory_radar.feeds import parse_rss
+
+    atom = (
+        b'<feed xmlns="http://www.w3.org/2005/Atom"><link rel="alternate" href="https://vendor.example.com/"/>'
+        b"<entry><id>urn:1</id><title>t</title>"
+        b'<content type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">'
+        b"<p>CVE-<span>2026</span>-1234 affects lib<span>foo</span></p>"
+        b"<p>second paragraph</p></div></content></entry></feed>"
+    )
+    summary = parse_rss(atom).items[0].summary
+    assert "CVE-2026-1234" in summary and "libfoo" in summary
+    assert "second paragraph" in summary

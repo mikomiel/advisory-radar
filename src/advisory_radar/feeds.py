@@ -175,10 +175,58 @@ _ATOM = "{http://www.w3.org/2005/Atom}"
 _RSS = "{http://purl.org/rss/1.0/}"
 
 
+#: XHTML elements that end a run of text. Inline elements (``<span>``, ``<b>``, ``<a>``) must stay adjacent,
+#: or "CVE-<span>2026</span>-1234" and "lib<span>foo</span>" would be split.
+_XHTML_BLOCKS = frozenset(
+    {
+        "p",
+        "div",
+        "br",
+        "li",
+        "ul",
+        "ol",
+        "tr",
+        "td",
+        "th",
+        "table",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "section",
+        "article",
+        "header",
+        "footer",
+        "blockquote",
+        "pre",
+        "hr",
+    }
+)
+
+
 def _text_of(node: ET.Element | None) -> str:
-    # Joined with a space: an XHTML block boundary ("<p>libfoo</p><p>fixed</p>") must not merge the words,
-    # and clean_text collapses the doubled spaces this introduces inside inline markup.
-    return clean_text(" ".join(node.itertext())) if node is not None else ""
+    if node is None:
+        return ""
+    parts: list[str] = []
+
+    def walk(element: ET.Element) -> None:
+        tag = element.tag.rsplit("}", 1)[-1] if isinstance(element.tag, str) else ""
+        block = tag in _XHTML_BLOCKS
+        if block:
+            parts.append(" ")
+        if element.text:
+            parts.append(element.text)
+        for child in list(element):
+            walk(child)
+            if child.tail:
+                parts.append(child.tail)
+        if block:
+            parts.append(" ")
+
+    walk(node)
+    return clean_text("".join(parts))
 
 
 #: A feed date outside this window is treated as absent: a stray huge integer must not survive to

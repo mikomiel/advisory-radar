@@ -636,8 +636,14 @@ class Intel:
             data = document.get("data") if isinstance(document, dict) else None
             if status != 200 or not isinstance(data, list):
                 return None
-            if data and any(not isinstance(row, dict) or not isinstance(row.get("cve"), str) for row in data):
-                return None  # a batch with an unusable row is a failed measurement, not a partial answer
+            requested = {cve.upper() for cve in cves[start : start + EPSS_BATCH]}
+            if data and any(
+                not isinstance(row, dict) or not isinstance(row.get("cve"), str) or row["cve"].upper() not in requested
+                for row in data
+            ):
+                # A batch with an unusable row, or one describing a CVE nobody asked for, is a failed
+                # measurement: accepting it would make the requested CVE look like "no score".
+                return None
             for row in data:
                 if row.get("epss") is None and row.get("percentile") is None:
                     # A row for the CVE with no numbers is malformed: "no score" is expressed by the CVE being
@@ -1005,7 +1011,8 @@ def judge(
     incomplete_note = "Incomplete severity data; treated as unknown."
     if not cves:
         if independent_ghsa_cvss is not None:
-            # An alias-free advisory carries its own severity, whatever else the item mentions.
+            # An alias-free advisory carries its own severity, whatever else the item mentions. Once it
+            # exists, the aggregate score is not used: part of it may belong to an already-claimed CVE.
             if independent_ghsa_cvss >= CRITICAL_CVSS:
                 return Verdict(
                     "critical", (), metrics_line(independent_ghsa_cvss, None, None, None, False, approximate=True), ""
@@ -1014,6 +1021,12 @@ def judge(
                 return Verdict(
                     "suppressed", (), metrics_line(independent_ghsa_cvss, None, None, None, False, approximate=True), ""
                 )
+            return Verdict(
+                "warning",
+                (),
+                metrics_line(independent_ghsa_cvss, None, None, None, False, approximate=True),
+                "" if osv_complete else incomplete_note,
+            )
         if osv_scores_are_aliased:
             # Every scored advisory aliases a CVE that is not being judged here (it was already claimed), so
             # the OSV label is not independent evidence about this item: keep it visible as unknown.
