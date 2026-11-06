@@ -41,6 +41,15 @@ jobs:
         run: uv run python scripts/check_no_estate_identifiers.py
 
       - name: Secret scan
-        uses: gitleaks/gitleaks-action@v2
-        with:
-          config: .gitleaks.toml
+        # pinned binary + reviewed digest: the v2 action fails on stderr noise and needs a token for PR scans
+        run: |
+          set -e
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz" -o /tmp/gitleaks.tgz
+          echo "9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          set +e
+          /tmp/gitleaks git --config .gitleaks.toml --redact --report-format json --report-path /tmp/gitleaks-report.json . 2>/tmp/gitleaks-stderr.log
+          code=$?
+          set -e
+          if [ "$code" -eq 1 ]; then echo "::error::leaks found"; cat /tmp/gitleaks-report.json; exit 1; fi
+          if [ "$code" -ne 0 ]; then echo "::error::gitleaks exited $code"; cat /tmp/gitleaks-stderr.log; exit "$code"; fi

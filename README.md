@@ -52,6 +52,25 @@ turns critical, and never re-sends what you already received.
 - Docker and Podman deployment (compose file + quadlet/kube YAML), `/healthz` and `/metrics`
 - Secrets via environment / `_FILE` only; redaction filter on logs; fail-closed source errors
 
+## Review and merge automation
+
+`main` is protected: a pull request needs **one approving review** and a green `ci`
+run. `.github/workflows/automerge.yml` then does the merging itself: an approved
+pull request whose checks are green is squash-merged (with `--match-head-commit`,
+so a head that moved is refused) when `ci` finishes or on a 30-minute sweep. Branch deletion follows the repository's *automatically delete head
+branches* setting.
+
+The workflow only runs from the default branch — `workflow_run` and `schedule`,
+never `pull_request*` and not `workflow_dispatch` (a dispatcher can pick another
+ref, and that ref's copy of the file is what runs). The trade-off is latency: a merge lands
+within ~30 minutes of the approval, not at the instant of the review. Nothing
+merges without an approval from the configured reviewer at the exact head, and
+any check that is not terminal-success stops it.
+
+The reviewer is the Gandalf GitHub App, which posts its review through the
+`external_github_review` route. Contributors can of course review each other;
+the point is that no human has to click merge.
+
 ## Development
 
 ```bash
