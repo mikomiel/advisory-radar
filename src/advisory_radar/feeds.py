@@ -124,12 +124,16 @@ def parse_feed(body: bytes) -> FeedExport:
         title = _text(node.get("title"))
         if not guid or not title:
             raise FeedError("feed entry has no usable id or title")
-        summary = ""
-        for field in ("summary", "content"):
-            content = node.get(field)
-            summary = _text(content.get("content")) if isinstance(content, dict) else ""
-            if summary:
-                break
+        # Both fields are read: a short summary and a full content block are commonly both present, and the
+        # identifiers or product name often live only in the longer one.
+        summary = " ".join(
+            text
+            for text in (
+                _text(node.get(field).get("content")) if isinstance(node.get(field), dict) else ""
+                for field in ("summary", "content")
+            )
+            if text
+        )
         published = node.get("published")
         origin = node.get("origin")
         origin = origin if isinstance(origin, dict) else {}
@@ -225,8 +229,13 @@ def parse_rss(body: bytes) -> FeedExport:
             title = _text_of(node.find("title"))
             if not guid or not title:
                 raise RssError("feed entry has no usable id or title")
-            summary = _text_of(node.find("description")) or _text_of(
-                node.find("{http://purl.org/rss/1.0/modules/content/}encoded")
+            summary = " ".join(
+                text
+                for text in (
+                    _text_of(node.find("description")),
+                    _text_of(node.find("{http://purl.org/rss/1.0/modules/content/}encoded")),
+                )
+                if text
             )
             items.append(
                 FeedEntry(guid, title, link, summary, _published_of(node.find("pubDate")), channel_title, channel_link)
@@ -250,7 +259,11 @@ def parse_rss(body: bytes) -> FeedExport:
             title = _text_of(node.find(f"{_ATOM}title"))
             if not guid or not title:
                 raise RssError("feed entry has no usable id or title")
-            summary = _text_of(node.find(f"{_ATOM}summary")) or _text_of(node.find(f"{_ATOM}content"))
+            summary = " ".join(
+                text
+                for text in (_text_of(node.find(f"{_ATOM}summary")), _text_of(node.find(f"{_ATOM}content")))
+                if text
+            )
             published = _published_of(node.find(f"{_ATOM}published")) or _published_of(node.find(f"{_ATOM}updated"))
             items.append(FeedEntry(guid, title, link, summary, published, channel_title, channel_link))
     else:

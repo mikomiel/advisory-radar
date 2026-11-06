@@ -1796,3 +1796,50 @@ def test_an_rss_cve_in_content_encoded_is_classified_and_watched(tmp_path):
     entry = export.items[0]
     assert "CVE-2026-1234" in entry.summary, "the full content must be read, not just the description"
     assert "CVE-2026-1234" in core.extract_ids(entry.title, entry.summary, entry.link)
+
+
+# ---------------------------------------------------------------------------
+# Twenty-ninth review round
+
+
+def test_a_cve_only_in_full_content_is_still_found():
+    from advisory_radar.feeds import parse_rss
+
+    rss = (
+        b'<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">'
+        b"<channel><title>T</title><link>https://vendor.example.com/</link>"
+        b"<item><title>Security update</title><guid>g1</guid>"
+        b"<description>Security update available</description>"
+        b"<content:encoded><![CDATA[Fixes CVE-2026-1234 in libfoo.]]></content:encoded></item>"
+        b"</channel></rss>"
+    )
+    entry = parse_rss(rss).items[0]
+    assert "Security update available" in entry.summary and "CVE-2026-1234" in entry.summary
+
+    atom = (
+        b'<feed xmlns="http://www.w3.org/2005/Atom"><link rel="alternate" href="https://vendor.example.com/"/>'
+        b"<entry><id>urn:1</id><title>t</title><summary>Update</summary>"
+        b"<content>Fixes CVE-2026-9999</content></entry></feed>"
+    )
+    entry = parse_rss(atom).items[0]
+    assert "Fixes CVE-2026-9999" in entry.summary
+
+
+def test_the_rendered_score_belongs_to_the_shown_cve():
+    facts = {
+        "CVE-2026-1111": core.CveFacts(None, None, None, None, True),
+        "CVE-2026-2222": core.CveFacts(None, None, None, None, True),
+    }
+    verdict = core.judge(
+        ["CVE-2026-1111", "CVE-2026-2222"],
+        facts,
+        frozenset(),
+        True,
+        3.9,
+        True,
+        osv_fallbacks={"CVE-2026-2222": 3.9},
+    )
+    assert verdict.tag == "warning"
+    assert "CVE-2026-1111" in verdict.line and "3.9" not in verdict.line, (
+        "the GHSA score belongs to CVE-2026-2222; showing it beside CVE-2026-1111 would be false evidence"
+    )

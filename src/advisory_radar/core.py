@@ -1024,14 +1024,17 @@ def judge(
             tag = "warning"
             ghsa_decides = True
     chosen = facts[shown]
-    cvss = chosen.cvss if chosen.cvss is not None else osv_cvss
+    # The displayed score must belong to the CVE that is shown: the item-wide OSV fallback may be another
+    # advisory's measurement.
+    shown_fallback = fallbacks.get(shown) if cves else None
+    cvss = chosen.cvss if chosen.cvss is not None else shown_fallback
     line = metrics_line(
         cvss,
         chosen.epss,
         chosen.percentile,
         chosen.ssvc,
         shown in kev,
-        approximate=chosen.cvss is None and osv_cvss is not None,
+        approximate=chosen.cvss is None and shown_fallback is not None,
     )
     if ghsa_decides:
         # The deciding evidence is the GHSA's OSV label, not the CVE we happen to show beside it.
