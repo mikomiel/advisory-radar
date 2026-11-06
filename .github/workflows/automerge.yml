@@ -1,8 +1,14 @@
 # Auto-merge for this repository: an approved, green pull request merges itself.
 #
-# This is the GitHub-native equivalent of the estate's reviewed-CI automerge executor: the gate is
-# "the reviewer approved the exact head" + "every required check is green". Nothing merges without both.
-# The reviewer is the Gandalf App (pull request approval), so its approval is what unlocks the merge.
+# This is the GitHub-native equivalent of the estate's reviewed-CI automerge executor. The gate is
+# "the reviewer approved *this exact head commit*" + "the required ci check is green on that commit".
+# GitHub's branch protection validates both again at merge time; this script only decides *whether to ask*.
+#
+# Safety rules this file must keep (see docs in the PR that added it):
+#   * never check out or execute pull-request / workflow_run head code - this job only reads PR metadata;
+#   * the approving review must be at the current head SHA, by the configured reviewer identity;
+#   * the required status context must be present and SUCCESS on that SHA;
+#   * branch protection must dismiss stale approvals on new commits (set on main, not by this file).
 name: automerge
 
 on:
@@ -16,42 +22,80 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: write        # merge + GitHub's own branch delete
+  pull-requests: write   # merge, read reviews
   checks: read
+  statuses: read         # legacy commit-status contexts are invisible without this
 
 concurrency:
   group: automerge
   cancel-in-progress: false
 
+env:
+  # The reviewing identity; its approval is the gate. Set to a plain login for a human reviewer.
+  REVIEWER_LOGIN: ecomwizards-gandalf[bot]
+  REQUIRED_CHECK: ci
+
 jobs:
   merge:
     runs-on: ubuntu-latest
     steps:
-      - name: Merge approved pull requests whose checks are green
+      - name: Merge approved pull requests whose required check is green at the same head
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          # Only pull requests that are open, not drafts, approved, and mergeable.
-          candidates=$(gh pr list --repo "$REPO" --state open --base main --limit 50 \
+          mapfile -t candidates < <(gh pr list --repo "$REPO" --state open --base main --limit 100 \
             --json number,reviewDecision,mergeable,isDraft \
-            --jq '.[] | select(.isDraft == false and .reviewDecision == "APPROVED" and .mergeable == "MERGEABLE") | .number')
+            --jq '.[] | select(.isDraft == false and .reviewDecision == "APPROVED") | .number')
 
-          for pr in $candidates; do
-            # Never merge over a red or pending check: auto-merge waits for the rest, a failed one stops us.
-            failed=$(gh pr view "$pr" --repo "$REPO" --json statusCheckRollup \
-              --jq '[.statusCheckRollup[] | select(.conclusion == "FAILURE" or .conclusion == "CANCELLED" or .conclusion == "TIMED_OUT" or .conclusion == "ACTION_REQUIRED")] | length')
+          for pr in "${candidates[@]}"; do
+            meta=$(gh pr view "$pr" --repo "$REPO" \
+              --json headRefOid,mergeable,reviews,statusCheckRollup)
+
+            head=$(jq -r '.headRefOid' <<<"$meta")
+            mergeable=$(jq -r '.mergeable' <<<"$meta")
+            if [ "$mergeable" != "MERGEABLE" ]; then
+              echo "skip #$pr: mergeable=$mergeable (retry on the next trigger)"
+              continue
+            fi
+
+            # The newest approving review must be for this exact head, by the configured identity.
+            approved=$(jq -r --arg reviewer "$REVIEWER_LOGIN" --arg head "$head" '
+              [.reviews[] | select(.state == "APPROVED" and .commit.oid == $head)]
+              | sort_by(.submittedAt) | last
+              | if . == null then "" else .author.login end' <<<"$meta")
+            if [ -z "$approved" ]; then
+              echo "skip #$pr: no approving review at head $head (a stale approval does not count)"
+              continue
+            fi
+            if [ "$approved" != "$REVIEWER_LOGIN" ]; then
+              echo "skip #$pr: approved by $approved, not $REVIEWER_LOGIN"
+              continue
+            fi
+
+            # Positive assertion: the required check answered SUCCESS for this head.
+            green=$(jq -r --arg check "$REQUIRED_CHECK" '
+              [.statusCheckRollup[] | select(.name == $check and .conclusion == "SUCCESS")] | length' <<<"$meta")
+            if [ "$green" -eq 0 ]; then
+              echo "skip #$pr: $REQUIRED_CHECK is not SUCCESS on $head"
+              continue
+            fi
+            failed=$(jq -r '[.statusCheckRollup[]
+              | select(.conclusion == "FAILURE" or .conclusion == "CANCELLED"
+                       or .conclusion == "TIMED_OUT" or .conclusion == "ACTION_REQUIRED")] | length' <<<"$meta")
             if [ "$failed" != "0" ]; then
               echo "skip #$pr: $failed failing check(s)"
               continue
             fi
-            echo "enabling auto-merge for #$pr"
-            if gh pr merge "$pr" --repo "$REPO" --auto --squash --delete-branch 2>/dev/null; then
-              continue
+
+            # Merge now rather than installing a standing auto-merge order: a later push would move the
+            # head past the review this check just validated.
+            if gh pr merge "$pr" --repo "$REPO" --squash; then
+              echo "merged #$pr at $head (approval by $approved)"
+              gh pr comment "$pr" --repo "$REPO" --body "Merged by automerge: $REQUIRED_CHECK green and approved at $head by $approved." || true
+            else
+              echo "skip #$pr: GitHub refused the merge (protection, or a check changed)"
             fi
-            # auto-merge already on, or the branch is up to date and every check is green: merge now.
-            gh pr merge "$pr" --repo "$REPO" --squash --delete-branch \
-              || echo "skip #$pr: GitHub will not merge it yet (checks pending or review stale)"
           done
