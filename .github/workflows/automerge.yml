@@ -86,12 +86,15 @@ jobs:
               echo "skip #$pr: $REQUIRED_CHECK is not SUCCESS on $head"
               continue
             fi
-            failed=$(jq -r '[.statusCheckRollup[]
-              | select(.conclusion == "FAILURE" or .conclusion == "CANCELLED"
-                       or .conclusion == "TIMED_OUT" or .conclusion == "ACTION_REQUIRED"
-                       or .conclusion == "STARTUP_FAILURE")] | length' <<<"$meta")
-            if [ "$failed" != "0" ]; then
-              echo "skip #$pr: $failed failing check(s)"
+            # Everything must be terminal and acceptable: a check run reports .conclusion, a legacy commit
+            # status reports .state, and a queued/in-progress one has neither a conclusion nor a state of
+            # success. Anything other than SUCCESS/NEUTRAL/SKIPPED skips the merge - pending included, so an
+            # additional check cannot start failing after we merged.
+            not_green=$(jq -r --argjson _ 0 '[.statusCheckRollup[]
+              | (.conclusion // .state // "PENDING")
+              | select(. != "SUCCESS" and . != "NEUTRAL" and . != "SKIPPED")] | length' <<<"$meta")
+            if [ "$not_green" != "0" ]; then
+              echo "skip #$pr: $not_green check(s) not green (pending, failing or errored)"
               continue
             fi
 
