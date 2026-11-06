@@ -189,8 +189,13 @@ def parse_rss(body: bytes) -> FeedExport:
             )
     elif root.tag == f"{_ATOM}feed":
         channel_title = _text_of(root.find(f"{_ATOM}title"))
-        link_node = root.find(f"{_ATOM}link")
-        channel_link = link_node.get("href", "") if link_node is not None else ""
+        # Only an alternate link is a public site. A rel="self" link is the subscription URL and can carry a
+        # feed credential, which must never reach a notification.
+        channel_link = ""
+        for candidate in root.findall(f"{_ATOM}link"):
+            if candidate.get("rel") in (None, "alternate") and candidate.get("href"):
+                channel_link = candidate.get("href", "")
+                break
         for node in root.findall(f"{_ATOM}entry"):
             link = ""
             for candidate in node.findall(f"{_ATOM}link"):

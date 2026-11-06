@@ -927,6 +927,7 @@ def judge(
     kev_known: bool,
     osv_cvss: float | None,
     osv_complete: bool = True,
+    osv_fallback_for: frozenset[str] | set[str] = frozenset(),
 ) -> Verdict:
     """Item verdict from the CVEs it names; the CVE that decides is the one shown.
 
@@ -943,7 +944,9 @@ def judge(
             else metrics_line(osv_cvss, None, None, None, False, approximate=True)
         )
         return Verdict("warning", (), line, "" if osv_complete else incomplete_note)
-    judged = {cve: level_of(facts[cve], cve in kev, kev_known, osv_cvss) for cve in cves}
+    judged = {
+        cve: level_of(facts[cve], cve in kev, kev_known, osv_cvss if cve in osv_fallback_for else None) for cve in cves
+    }
     # An unscored CVE (past the lookup cap) is not watched unless a critical signal names it.
     levels = tuple((cve, level) for cve, (level, _) in judged.items() if not facts[cve].skipped or level == "critical")
     critical = [cve for cve in cves if judged[cve][0] == "critical"]
@@ -1302,10 +1305,12 @@ def classify_new(
         ghsas = [identifier for identifier in explicit if identifier.startswith("GHSA-")]
         osv_cvss: float | None = None
         osv_complete = True
+        osv_aliases: set[str] = set()
         for ghsa in ghsas:
             osv = intel.ghsa(ghsa)
             osv_complete = osv_complete and osv.complete
             cves += [cve for cve in osv.cves if cve not in cves]
+            osv_aliases.update(osv.cves)
             if osv.cvss is not None:
                 osv_cvss = max(osv_cvss or 0.0, osv.cvss)
         vendor_ids = [identifier for identifier in explicit if identifier.startswith(("PSA-", "DSA-"))]
@@ -1322,7 +1327,17 @@ def classify_new(
         facts = intel.cves(new_cves, lookup_limit=MAX_ITEM_CVE_LOOKUPS) if new_cves else {}
         # A source page that stayed unreadable past ENRICH_RETRY_SECONDS: the item was never measured, so it may be
         # a warning but never suppressed (as after a failed OSV lookup), and its note says why it is unknown.
-        verdict = judge(new_cves, facts, kev, kev_known, osv_cvss, osv_complete and not unenriched)
+        # An OSV score is evidence about the CVEs that advisory aliases, not about every CVE in the item: a LOW
+        # GHSA must not suppress an unrelated, unmeasured CVE.
+        verdict = judge(
+            new_cves,
+            facts,
+            kev,
+            kev_known,
+            osv_cvss,
+            osv_complete and not unenriched,
+            osv_fallback_for=osv_aliases,
+        )
         if unenriched and verdict.tag == "warning":
             verdict = replace(verdict, note=ENRICH_FAILED_NOTE)
         # The CVSS each watched CVE had when its message was queued: a later escalation by the remote rule needs it.

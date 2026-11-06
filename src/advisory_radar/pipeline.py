@@ -101,6 +101,7 @@ def _run_pass(
     intel = core.Intel(http, cache, clock, sleep)
 
     fetched_ids: set[str] = set()
+    answered: list[tuple[object, object]] = []
     for source in sources:
         try:
             window = source.fetch(http)
@@ -129,6 +130,15 @@ def _run_pass(
         fetched_ids.add(source.id)
         windows[source.id] = [item.guid for item in window.items]
         live_guids.update(item.guid for item in window.items)
+        answered.append((source, window))
+
+    # Classify in a rotating order: with more sources than DELIVERY_CAP, a fixed order would let the first
+    # ones fill the queue every pass and leave the last ones permanently unclassified.
+    if len(answered) > 1:
+        turn = int(state.get("classify_turn", 0)) % len(answered)
+        answered = answered[turn:] + answered[:turn]
+        state["classify_turn"] = turn + 1
+    for source, window in answered:
         items = [item for item in window.items if core.passes_filter(item, policy)]
         seeded = state.setdefault("seeded", {})
         if source.id not in seeded:
@@ -153,7 +163,7 @@ def _run_pass(
             now,
             window.host,
             policy,
-            share=max(1, core.DELIVERY_CAP // max(1, len(sources))),
+            share=max(1, core.DELIVERY_CAP // max(1, len(answered))),
         )
         if not dry_run:
             save_state(cfg.state_path, state)

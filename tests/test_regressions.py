@@ -845,12 +845,14 @@ def test_a_busy_first_source_does_not_starve_the_second(tmp_path):
 
 
 def test_rss_and_atom_reject_unusable_entries():
-    from advisory_radar.feeds import FeedError, parse_feed
+    from advisory_radar.feeds import RssError, parse_rss
 
-    with pytest.raises(FeedError):
-        parse_feed(b"<rss><channel><item><description>x</description></item></channel></rss>")
-    with pytest.raises(FeedError):
-        parse_feed(b'<feed xmlns="http://www.w3.org/2005/Atom"><entry></entry></feed>')
+    with pytest.raises(RssError):
+        parse_rss(b"<rss><channel><item><description>x</description></item></channel></rss>")
+    with pytest.raises(RssError):
+        parse_rss(b'<feed xmlns="http://www.w3.org/2005/Atom"><entry></entry></feed>')
+    export = parse_rss(b"<rss><channel><item><title>t</title><guid>g</guid></item></channel></rss>")
+    assert export.items[0].guid == "g"
 
 
 def test_a_colon_in_a_plugin_id_is_refused(tmp_path):
@@ -876,3 +878,71 @@ def test_an_unmeasured_osv_answer_stays_unmeasured_through_the_cache():
     assert intel.ghsa("GHSA-aaaa-bbbb-cccc").complete is False
     assert intel.ghsa("GHSA-aaaa-bbbb-cccc").complete is False, "the cache must not turn it into a measurement"
     assert intel.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Twelfth review round
+
+
+def test_an_osv_score_never_judges_an_unrelated_cve():
+    """A LOW GHSA aliases its own CVE; it must not become the score of a different, unmeasured CVE."""
+    facts = {"CVE-2026-7777": core.CveFacts(None, None, None, None, True)}
+    verdict = core.judge(
+        ["CVE-2026-7777"],
+        facts,
+        frozenset(),
+        True,
+        3.9,
+        True,
+        osv_fallback_for={"CVE-2026-8888"},
+    )
+    assert verdict.tag == "warning", "an unrelated LOW score must not suppress this CVE"
+    aliased = core.judge(["CVE-2026-7777"], facts, frozenset(), True, 3.9, True, osv_fallback_for={"CVE-2026-7777"})
+    assert aliased.tag == "suppressed"
+
+
+def test_a_private_atom_self_link_never_reaches_a_notification():
+    from advisory_radar.feeds import parse_rss
+
+    atom = (
+        b'<feed xmlns="http://www.w3.org/2005/Atom">'
+        b'<link rel="self" href="https://feeds.example/atom?token=SECRET"/>'
+        b'<link rel="alternate" href="https://vendor.example/blog"/>'
+        b"<entry><id>urn:1</id><title>t</title></entry></feed>"
+    )
+    export = parse_rss(atom)
+    assert export.items[0].source_url == "https://vendor.example/blog"
+    assert "SECRET" not in export.items[0].source_url
+
+
+def test_classification_rotates_across_more_sources_than_the_queue(tmp_path):
+    cfg = config(tmp_path)
+    notifier = Notifier()
+    sources = [WindowSource(f"s{index}", [item(f"g{index}", f"source {index} note")]) for index in range(6)]
+    delivered = set()
+    for _ in range(6):
+        notifier.sent.clear()
+        pipeline.run_pass(
+            cfg,
+            sources,
+            [notifier],
+            http=http_for({}),
+            clock=lambda: float(NOW),
+            sleep=lambda s: None,
+        )
+        delivered.update(entry["title"] for entry in notifier.sent)
+    assert any("source 5" in title for title in delivered), "the last source must eventually be classified"
+
+
+def test_a_damaged_kev_cache_is_not_a_known_catalog(tmp_path):
+    from advisory_radar.kev import KEV_CACHE_SCHEMA, load_kev
+    from advisory_radar.state import save_state
+
+    cache = tmp_path / "kev.json"
+    save_state(cache, {"schema": KEV_CACHE_SCHEMA, "cves": ["not-a-cve"]})
+
+    def http(method, url, headers, body):
+        return 500, {}, b""
+
+    cves, known = load_kev(http, cache, save=False)
+    assert cves == frozenset() and known is False
