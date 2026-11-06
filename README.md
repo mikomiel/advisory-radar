@@ -61,9 +61,9 @@ so a head that moved is refused) when `ci` finishes, on a 30-minute sweep, or on
 demand. Branch deletion follows the repository's *automatically delete head
 branches* setting.
 
-The workflow only runs from the default branch — `workflow_run`, `schedule` and
-`workflow_dispatch`, never `pull_request*` — because those events execute the
-pull request's own copy of the workflow. The trade-off is latency: a merge lands
+The workflow only runs from the default branch — `workflow_run` and `schedule`,
+never `pull_request*` and not `workflow_dispatch` (a dispatcher can pick another
+ref, and that ref's copy of the file is what runs). The trade-off is latency: a merge lands
 within ~30 minutes of the approval, not at the instant of the review. Nothing
 merges without an approval from the configured reviewer at the exact head, and
 any check that is not terminal-success stops it.

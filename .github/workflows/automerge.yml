@@ -14,7 +14,8 @@ name: automerge
 # Only trusted-default-branch triggers. `pull_request_review` is deliberately absent: that event runs the
 # workflow definition from the pull request itself, so a same-repository PR could rewrite this script and
 # trigger it with a comment-only review, executing attacker-controlled code with a write token. `workflow_run`,
-# `schedule` and `workflow_dispatch` always run the default branch's definition. The cost is latency: a merge
+# `schedule` always runs the default branch's definition. `workflow_dispatch` does not qualify: the dispatcher
+# picks the ref, and that ref's copy of this file is what runs. The cost is latency: a merge
 # happens at the next `ci` completion, the next sweep, or on demand - never within the reviewed PR.
 on:
   workflow_run:
@@ -22,7 +23,6 @@ on:
     types: [completed]
   schedule:
     - cron: "*/30 * * * *"   # sweep: pick up approvals
-  workflow_dispatch:
 
 permissions:
   contents: write        # merge + GitHub's own branch delete
@@ -53,9 +53,19 @@ jobs:
           set -euo pipefail
           # gh paginates internally up to this bound, which is far above any realistic queue; the comment is a
           # bound, not "to completion".
-          mapfile -t candidates < <(gh pr list --repo "$REPO" --state open --base main --limit 1000 \
+          # An enumeration failure must fail the job: inside process substitution its exit status is lost and
+          # an API error would look like an empty queue.
+          if ! listing=$(gh pr list --repo "$REPO" --state open --base main --limit 1000 \
             --json number,reviewDecision,mergeable,isDraft \
-            --jq '.[] | select(.isDraft == false and .reviewDecision == "APPROVED") | .number')
+            --jq '.[] | select(.isDraft == false and .reviewDecision == "APPROVED") | .number'); then
+            echo "::error::cannot enumerate open pull requests"
+            exit 1
+          fi
+          if [ -z "$listing" ]; then
+            echo "no approved pull requests to consider"
+            exit 0
+          fi
+          mapfile -t candidates <<<"$listing"
 
           for pr in "${candidates[@]}"; do
             meta=$(gh pr view "$pr" --repo "$REPO" \
