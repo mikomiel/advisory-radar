@@ -736,3 +736,42 @@ def test_an_overflowing_metric_is_unknown_not_fatal(tmp_path):
         sleep=lambda s: None,
     )
     assert code == 0 and notifier.sent, "an overflowing score must not block delivery"
+
+
+# ---------------------------------------------------------------------------
+# Ninth review round
+
+
+def test_low_ghsa_does_not_suppress_an_unmeasured_one():
+    facts = {"CVE-2026-1": core.CveFacts(None, None, None, None, True)}
+    verdict = core.judge([], facts, frozenset(), True, 3.9, osv_complete=False)
+    assert verdict.tag != "suppressed", "an unmeasured advisory must keep the item visible"
+    verdict_measured = core.judge([], facts, frozenset(), True, 3.9, osv_complete=True)
+    assert verdict_measured.tag == "suppressed"
+
+
+def test_an_osv_404_leaves_the_item_unsuppressed():
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda s: None)
+
+        def _get(self, url):
+            return 404, None
+
+    assert Intel().ghsa("GHSA-aaaa-bbbb-cccc").complete is False
+
+
+def test_deeply_nested_json_is_a_failed_lookup_not_a_crash():
+    from advisory_radar.http import parse_json
+
+    body = ("[" * 200000 + "]" * 200000).encode()
+    assert parse_json(body) is None
+
+
+def test_unknown_web_keys_are_refused(tmp_path):
+    from advisory_radar.config import ConfigError
+
+    path = tmp_path / "c.yml"
+    path.write_text("sources: []\nnotifiers: []\nweb:\n  hots: 127.0.0.1\n")
+    with pytest.raises(ConfigError):
+        load_config(path, {})

@@ -134,6 +134,10 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
 
     web = document.get("web") or {}
     _require(isinstance(web, dict), "web must be a mapping")
+    _require(
+        not set(web) - {"host", "port"},
+        f"unknown web keys {sorted(set(web) - {'host', 'port'})}",
+    )
     web_host = str(web.get("host", "0.0.0.0"))
     web_port = web.get("port", 8080)
     _require(isinstance(web_port, int) and 1 <= web_port <= 65535, "web.port must be an integer in 1..65535")

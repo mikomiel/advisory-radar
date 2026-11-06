@@ -62,7 +62,8 @@ def parse_json(body: bytes) -> object | None:
     """Untrusted body parsed as JSON; invalid JSON is None (a failed lookup), never an exception."""
     try:
         return json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError: a few thousand nested arrays defeat the decoder with a tiny body.
         return None
 
 

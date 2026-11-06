@@ -822,7 +822,9 @@ class Intel:
             return OsvFacts(tuple(entry["cves"]), entry["cvss"], True)
         status, document = self._get(OSV_URL + ghsa)
         if status == 404:
-            return OsvFacts((), None, True)
+            # OSV does not know this advisory. That is not a measurement of zero severity: a LOW sibling must
+            # not suppress an item whose other advisory is unmeasured.
+            return OsvFacts((), None, False)
         if not isinstance(document, dict):
             return OsvFacts((), None, False)
         aliases = document.get("aliases")
