@@ -820,3 +820,59 @@ def test_a_malformed_feed_entry_fails_the_source():
         parse_feed(b'{"items": [{}]}')
     with pytest.raises(FeedError):
         parse_feed(b'{"items": [1, 2]}')
+
+
+# ---------------------------------------------------------------------------
+# Eleventh review round
+
+
+def test_a_busy_first_source_does_not_starve_the_second(tmp_path):
+    cfg = config(tmp_path)
+    notifier = Notifier()
+    busy = [item(f"b{index}", f"vendor note {index}") for index in range(20)]
+    quiet = [item("q1", "quiet source advisory")]
+    code = pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", busy), WindowSource("s2", quiet)],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 0
+    titles = [entry["title"] for entry in notifier.sent]
+    assert any("quiet source" in title for title in titles), "each source gets a share of the queue"
+
+
+def test_rss_and_atom_reject_unusable_entries():
+    from advisory_radar.feeds import FeedError, parse_feed
+
+    with pytest.raises(FeedError):
+        parse_feed(b"<rss><channel><item><description>x</description></item></channel></rss>")
+    with pytest.raises(FeedError):
+        parse_feed(b'<feed xmlns="http://www.w3.org/2005/Atom"><entry></entry></feed>')
+
+
+def test_a_colon_in_a_plugin_id_is_refused(tmp_path):
+    from advisory_radar.config import ConfigError
+
+    path = tmp_path / "c.yml"
+    path.write_text("sources:\n  - id: vendor:prod\n    type: rss\n    url: https://x.example/f\nnotifiers: []\n")
+    with pytest.raises(ConfigError):
+        load_config(path, {})
+
+
+def test_an_unmeasured_osv_answer_stays_unmeasured_through_the_cache():
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda s: None)
+            self.calls = 0
+
+        def _get(self, url):
+            self.calls += 1
+            return 200, {"id": "GHSA-aaaa-bbbb-cccc"}
+
+    intel = Intel()
+    assert intel.ghsa("GHSA-aaaa-bbbb-cccc").complete is False
+    assert intel.ghsa("GHSA-aaaa-bbbb-cccc").complete is False, "the cache must not turn it into a measurement"
+    assert intel.calls == 1

@@ -114,6 +114,12 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
         _require(isinstance(entry.get("enabled", True), bool), f"{entry['id']}: enabled must be a bool")
     ids = [entry["id"] for entry in (*sources, *notifiers)]
     _require(len(ids) == len(set(ids)), f"duplicate plugin ids: {ids}")
+    # State keys join the source id and the item's guid with ":", so a colon in an id could collide with
+    # another source's id+guid pair.
+    _require(
+        all(re.fullmatch(r"[A-Za-z0-9._-]+", entry["id"]) for entry in (*sources, *notifiers)),
+        "plugin ids may use only letters, digits, dot, dash and underscore",
+    )
     secret_names = tuple(sorted(set(_ENV_RE.findall(yaml.safe_dump(document)))))
     resolved: list[str] = []
     document = _expand(document, env, resolved)

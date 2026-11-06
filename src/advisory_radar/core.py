@@ -819,7 +819,7 @@ class Intel:
     def ghsa(self, ghsa: str) -> OsvFacts:
         entry = self._fresh(ghsa, False)
         if entry is not None:
-            return OsvFacts(tuple(entry["cves"]), entry["cvss"], True)
+            return OsvFacts(tuple(entry["cves"]), entry["cvss"], bool(entry.get("complete", True)))
         status, document = self._get(OSV_URL + ghsa)
         if status == 404:
             # OSV does not know this advisory. That is not a measurement of zero severity: a LOW sibling must
@@ -841,7 +841,7 @@ class Intel:
         # An advisory with neither a CVE alias nor a usable severity label was not measured: its severity is
         # unknown, and it must not be suppressed by a LOW sibling.
         complete = bool(cves) or cvss is not None
-        self._cache[ghsa] = {"at": int(self._clock()), "cves": list(cves), "cvss": cvss}
+        self._cache[ghsa] = {"at": int(self._clock()), "cves": list(cves), "cvss": cvss, "complete": complete}
         return OsvFacts(cves, cvss, complete)
 
 
@@ -1197,10 +1197,17 @@ def classify_new(
     now: int,
     feed_host: str,
     policy: Policy,
+    *,
+    share: int | None = None,
 ) -> None:
-    """Queue the items nobody has seen, oldest first, until the delivery cap or the lookup budget is reached."""
+    """Queue the items nobody has seen, oldest first, until the delivery cap or the lookup budget is reached.
+
+    ``share`` bounds how much of the pending room one source may take, so a busy first source cannot fill the
+    queue and leave later sources unclassified pass after pass.
+    """
     seen: dict = state["seen"]
     pending: list[dict] = state["pending"]
+    start = len(pending)
     claimed = _claimed(state)
     # Item guid -> epoch of its first enrichment fault (``_enrichment_wait``); ``_prune_enrich_clock`` keeps it clean.
     retry: dict[str, int] = state.setdefault("enrich_retry", {})
@@ -1209,7 +1216,8 @@ def classify_new(
     classified = 0
     backlog = 0
     for item in sorted(items, key=lambda candidate: candidate.published or 0):
-        if len(pending) >= DELIVERY_CAP or classified >= MAX_CLASSIFY:
+        room = min(DELIVERY_CAP, start + share) if share else DELIVERY_CAP
+        if len(pending) >= room or classified >= MAX_CLASSIFY:
             break
         if f"src:{item.guid}" in claimed:
             continue  # Already seen under its own guid, before a PSA/CVE id was read from it.

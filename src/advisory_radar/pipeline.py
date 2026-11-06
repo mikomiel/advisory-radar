@@ -144,7 +144,17 @@ def _run_pass(
             )
         else:
             candidates = items
-        core.classify_new(state, candidates, intel, kev, kev_known, now, window.host, policy)
+        core.classify_new(
+            state,
+            candidates,
+            intel,
+            kev,
+            kev_known,
+            now,
+            window.host,
+            policy,
+            share=max(1, core.DELIVERY_CAP // max(1, len(sources))),
+        )
         if not dry_run:
             save_state(cfg.state_path, state)
 

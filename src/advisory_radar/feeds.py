@@ -182,7 +182,7 @@ def parse_rss(body: bytes) -> FeedExport:
             guid = _text_of(node.find("guid")) or link
             title = _text_of(node.find("title"))
             if not guid or not title:
-                continue
+                raise RssError("feed entry has no usable id or title")
             summary = _text_of(node.find("description"))
             items.append(
                 FeedEntry(guid, title, link, summary, _published_of(node.find("pubDate")), channel_title, channel_link)
@@ -200,7 +200,7 @@ def parse_rss(body: bytes) -> FeedExport:
             guid = _text_of(node.find(f"{_ATOM}id")) or link
             title = _text_of(node.find(f"{_ATOM}title"))
             if not guid or not title:
-                continue
+                raise RssError("feed entry has no usable id or title")
             summary = _text_of(node.find(f"{_ATOM}summary")) or _text_of(node.find(f"{_ATOM}content"))
             published = _published_of(node.find(f"{_ATOM}published")) or _published_of(node.find(f"{_ATOM}updated"))
             items.append(FeedEntry(guid, title, link, summary, published, channel_title, channel_link))
