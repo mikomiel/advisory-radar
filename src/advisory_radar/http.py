@@ -6,6 +6,7 @@ import http.client
 import json
 import logging
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Mapping
 
@@ -40,8 +41,10 @@ _OPENER = urllib.request.build_opener(_NoRedirects)
 def urllib_http(
     method: str, url: str, headers: Mapping[str, str], body: bytes | None
 ) -> tuple[int, dict[str, str], bytes]:
-    request = urllib.request.Request(url, data=body, headers={"User-Agent": USER_AGENT, **headers}, method=method)
     try:
+        # Built inside the guard: a malformed URL raises a ValueError whose text carries the URL, and a URL
+        # can carry a token.
+        request = urllib.request.Request(url, data=body, headers={"User-Agent": USER_AGENT, **headers}, method=method)
         with _OPENER.open(request, timeout=HTTP_TIMEOUT) as response:
             return response.status, dict(response.headers), response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
@@ -75,7 +78,10 @@ class RedactFilter(logging.Filter):
 
     def __init__(self, secrets) -> None:
         super().__init__()
-        self.secrets = [secret for secret in secrets if secret]
+        # A token that reaches a URL is percent-encoded there, so the encoded form must be redacted too.
+        values = [secret for secret in secrets if secret]
+        encoded = {urllib.parse.quote(secret, safe="") for secret in values}
+        self.secrets = sorted({*values, *encoded}, key=len, reverse=True)
 
     def filter(self, record: logging.LogRecord) -> bool:
         text = record.getMessage()

@@ -121,6 +121,11 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
     # Built plugins read the expanded entries; the structural checks above used the raw ones.
     sources = document.get("sources") or []
     notifiers = document.get("notifiers") or []
+    expanded_ids = [entry["id"] for entry in (*sources, *notifiers)]
+    _require(
+        len(expanded_ids) == len(set(expanded_ids)),
+        "two plugin ids expand to the same value; ids must stay unique after ${...} expansion",
+    )
 
     poll = document.get("poll_interval", "15m")
     match = re.fullmatch(r"(\d+)([smh])", str(poll))

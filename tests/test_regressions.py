@@ -663,3 +663,76 @@ def test_a_kev_hit_escalates_even_when_the_scored_lookups_fail():
     queued = [entry for entry in state["pending"] if entry["kind"] == "escalation"]
     assert queued and queued[0]["cves"] == [cve], "a known KEV hit must escalate"
     assert queued[0]["tag"] == "critical"
+
+
+# ---------------------------------------------------------------------------
+# Eighth review round
+
+
+def test_a_failing_first_source_does_not_block_the_next_one(tmp_path):
+    cfg = config(tmp_path)
+    notifier = Notifier()
+    code = pipeline.run_pass(
+        cfg,
+        [FailingSource("s1", []), WindowSource("s2", [item("g1", "healthy advisory")])],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 1  # the fault is reported
+    assert notifier.sent, "the healthy source must still be processed"
+    state = json.loads(cfg.state_path.read_text())
+    assert "s2" in state["seeded"] and "s1" not in state["seeded"]
+
+
+def test_a_malformed_source_url_does_not_leak_its_token():
+    import logging
+
+    from advisory_radar.http import RedactFilter, urllib_http
+
+    status, _, _ = urllib_http("GET", "not-a-url/with?token=a/b+c&d", {}, None)
+    assert status == 0
+    record = logging.LogRecord("t", logging.ERROR, __file__, 1, "bad %s", ("a/b+c&d",), None)
+    RedactFilter(["a/b+c&d"]).filter(record)
+    assert "a%2Fb%2Bc%26d" not in record.getMessage()
+    assert "a/b+c&d" not in record.getMessage()
+
+
+def test_two_ids_that_expand_to_one_value_are_refused(tmp_path):
+    from advisory_radar.config import ConfigError
+
+    path = tmp_path / "c.yml"
+    path.write_text(
+        "sources: []\nnotifiers:\n  - id: ${A}\n    type: webhook\n    url: https://x.example/y\n"
+        "  - id: ${B}\n    type: webhook\n    url: https://x.example/z\n"
+    )
+    with pytest.raises(ConfigError):
+        load_config(path, {"A": "same", "B": "same"})
+
+
+def test_an_overflowing_metric_is_unknown_not_fatal(tmp_path):
+    huge = int("9" * 400)
+    cfg = config(tmp_path)
+    notifier = Notifier()
+    feeds = {"https://feeds.example.com/a": feed("g1", "CVE-2026-4242 thing")}
+
+    def http(method, url, headers, body):
+        if "cveawg.mitre.org" in url:
+            body = {"containers": {"cna": {"metrics": [{"cvssV3_1": {"baseScore": huge}}]}}}
+            return 200, {}, json.dumps(body).encode()
+        if "api.first.org" in url:
+            return 200, {}, json.dumps({"data": []}).encode()
+        if "cisa.gov" in url:
+            return 200, {}, json.dumps({"vulnerabilities": []}).encode()
+        return 200, {}, feeds.get(url, b"")
+
+    code = pipeline.run_pass(
+        cfg,
+        [RssSource("s1", "https://feeds.example.com/a")],
+        [notifier],
+        http=http,
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 0 and notifier.sent, "an overflowing score must not block delivery"

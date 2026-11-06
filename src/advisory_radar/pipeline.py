@@ -107,9 +107,7 @@ def _run_pass(
         except Exception as exc:  # a source fault fails the pass but keeps state
             LOG.error("source %s: %s: %s; state kept", source.id, type(exc).__name__, exc)
             source_ok = False
-            if stored is None:
-                return 1  # a first run has nothing to persist safely
-            continue
+            continue  # other sources still bootstrap; this one is seeded when it first answers
         window = SourceWindow(
             source.id,
             tuple(_namespaced(item, source.id) for item in window.items),
@@ -149,6 +147,10 @@ def _run_pass(
         core.classify_new(state, candidates, intel, kev, kev_known, now, window.host, policy)
         if not dry_run:
             save_state(cfg.state_path, state)
+
+    if stored is None and not fetched_ids:
+        LOG.error("no source could be read on the first pass; nothing to persist")
+        return 1
 
     # Prune once, against every window fetched this pass, and only for sources that answered: a source
     # outage must not wipe that source's retry deadlines.

@@ -503,7 +503,7 @@ def _number(value: object) -> float | None:
         return None
     try:
         number = float(value) if isinstance(value, (int, float, str)) else None
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
     return number if number is not None and math.isfinite(number) else None
 
