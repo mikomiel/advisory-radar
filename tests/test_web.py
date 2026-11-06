@@ -72,3 +72,11 @@ def test_login_and_dashboard(tmp_path):
     other, _ = make_client(tmp_path, token="other")
     bad = other.post("/login", data={"token": "nope"})
     assert "Wrong token" in bad.text
+
+
+def test_login_cookie_is_secure_behind_a_tls_proxy(tmp_path: Path):
+    client, _ = make_client(tmp_path)
+    response = client.post(
+        "/login", data={"token": "secret-token"}, headers={"x-forwarded-proto": "https"}, follow_redirects=False
+    )
+    assert "secure" in response.headers["set-cookie"].lower()

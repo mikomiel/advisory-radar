@@ -9,6 +9,7 @@ frontend build step.
 
 from __future__ import annotations
 
+import hmac
 import html
 import time
 import urllib.parse
@@ -106,9 +107,18 @@ def create_app(
 
         form = urllib.parse.parse_qs((await request.body()).decode("utf-8", "replace"))
         token = (form.get("token") or [""])[0]
-        if token and token == env.get("ADVISORY_RADAR_AUTH_TOKEN", ""):
+        expected = env.get("ADVISORY_RADAR_AUTH_TOKEN", "")
+        # constant-time: a byte-by-byte comparison leaks the token prefix
+        if token and expected and hmac.compare_digest(token.encode(), expected.encode()):
             response = RedirectResponse("/", status_code=303)
-            response.set_cookie("advisory_radar_session", auth.login_cookie(), httponly=True, samesite="lax")
+            secure = (request.headers.get("x-forwarded-proto") or request.url.scheme) == "https"
+            response.set_cookie(
+                "advisory_radar_session",
+                auth.login_cookie(),
+                httponly=True,
+                samesite="lax",
+                secure=secure,
+            )
             return response
         return page(
             "Login",
@@ -265,7 +275,8 @@ def create_app(
         from .state import load_state_document, save_state, state_lock
 
         secret = env.get("ADVISORY_RADAR_WEBHOOK_SECRET", "")
-        if secret and request.headers.get("authorization") != f"Bearer {secret}":
+        presented = request.headers.get("authorization") or ""
+        if secret and not hmac.compare_digest(presented.encode(), f"Bearer {secret}".encode()):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         payload = await request.json()
         entry = webhook_item_from_payload(payload)
