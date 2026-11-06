@@ -64,7 +64,12 @@ def load_kev(http: Http, cache_path: Path, *, save: bool) -> tuple[frozenset[str
             )
         return frozenset(cves), True
     if cached:
-        LOG.warning("kev: fetch failed or returned an unusable catalog (HTTP %s); using the cached one", status)
-        return frozenset(cached.get("cves", [])), True
+        # The cached CVEs still promote (a hit is a hit), but an unvalidated catalog may simply be missing a
+        # new entry, so its silence must not authorize suppression: known stays False.
+        LOG.warning(
+            "kev: fetch failed or returned an unusable catalog (HTTP %s); using the cached one for promotion only",
+            status,
+        )
+        return frozenset(cached.get("cves", [])), False
     LOG.warning("kev: fetch failed (HTTP %s) and no cached catalog exists; nothing is promoted by KEV", status)
     return frozenset(), False

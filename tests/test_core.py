@@ -222,6 +222,7 @@ def test_kev_load_fresh_and_fallback():
 
         kev2, known2 = load_kev(http_304, cache, save=True)
         assert known2 and kev2 == kev
-        # failure with cache falls back
+        # failure with cache falls back, but an unvalidated catalog may be missing a new entry: its CVEs still
+        # promote, while never authorizing a suppression ("not listed" is not verified this pass)
         kev3, known3 = load_kev(lambda *a: (0, {}, b""), cache, save=True)
-        assert known3 and kev3 == kev
+        assert kev3 == kev and known3 is False

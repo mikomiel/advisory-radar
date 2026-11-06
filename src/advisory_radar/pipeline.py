@@ -120,7 +120,9 @@ def _run_pass(
         # Only a source that knows its own page size can prove it returned a complete window (a FreshRSS
         # export, a changedetection watch). An RSS/Atom feed is bounded by its publisher, so a rotation
         # there is undetectable; see README, "Sources".
-        if window.truncated and previous is not None and not set(previous) & {item.guid for item in window.items}:
+        # An empty previous window proves nothing: the source had no entries, so "no overlap" is expected and a
+        # gap there would reject every later full window forever.
+        if window.truncated and previous and not set(previous) & {item.guid for item in window.items}:
             LOG.error(
                 "source %s: window gap: the window is full (%d entries) and shares none with the previous "
                 "pass; items may have been missed. Keeping the last trusted window and deferring this source",

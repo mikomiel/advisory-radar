@@ -444,7 +444,8 @@ def test_a_malformed_kev_catalog_is_not_trusted(tmp_path):
         return 200, {}, json.dumps({"vulnerabilities": [{"nope": 1}]}).encode()
 
     cves, known = load_kev(http, cache, save=False)
-    assert known is True and cves == frozenset({"CVE-2026-1111"}), "a reshaped catalog must fall back to the cache"
+    assert cves == frozenset({"CVE-2026-1111"}), "a reshaped catalog must fall back to the cache for promotion"
+    assert known is False, "an unvalidated cache never authorizes a suppression"
 
     def empty(method, url, headers, body):
         return 200, {}, json.dumps({"vulnerabilities": []}).encode()
@@ -2241,3 +2242,47 @@ def test_inline_xhtml_stays_adjacent():
     summary = parse_rss(atom).items[0].summary
     assert "CVE-2026-1234" in summary and "libfoo" in summary
     assert "second paragraph" in summary
+
+
+# ---------------------------------------------------------------------------
+# Thirty-seventh review round
+
+
+def test_an_empty_previous_window_does_not_create_a_gap(tmp_path):
+    cfg = config(tmp_path)
+    notifier = Notifier()
+    first = pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [], truncated=True)],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert first == 0
+    many = [item(f"g{index}", f"advisory {index}") for index in range(5)]
+    second = pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", many, truncated=True)],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW + 60),
+        sleep=lambda s: None,
+    )
+    assert second == 0, "an empty baseline must not be read as a gap"
+    assert notifier.sent, "the new advisories are processed"
+
+
+def test_a_stale_kev_cache_does_not_authorize_suppression():
+    import tempfile
+    from pathlib import Path
+
+    from advisory_radar.kev import KEV_CACHE_SCHEMA, load_kev
+    from advisory_radar.state import save_state
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp) / "kev.json"
+        save_state(cache, {"schema": KEV_CACHE_SCHEMA, "cves": ["CVE-2026-1111"]})
+        cves, known = load_kev(lambda *a: (500, {}, b""), cache, save=False)
+    assert cves == frozenset({"CVE-2026-1111"}), "cached hits still promote"
+    assert known is False, "an outage must not let the old catalog's silence suppress a CVE"
