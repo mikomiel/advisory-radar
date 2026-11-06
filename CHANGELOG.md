@@ -7,6 +7,11 @@ operator action, and the release workflow then builds and pushes the image to
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-06
+
+The first public release: the extracted security-advisory notifier, packaged as a
+single container with plugin seams for sources and notifiers.
+
 ### Added
 - Core pipeline: configurable source plugins (RSS/Atom, FreshRSS GReader,
   changedetection.io API polling, generic inbound webhook) with per-source
