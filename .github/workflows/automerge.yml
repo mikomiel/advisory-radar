@@ -1,0 +1,140 @@
+# Auto-merge for this repository: an approved, green pull request merges itself.
+#
+# This is the GitHub-native equivalent of the estate's reviewed-CI automerge executor. The gate is
+# "the reviewer approved *this exact head commit*" + "the required ci check is green on that commit".
+# GitHub's branch protection validates both again at merge time; this script only decides *whether to ask*.
+#
+# Safety rules this file must keep (see docs in the PR that added it):
+#   * never check out or execute pull-request / workflow_run head code - this job only reads PR metadata;
+#   * the approving review must be at the current head SHA, by the configured reviewer identity;
+#   * the required status context must be present and SUCCESS on that SHA;
+#   * branch protection must dismiss stale approvals on new commits (set on main, not by this file).
+name: automerge
+
+# Only trusted-default-branch triggers. `pull_request_review` is deliberately absent: that event runs the
+# workflow definition from the pull request itself, so a same-repository PR could rewrite this script and
+# trigger it with a comment-only review, executing attacker-controlled code with a write token. `workflow_run`,
+# `schedule` always runs the default branch's definition. `workflow_dispatch` does not qualify: the dispatcher
+# picks the ref, and that ref's copy of this file is what runs. The cost is latency: a merge
+# happens at the next `ci` completion, the next sweep, or on demand - never within the reviewed PR.
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+  schedule:
+    - cron: "*/30 * * * *"   # sweep: pick up approvals
+
+permissions:
+  contents: write        # merge + GitHub's own branch delete
+  pull-requests: write   # merge, read reviews
+  checks: read
+  statuses: read         # legacy commit-status contexts are invisible without this
+
+concurrency:
+  group: automerge
+  cancel-in-progress: false
+
+env:
+  # The reviewing identity; its approval is the gate. Matched against the REST representation, which carries
+  # the "[bot]" suffix, the actor type and a stable numeric id: a human account with the same name cannot pass.
+  REVIEWER_LOGIN: ecomwizards-gandalf[bot]
+  REVIEWER_TYPE: Bot
+  REQUIRED_CHECK: ci
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge approved pull requests whose required check is green at the same head
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # gh paginates internally up to this bound, which is far above any realistic queue; the comment is a
+          # bound, not "to completion".
+          # An enumeration failure must fail the job: inside process substitution its exit status is lost and
+          # an API error would look like an empty queue.
+          if ! listing=$(gh pr list --repo "$REPO" --state open --base main --limit 1000 \
+            --json number,reviewDecision,mergeable,isDraft \
+            --jq '.[] | select(.isDraft == false and .reviewDecision == "APPROVED") | .number'); then
+            echo "::error::cannot enumerate open pull requests"
+            exit 1
+          fi
+          if [ -z "$listing" ]; then
+            echo "no approved pull requests to consider"
+            exit 0
+          fi
+          mapfile -t candidates <<<"$listing"
+
+          for pr in "${candidates[@]}"; do
+            meta=$(gh pr view "$pr" --repo "$REPO" \
+              --json headRefOid,mergeable,reviews,statusCheckRollup)
+
+            head=$(jq -r '.headRefOid' <<<"$meta")
+            mergeable=$(jq -r '.mergeable' <<<"$meta")
+            if [ "$mergeable" != "MERGEABLE" ]; then
+              echo "skip #$pr: mergeable=$mergeable (retry on the next trigger)"
+              continue
+            fi
+
+            # The configured reviewer's own latest review decides, and only if it approved this exact head.
+            # Read over REST: .user.type distinguishes an App bot from a human account of the same name, and
+            # .user.login keeps the "[bot]" suffix that the GraphQL shape drops.
+            # jq -s 'add': --paginate emits one JSON array per page, and selecting the latest review per page
+            # would return several answers (an eligible approval on a later page would look like a mismatch).
+            reviews=$(gh api --paginate "repos/$REPO/pulls/$pr/reviews?per_page=100" | jq -s -c 'add')
+            reviewer_state=$(jq -r --arg reviewer "$REVIEWER_LOGIN" --arg type "$REVIEWER_TYPE" '
+              [.[] | select(.user.login == $reviewer and .user.type == $type)]
+              | sort_by(.submitted_at) | last | .state // ""' <<<"$reviews")
+            reviewer_head=$(jq -r --arg reviewer "$REVIEWER_LOGIN" --arg type "$REVIEWER_TYPE" '
+              [.[] | select(.user.login == $reviewer and .user.type == $type)]
+              | sort_by(.submitted_at) | last | .commit_id // ""' <<<"$reviews")
+            if [ "$reviewer_state" != "APPROVED" ]; then
+              echo "skip #$pr: $REVIEWER_LOGIN's latest review is '${reviewer_state:-none}', not APPROVED"
+              continue
+            fi
+            if [ "$reviewer_head" != "$head" ]; then
+              echo "skip #$pr: $REVIEWER_LOGIN approved $reviewer_head, head is $head (stale approval)"
+              continue
+            fi
+
+            # Positive assertion: the required check answered SUCCESS for this head.
+            green=$(jq -r --arg check "$REQUIRED_CHECK" '
+              [.statusCheckRollup[] | select(.name == $check and .conclusion == "SUCCESS")] | length' <<<"$meta")
+            if [ "$green" -eq 0 ]; then
+              echo "skip #$pr: $REQUIRED_CHECK is not SUCCESS on $head"
+              continue
+            fi
+            # Everything must be terminal and acceptable: a check run reports .conclusion, a legacy commit
+            # status reports .state, and a queued/in-progress one has neither a conclusion nor a state of
+            # success. Anything other than SUCCESS/NEUTRAL/SKIPPED skips the merge - pending included, so an
+            # additional check cannot start failing after we merged.
+            # statusCheckRollup is bounded (100 contexts); at that size an omitted check could be the failing
+            # one, so refuse to merge rather than trust an incomplete list.
+            contexts=$(jq -r '.statusCheckRollup | length' <<<"$meta")
+            if [ "$contexts" -ge 100 ]; then
+              echo "skip #$pr: $contexts check contexts - the rollup may be truncated, cannot verify completeness"
+              continue
+            fi
+
+            not_green=$(jq -r --argjson _ 0 '[.statusCheckRollup[]
+              | (.conclusion // .state // "PENDING")
+              | select(. != "SUCCESS" and . != "NEUTRAL" and . != "SKIPPED")] | length' <<<"$meta")
+            if [ "$not_green" != "0" ]; then
+              echo "skip #$pr: $not_green check(s) not green (pending, failing or errored)"
+              continue
+            fi
+
+            # Merge now rather than installing a standing auto-merge order: a later push would move the
+            # head past the review this check just validated.
+            # --match-head-commit: if the head moved between the checks above and this call, GitHub refuses
+            # instead of merging a commit the reviewer never saw.
+            if gh pr merge "$pr" --repo "$REPO" --squash --match-head-commit "$head"; then
+              echo "merged #$pr at $head (approval by $REVIEWER_LOGIN)"
+              gh pr comment "$pr" --repo "$REPO" \
+                --body "Merged by automerge: $REQUIRED_CHECK green and approved at \`$head\` by $REVIEWER_LOGIN." || true
+            else
+              echo "skip #$pr: GitHub refused the merge (protection, or a check changed)"
+            fi
+          done
