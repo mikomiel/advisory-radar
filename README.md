@@ -56,9 +56,12 @@ turns critical, and never re-sends what you already received.
 
 `main` is protected: a pull request needs **one approving review** and a green `ci`
 run. `.github/workflows/automerge.yml` then does the merging itself — an approved
-pull request whose checks are green is squash-merged and its branch deleted, on
-the approval event, when `ci` finishes, and on a 30-minute sweep. Nothing merges
-without an approval, and a failing check stops it.
+pull request whose checks are green is squash-merged immediately (with
+`--match-head-commit`, so a head that moved is refused), on the approval event,
+when `ci` finishes, and on a 30-minute sweep. Branch deletion follows the
+repository's *automatically delete head branches* setting. Nothing merges without
+an approval from the configured reviewer at the exact head, and any check that is
+not terminal-success stops it.
 
 The reviewer is the Gandalf GitHub App, which posts its review through the
 `external_github_review` route. Contributors can of course review each other;
