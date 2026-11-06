@@ -6,20 +6,25 @@ enrich every finding with CVE.org / NVD CVSS, EPSS, CISA KEV and OSV, decide a
 severity per CVE, and deliver one deduplicated alert per new advisory to the
 channels you configure (Discord, Matrix, ntfy, Gotify, Apprise, generic webhook,
 SMTP). A built-in web UI shows alerts, sources, notifiers, the parked queue and
-run history. One container, one process, SQLite state, YAML + environment
+run history. One container, one process, JSON state on a volume, YAML + environment
 configuration.
 
 ## Quickstart
 
 ```bash
+# Until the first tagged release is on GHCR, build locally:
+docker build -t ghcr.io/mikomiel/advisory-radar:latest .
 docker compose up -d
-# or with Podman:
-podman play kube deploy/podman/advisory-radar.yaml
+# or with Podman: install deploy/podman/advisory-radar.container as a quadlet
+# (see docs/deployment.md)
 ```
 
-Then open http://localhost:8080 and add your first source. Configuration lives
-in `config/` on the mounted volume (see `examples/config.yml`); secrets come
-from environment variables or `<NAME>_FILE` files, never from committed files.
+Then open http://localhost:8080 (sign in with `ADVISORY_RADAR_AUTH_TOKEN`) for the
+dashboard, alert history, parked queue, run log and config overview. `/healthz`
+and `/metrics` (Prometheus text) are unauthenticated for probes and scrapers.
+Configuration lives in `config/` on the mounted volume (see `examples/config.yml`);
+secrets come from environment variables or `<NAME>_FILE` files, never from
+committed files.
 
 ```yaml
 # examples/config.yml (abridged)
@@ -31,9 +36,32 @@ notifiers:
   - id: discord
     type: discord_webhook
     url: ${DISCORD_WEBHOOK_URL}
-watchlist:
-  products: [nodejs, postgresql, nginx]
+# optional: scope alerts to what you run (see below)
+watchlist: ./config/watchlist.json
 ```
+
+`watchlist.json` is optional. Without it every advisory that arrives is judged;
+with it, only items that match one of your products (a name alias in the text or
+a link on one of its domains) are considered, and `excluded_products` drops the
+ones you do not run. Package patterns filter Debian DSA titles.
+
+```json
+{
+  "schema": "security-watchlist.v1",
+  "debian_source_packages": ["curl", "openssl"],
+  "excluded_products": ["legacy-app"],
+  "products": [{"id": "nodejs", "aliases": ["node.js"], "domains": ["nodejs.org"]}]
+}
+```
+
+### Gap detection
+
+A source that knows its own page size (a FreshRSS export, a changedetection
+watch) reports a truncated window, and the pass fails loudly when a full window
+shares nothing with the previous one — that is how silently missed advisories
+surface. An RSS/Atom feed is bounded by its publisher instead, so a skipped item
+there cannot be detected; poll those feeds often enough that rotation is
+unlikely.
 
 ## Why
 
@@ -44,11 +72,11 @@ turns critical, and never re-sends what you already received.
 
 ## Features
 
-- Configurable source plugins: RSS/Atom, FreshRSS (GReader API), changedetection.io (API poll + inbound webhook), generic inbound webhook, Adobe APSB, Debian DSA, PHP ChangeLog, Node.js security blog
+- Configurable source plugins: RSS/Atom, FreshRSS (GReader API), changedetection.io (API poll + inbound webhook), generic inbound webhook; vendor enrichment for Debian DSA, php.net ChangeLog, Node.js security blog, Adobe APSB bulletins
 - Enrichment plugins: CVE.org, NVD, FIRST EPSS, CISA KEV, OSV, Debian security tracker
-- Notifier plugins: Discord, Matrix, ntfy, Gotify, Apprise, generic webhook, SMTP
+- Notifier plugins: Discord webhook, Matrix (Hookshot), ntfy, Gotify, Apprise, generic webhook, SMTP
 - Severity decision per CVE with re-evaluation window and one escalation per level
-- Web UI + REST API, in-process scheduler (default every 15 min), SQLite state
+- Web UI + REST API, in-process scheduler (default every 15 min), atomic JSON state on a volume
 - Docker and Podman deployment (compose file + quadlet/kube YAML), `/healthz` and `/metrics`
 - Secrets via environment / `_FILE` only; redaction filter on logs; fail-closed source errors
 
@@ -93,3 +121,14 @@ vulnerabilities.
 ## License
 
 [MIT](LICENSE)
+
+## Status
+
+`0.1.0` — the first public release. The pipeline, plugin seams, web UI, container
+and integrations are complete and tested (178 tests), and CI runs them on free
+GitHub-hosted runners. Version numbers follow SemVer; every `vX.Y.Z` tag on `main`
+publishes a multi-arch image to `ghcr.io/mikomiel/advisory-radar`.
+
+What is deliberately not here yet: a per-host agent, alert deduplication across
+sources beyond the watch window, and any hosted service. Issues and pull requests
+are welcome.

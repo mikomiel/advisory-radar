@@ -40,6 +40,43 @@ jobs:
       - name: No internal identifiers (estate guard)
         run: uv run python scripts/check_no_estate_identifiers.py
 
+      - name: Workflow YAML parses
+        run: |
+          uv run python - <<'PYX'
+          import pathlib, sys, yaml
+          bad = []
+          for path in sorted(pathlib.Path(".github/workflows").glob("*.yml")):
+              try:
+                  yaml.safe_load(path.read_text())
+              except Exception as exc:
+                  bad.append(f"{path}: {exc}")
+          print("\\n".join(bad) or f"{len(list(pathlib.Path('.github/workflows').glob('*.yml')))} workflow file(s) OK")
+          sys.exit(1 if bad else 0)
+          PYX
+
+      - name: Container image builds and starts
+        # A build alone would not have caught a virtualenv relocated to a different path or a data
+        # directory the container user cannot write; this starts the image and asks it for /healthz.
+        run: |
+          set -euo pipefail
+          docker build -t advisory-radar:ci .
+          tmp=$(mktemp -d)
+          mkdir -p "$tmp/config" "$tmp/data"
+          printf 'sources: []\nnotifiers: []\nstate_path: /data/state.json\nweb:\n  port: 8080\n' > "$tmp/config/config.yml"
+          chmod -R a+rwX "$tmp"
+          docker run -d --name radar-ci -p 18080:8080 \
+            -v "$tmp/config:/config:ro" -v "$tmp/data:/data" \
+            -e ADVISORY_RADAR_AUTH_TOKEN=ci-token advisory-radar:ci
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/healthz >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:18080/healthz
+          # the state file must be writable by the container user
+          docker exec radar-ci python -c "import pathlib; pathlib.Path('/data/probe').write_text('x')"
+          docker logs radar-ci | tail -20
+          docker rm -f radar-ci
+
       - name: Secret scan
         # pinned binary + reviewed digest: the v2 action fails on stderr noise and needs a token for PR scans
         run: |

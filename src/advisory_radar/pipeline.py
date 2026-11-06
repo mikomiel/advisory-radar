@@ -1,0 +1,321 @@
+"""One pass of the pipeline: fetch sources, classify, re-evaluate, deliver."""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections.abc import Callable, Mapping
+from pathlib import Path
+
+from . import core
+from .config import Config
+from .http import Http, RedactFilter, urllib_http
+from .kev import load_kev
+from .notifiers import build_notifier
+from .plugins import Source, SourceWindow
+from .sources import build_source
+from .state import LockBusy, SourceError, load_state_document, save_state, state_lock
+from .watchlist import load_policy
+
+LOG = logging.getLogger("advisory_radar")
+
+KEV_CACHE_NAME = "kev.json"
+
+
+def _namespaced(item: core.Item, source_id: str) -> core.Item:
+    """Give an item a source-scoped guid: two feeds may both publish guid ``1`` for unrelated advisories."""
+    return core.Item(
+        f"{source_id}:{item.guid}",
+        item.title,
+        item.link,
+        item.summary,
+        item.published,
+        item.explicit,
+        item.source_title,
+        item.source_url,
+    )
+
+
+def _source_windows(state: dict) -> dict:
+    return state.setdefault("windows", {})
+
+
+def run_pass(
+    cfg: Config,
+    sources: list[Source],
+    notifiers: list,
+    *,
+    http: Http = urllib_http,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+    dry_run: bool = False,
+    lock_blocking: bool = True,
+) -> int:
+    """Run one pass under the state lock: exit 0 when every owed message landed, 1 on any fault.
+
+    The lock is held for the whole read/classify/deliver/write transaction, so the scheduler, the web
+    UI's "run now" and a CLI ``once`` can never deliver the same pending message twice or overwrite each
+    other's state. ``lock_blocking=False`` returns 1 immediately when another pass holds it.
+    """
+    if dry_run:
+        return _run_pass(cfg, sources, notifiers, http=http, clock=clock, sleep=sleep, dry_run=True)
+    try:
+        with state_lock(cfg.state_path, blocking=lock_blocking):
+            return _run_pass(cfg, sources, notifiers, http=http, clock=clock, sleep=sleep, dry_run=False)
+    except LockBusy:
+        LOG.warning("another pass holds the state lock; skipped this run")
+        return 1
+
+
+def _run_pass(
+    cfg: Config,
+    sources: list[Source],
+    notifiers: list,
+    *,
+    http: Http,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+    dry_run: bool,
+) -> int:
+    """The pass itself; ``run_pass`` owns the state lock around it."""
+    now = int(clock())
+    try:
+        stored = load_state_document(cfg.state_path, core.STATE_SCHEMA, "advisory state")
+    except SourceError as exc:
+        LOG.error("%s; not re-seeding", exc)
+        return 1
+    policy = load_policy(cfg.watchlist_path) if cfg.watchlist_path else _default_policy()
+    core.HIDDEN_SOURCE_HOSTS = cfg.hidden_source_hosts
+
+    state = core.new_state() if stored is None else stored
+    state.setdefault("parked", [])
+    core._prune(state, now)
+    # Both of these must come from the state document that is actually written: a detached dict never
+    # reaches disk, so the first window was lost and the 24h cache was never persisted.
+    windows = _source_windows(state)
+    stored_windows = dict(windows)  # what the previous pass observed, for the gap check
+    cache = state.setdefault("cache", {})
+    live_guids: set[str] = set()
+    gap = False
+    source_ok = True
+    kev, kev_known = load_kev(http, cfg.state_path.with_name(KEV_CACHE_NAME), save=not dry_run)
+    intel = core.Intel(http, cache, clock, sleep)
+    # Re-evaluate before classification: both share one NVD budget, and a busy news day must not starve a due
+    # watch of the measurement that could escalate it. A watch created later this pass is evaluated next pass.
+    core.reevaluate(state, intel, kev, kev_known, now, "")
+
+    fetched_ids: set[str] = set()
+    answered: list[tuple[object, object]] = []
+    for source in sources:
+        try:
+            window = source.fetch(http, state)
+        except Exception as exc:  # a source fault fails the pass but keeps state
+            LOG.error("source %s: %s: %s; state kept", source.id, type(exc).__name__, exc)
+            source_ok = False
+            continue  # other sources still bootstrap; this one is seeded when it first answers
+        window = SourceWindow(
+            source.id,
+            tuple(_namespaced(item, source.id) for item in window.items),
+            window.truncated,
+            window.host,
+        )
+        previous = stored_windows.get(source.id)
+        # Only a source that knows its own page size can prove it returned a complete window (a FreshRSS
+        # export, a changedetection watch). An RSS/Atom feed is bounded by its publisher, so a rotation
+        # there is undetectable; see README, "Sources".
+        # An empty previous window proves nothing: the source had no entries, so "no overlap" is expected and a
+        # gap there would reject every later full window forever.
+        if window.truncated and previous and not set(previous) & {item.guid for item in window.items}:
+            LOG.error(
+                "source %s: window gap: the window is full (%d entries) and shares none with the previous "
+                "pass; items may have been missed. Keeping the last trusted window and deferring this source",
+                source.id,
+                len(window.items),
+            )
+            # Fail closed: do not adopt a window we cannot trust. The next pass compares against the same
+            # trusted window, so a genuinely recovered export clears the gap and a damaged one keeps failing.
+            gap = True
+            continue
+        fetched_ids.add(source.id)
+        live_guids.update(item.guid for item in window.items)
+        # The window is written together with the results below: advancing it here would let a checkpoint
+        # after another source persist this one's new window before its candidates were classified.
+        answered.append((source, window))
+
+    carried = state.setdefault("carry", {})
+    enabled_ids = {source.id for source in sources}
+    answered_now = {source.id for source, _ in answered}
+    # Only a source that still exists may push work through carry.
+    for stale in [sid for sid in carried if sid not in enabled_ids]:
+        carried.pop(stale, None)
+
+    # One work list for fairness: freshly fetched sources and sources whose only remaining work is carried
+    # candidates. A busy healthy source must not take every slot while a failed source's captured candidates
+    # wait, so both kinds share the rotation and the per-source share.
+    units: list[tuple[object, object]] = [(source, window) for source, window in answered]
+    units += [(source, None) for source in sources if source.id not in answered_now and carried.get(source.id)]
+    if len(units) > 1:
+        turn = int(state.get("classify_turn", 0)) % len(units)
+        units = units[turn:] + units[:turn]
+        state["classify_turn"] = turn + 1
+
+    for source, window in units:
+        if window is None:
+            host = ""
+            items = []
+        else:
+            host = window.host
+            items = []
+            for item in window.items:
+                if core.passes_filter(item, policy):
+                    items.append(item)
+                elif source.kind == "webhook":
+                    # An out-of-scope webhook entry gets a terminal disposition, so the inbox can release it
+                    # instead of letting irrelevant entries fill the capacity that real advisories need.
+                    state["seen"].setdefault(f"src:{source.id}:{item.guid}", {"at": now, "outcome": "filtered"})
+        # Items carried from an earlier pass come first: the window they arrived in is already gone.
+        earlier = [core.item_from_state(row) for row in carried.pop(source.id, [])]
+        # The policy may have changed while these waited: scope applies at classification time, not arrival.
+        earlier = [item for item in earlier if core.passes_filter(item, policy)]
+        trusted = {item.guid for item in earlier}
+        if earlier:
+            known = {item.guid for item in items}
+            items = [item for item in earlier if item.guid not in known] + items
+        seeded = state.setdefault("seeded", {})
+        if source.id not in seeded:
+            # Bootstrap is per source: a source that failed on the first pass must still be seeded when it
+            # recovers, or its history would be delivered as news.
+            candidates = core.seed(state, items, now)
+            seeded[source.id] = True
+            LOG.info(
+                "first run on %s: %d older item(s) marked delivered, %d recent item(s) queued",
+                source.id,
+                len(items) - len(candidates),
+                len(candidates),
+            )
+        else:
+            candidates = items
+        left = core.classify_new(
+            state,
+            candidates,
+            intel,
+            kev,
+            kev_known,
+            now,
+            host,
+            policy,
+            share=max(1, core.DELIVERY_CAP // max(1, len(units))),
+            trusted=trusted,
+        )
+        if left:
+            carried[source.id] = [core.item_to_state(item) for item in left]
+        if window is not None:
+            windows[source.id] = [item.guid for item in window.items]
+        # A source that tracks a cursor advances it only now: the same write carries the candidates, so a crash
+        # between fetch and classification cannot skip an advisory forever.
+        commit = getattr(source, "commit", None)
+        if commit is not None:
+            commit(state)
+        if source.kind == "webhook":
+            # An entry is done once every identity it can be known by is claimed: the ids its text names, and the
+            # source-scoped identity used for an entry that names none. Both namespaces must match what
+            # classification records, or a delivered entry stays in the inbox forever.
+            inbox = state.get("webhook_inbox", {}).get(source.id, [])
+            claimed = core._claimed(state)
+            kept = []
+            for entry in inbox:
+                # The identity classification records for an id-less item: guids are namespaced per source,
+                # so the claim is `src:{source}:{guid}`.
+                identities = core.extract_ids(
+                    str(entry.get("title", "")), str(entry.get("summary", "")), str(entry.get("link", ""))
+                ) or (f"src:{source.id}:{entry.get('guid', '')}",)
+                if not all(identifier in claimed for identifier in identities):
+                    kept.append(entry)
+            if kept:
+                state.setdefault("webhook_inbox", {})[source.id] = kept
+            else:
+                state.get("webhook_inbox", {}).pop(source.id, None)
+
+        if not dry_run:
+            save_state(cfg.state_path, state)
+
+    if not carried:
+        state.pop("carry", None)  # only after every source has written into the attached dict
+
+    if stored is None and not fetched_ids and not cfg.adobe_commerce:
+        LOG.error("no source could be read on the first pass; nothing to persist")
+        return 1
+
+    # Prune once, against every window fetched this pass, and only for sources that answered: a source
+    # outage must not wipe that source's retry deadlines.
+    # Carried candidates keep their retry clocks: they are no longer in any window but are still owed a pass.
+    carried_guids = {
+        str(row.get("guid"))
+        for rows in (state.get("carry") or {}).values()
+        if isinstance(rows, list)
+        for row in rows
+        if isinstance(row, dict)
+    }
+    for key in ("enrich_retry", "enrich_pending"):
+        kept = {
+            guid
+            for guid in (state.get(key) or {})
+            if guid.split(":", 1)[0] not in fetched_ids or guid in live_guids or guid in carried_guids
+        }
+        core._prune_enrich_clock(state, key, kept)
+
+    adobe_ok = core.adobe_pass(state, http, kev, kev_known, now) if cfg.adobe_commerce else True
+
+    if dry_run:
+        for entry in state["pending"][: core.DELIVERY_CAP]:
+            print(f"[dry-run] tag={entry['tag']}\n{entry['title']}\n{entry['body']}")
+        LOG.info("dry run: nothing sent, no state written")
+        return 0 if source_ok and adobe_ok and not gap else 1
+
+    save_state(cfg.state_path, state)  # pending is durable before the first POST
+    queued, parked_before = len(state["pending"]), len(state["parked"])
+    if not notifiers and state["pending"]:
+        LOG.error(
+            "no enabled notifiers: %d message(s) stay pending until one is configured",
+            len(state["pending"]),
+        )
+        delivered = False
+    else:
+        delivered = core.deliver(state, notifiers, http, now, persist=lambda: save_state(cfg.state_path, state))
+    save_state(cfg.state_path, state)
+    newly_parked = len(state["parked"]) - parked_before
+    sent = queued - len(state["pending"]) - newly_parked
+    LOG.info("pass: %d sent, %d parked, %d pending", sent, newly_parked, len(state["pending"]))
+    if state["parked"]:
+        LOG.warning(
+            "%d message(s) parked, newest %s; run release-parked or drop-parked",
+            len(state["parked"]),
+            core._audit_ids(state["parked"][-1]),
+        )
+    code = 0 if delivered and not state["parked"] and not gap and adobe_ok and source_ok else 1
+    runs = state.setdefault("runs", [])
+    runs.append({"at": now, "sent": sent, "parked": newly_parked, "pending": len(state["pending"]), "code": code})
+    del runs[:-200]
+    save_state(cfg.state_path, state)  # the run record is part of the state, so it must be saved
+    return code
+
+
+def state_cache(stored: dict | None) -> dict:
+    return stored["cache"] if stored is not None else {}
+
+
+def _default_policy():
+    """The packaged default watchlist (allow every Debian package, no product scope)."""
+    return load_policy(Path(__file__).with_name("watchlist.default.json"))
+
+
+def build_plugins(cfg: Config, env: Mapping[str, str]):
+    sources = [build_source(dict(entry), env) for entry in cfg.sources]
+    notifiers = [build_notifier(dict(entry), env) for entry in cfg.notifiers]
+    return sources, notifiers
+
+
+def attach_redaction(secrets: list[str]) -> RedactFilter:
+    redactor = RedactFilter(secrets)
+    LOG.addFilter(redactor)
+    return redactor

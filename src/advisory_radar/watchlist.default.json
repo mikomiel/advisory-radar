@@ -1,0 +1,6 @@
+{
+  "schema": "security-watchlist.v1",
+  "debian_source_packages": ["*"],
+  "excluded_products": [],
+  "products": []
+}

@@ -1,0 +1,25 @@
+# Quickstart: docker compose up -d
+# Secrets go in .env (gitignored) or your orchestrator's secret mechanism:
+#   ADVISORY_RADAR_AUTH_TOKEN=...
+#   DISCORD_WEBHOOK_URL=...
+services:
+  advisory-radar:
+    image: ghcr.io/mikomiel/advisory-radar:latest
+    # The image's own user is UID 10001; run as you instead, so ./data stays writable without a chown.
+    user: "${ADVISORY_RADAR_UID:-1000}:${ADVISORY_RADAR_GID:-1000}"
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/config:ro
+      - ./data:/data
+    env_file:
+      - .env
+    environment:
+      ADVISORY_RADAR_CONFIG: /config/config.yml
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

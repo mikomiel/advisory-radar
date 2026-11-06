@@ -5,28 +5,28 @@
 # How often sources are polled (ISO 8601 duration-ish; default 15m).
 poll_interval: 15m
 
-# Where state is kept inside the container (default /data/state.db).
-state_path: /data/state.db
+# Where state is kept inside the container.
+state_path: /data/state.json
 
 sources:
   - id: nodejs-security
     type: rss
     url: https://nodejs.org/en/feed/vulnerability.xml
-  # - id: my-watch
+  # - id: freshrss
+  #   type: freshrss
+  #   url: https://freshrss.example.com
+  #   token: ${FRESHRSS_TOKEN}
+  # - id: page-watches
   #   type: changedetection
   #   url: https://changedetection.example.com
   #   api_key: ${CHANGEDETECTION_API_KEY}
+  #   tag: security          # optional: only watches with this tag
   # - id: inbox
-  #   type: webhook   # receives POST /webhooks/generic at runtime
+  #   type: webhook          # receives POST /webhooks/inbox (set ADVISORY_RADAR_WEBHOOK_SECRET)
 
-watchlist:
-  # Product names/aliases your deployment runs; advisories naming only
-  # unlisted products are filtered out.
-  products:
-    - nodejs
-    - postgresql
-    - nginx
-  excluded_products: []
+# Scope alerts to what you run. Point at a watchlist file (JSON, format in the
+# README); without one, every advisory that arrives is judged.
+# watchlist: /config/watchlist.json
 
 notifiers:
   - id: discord
@@ -37,10 +37,28 @@ notifiers:
   #   url: http://apprise:8000
   #   key: alerts
   #   password: ${APPRISE_PASSWORD}
+  # - id: hooks
+  #   type: webhook
+  #   url: https://hooks.example.com/advisory-radar
+  # - id: matrix
+  #   type: matrix_webhook
+  #   url: ${MATRIX_HOOKSHOT_WEBHOOK}
+  # - id: ntfy
+  #   type: ntfy
+  #   url: https://ntfy.example.com
+  #   topic: security-alerts
+  # - id: mail
+  #   type: smtp
+  #   host: smtp.example.com
+  #   port: 587
+  #   use_tls: true        # STARTTLS on the submission port (587)
+  #   from: radar@example.com
+  #   to: admin@example.com
+  #   username: radar@example.com
+  #   password: ${SMTP_PASSWORD}
 
 # Web UI listen address inside the container.
 web:
   host: 0.0.0.0
   port: 8080
-  # Session auth token; set via env, never in this file.
-  auth_token: ${ADVISORY_RADAR_AUTH_TOKEN}
+  # The session auth token is env-only: ADVISORY_RADAR_AUTH_TOKEN.
