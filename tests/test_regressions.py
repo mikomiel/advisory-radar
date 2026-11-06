@@ -2327,3 +2327,60 @@ def test_a_percentile_only_epss_row_is_a_failed_measurement():
             return 404, None
 
     assert Intel().cves(["CVE-2026-1234"])["CVE-2026-1234"].complete is False
+
+
+# ---------------------------------------------------------------------------
+# Thirty-ninth review round
+
+
+def test_a_claimed_ghsa_does_not_promote_a_new_low_finding():
+    """An advisory already delivered is not evidence about the new finding in this item."""
+    state = core.new_state()
+    claimed_ghsa = "GHSA-aaaa-bbbb-cccc"
+    state["seen"][claimed_ghsa] = {"at": NOW - 7200, "outcome": "delivered"}
+    item = core.Item(
+        "g1",
+        "GHSA-aaaa-bbbb-cccc and CVE-2026-2222",
+        "https://vendor.example.com/a",
+        "notes",
+        NOW - 60,
+        (claimed_ghsa, "CVE-2026-2222"),
+    )
+
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(lambda *a: (404, {}, b""), {}, lambda: float(NOW), lambda s: None)
+
+        def ghsa(self, ghsa):
+            return core.OsvFacts((), 9.8, True)  # the already-delivered advisory is CRITICAL
+
+    policy = core.Policy(("curl",), (), ())
+    core.classify_new(
+        state,
+        [item],
+        Intel(),
+        frozenset(),
+        True,
+        NOW,
+        "vendor.example.com",
+        policy,
+    )
+    tags = [entry["tag"] for entry in state["pending"]]
+    assert "critical" not in tags, "a claimed advisory must not promote the new finding"
+
+
+def test_a_plugin_type_error_does_not_echo_the_expanded_value(tmp_path, caplog):
+    import logging
+
+    from advisory_radar import cli
+
+    path = tmp_path / "c.yml"
+    path.write_text(
+        "sources: []\nnotifiers:\n  - id: n\n    type: ${NOTIFIER_KIND}\n    url: https://hooks.example.com/x\n"
+        "state_path: " + str(tmp_path / "state.json") + "\n"
+    )
+    env = {"NOTIFIER_KIND": "https://hooks.example.com/SUPERSECRET"}
+    with caplog.at_level(logging.ERROR):
+        code = cli.main(["--config", str(path), "once"], env=env)
+    assert code == 1, "a bad plugin type is a configuration error, not a traceback"
+    assert "SUPERSECRET" not in caplog.text

@@ -64,7 +64,13 @@ def main(
         return 1
     redactor = pipeline.attach_redaction(secret_values(cfg))
     try:
-        sources, notifiers = pipeline.build_plugins(cfg, environment)
+        try:
+            sources, notifiers = pipeline.build_plugins(cfg, environment)
+        except (ValueError, KeyError) as exc:
+            # Inside the redacted block: a builder error would otherwise traceback unredacted, and plugin
+            # fields are expanded from the environment.
+            LOG.error("plugin configuration: %s", exc)
+            return 1
         if args.command == "release-parked":
             with state_lock(cfg.state_path):
                 return core.manage_parked(cfg.state_path, release=True, now=int(clock()))

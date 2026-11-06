@@ -90,5 +90,6 @@ def build_notifier(cfg: dict, env: dict[str, str]):
     builder = NOTIFIER_BUILDERS.get(kind or "")
     if builder is None:
         builtins = ", ".join(sorted(NOTIFIER_BUILDERS))
-        raise ValueError(f"unknown notifier type {kind!r} (id {cfg.get('id')!r}); built-ins: {builtins}")
+        # No value in the message: `type` is expanded from the environment too, and the CLI logs this error.
+        raise ValueError(f"unknown notifier type (id {cfg.get('id')!r}); built-ins: {builtins}")
     return builder(cfg, env)

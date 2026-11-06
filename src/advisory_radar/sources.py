@@ -66,7 +66,7 @@ def build_source(cfg: dict, env: dict[str, str]) -> Source:
     kind = cfg.get("type")
     builder = SOURCE_BUILDERS.get(kind or "")
     if builder is None:
-        raise ValueError(f"unknown source type {kind!r} (id {cfg.get('id')!r}); built-ins: {sorted(SOURCE_BUILDERS)}")
+        raise ValueError(f"unknown source type (id {cfg.get('id')!r}); built-ins: {sorted(SOURCE_BUILDERS)}")
     return builder(cfg, env)
 
 

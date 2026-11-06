@@ -1490,8 +1490,9 @@ def classify_new(
                     aliased_scored = True
                     for alias in osv.cves:
                         osv_fallbacks[alias] = max(osv_fallbacks.get(alias, 0.0), osv.cvss)
-                else:
-                    # The advisory has no CVE alias, so its label is its only severity evidence.
+                elif ghsa not in claimed:
+                    # An alias-free advisory is its own severity evidence - unless it was already delivered,
+                    # in which case it says nothing about the new finding this item carries.
                     independent_scored = True
                     independent_ghsa_cvss = max(independent_ghsa_cvss or 0.0, osv.cvss)
         vendor_ids = [identifier for identifier in explicit if identifier.startswith(("PSA-", "DSA-"))]
