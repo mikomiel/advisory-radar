@@ -894,10 +894,10 @@ def test_an_osv_score_never_judges_an_unrelated_cve():
         True,
         3.9,
         True,
-        osv_fallback_for={"CVE-2026-8888"},
+        osv_fallbacks={"CVE-2026-8888": 3.9},
     )
     assert verdict.tag == "warning", "an unrelated LOW score must not suppress this CVE"
-    aliased = core.judge(["CVE-2026-7777"], facts, frozenset(), True, 3.9, True, osv_fallback_for={"CVE-2026-7777"})
+    aliased = core.judge(["CVE-2026-7777"], facts, frozenset(), True, 3.9, True, osv_fallbacks={"CVE-2026-7777": 3.9})
     assert aliased.tag == "suppressed"
 
 
@@ -946,3 +946,50 @@ def test_a_damaged_kev_cache_is_not_a_known_catalog(tmp_path):
 
     cves, known = load_kev(http, cache, save=False)
     assert cves == frozenset() and known is False
+
+
+def test_a_two_ghsa_item_does_not_lend_one_score_to_the_others_cve():
+    facts = {"CVE-2026-7777": core.CveFacts(None, None, None, None, True)}
+    verdict = core.judge(["CVE-2026-7777"], facts, frozenset(), True, 3.9, True, osv_fallbacks={})
+    assert verdict.tag == "warning", "no GHSA aliases this CVE, so no OSV score judges it"
+
+
+def test_delivery_persists_each_acknowledgement():
+    state = core.new_state()
+    entry = {
+        "kind": "new",
+        "tag": "warning",
+        "title": "t",
+        "body": "b",
+        "ids": ["src:x"],
+        "cves": [],
+        "levels": {},
+        "source": "s",
+        "link": "",
+        "first_attempt_at": NOW,
+    }
+    state["pending"].append(entry)
+    calls = []
+    core.deliver(state, [Notifier(200), ExplodingNotifier()], http_for({}), NOW, persist=lambda: calls.append(1))
+    assert calls, "a successful channel must be persisted before the next one is attempted"
+    assert state["pending"][0]["sent_to"] == ["fake"]
+
+
+def test_an_empty_kev_cache_is_not_a_known_catalog(tmp_path):
+    from advisory_radar.kev import KEV_CACHE_SCHEMA, load_kev
+    from advisory_radar.state import save_state
+
+    for payload in ({"schema": KEV_CACHE_SCHEMA}, {"schema": KEV_CACHE_SCHEMA, "cves": []}):
+        cache = tmp_path / f"kev-{len(payload)}.json"
+        save_state(cache, payload)
+        cves, known = load_kev(lambda *a: (500, {}, b""), cache, save=False)
+        assert cves == frozenset() and known is False
+
+
+def test_a_zero_poll_interval_is_refused(tmp_path):
+    from advisory_radar.config import ConfigError
+
+    path = tmp_path / "c.yml"
+    path.write_text("sources: []\nnotifiers: []\npoll_interval: 0s\n")
+    with pytest.raises(ConfigError):
+        load_config(path, {})

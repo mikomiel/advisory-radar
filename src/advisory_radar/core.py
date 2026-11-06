@@ -927,7 +927,7 @@ def judge(
     kev_known: bool,
     osv_cvss: float | None,
     osv_complete: bool = True,
-    osv_fallback_for: frozenset[str] | set[str] = frozenset(),
+    osv_fallbacks: Mapping[str, float] | None = None,
 ) -> Verdict:
     """Item verdict from the CVEs it names; the CVE that decides is the one shown.
 
@@ -944,8 +944,15 @@ def judge(
             else metrics_line(osv_cvss, None, None, None, False, approximate=True)
         )
         return Verdict("warning", (), line, "" if osv_complete else incomplete_note)
+    fallbacks = osv_fallbacks or {}
     judged = {
-        cve: level_of(facts[cve], cve in kev, kev_known, osv_cvss if cve in osv_fallback_for else None) for cve in cves
+        cve: level_of(
+            facts[cve],
+            cve in kev,
+            kev_known,
+            fallbacks.get(cve),
+        )
+        for cve in cves
     }
     # An unscored CVE (past the lookup cap) is not watched unless a critical signal names it.
     levels = tuple((cve, level) for cve, (level, _) in judged.items() if not facts[cve].skipped or level == "critical")
@@ -1305,14 +1312,16 @@ def classify_new(
         ghsas = [identifier for identifier in explicit if identifier.startswith("GHSA-")]
         osv_cvss: float | None = None
         osv_complete = True
-        osv_aliases: set[str] = set()
+        #: CVE -> the score of the GHSA that aliases it, so one advisory's LOW cannot judge another's CVE.
+        osv_fallbacks: dict[str, float] = {}
         for ghsa in ghsas:
             osv = intel.ghsa(ghsa)
             osv_complete = osv_complete and osv.complete
             cves += [cve for cve in osv.cves if cve not in cves]
-            osv_aliases.update(osv.cves)
             if osv.cvss is not None:
                 osv_cvss = max(osv_cvss or 0.0, osv.cvss)
+                for alias in osv.cves:
+                    osv_fallbacks[alias] = max(osv_fallbacks.get(alias, 0.0), osv.cvss)
         vendor_ids = [identifier for identifier in explicit if identifier.startswith(("PSA-", "DSA-"))]
         identity = cves or ghsas or vendor_ids or [f"src:{item.guid}"]
         ids = list(dict.fromkeys([*explicit, *identity, *own]))
@@ -1336,7 +1345,7 @@ def classify_new(
             kev_known,
             osv_cvss,
             osv_complete and not unenriched,
-            osv_fallback_for=osv_aliases,
+            osv_fallbacks=osv_fallbacks,
         )
         if unenriched and verdict.tag == "warning":
             verdict = replace(verdict, note=ENRICH_FAILED_NOTE)
@@ -1779,7 +1788,14 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
 # Delivery
 
 
-def deliver(state: dict, notifiers: Sequence, http: Http, now: int) -> bool:
+def deliver(
+    state: dict,
+    notifiers: Sequence,
+    http: Http,
+    now: int,
+    *,
+    persist: Callable[[], None] | None = None,
+) -> bool:
     """POST up to DELIVERY_CAP pending messages to every notifier; False when a failure stopped the pass.
 
     A failed message stays at the head and stops the pass, so order is kept. Its
@@ -1809,6 +1825,10 @@ def deliver(state: dict, notifiers: Sequence, http: Http, now: int) -> bool:
                 status = 0
             if 200 <= status < 300:
                 already.add(notifier.id)
+                if persist is not None:
+                    # Persist the acknowledgement now: a shutdown between channels must not resend it.
+                    entry["sent_to"] = sorted(already)
+                    persist()
             statuses.append(status)
         if all(200 <= status < 300 for status in statuses):
             entry.pop("sent_to", None)

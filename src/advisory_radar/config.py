@@ -137,6 +137,7 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
     match = re.fullmatch(r"(\d+)([smh])", str(poll))
     _require(match is not None, "poll_interval must look like 15m, 30s or 12h")
     seconds = int(match.group(1)) * {"s": 1, "m": 60, "h": 3600}[match.group(2)]
+    _require(seconds > 0, "poll_interval must be greater than zero")
 
     web = document.get("web") or {}
     _require(isinstance(web, dict), "web must be a mapping")

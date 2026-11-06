@@ -32,10 +32,13 @@ def load_kev(http: Http, cache_path: Path, *, save: bool) -> tuple[frozenset[str
         cached = load_state_document(cache_path, KEV_CACHE_SCHEMA, "kev cache") or {}
     except (OSError, SourceError):
         cached = {}  # A cache is rebuilt, never trusted over a fresh fetch.
-    if not isinstance(cached.get("cves", []), list) or any(
-        not isinstance(cve, str) or not KEV_ID_RE.match(cve.upper()) for cve in cached.get("cves", [])
+    cached_cves = cached.get("cves")
+    if (
+        not isinstance(cached_cves, list)
+        or not cached_cves
+        or any(not isinstance(cve, str) or not KEV_ID_RE.match(cve.upper()) for cve in cached_cves)
     ):
-        cached = {}  # a damaged cache must not masquerade as a known empty catalog
+        cached = {}  # a damaged or empty cache must not masquerade as a known empty catalog
     headers = {"Accept": "application/json"}
     if cached.get("etag"):
         headers["If-None-Match"] = cached["etag"]

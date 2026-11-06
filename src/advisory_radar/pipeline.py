@@ -198,7 +198,7 @@ def _run_pass(
         )
         delivered = False
     else:
-        delivered = core.deliver(state, notifiers, http, now)
+        delivered = core.deliver(state, notifiers, http, now, persist=lambda: save_state(cfg.state_path, state))
     save_state(cfg.state_path, state)
     newly_parked = len(state["parked"]) - parked_before
     sent = queued - len(state["pending"]) - newly_parked
