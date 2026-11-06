@@ -1421,8 +1421,12 @@ def test_the_carry_map_survives_a_source_that_finishes_first(tmp_path):
     first = [item("a1", "first source advisory")]
     many = [item(f"b{index}", f"second source advisory {index}") for index in range(12)]
     pipeline.run_pass(
-        cfg, [WindowSource("s1", first), WindowSource("s2", many)], [notifier], http=http_for({}),
-        clock=lambda: float(NOW), sleep=lambda s: None,
+        cfg,
+        [WindowSource("s1", first), WindowSource("s2", many)],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
     )
     state = json.loads(cfg.state_path.read_text())
     assert "s2" in state.get("carry", {}), "the overflowing source's items are retained"
