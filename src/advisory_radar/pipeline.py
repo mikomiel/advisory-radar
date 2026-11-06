@@ -108,7 +108,7 @@ def _run_pass(
     answered: list[tuple[object, object]] = []
     for source in sources:
         try:
-            window = source.fetch(http)
+            window = source.fetch(http, state)
         except Exception as exc:  # a source fault fails the pass but keeps state
             LOG.error("source %s: %s: %s; state kept", source.id, type(exc).__name__, exc)
             source_ok = False
@@ -204,6 +204,25 @@ def _run_pass(
             carried[source.id] = [core.item_to_state(item) for item in left]
         if window is not None:
             windows[source.id] = [item.guid for item in window.items]
+        if source.kind == "webhook":
+            inbox = state.get("webhook_inbox", {}).get(source.id, [])
+            claimed = core._claimed(state)
+            kept = [
+                entry
+                for entry in inbox
+                if not all(
+                    identifier in claimed
+                    for identifier in core.extract_ids(
+                        str(entry.get("title", "")), str(entry.get("summary", "")), str(entry.get("link", ""))
+                    )
+                    or (f"src:{entry.get('guid', '')}",)
+                )
+            ]
+            if kept:
+                state.setdefault("webhook_inbox", {}).setdefault(source.id, kept)
+            else:
+                state.get("webhook_inbox", {}).pop(source.id, None)
+
         if not dry_run:
             save_state(cfg.state_path, state)
 

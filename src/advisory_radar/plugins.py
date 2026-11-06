@@ -28,11 +28,16 @@ class SourceWindow:
 
 
 class Source(Protocol):
-    """A configured feed-like input. ``fetch`` must be idempotent and bounded."""
+    """A configured feed-like input. ``fetch`` must be idempotent and bounded.
+
+    ``state`` is the pipeline's persistent state document; sources keep their
+    own per-source maps under ``state[source.kind][source.id]``.
+    """
 
     id: str
+    kind: str
 
-    def fetch(self, http: Http) -> SourceWindow: ...
+    def fetch(self, http: Http, state: dict) -> SourceWindow: ...
 
 
 class Notifier(Protocol):

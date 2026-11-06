@@ -70,9 +70,9 @@ turns critical, and never re-sends what you already received.
 
 ## Features
 
-- Configurable source plugins: RSS/Atom, FreshRSS (GReader API), changedetection.io (API poll + inbound webhook), generic inbound webhook, Adobe APSB, Debian DSA, PHP ChangeLog, Node.js security blog
+- Configurable source plugins: RSS/Atom, FreshRSS (GReader API), changedetection.io (API poll + inbound webhook), generic inbound webhook; vendor enrichment for Debian DSA, php.net ChangeLog, Node.js security blog, Adobe APSB bulletins
 - Enrichment plugins: CVE.org, NVD, FIRST EPSS, CISA KEV, OSV, Debian security tracker
-- Notifier plugins: Discord, Matrix, ntfy, Gotify, Apprise, generic webhook, SMTP
+- Notifier plugins: Discord webhook, Matrix (Hookshot), ntfy, Gotify, Apprise, generic webhook, SMTP
 - Severity decision per CVE with re-evaluation window and one escalation per level
 - Web UI + REST API, in-process scheduler (default every 15 min), atomic JSON state on a volume
 - Docker and Podman deployment (compose file + quadlet/kube YAML), `/healthz` and `/metrics`

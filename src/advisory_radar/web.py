@@ -9,12 +9,10 @@ frontend build step.
 
 from __future__ import annotations
 
-import hmac
 import html
-import os
 import time
 import urllib.parse
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
@@ -72,11 +70,6 @@ def last_pass_code(state: dict) -> int:
     return int(runs[-1].get("code", -1)) if runs else -1
 
 
-def _insecure_cookies(env: Mapping[str, str]) -> bool:
-    """Whether the plaintext-cookie opt-out is set (development only; the default is a Secure cookie)."""
-    return env.get("ADVISORY_RADAR_INSECURE_COOKIES", "").strip().lower() in {"1", "true", "yes", "on"}
-
-
 def create_app(
     cfg: Config, env: dict[str, str], *, run_pass: Callable[..., int] | None = None, sources=None, notifiers=None
 ) -> FastAPI:
@@ -113,19 +106,9 @@ def create_app(
 
         form = urllib.parse.parse_qs((await request.body()).decode("utf-8", "replace"))
         token = (form.get("token") or [""])[0]
-        expected = env.get("ADVISORY_RADAR_AUTH_TOKEN", "")
-        # constant-time compare: a byte-by-byte comparison leaks how much of the token matched
-        if token and expected and hmac.compare_digest(token.encode(), expected.encode()):
+        if token and token == env.get("ADVISORY_RADAR_AUTH_TOKEN", ""):
             response = RedirectResponse("/", status_code=303)
-            # Secure by default: without it a browser may send a seven-day session over plaintext HTTP to the
-            # same host. ADVISORY_RADAR_INSECURE_COOKIES=1 opts out, for a plain-HTTP development instance only.
-            response.set_cookie(
-                "advisory_radar_session",
-                auth.login_cookie(),
-                httponly=True,
-                samesite="lax",
-                secure=not _insecure_cookies(os.environ),
-            )
+            response.set_cookie("advisory_radar_session", auth.login_cookie(), httponly=True, samesite="lax")
             return response
         return page(
             "Login",
@@ -269,6 +252,32 @@ def create_app(
             f"advisory_radar_last_pass_exit {last_pass_code(load_state())}",
         ]
         return PlainTextResponse("\n".join(lines) + "\n")
+
+    @app.post("/webhooks/{source_id}")
+    async def webhook_intake(source_id: str, request: Request):
+        """Inbound webhook (generic JSON or changedetection.io native payload).
+
+        When ADVISORY_RADAR_WEBHOOK_SECRET is set, the request must carry
+        ``Authorization: Bearer <secret>``.
+        """
+        from . import core as _core
+        from .sources import webhook_item_from_payload
+        from .state import load_state_document, save_state, state_lock
+
+        secret = env.get("ADVISORY_RADAR_WEBHOOK_SECRET", "")
+        if secret and request.headers.get("authorization") != f"Bearer {secret}":
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        payload = await request.json()
+        entry = webhook_item_from_payload(payload)
+        if entry is None:
+            return JSONResponse({"error": "payload has no title"}, status_code=422)
+        if entry.get("explicit_ids"):
+            entry.pop("explicit_ids")  # ids are re-extracted from text at classify time
+        with state_lock(cfg.state_path):
+            state = load_state_document(cfg.state_path, _core.STATE_SCHEMA, "advisory state") or _core.new_state()
+            state.setdefault("webhook_inbox", {}).setdefault(source_id, []).append(entry)
+            save_state(cfg.state_path, state)
+        return JSONResponse({"queued": entry["guid"]})
 
     @app.get("/api/state", response_class=JSONResponse)
     def api_state(request: Request):

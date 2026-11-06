@@ -16,6 +16,13 @@ sources:
   #   type: freshrss
   #   url: https://freshrss.example.com
   #   token: ${FRESHRSS_TOKEN}
+  # - id: page-watches
+  #   type: changedetection
+  #   url: https://changedetection.example.com
+  #   api_key: ${CHANGEDETECTION_API_KEY}
+  #   tag: security          # optional: only watches with this tag
+  # - id: inbox
+  #   type: webhook          # receives POST /webhooks/inbox (set ADVISORY_RADAR_WEBHOOK_SECRET)
 
 # Scope alerts to what you run. Point at a watchlist file (JSON, format in the
 # README); without one, every advisory that arrives is judged.
@@ -33,6 +40,22 @@ notifiers:
   # - id: hooks
   #   type: webhook
   #   url: https://hooks.example.com/advisory-radar
+  # - id: matrix
+  #   type: matrix_webhook
+  #   url: ${MATRIX_HOOKSHOT_WEBHOOK}
+  # - id: ntfy
+  #   type: ntfy
+  #   url: https://ntfy.example.com
+  #   topic: security-alerts
+  # - id: mail
+  #   type: smtp
+  #   host: smtp.example.com
+  #   port: 587
+  #   use_tls: true
+  #   from: radar@example.com
+  #   to: admin@example.com
+  #   username: radar@example.com
+  #   password: ${SMTP_PASSWORD}
 
 # Web UI listen address inside the container.
 web:
