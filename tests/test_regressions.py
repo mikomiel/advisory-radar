@@ -188,6 +188,8 @@ def test_run_record_is_persisted(tmp_path):
 class WindowSource:
     """A source that returns a fixed window, so a test controls truncation and identity."""
 
+    kind = "rss"  # protocol versions after P1 read it
+
     def __init__(self, source_id: str, items, truncated: bool = False, host: str = "feeds.example.com") -> None:
         self.id = source_id
         self._items = tuple(items)
