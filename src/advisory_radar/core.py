@@ -425,17 +425,28 @@ def _best(scores: Sequence[tuple[float, bool]]) -> tuple[float | None, bool]:
     return top, any(remote for score, remote in scores if score == top)
 
 
-def _scores(metrics: object) -> list[tuple[float, bool]]:
-    found = []
+def _scores(metrics: object) -> tuple[list[tuple[float, bool]], bool]:
+    """(usable scores, whether a supported metric was present but unreadable).
+
+    A malformed supported metric means the severity was not fully measured: the caller must treat the facts as
+    incomplete, or a readable LOW beside an unreadable CRITICAL would authorize a suppression.
+    """
+    found: list[tuple[float, bool]] = []
+    malformed = False
     for metric in metrics if isinstance(metrics, list) else []:
         for key in ("cvssV4_0", "cvssV3_1", "cvssV3_0", "cvssV2_0"):
-            data = metric.get(key) if isinstance(metric, dict) else None
+            if not isinstance(metric, dict) or key not in metric:
+                continue
+            data = metric.get(key)
             if not isinstance(data, dict):
+                malformed = True
                 continue
             score = _bounded(data.get("baseScore"), 0.0, 10.0)
-            if score is not None:
+            if score is None:
+                malformed = True
+            else:
                 found.append((score, remote_unauth(data.get("vectorString"))))
-    return found
+    return found, malformed
 
 
 def _ssvc_exploitation(metrics: object) -> str | None:
@@ -458,12 +469,12 @@ def parse_cve_org(document: dict) -> tuple[float | None, str | None]:
     return cvss, ssvc
 
 
-def cve_org_facts(document: dict) -> tuple[float | None, str | None, bool]:
+def cve_org_facts(document: dict) -> tuple[float | None, str | None, bool, bool]:
     """``parse_cve_org`` plus whether a metric giving the chosen score is remote and unauthenticated (same source)."""
     containers = document.get("containers")
     containers = containers if isinstance(containers, dict) else {}
     cna = containers.get("cna")
-    cna_scores = _scores(cna.get("metrics") if isinstance(cna, dict) else None)
+    cna_scores, malformed = _scores(cna.get("metrics") if isinstance(cna, dict) else None)
     adp_scores: list[tuple[float, bool]] = []
     ssvc = None
     adps = containers.get("adp")
@@ -471,10 +482,12 @@ def cve_org_facts(document: dict) -> tuple[float | None, str | None, bool]:
         provider = adp.get("providerMetadata") if isinstance(adp, dict) else None
         if not isinstance(provider, dict) or provider.get("shortName") != "CISA-ADP":
             continue
-        adp_scores += _scores(adp.get("metrics"))
+        adp_found, adp_malformed = _scores(adp.get("metrics"))
+        adp_scores += adp_found
+        malformed = malformed or adp_malformed
         ssvc = ssvc or _ssvc_exploitation(adp.get("metrics"))
     cvss, remote = _best(cna_scores or adp_scores)
-    return cvss, ssvc, remote
+    return cvss, ssvc, remote, malformed
 
 
 def parse_nvd(document: dict) -> float | None:
@@ -616,7 +629,9 @@ class Intel:
         if not isinstance(identifier, str) or identifier.upper() != cve.upper():
             # A missing or different identity is not evidence about the requested CVE (an error body has none).
             return False, None, None, False
-        return (True, *cve_org_facts(document))
+        cvss, ssvc, remote, malformed = cve_org_facts(document)
+        # An unreadable supported metric means the severity was not measured in full: fail closed.
+        return (not malformed, cvss, ssvc, remote)
 
     def _nvd(self, cve: str) -> tuple[bool, float | None, bool]:
         self._sleep(NVD_PACE_SECONDS)

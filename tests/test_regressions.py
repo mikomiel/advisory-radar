@@ -2513,6 +2513,7 @@ def test_an_adobe_bulletin_outstanding_from_an_earlier_window_is_still_delivered
         },
     }
     # the next response no longer lists APSB26-01 at all
+    original_list, original_detail = core._adobe_list, core._adobe_detail
     core._adobe_list = lambda http, stored: (adobe_module.Bulletin("APSB26-02", None, ("CVE-2026-2",), "u"),)
     core._adobe_detail = lambda http, apsb: adobe_module.Detail((), (), (), "", False)
     try:
@@ -2520,8 +2521,7 @@ def test_an_adobe_bulletin_outstanding_from_an_earlier_window_is_still_delivered
         queued = [entry for entry in state["pending"] if "APSB26-01" in entry.get("ids", "")]
         assert queued, "a bulletin that rotated out of the list is still owed its message"
     finally:
-        del core._adobe_list
-        del core._adobe_detail
+        core._adobe_list, core._adobe_detail = original_list, original_detail
 
 
 def test_parked_queue_can_be_dropped_without_notifier_credentials(tmp_path):
@@ -2540,4 +2540,54 @@ def test_parked_queue_can_be_dropped_without_notifier_credentials(tmp_path):
     )
     code = cli.main(["--config", str(path), "drop-parked"], env={})  # the referenced variable is missing
     assert code == 0, "a state-only command must not need plugin credentials"
+    assert not load_state_document(state_path, core.STATE_SCHEMA, "state").get("parked")
+
+
+def test_an_unreadable_supported_cvss_metric_prevents_suppression():
+    """A readable LOW beside an unreadable CRITICAL must not authorize a suppression."""
+    document = {
+        "cveMetadata": {"cveId": "CVE-2026-1234"},
+        "containers": {
+            "cna": {
+                "metrics": [
+                    {"cvssV3_1": {"baseScore": 2.0, "vectorString": "AV:N/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N"}},
+                    {"cvssV4_0": {"baseScore": "not-a-number"}},
+                ]
+            }
+        },
+    }
+    cvss, _ssvc, _remote, malformed = core.cve_org_facts(document)
+    assert cvss == 2.0
+    assert malformed is True, "an unreadable supported metric makes the severity incomplete"
+
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda s: None)
+
+        def _get(self, url):
+            if "cve.org" in url or "cveawg" in url:
+                return 200, document
+            return 404, None
+
+    facts = Intel().cves(["CVE-2026-1234"])["CVE-2026-1234"]
+    assert facts.complete is False
+
+
+def test_parked_queue_recovery_survives_an_unbuildable_plugin(tmp_path):
+    """Recovery must not depend on a plugin that cannot even be built."""
+    from advisory_radar import cli
+    from advisory_radar.state import load_state_document
+
+    state_path = tmp_path / "state.json"
+    state = core.new_state()
+    state["parked"] = [{"kind": "alert", "tag": "warning", "title": "t", "body": "b", "ids": ["CVE-2026-1"]}]
+    core.save_state(state_path, state)
+    path = tmp_path / "c.yml"
+    path.write_text(
+        "sources: []\n"
+        "notifiers:\n  - id: n\n    type: no_such_notifier\n    url: ${WEBHOOK_URL_FILE}\n"
+        f"state_path: {state_path}\n"
+    )
+    code = cli.main(["--config", str(path), "drop-parked"], env={})
+    assert code == 0
     assert not load_state_document(state_path, core.STATE_SCHEMA, "state").get("parked")

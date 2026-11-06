@@ -69,7 +69,8 @@ class TestFactsParsing:
                 ],
             }
         }
-        cvss, ssvc, remote = core.cve_org_facts(document)
+        cvss, ssvc, remote, malformed = core.cve_org_facts(document)
+        assert malformed is False
         assert cvss == 9.8 and ssvc == "active" and remote is True
 
     def test_nvd_prefers_primary(self):

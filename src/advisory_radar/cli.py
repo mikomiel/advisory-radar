@@ -67,6 +67,12 @@ def main(
     try:
         # These only touch the state document: no source or notifier is built, so an unrelated plugin with a
         # missing credential cannot block recovery of an existing parked queue.
+        if args.command == "release-parked":
+            with state_lock(cfg.state_path):
+                return core.manage_parked(cfg.state_path, release=True, now=int(clock()))
+        if args.command == "drop-parked":
+            with state_lock(cfg.state_path):
+                return core.manage_parked(cfg.state_path, release=False, now=int(clock()))
         try:
             sources, notifiers = pipeline.build_plugins(cfg, environment)
         except (ValueError, KeyError) as exc:
@@ -74,12 +80,6 @@ def main(
             # fields are expanded from the environment.
             LOG.error("plugin configuration: %s", exc)
             return 1
-        if args.command == "release-parked":
-            with state_lock(cfg.state_path):
-                return core.manage_parked(cfg.state_path, release=True, now=int(clock()))
-        if args.command == "drop-parked":
-            with state_lock(cfg.state_path):
-                return core.manage_parked(cfg.state_path, release=False, now=int(clock()))
         if args.command == "test-notify":
             entry = {
                 "kind": "test",

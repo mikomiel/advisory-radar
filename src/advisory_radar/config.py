@@ -35,6 +35,8 @@ def _expand(value: object, env: dict[str, str], resolved: list[str] | None = Non
                     if resolved is not None:
                         resolved.append(contents)  # the value, not the path, is what must be redacted
                     return contents
+                if lenient:
+                    return match.group(0)  # a state-only command never builds the plugin that reads it
                 raise ConfigError(f"${{{name}_FILE}}: no readable file (env {name}_FILE={path!r})")
             if name not in env:
                 if lenient:
