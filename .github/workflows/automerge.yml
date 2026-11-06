@@ -61,17 +61,21 @@ jobs:
               continue
             fi
 
-            # The newest approving review must be for this exact head, by the configured identity.
-            approved=$(jq -r --arg reviewer "$REVIEWER_LOGIN" --arg head "$head" '
-              [.reviews[] | select(.state == "APPROVED" and .commit.oid == $head)]
-              | sort_by(.submittedAt) | last
-              | if . == null then "" else .author.login end' <<<"$meta")
-            if [ -z "$approved" ]; then
-              echo "skip #$pr: no approving review at head $head (a stale approval does not count)"
+            # The configured reviewer's own latest review decides, and only if it approved this exact head.
+            # Filtering by author first matters: a later human approval must not hide the bot's approval,
+            # and a bot "request changes" after an approval must win.
+            reviewer_state=$(jq -r --arg reviewer "$REVIEWER_LOGIN" '
+              [.reviews[] | select(.author.login == $reviewer)] | sort_by(.submittedAt) | last
+              | .state // ""' <<<"$meta")
+            reviewer_head=$(jq -r --arg reviewer "$REVIEWER_LOGIN" '
+              [.reviews[] | select(.author.login == $reviewer)] | sort_by(.submittedAt) | last
+              | .commit.oid // ""' <<<"$meta")
+            if [ "$reviewer_state" != "APPROVED" ]; then
+              echo "skip #$pr: $REVIEWER_LOGIN's latest review is '${reviewer_state:-none}', not APPROVED"
               continue
             fi
-            if [ "$approved" != "$REVIEWER_LOGIN" ]; then
-              echo "skip #$pr: approved by $approved, not $REVIEWER_LOGIN"
+            if [ "$reviewer_head" != "$head" ]; then
+              echo "skip #$pr: $REVIEWER_LOGIN approved $reviewer_head, head is $head (stale approval)"
               continue
             fi
 
@@ -84,7 +88,8 @@ jobs:
             fi
             failed=$(jq -r '[.statusCheckRollup[]
               | select(.conclusion == "FAILURE" or .conclusion == "CANCELLED"
-                       or .conclusion == "TIMED_OUT" or .conclusion == "ACTION_REQUIRED")] | length' <<<"$meta")
+                       or .conclusion == "TIMED_OUT" or .conclusion == "ACTION_REQUIRED"
+                       or .conclusion == "STARTUP_FAILURE")] | length' <<<"$meta")
             if [ "$failed" != "0" ]; then
               echo "skip #$pr: $failed failing check(s)"
               continue
@@ -92,9 +97,12 @@ jobs:
 
             # Merge now rather than installing a standing auto-merge order: a later push would move the
             # head past the review this check just validated.
-            if gh pr merge "$pr" --repo "$REPO" --squash; then
-              echo "merged #$pr at $head (approval by $approved)"
-              gh pr comment "$pr" --repo "$REPO" --body "Merged by automerge: $REQUIRED_CHECK green and approved at $head by $approved." || true
+            # --match-head-commit: if the head moved between the checks above and this call, GitHub refuses
+            # instead of merging a commit the reviewer never saw.
+            if gh pr merge "$pr" --repo "$REPO" --squash --match-head-commit "$head"; then
+              echo "merged #$pr at $head (approval by $REVIEWER_LOGIN)"
+              gh pr comment "$pr" --repo "$REPO" \
+                --body "Merged by automerge: $REQUIRED_CHECK green and approved at \`$head\` by $REVIEWER_LOGIN." || true
             else
               echo "skip #$pr: GitHub refused the merge (protection, or a check changed)"
             fi
