@@ -1657,3 +1657,55 @@ def test_a_malformed_epss_row_is_not_a_complete_measurement(tmp_path):
 
     facts = Intel().cves(["CVE-2026-1234"])
     assert facts["CVE-2026-1234"].complete is False, "an unusable number is a failed measurement"
+
+
+# ---------------------------------------------------------------------------
+# Twenty-sixth review round
+
+
+def test_a_populated_but_unusable_epss_response_is_a_failure():
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda s: None)
+
+        def _get(self, url):
+            if "api.first.org" in url:
+                return 200, {"data": [{}]}
+            return 404, None
+
+    facts = Intel().cves(["CVE-2026-1234"])
+    assert facts["CVE-2026-1234"].complete is False
+
+    class Empty(Intel):
+        def _get(self, url):
+            if "api.first.org" in url:
+                return 200, {"data": []}  # a valid empty result stays a measurement
+            return 404, None
+
+    assert Empty().cves(["CVE-2026-1234"])["CVE-2026-1234"].epss is None
+
+
+def test_carried_candidates_progress_while_their_source_fails(tmp_path):
+    cfg = config(tmp_path)
+    notifier = Notifier()
+    state = core.new_state()
+    state["seeded"] = {"s1": True}
+    state["carry"] = {
+        "s1": [
+            core.item_to_state(core.Item("g1", "captured advisory", "https://vendor.example.com/a", "n", NOW - 60, ()))
+        ]
+    }
+    from advisory_radar.state import save_state
+
+    save_state(cfg.state_path, state)
+    pipeline.run_pass(
+        cfg,
+        [FailingSource("s1", [])],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert any("captured advisory" in entry["title"] for entry in notifier.sent), (
+        "a source outage must not freeze already captured candidates"
+    )

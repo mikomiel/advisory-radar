@@ -186,6 +186,33 @@ def _run_pass(
         if not dry_run:
             save_state(cfg.state_path, state)
 
+    # A source that failed (or whose window was untrusted) must not freeze work already captured from it:
+    # those candidates are complete and can be classified under the current policy.
+    answered_now = {source.id for source, _ in answered}
+    for source_id in list(carried):
+        if source_id in answered_now:
+            continue
+        held = [core.item_from_state(row) for row in carried.pop(source_id, [])]
+        held = [item for item in held if core.passes_filter(item, policy)]
+        if not held:
+            continue
+        left = core.classify_new(
+            state,
+            held,
+            intel,
+            kev,
+            kev_known,
+            now,
+            "",
+            policy,
+            share=max(1, core.DELIVERY_CAP // max(1, len(sources))),
+            trusted={item.guid for item in held},
+        )
+        if left:
+            carried[source_id] = [core.item_to_state(item) for item in left]
+        if not dry_run:
+            save_state(cfg.state_path, state)
+
     if not carried:
         state.pop("carry", None)  # only after every source has written into the attached dict
 
