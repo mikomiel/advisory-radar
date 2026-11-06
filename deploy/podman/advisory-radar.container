@@ -1,0 +1,29 @@
+# Podman quadlet for advisory-radar (rootless):
+#   mkdir -p ~/.config/containers/systemd
+#   cp deploy/podman/advisory-radar.container ~/.config/containers/systemd/
+#   systemctl --user daemon-reload && systemctl --user start advisory-radar
+# Secrets: put them in ~/.config/advisory-radar.env (mode 600) — the quadlet
+# references it with EnvironmentFile. Never commit that file.
+#
+# UserNS=keep-id: the image runs as UID 10001, and a rootless container cannot
+# write a host directory owned by your account unless its UID is mapped to yours.
+
+[Container]
+Image=ghcr.io/mikomiel/advisory-radar:latest
+ContainerName=advisory-radar
+PublishPort=8080:8080
+Volume=%h/.config/advisory-radar:/config:ro
+Volume=%h/.local/share/advisory-radar:/data
+UserNS=keep-id:uid=10001,gid=10001
+EnvironmentFile=%h/.config/advisory-radar.env
+Environment=ADVISORY_RADAR_CONFIG=/config/config.yml
+HealthCmd=python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"
+HealthInterval=30s
+HealthTimeout=5s
+HealthRetries=3
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target
