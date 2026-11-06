@@ -100,7 +100,9 @@ def _bool_option(value: object, name: str) -> bool:
             return True
         if lowered in _FALSE_WORDS:
             return False
-    raise ConfigError(f"{name} must be a boolean (true/false), got {value!r}")
+    # No value in the message: an environment- or file-expanded option can hold a secret, and the CLI logs
+    # configuration errors before the redaction filter is installed.
+    raise ConfigError(f"{name} must be true or false")
 
 
 def _require(condition: bool, message: str) -> None:

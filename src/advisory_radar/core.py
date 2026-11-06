@@ -1637,8 +1637,10 @@ def reevaluate(state: dict, intel: Intel, kev: frozenset[str], kev_known: bool, 
         current = facts[cve]
         entry = watch[cve]
         deciding = critical_reason(current, kev_known and cve in kev)
-        if cve in deferred:
-            continue  # no request was made: try again next pass instead of waiting a whole day
+        if cve in deferred and not deciding:
+            # No request was made and nothing independently decisive is known: try again next pass rather
+            # than waiting a whole day. KEV or SSVC evidence still escalates now.
+            continue
         if not current.complete and not deciding:
             # A failed lookup changes nothing unless an independently sufficient signal (KEV, SSVC active,
             # or a remote-unauthenticated CVSS >= 9.0) already decides the level.

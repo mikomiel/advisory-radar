@@ -2140,14 +2140,11 @@ def test_a_deferred_nvd_lookup_does_not_advance_the_daily_clock():
     assert state["watch"][cve]["last_eval"] == NOW - 2 * 86400, "a deferred lookup is not an attempt"
 
 
-def test_suppressing_a_new_cve_keeps_an_earlier_record(tmp_path):
-    cfg = config(tmp_path)
+def test_suppressing_a_new_cve_keeps_an_earlier_record():
+    """A delivered CVE keeps its history when a later item suppresses a different, new CVE."""
     state = core.new_state()
     state["seen"]["CVE-2026-1111"] = {"at": NOW - 7200, "outcome": "delivered"}
-    from advisory_radar.state import save_state
-
-    save_state(cfg.state_path, state)
-    item_with_both = core.Item(
+    item = core.Item(
         "g1",
         "CVE-2026-1111 and CVE-2026-2222",
         "https://vendor.example.com/a",
@@ -2155,20 +2152,44 @@ def test_suppressing_a_new_cve_keeps_an_earlier_record(tmp_path):
         NOW - 60,
         ("CVE-2026-1111", "CVE-2026-2222"),
     )
+    facts = {"CVE-2026-2222": core.CveFacts(2.0, None, 0.001, 0.1, True)}
+    verdict = core.judge(["CVE-2026-2222"], facts, frozenset(), True, None, True, osv_fallbacks={})
+    assert verdict.tag == "suppressed"
+    core._suppressed(state, ["CVE-2026-1111", "CVE-2026-2222"], verdict, item, {}, NOW)
+    assert state["seen"]["CVE-2026-1111"] == {"at": NOW - 7200, "outcome": "delivered"}
+    assert state["seen"]["CVE-2026-2222"]["outcome"] == "suppressed"
 
-    class Intel(core.Intel):
-        def __init__(self):
-            super().__init__(lambda *a: (404, {}, b""), {}, lambda: float(NOW), lambda s: None)
 
-    pipeline.run_pass(
-        cfg,
-        [WindowSource("s1", [item_with_both])],
-        [Notifier()],
-        http=http_for({}),
-        clock=lambda: float(NOW),
-        sleep=lambda s: None,
-    )
-    state = json.loads(cfg.state_path.read_text())
-    assert state["seen"]["CVE-2026-1111"] == {"at": NOW - 7200, "outcome": "delivered"}, (
-        "an already-delivered CVE keeps its history"
-    )
+# ---------------------------------------------------------------------------
+# Thirty-fifth review round
+
+
+def test_a_confirmed_kev_hit_escalates_even_when_the_lookup_was_deferred():
+    state = core.new_state()
+    cve = "CVE-2026-8888"
+    state["watch"][cve] = {
+        "since": NOW - 3 * 86400,
+        "last_eval": NOW - 2 * 86400,
+        "level": "warning",
+        "title": "t",
+        "link": "https://vendor.example.com/a",
+    }
+
+    class Intel:
+        def cves(self, cves, force=False, deferred=None):
+            (deferred if deferred is not None else set()).update(cves)  # budget ran out
+            return {name: core.CveFacts(None, None, None, None, False) for name in cves}
+
+    core.reevaluate(state, Intel(), frozenset({cve}), True, NOW, "")
+    queued = [entry for entry in state["pending"] if entry["kind"] == "escalation"]
+    assert queued and queued[0]["tag"] == "critical", "a confirmed KEV hit must not wait for the budget"
+
+
+def test_a_boolean_error_does_not_echo_the_value(tmp_path):
+    from advisory_radar.config import ConfigError
+
+    path = tmp_path / "c.yml"
+    path.write_text("sources: []\nnotifiers: []\nadobe_commerce: ${SECRET}\n")
+    with pytest.raises(ConfigError) as caught:
+        load_config(path, {"SECRET": "s3cr3t-value"})
+    assert "s3cr3t-value" not in str(caught.value)
