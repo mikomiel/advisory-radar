@@ -775,3 +775,48 @@ def test_unknown_web_keys_are_refused(tmp_path):
     path.write_text("sources: []\nnotifiers: []\nweb:\n  hots: 127.0.0.1\n")
     with pytest.raises(ConfigError):
         load_config(path, {})
+
+
+# ---------------------------------------------------------------------------
+# Tenth review round
+
+
+def test_an_osv_object_without_alias_or_severity_is_unmeasured():
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda s: None)
+
+        def _get(self, url):
+            return 200, {"id": "GHSA-aaaa-bbbb-cccc"}
+
+    assert Intel().ghsa("GHSA-aaaa-bbbb-cccc").complete is False
+
+
+def test_an_adobe_only_configuration_bootstraps(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "c.yml"
+    cfg_path.write_text(
+        "sources: []\nnotifiers: []\nadobe_commerce: true\nstate_path: " + str(tmp_path / "state.json") + "\n"
+    )
+    from advisory_radar.config import load_config
+
+    cfg = load_config(cfg_path, {})
+    called = []
+
+    def fake_adobe(state, http, kev, kev_known, now):
+        called.append(now)
+        return True
+
+    monkeypatch.setattr(core, "adobe_pass", fake_adobe)
+    code = pipeline.run_pass(cfg, [], [Notifier()], http=http_for({}), clock=lambda: float(NOW), sleep=lambda s: None)
+    assert called, "an Adobe-only configuration must still run the Adobe pass on the first run"
+    assert (tmp_path / "state.json").exists()
+    assert code == 0
+
+
+def test_a_malformed_feed_entry_fails_the_source():
+    from advisory_radar.feeds import FeedError, parse_feed
+
+    with pytest.raises(FeedError):
+        parse_feed(b'{"items": [{}]}')
+    with pytest.raises(FeedError):
+        parse_feed(b'{"items": [1, 2]}')

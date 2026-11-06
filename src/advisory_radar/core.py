@@ -838,8 +838,11 @@ class Intel:
         specific = document.get("database_specific")
         label = specific.get("severity") if isinstance(specific, dict) else None
         cvss = OSV_SEVERITY_SCORE.get(label.upper()) if isinstance(label, str) else None
+        # An advisory with neither a CVE alias nor a usable severity label was not measured: its severity is
+        # unknown, and it must not be suppressed by a LOW sibling.
+        complete = bool(cves) or cvss is not None
         self._cache[ghsa] = {"at": int(self._clock()), "cves": list(cves), "cvss": cvss}
-        return OsvFacts(cves, cvss, True)
+        return OsvFacts(cves, cvss, complete)
 
 
 # --------------------------------------------------------------------------

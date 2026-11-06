@@ -77,14 +77,14 @@ def parse_feed(body: bytes) -> FeedExport:
     items = []
     for node in entries:
         if not isinstance(node, dict):
-            continue
+            raise FeedError("feed entry is not an object")
         identifier = node.get("id")
         match = GREADER_ID.match(identifier if isinstance(identifier, str) else "")
         link = _first_href(node.get("canonical")) or _first_href(node.get("alternate"))
         guid = str(int(match.group(1), 16)) if match else link
         title = _text(node.get("title"))
         if not guid or not title:
-            continue
+            raise FeedError("feed entry has no usable id or title")
         summary = ""
         for field in ("summary", "content"):
             content = node.get(field)

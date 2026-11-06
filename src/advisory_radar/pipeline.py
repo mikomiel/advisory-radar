@@ -148,7 +148,7 @@ def _run_pass(
         if not dry_run:
             save_state(cfg.state_path, state)
 
-    if stored is None and not fetched_ids:
+    if stored is None and not fetched_ids and not cfg.adobe_commerce:
         LOG.error("no source could be read on the first pass; nothing to persist")
         return 1
 
