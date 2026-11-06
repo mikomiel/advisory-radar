@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from . import core, pipeline
-from .config import ConfigError, collect_secrets, load_config
+from .config import ConfigError, load_config, secret_values
 from .http import Http, urllib_http
 from .state import state_lock
 
@@ -62,9 +62,7 @@ def main(
     except ConfigError as exc:
         LOG.error("config: %s", exc)
         return 1
-    redactor = pipeline.attach_redaction(
-        [environment[name] for name in collect_secrets(cfg, environment) if environment.get(name)]
-    )
+    redactor = pipeline.attach_redaction(secret_values(cfg))
     try:
         sources, notifiers = pipeline.build_plugins(cfg, environment)
         if args.command == "release-parked":

@@ -22,7 +22,7 @@ class ConfigError(ValueError):
     pass
 
 
-def _expand(value: object, env: dict[str, str]) -> object:
+def _expand(value: object, env: dict[str, str], resolved: list[str] | None = None) -> object:
     if isinstance(value, str):
 
         def replace(match: re.Match[str]) -> str:
@@ -31,17 +31,22 @@ def _expand(value: object, env: dict[str, str]) -> object:
             if file_mode:
                 path = env.get(name + "_FILE") or env.get(name)
                 if path and Path(path).is_file():
-                    return Path(path).read_text(encoding="utf-8").strip()
+                    contents = Path(path).read_text(encoding="utf-8").strip()
+                    if resolved is not None:
+                        resolved.append(contents)  # the value, not the path, is what must be redacted
+                    return contents
                 raise ConfigError(f"${{{name}_FILE}}: no readable file (env {name}_FILE={path!r})")
             if name not in env:
                 raise ConfigError(f"${{{name}}} is not set in the environment")
+            if resolved is not None:
+                resolved.append(env[name])
             return env[name]
 
         return _ENV_RE.sub(replace, value)
     if isinstance(value, list):
-        return [_expand(item, env) for item in value]
+        return [_expand(item, env, resolved) for item in value]
     if isinstance(value, dict):
-        return {key: _expand(item, env) for key, item in value.items()}
+        return {key: _expand(item, env, resolved) for key, item in value.items()}
     return value
 
 
@@ -59,6 +64,8 @@ class Config:
     raw: dict = field(default_factory=dict)
     #: ``${NAME}`` references read from the file *before* expansion, for log redaction.
     secret_names: tuple[str, ...] = ()
+    #: The values those references expanded to, including the contents of a ``${NAME}_FILE``.
+    secret_values: tuple[str, ...] = ()
 
 
 _SOURCE_KEYS = {"id", "type", "url", "token", "enabled"}
@@ -108,7 +115,9 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
     ids = [entry["id"] for entry in (*sources, *notifiers)]
     _require(len(ids) == len(set(ids)), f"duplicate plugin ids: {ids}")
     secret_names = tuple(sorted(set(_ENV_RE.findall(yaml.safe_dump(document)))))
-    document = _expand(document, env)
+    resolved: list[str] = []
+    document = _expand(document, env, resolved)
+    secret_values = tuple(sorted({value for value in resolved if value}))
     # Built plugins read the expanded entries; the structural checks above used the raw ones.
     sources = document.get("sources") or []
     notifiers = document.get("notifiers") or []
@@ -142,6 +151,7 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
         web_port=int(web_port),
         raw=document,
         secret_names=secret_names,
+        secret_values=secret_values,
     )
 
 
@@ -152,3 +162,8 @@ def collect_secrets(config: Config, env: dict[str, str] | None = None) -> list[s
     it would find nothing to redact.
     """
     return list(config.secret_names)
+
+
+def secret_values(config: Config) -> list[str]:
+    """The expanded secret values, so a log line cannot carry one even when it was read from a file."""
+    return list(config.secret_values)

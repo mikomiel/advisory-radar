@@ -401,3 +401,74 @@ def test_a_source_outage_keeps_that_sources_retry_clocks(tmp_path):
     reloaded = json.loads(cfg.state_path.read_text())
     assert "s1:g1" in reloaded["enrich_retry"], "an outage must not erase the retry deadline"
     assert "s2:g2" in reloaded["enrich_retry"]
+
+
+# ---------------------------------------------------------------------------
+# Fourth review round
+
+
+def test_file_backed_secret_values_are_redacted(tmp_path):
+    import logging
+
+    from advisory_radar.config import secret_values
+    from advisory_radar.http import RedactFilter
+
+    secret_file = tmp_path / "hook"
+    secret_file.write_text("https://hooks.example.com/SUPERSECRET\n")
+    cfg_path = tmp_path / "c.yml"
+    cfg_path.write_text(
+        "sources: []\nnotifiers:\n  - id: d\n    type: discord_webhook\n    url: ${HOOK_URL_FILE}\n"
+        "state_path: /tmp/x.json\n"
+    )
+    cfg = load_config(cfg_path, {"HOOK_URL_FILE": str(secret_file)})
+    assert cfg.notifiers[0]["url"] == "https://hooks.example.com/SUPERSECRET"
+    assert "https://hooks.example.com/SUPERSECRET" in secret_values(cfg)
+    record = logging.LogRecord(
+        "t", logging.ERROR, __file__, 1, "bad url %s", ("https://hooks.example.com/SUPERSECRET",), None
+    )
+    RedactFilter(secret_values(cfg)).filter(record)
+    assert "SUPERSECRET" not in record.getMessage()
+
+
+def test_a_malformed_kev_catalog_is_not_trusted(tmp_path):
+    from advisory_radar.kev import KEV_CACHE_SCHEMA, load_kev
+    from advisory_radar.state import save_state
+
+    cache = tmp_path / "kev.json"
+    save_state(cache, {"schema": KEV_CACHE_SCHEMA, "etag": "", "last_modified": "", "cves": ["CVE-2026-1111"]})
+
+    def http(method, url, headers, body):
+        return 200, {}, json.dumps({"vulnerabilities": [{"nope": 1}]}).encode()
+
+    cves, known = load_kev(http, cache, save=False)
+    assert known is True and cves == frozenset({"CVE-2026-1111"}), "a reshaped catalog must fall back to the cache"
+
+    def empty(method, url, headers, body):
+        return 200, {}, json.dumps({"vulnerabilities": []}).encode()
+
+    cves, known = load_kev(empty, tmp_path / "none.json", save=False)
+    assert known is False and cves == frozenset()
+
+
+def test_non_finite_and_out_of_range_numbers_are_unknown():
+    assert core._number("Infinity") is None
+    assert core._number(float("nan")) is None
+    assert core._bounded(-1.0, 0.0, 10.0) is None
+    assert core._bounded(9.8, 0.0, 10.0) == 9.8
+
+
+def test_a_vendor_feed_keeps_its_advisory_link():
+    title, body = core.render(
+        "critical",
+        "CVE-2026-4242 in node",
+        ["CVE-2026-4242"],
+        "9.8",
+        "",
+        "https://nodejs.org/en/blog/vulnerability/x",
+        "notes",
+        NOW,
+        "nodejs.org",
+        "Node.js feed",
+        "https://nodejs.org/en/feed",
+    )
+    assert "https://nodejs.org/en/blog/vulnerability/x" in (title + body)

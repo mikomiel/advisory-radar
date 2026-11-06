@@ -23,6 +23,7 @@ from __future__ import annotations
 import datetime
 import fnmatch
 import logging
+import math
 import re
 import unicodedata
 import urllib.error
@@ -425,9 +426,9 @@ def _scores(metrics: object) -> list[tuple[float, bool]]:
             data = metric.get(key) if isinstance(metric, dict) else None
             if not isinstance(data, dict):
                 continue
-            score = data.get("baseScore")
-            if isinstance(score, (int, float)) and not isinstance(score, bool):
-                found.append((float(score), remote_unauth(data.get("vectorString"))))
+            score = _bounded(data.get("baseScore"), 0.0, 10.0)
+            if score is not None:
+                found.append((score, remote_unauth(data.get("vectorString"))))
     return found
 
 
@@ -488,23 +489,28 @@ def nvd_facts(document: dict) -> tuple[float | None, bool]:
             data = entry.get("cvssData") if isinstance(entry, dict) else None
             if not isinstance(data, dict):
                 continue
-            score = data.get("baseScore")
-            if isinstance(score, (int, float)) and not isinstance(score, bool):
+            score = _bounded(data.get("baseScore"), 0.0, 10.0)
+            if score is not None:
                 (primary if entry.get("type") == "Primary" else other).append(
-                    (float(score), remote_unauth(data.get("vectorString")))
+                    (score, remote_unauth(data.get("vectorString")))
                 )
     return _best(primary or other)
 
 
 def _number(value: object) -> float | None:
+    """A finite float, or None: ``NaN``/``Infinity`` from a feed must never reach a decision or a render."""
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
-        return float(value)
     try:
-        return float(value) if isinstance(value, str) else None
+        number = float(value) if isinstance(value, (int, float, str)) else None
     except ValueError:
         return None
+    return number if number is not None and math.isfinite(number) else None
+
+
+def _bounded(value: object, low: float, high: float) -> float | None:
+    number = _number(value)
+    return number if number is not None and low <= number <= high else None
 
 
 def _cve_age(cve: str) -> tuple[int, int]:
@@ -598,7 +604,10 @@ class Intel:
             if status != 200 or not isinstance(data, list):
                 return None
             scores |= {
-                row["cve"].upper(): (_number(row.get("epss")), _number(row.get("percentile")))
+                row["cve"].upper(): (
+                    _bounded(row.get("epss"), 0.0, 1.0),
+                    _bounded(row.get("percentile"), 0.0, 1.0),
+                )
                 for row in data
                 if isinstance(row, dict) and isinstance(row.get("cve"), str)
             }
@@ -1049,10 +1058,9 @@ def _fact(label: str, value: str) -> str:
 
 
 def _source_value(source_title: str, source_url: str, feed_host: str) -> str:
-    """``<name> — <site>``; the site only when it is a public https URL off the feed host and hidden hosts."""
+    """``<name> — <site>``; the site only when it is a public https URL off a hidden host."""
     title = _cap(_md(source_title), MAX_SOURCE_TITLE)
-    hidden = {feed_host, *HIDDEN_SOURCE_HOSTS}
-    public = _public_https(source_url) and _host(source_url) not in hidden
+    public = _public_https(source_url) and _host(source_url) not in HIDDEN_SOURCE_HOSTS
     site = _autolink(source_url) if public else ""
     return f"{title} — {site}" if title and site else title or site
 
@@ -1105,7 +1113,7 @@ def render(
     if note:
         facts.append(_fact("Note", note))
     links = []
-    if _public_https(link) and _host(link) != feed_host:
+    if _public_https(link) and _host(link) not in HIDDEN_SOURCE_HOSTS:
         links.append(_fact("Advisory", _autolink(link)))
     if source := _source_value(source_title, source_url, feed_host):
         links.append(_fact("Source", source))
