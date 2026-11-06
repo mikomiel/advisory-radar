@@ -1484,15 +1484,16 @@ def classify_new(
             osv = intel.ghsa(ghsa)
             osv_complete = osv_complete and osv.complete
             cves += [cve for cve in osv.cves if cve not in cves]
-            if osv.cvss is not None:
+            claimed_advisory = not osv.cves and ghsa in claimed
+            if osv.cvss is not None and not claimed_advisory:
+                # An advisory already delivered is not evidence about the new finding this item carries.
                 osv_cvss = max(osv_cvss or 0.0, osv.cvss)
                 if osv.cves:
                     aliased_scored = True
                     for alias in osv.cves:
                         osv_fallbacks[alias] = max(osv_fallbacks.get(alias, 0.0), osv.cvss)
-                elif ghsa not in claimed:
-                    # An alias-free advisory is its own severity evidence - unless it was already delivered,
-                    # in which case it says nothing about the new finding this item carries.
+                elif not claimed_advisory:
+                    # An alias-free advisory is its own severity evidence.
                     independent_scored = True
                     independent_ghsa_cvss = max(independent_ghsa_cvss or 0.0, osv.cvss)
         vendor_ids = [identifier for identifier in explicit if identifier.startswith(("PSA-", "DSA-"))]
@@ -1875,9 +1876,13 @@ def _adobe_list(http: Http, stored: object) -> tuple[adobe.Bulletin, ...] | str:
         )
     ):
         return "the stored Adobe state is invalid; not re-seeding"
-    # A list lacking a bulletin already seen may be another or a cut-off list; "nothing new" would misread it.
-    missing = sorted(set(stored["seen"] if stored else ()) - {bulletin.apsb for bulletin in bulletins})
-    return f"previously seen {', '.join(missing[:MAX_SHOWN_IDS])} missing from the response" if missing else bulletins
+    # A list that shares nothing with the response seen last pass may be another or a cut-off list; comparing
+    # against the lifetime history instead would reject every normally rotating response forever.
+    previous = stored.get("window") if isinstance(stored, dict) else None
+    current = {bulletin.apsb for bulletin in bulletins}
+    if isinstance(previous, list) and previous and not current & set(previous):
+        return "the response shares no bulletin with the previous one; it may be cut off"
+    return bulletins
 
 
 def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, now: int) -> bool:
@@ -1903,6 +1908,7 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
         return False
     if stored is None:
         state["adobe"] = {
+            "window": sorted({bulletin.apsb for bulletin in bulletins}),
             "seen": {
                 bulletin.apsb: {
                     "cves": list(bulletin.cves),
@@ -1910,7 +1916,7 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
                     "exploited": any(cve in kev for cve in bulletin.cves) if kev_known else None,
                 }
                 for bulletin in bulletins
-            }
+            },
         }
         LOG.info("adobe commerce: first run, %d bulletin(s) recorded without a message", len(bulletins))
         return True
@@ -1931,6 +1937,8 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
             [int(number) for number in re.findall(r"\d+", bulletin.apsb)],
         ),
     )
+    # Record this pass's window, which the next pass compares against for the cut-off check.
+    state["adobe"]["window"] = sorted({bulletin.apsb for bulletin in bulletins})
     fresh = fresh[:MAX_ADOBE_NEW]
     followed = 0
     queued = 0
