@@ -32,10 +32,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # The reviewing identity; its approval is the gate. gh's --json reviews reads authors over GraphQL, where a
-  # GitHub App bot's login has no "[bot]" suffix (REST adds it), so this is the plain slug and both sides are
-  # normalised below. A human reviewer's login works as-is.
-  REVIEWER_LOGIN: ecomwizards-gandalf
+  # The reviewing identity; its approval is the gate. Matched against the REST representation, which carries
+  # the "[bot]" suffix, the actor type and a stable numeric id: a human account with the same name cannot pass.
+  REVIEWER_LOGIN: ecomwizards-gandalf[bot]
+  REVIEWER_TYPE: Bot
   REQUIRED_CHECK: ci
 
 jobs:
@@ -48,7 +48,9 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          mapfile -t candidates < <(gh pr list --repo "$REPO" --state open --base main --limit 100 \
+          # Paginated to completion (gh follows the pages itself): a limit applied before filtering would hide
+          # an eligible PR that happens to sit beyond the first page.
+          mapfile -t candidates < <(gh pr list --repo "$REPO" --state open --base main --limit 1000 \
             --json number,reviewDecision,mergeable,isDraft \
             --jq '.[] | select(.isDraft == false and .reviewDecision == "APPROVED") | .number')
 
@@ -64,14 +66,15 @@ jobs:
             fi
 
             # The configured reviewer's own latest review decides, and only if it approved this exact head.
-            # Filtering by author first matters: a later human approval must not hide the bot's approval,
-            # and a bot "request changes" after an approval must win.
-            reviewer_state=$(jq -r --arg reviewer "$REVIEWER_LOGIN" '
-              [.reviews[] | select((.author.login | sub("\\[bot\\]$"; "")) == $reviewer)]
-              | sort_by(.submittedAt) | last | .state // ""' <<<"$meta")
-            reviewer_head=$(jq -r --arg reviewer "$REVIEWER_LOGIN" '
-              [.reviews[] | select((.author.login | sub("\\[bot\\]$"; "")) == $reviewer)]
-              | sort_by(.submittedAt) | last | .commit.oid // ""' <<<"$meta")
+            # Read over REST: .user.type distinguishes an App bot from a human account of the same name, and
+            # .user.login keeps the "[bot]" suffix that the GraphQL shape drops.
+            reviews=$(gh api --paginate "repos/$REPO/pulls/$pr/reviews")
+            reviewer_state=$(jq -r --arg reviewer "$REVIEWER_LOGIN" --arg type "$REVIEWER_TYPE" '
+              [.[] | select(.user.login == $reviewer and .user.type == $type)]
+              | sort_by(.submitted_at) | last | .state // ""' <<<"$reviews")
+            reviewer_head=$(jq -r --arg reviewer "$REVIEWER_LOGIN" --arg type "$REVIEWER_TYPE" '
+              [.[] | select(.user.login == $reviewer and .user.type == $type)]
+              | sort_by(.submitted_at) | last | .commit_id // ""' <<<"$reviews")
             if [ "$reviewer_state" != "APPROVED" ]; then
               echo "skip #$pr: $REVIEWER_LOGIN's latest review is '${reviewer_state:-none}', not APPROVED"
               continue
