@@ -156,6 +156,11 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
     web_host = str(web.get("host", "0.0.0.0"))
     web_port = web.get("port", 8080)
     _require(isinstance(web_port, int) and 1 <= web_port <= 65535, "web.port must be an integer in 1..65535")
+    state_path = Path(document.get("state_path", "data/state.json"))
+    _require(
+        state_path.name != "kev.json",
+        "state_path must not be named kev.json: that is the KEV cache's filename beside the state file",
+    )
     watchlist = document.get("watchlist")
     _require(
         watchlist is None or isinstance(watchlist, str),
@@ -168,7 +173,7 @@ def load_config(path: Path, env: dict[str, str] | None = None) -> Config:
         notifiers=tuple(entry for entry in notifiers if entry.get("enabled", True)),
         watchlist_path=watchlist_path,
         poll_interval_seconds=seconds,
-        state_path=Path(document.get("state_path", "data/state.json")),
+        state_path=state_path,
         hidden_source_hosts=hidden,
         adobe_commerce=bool(document.get("adobe_commerce", False)),
         web_host=web_host,

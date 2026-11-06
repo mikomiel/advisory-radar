@@ -122,11 +122,14 @@ def _run_pass(
         if window.truncated and previous is not None and not set(previous) & {item.guid for item in window.items}:
             LOG.error(
                 "source %s: window gap: the window is full (%d entries) and shares none with the previous "
-                "pass; items may have been missed",
+                "pass; items may have been missed. Keeping the last trusted window and deferring this source",
                 source.id,
                 len(window.items),
             )
+            # Fail closed: do not adopt a window we cannot trust. The next pass compares against the same
+            # trusted window, so a genuinely recovered export clears the gap and a damaged one keeps failing.
             gap = True
+            continue
         fetched_ids.add(source.id)
         windows[source.id] = [item.guid for item in window.items]
         live_guids.update(item.guid for item in window.items)

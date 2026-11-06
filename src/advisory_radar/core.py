@@ -996,15 +996,18 @@ def judge(
             # Sent as a warning, so the watch records it as sent: a later re-score is not a second warning.
             tag = "warning"
             levels = tuple((cve, "warning") for cve, _ in levels)
+    ghsa_decides = False
     if independent_ghsa_cvss is not None:
         # An alias-free GHSA carries its own severity: a LOW CVE beside it must not hide it, and an aliased
         # GHSA (whose score is already represented by its CVE) must not override the CVE's own score.
         if independent_ghsa_cvss >= CRITICAL_CVSS:
             tag = "critical"
+            ghsa_decides = True
         elif tag == "suppressed" and independent_ghsa_cvss >= LOW_BELOW:
             # Both components are measured and both are LOW: keep the suppression. Only a second advisory
             # above the LOW floor is news.
             tag = "warning"
+            ghsa_decides = True
     chosen = facts[shown]
     cvss = chosen.cvss if chosen.cvss is not None else osv_cvss
     line = metrics_line(
@@ -1015,12 +1018,17 @@ def judge(
         shown in kev,
         approximate=chosen.cvss is None and osv_cvss is not None,
     )
+    if ghsa_decides:
+        # The deciding evidence is the GHSA's OSV label, not the CVE we happen to show beside it.
+        line = f"OSV GHSA severity {independent_ghsa_cvss:g} (approximate); {line}"
     if len(cves) > 1:
         line = f"{shown}: {line} (+{len(cves) - 1} more CVEs)"
     unscored = sum(1 for cve in cves if not facts[cve].complete)
     if unscored:
         line += f" (+{unscored} CVEs unscored)"
     note = REASON_NOTE.get(judged[shown][1] or "", "")
+    if ghsa_decides:
+        note = "An advisory in this item without a CVE id decides the severity."
     if tag == "warning" and (not osv_complete or any(not facts[cve].complete for cve in cves)):
         note = incomplete_note
     return Verdict(tag, levels, line, note)

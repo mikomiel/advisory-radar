@@ -1252,3 +1252,52 @@ def test_an_absurd_cve_suffix_does_not_raise():
     cve = "CVE-2026-" + "9" * 5000
     assert core._cve_age(cve) == (2026, 0)
     assert core.parse_nodejs_page(f"security releases {cve}") is not None
+
+
+# ---------------------------------------------------------------------------
+# Nineteenth review round
+
+
+def test_a_gap_keeps_the_last_trusted_window(tmp_path):
+    cfg = config(tmp_path)
+    notifier = Notifier()
+    trusted = pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [item("g1", "first")], truncated=True)],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert trusted == 0
+    for _ in range(2):  # the same untrustworthy window twice must keep failing
+        code = pipeline.run_pass(
+            cfg,
+            [WindowSource("s1", [item("g2", "second")], truncated=True)],
+            [notifier],
+            http=http_for({}),
+            clock=lambda: float(NOW + 60),
+            sleep=lambda s: None,
+        )
+        assert code == 1, "a gap must not be adopted as the new baseline"
+        state = json.loads(cfg.state_path.read_text())
+        assert state["windows"]["s1"] == ["s1:g1"], "the trusted window is kept"
+
+
+def test_a_state_file_named_kev_json_is_refused(tmp_path):
+    from advisory_radar.config import ConfigError
+
+    path = tmp_path / "c.yml"
+    path.write_text("sources: []\nnotifiers: []\nstate_path: /data/kev.json\n")
+    with pytest.raises(ConfigError, match="kev.json"):
+        load_config(path, {})
+
+
+def test_a_ghsa_decided_verdict_renders_the_ghsa_evidence():
+    facts = {"CVE-2026-4444": core.CveFacts(2.0, None, 0.001, 0.1, True)}
+    verdict = core.judge(
+        ["CVE-2026-4444"], facts, frozenset(), True, 9.8, True, osv_fallbacks={}, independent_ghsa_cvss=9.8
+    )
+    assert verdict.tag == "critical"
+    assert "OSV GHSA severity" in verdict.line, "the deciding evidence must be shown, not the unrelated CVE score"
+    assert "without a CVE id" in verdict.note
