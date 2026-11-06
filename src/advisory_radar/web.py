@@ -9,6 +9,7 @@ frontend build step.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import html
 import json
@@ -17,7 +18,7 @@ import time
 import urllib.parse
 from collections.abc import Callable, Mapping
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from itsdangerous import BadSignature, URLSafeSerializer
 
@@ -31,15 +32,19 @@ nav a{{margin-right:1rem}} table{{border-collapse:collapse}} td,th{{border:1px s
 form{{display:inline}} button{{cursor:pointer}}
 </style></head><body><nav><a href="/">Dashboard</a><a href="/alerts">Alerts</a>
 <a href="/parked">Parked</a><a href="/config">Config</a><a href="/runs">Runs</a>
-<a href="/healthz">healthz</a></nav><h1>{title}</h1>{body}</body></html>"""
+<a href="/healthz">healthz</a>{nav_extra}</nav><h1>{title}</h1>{body}</body></html>"""
 
 
 def esc(value: object) -> str:
     return html.escape(str(value))
 
 
-def page(title: str, body: str) -> HTMLResponse:
-    return HTMLResponse(PAGE.format(title=esc(title), body=body))
+def page(
+    title: str, body: str, *, nav_extra: str = "", status_code: int = 200, headers: Mapping[str, str] | None = None
+) -> HTMLResponse:
+    return HTMLResponse(
+        PAGE.format(title=esc(title), nav_extra=nav_extra, body=body), status_code=status_code, headers=headers
+    )
 
 
 class Auth:
@@ -75,6 +80,16 @@ def last_pass_code(state: dict) -> int:
 
 #: A login form is a handful of bytes; an unauthenticated request must not be able to make us buffer more.
 LOGIN_BODY_LIMIT = 8 * 1024
+#: The form field and the header that carry the per-session token; a state-changing POST needs one of them.
+CSRF_FIELD = "csrf"
+CSRF_HEADER = "x-csrf-token"
+#: Every page is server-rendered HTML with one inline stylesheet: no scripts, no fonts, no external origins.
+#: A page that needs any of those widens this deliberately, in the same change that adds it.
+CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+#: Failed logins one peer may make inside this window before the endpoint refuses; the token is 24 random bytes,
+#: so throttling only has to make online guessing pointless, not impossible.
+LOGIN_WINDOW_SECONDS = 300
+LOGIN_MAX_FAILURES = 5
 
 
 class BodyTooLarge(Exception):
@@ -105,6 +120,11 @@ def _insecure_cookies(env: Mapping[str, str]) -> bool:
     return env.get("ADVISORY_RADAR_INSECURE_COOKIES", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _public_https(env: Mapping[str, str]) -> bool:
+    """Whether TLS terminates in front of this process, so HSTS may be sent (opt-in: a wrong HSTS pins a browser)."""
+    return env.get("ADVISORY_RADAR_PUBLIC_HTTPS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def create_app(
     cfg: Config, env: dict[str, str], *, run_pass: Callable[..., int] | None = None, sources=None, notifiers=None
 ) -> FastAPI:
@@ -118,6 +138,79 @@ def create_app(
         # The session cookie is signed with this token; an empty key is a public key, so anyone could
         # mint a cookie for a protected endpoint.
         raise ValueError("ADVISORY_RADAR_AUTH_TOKEN must be set to serve the web UI")
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        """Headers on every response, including /healthz and /metrics.
+
+        ``default-src 'none'`` is honest today: the pages ship no script and load nothing external. An
+        authenticated page lists advisories and run history, so it must not sit in a shared proxy's cache.
+        """
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Content-Security-Policy", CSP)
+        if _public_https(env):
+            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+        if response.headers.get("content-type", "").startswith("text/html"):
+            response.headers.setdefault("Cache-Control", "no-store")
+        return response
+
+    @app.exception_handler(HTTPException)
+    async def http_error(request: Request, exc: HTTPException):
+        """A browser gets a page, a script gets JSON; neither leaks why a token was refused."""
+        if "text/html" in request.headers.get("accept", ""):
+            return page("Error", f"<p>{esc(exc.detail)}</p>", status_code=exc.status_code)
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
+
+    def csrf_token(request: Request) -> str:
+        """The HMAC of this session's cookie: a token bound to the session, with no extra state to store."""
+        session = request.cookies.get("advisory_radar_session") or ""
+        return hmac.new(token.encode(), session.encode(), hashlib.sha256).hexdigest()
+
+    def csrf_field(request: Request) -> str:
+        return f'<input type="hidden" name="{CSRF_FIELD}" value="{esc(csrf_token(request))}">'
+
+    def sign_out_form(request: Request) -> str:
+        """The nav's sign-out button, present on every authenticated page."""
+        return (
+            f'<form method="post" action="/logout">{csrf_field(request)}<button type="submit">Sign out</button></form>'
+        )
+
+    async def require_csrf(request: Request) -> None:
+        """Refuse a state-changing POST no page of ours issued.
+
+        SameSite=Lax already keeps the cookie off a cross-site POST; this is the second lock, for a browser or
+        proxy that does not apply it. The body read here carries the token field only -- every endpoint using
+        this dependency acts on the session cookie and reads no body of its own.
+        """
+        if not auth.valid(request):  # the endpoint itself redirects an unauthenticated caller
+            return
+        try:
+            raw = await _body(request, LOGIN_BODY_LIMIT)
+        except BodyTooLarge:
+            raise HTTPException(status_code=413, detail="payload too large") from None
+        supplied = request.headers.get(CSRF_HEADER, "")
+        if not supplied:
+            form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
+            supplied = (form.get(CSRF_FIELD) or [""])[0]
+        if not supplied or not hmac.compare_digest(csrf_token(request), supplied):
+            raise HTTPException(status_code=403, detail="invalid form token; reload the page and try again")
+
+    #: Failed logins per peer address, pruned on every check so the map stays tiny.
+    failures: dict[str, list[float]] = {}
+
+    def login_refusal(peer: str, now: float) -> int | None:
+        """Seconds until the next attempt is allowed, or None when this peer may try now."""
+        recent = [stamp for stamp in failures.get(peer, ()) if now - stamp < LOGIN_WINDOW_SECONDS]
+        if recent:
+            failures[peer] = recent
+        else:
+            failures.pop(peer, None)
+        if len(recent) < LOGIN_MAX_FAILURES:
+            return None
+        return max(1, int(LOGIN_WINDOW_SECONDS - (now - recent[0])))
 
     def require_auth(request: Request) -> bool:
         return auth.valid(request)
@@ -138,18 +231,28 @@ def create_app(
 
     @app.post("/login")
     async def login(request: Request):
+        peer = request.client.host if request.client else "unknown"
+        now = time.time()
+        wait = login_refusal(peer, now)
+        if wait is not None:
+            # Refuse before reading the body: a throttled peer costs this process nothing.
+            return page(
+                "Too many attempts",
+                "<p>Too many failed sign-in attempts. Try again shortly.</p>",
+                status_code=429,
+                headers={"Retry-After": str(wait)},
+            )
         # parse the urlencoded body by hand: no python-multipart dependency
-        import urllib.parse
-
         try:
             raw = await _body(request, LOGIN_BODY_LIMIT)
         except BodyTooLarge:
             return PlainTextResponse("payload too large", status_code=413)
         form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
-        token = (form.get("token") or [""])[0]
+        supplied = (form.get("token") or [""])[0]
         expected = env.get("ADVISORY_RADAR_AUTH_TOKEN", "")
         # constant-time compare: a byte-by-byte comparison leaks how much of the token matched
-        if token and expected and hmac.compare_digest(token.encode(), expected.encode()):
+        if supplied and expected and hmac.compare_digest(supplied.encode(), expected.encode()):
+            failures.pop(peer, None)
             response = RedirectResponse("/", status_code=303)
             # Secure by default: without it a browser may send a seven-day session over plaintext HTTP to the
             # same host. ADVISORY_RADAR_INSECURE_COOKIES=1 opts out, for a plain-HTTP development instance only.
@@ -161,11 +264,24 @@ def create_app(
                 secure=not _insecure_cookies(os.environ),
             )
             return response
+        failures.setdefault(peer, []).append(now)
         return page(
             "Login",
             '<p>Wrong token.</p><form method="post" action="/login">'
             '<input type="password" name="token"><button>Sign in</button></form>',
         )
+
+    @app.post("/logout", dependencies=[Depends(require_csrf)])
+    def logout():
+        """Clear the session cookie. The token cannot be revoked, but the browser stops sending it."""
+        response = RedirectResponse("/login", status_code=303)
+        response.delete_cookie(
+            "advisory_radar_session",
+            httponly=True,
+            samesite="lax",
+            secure=not _insecure_cookies(os.environ),
+        )
+        return response
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard(request: Request):
@@ -182,11 +298,11 @@ def create_app(
             f"Seen in last 24h: <b>{today_seen}</b> · Total seen: <b>{len(seen)}</b></p>"
             f"<p class='muted'>Last pass: {esc(last.get('at', 'never'))} — sent {last.get('sent', 0)}, "
             f"parked {last.get('parked', 0)}, exit {last.get('code', '?')}</p>"
-            '<form method="post" action="/run"><button>Run a pass now</button></form>'
+            f'<form method="post" action="/run">{csrf_field(request)}<button>Run a pass now</button></form>'
         )
-        return page("Dashboard", body)
+        return page("Dashboard", body, nav_extra=sign_out_form(request))
 
-    @app.post("/run")
+    @app.post("/run", dependencies=[Depends(require_csrf)])
     def run_now(request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
@@ -207,7 +323,7 @@ def create_app(
                 f"<td class='muted'>{esc(record.get('at', ''))}</td></tr>"
             )
         body = "<table><tr><th>ID</th><th>Outcome</th><th>First seen (epoch)</th></tr>" + "".join(rows) + "</table>"
-        return page("Alerts", body)
+        return page("Alerts", body, nav_extra=sign_out_form(request))
 
     @app.get("/parked", response_class=HTMLResponse)
     def parked_page(request: Request):
@@ -222,12 +338,13 @@ def create_app(
             )
         body = (
             "<table><tr><th>Tag</th><th>Title</th><th>IDs</th></tr>" + "".join(rows) + "</table>"
-            '<form method="post" action="/parked/release"><button>Release all</button></form> '
-            '<form method="post" action="/parked/drop"><button>Drop all</button></form>'
+            f'<form method="post" action="/parked/release">{csrf_field(request)}'
+            "<button>Release all</button></form> "
+            f'<form method="post" action="/parked/drop">{csrf_field(request)}<button>Drop all</button></form>'
         )
-        return page("Parked messages", body)
+        return page("Parked messages", body, nav_extra=sign_out_form(request))
 
-    @app.post("/parked/release")
+    @app.post("/parked/release", dependencies=[Depends(require_csrf)])
     def parked_release(request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
@@ -238,7 +355,7 @@ def create_app(
             core.manage_parked(cfg.state_path, release=True, now=int(time.time()))
         return RedirectResponse("/parked", status_code=303)
 
-    @app.post("/parked/drop")
+    @app.post("/parked/drop", dependencies=[Depends(require_csrf)])
     def parked_drop(request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
@@ -265,7 +382,7 @@ def create_app(
             "<p class='muted'>Edit config/config.yml on the volume and restart; secrets come from the "
             "environment only.</p>"
         )
-        return page("Configuration", body)
+        return page("Configuration", body, nav_extra=sign_out_form(request))
 
     @app.get("/runs", response_class=HTMLResponse)
     def runs_page(request: Request):
@@ -278,7 +395,10 @@ def create_app(
         )
         return page(
             "Runs",
-            "<table><tr><th>At</th><th>Sent</th><th>Parked</th><th>Pending</th><th>Exit</th></tr>" + rows + "</table>",
+            nav_extra=sign_out_form(request),
+            body="<table><tr><th>At</th><th>Sent</th><th>Parked</th><th>Pending</th><th>Exit</th></tr>"
+            + rows
+            + "</table>",
         )
 
     @app.get("/healthz", response_class=PlainTextResponse)
