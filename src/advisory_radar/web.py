@@ -68,9 +68,39 @@ def _public_url(url: str) -> str:
     return f"{parts.scheme}://{parts.hostname}"
 
 
+def _number(value: object, default: int = 0) -> int:
+    """A state value as an integer: a hand-edited or older state must not break a probe or a scrape."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return int(value)
+
+
 def last_pass_code(state: dict) -> int:
     runs = state.get("runs") or []
-    return int(runs[-1].get("code", -1)) if runs else -1
+    return _number(runs[-1].get("code"), -1) if runs and isinstance(runs[-1], dict) else -1
+
+
+#: A pass may be this many poll intervals late before the instance is not ready. Two skipped runs of slack keeps a
+#: slow source from flapping the probe, and a stopped scheduler still surfaces within a few intervals.
+READY_AGE_FACTOR = 3
+#: Floor for the staleness limit: a 30 s poll interval must not declare itself unready between two passes.
+READY_MIN_AGE_SECONDS = 300
+
+
+def readiness(cfg: Config, state: dict, now: int) -> tuple[bool, str]:
+    """Whether a pass finished recently enough to trust, and the sentence a caller shows."""
+    runs = state.get("runs") or []
+    if not isinstance(runs, list) or not runs:
+        return False, "not ready: no pass has completed yet"
+    last = runs[-1]
+    at = _number(last.get("at")) if isinstance(last, dict) else 0
+    if not at:
+        return False, "not ready: the last run record has no timestamp"
+    limit = max(READY_AGE_FACTOR * cfg.poll_interval_seconds, READY_MIN_AGE_SECONDS)
+    age = now - at
+    if age > limit:
+        return False, f"not ready: the last pass finished {age // 60} min ago (limit {limit // 60} min)"
+    return True, "ready"
 
 
 #: A login form is a handful of bytes; an unauthenticated request must not be able to make us buffer more.
@@ -106,7 +136,13 @@ def _insecure_cookies(env: Mapping[str, str]) -> bool:
 
 
 def create_app(
-    cfg: Config, env: dict[str, str], *, run_pass: Callable[..., int] | None = None, sources=None, notifiers=None
+    cfg: Config,
+    env: dict[str, str],
+    *,
+    run_pass: Callable[..., int] | None = None,
+    sources=None,
+    notifiers=None,
+    clock: Callable[[], float] = time.time,
 ) -> FastAPI:
     app = FastAPI(title="advisory-radar", docs_url=None, redoc_url=None)
     auth = Auth(env.get("ADVISORY_RADAR_AUTH_TOKEN", ""))
@@ -283,25 +319,56 @@ def create_app(
 
     @app.get("/healthz", response_class=PlainTextResponse)
     def healthz():
+        """Liveness only: this process answers HTTP. Pass freshness belongs to /readyz."""
         return PlainTextResponse("ok")
+
+    @app.get("/readyz", response_class=PlainTextResponse)
+    def readyz():
+        """Readiness: the state is readable and a pass finished recently enough.
+
+        503 makes a dead scheduler visible to a container probe or an uptime monitor; /healthz keeps answering
+        while the process is alive, which is the only thing a liveness probe may ask. An unreadable state is
+        also not ready: every page and the pass itself depend on it.
+        """
+        from .state import SourceError
+
+        try:
+            state = load_state()
+        except SourceError as exc:
+            return PlainTextResponse(f"not ready: {exc}", status_code=503)
+        ok, reason = readiness(cfg, state, int(clock()))
+        return PlainTextResponse(reason, status_code=200 if ok else 503)
 
     @app.get("/metrics", response_class=PlainTextResponse)
     def metrics():
         state = load_state()
-        lines = [
-            "# HELP advisory_radar_pending Pending messages awaiting delivery",
-            "# TYPE advisory_radar_pending gauge",
-            f"advisory_radar_pending {len(state.get('pending', []))}",
-            "# HELP advisory_radar_parked Parked messages awaiting an operator decision",
-            "# TYPE advisory_radar_parked gauge",
-            f"advisory_radar_parked {len(state.get('parked', []))}",
-            "# HELP advisory_radar_seen_total Items ever seen",
-            "# TYPE advisory_radar_seen_total counter",
-            f"advisory_radar_seen_total {len(state.get('seen', {}))}",
-            "# HELP advisory_radar_last_pass_exit Exit code of the last pass",
-            "# TYPE advisory_radar_last_pass_exit gauge",
-            f"advisory_radar_last_pass_exit {last_pass_code(load_state())}",
+        runs = state.get("runs") or []
+        last = runs[-1] if runs and isinstance(runs[-1], dict) else {}
+        ok, _ = readiness(cfg, state, int(clock()))
+        gauges = [
+            ("pending", "Pending messages awaiting delivery", "gauge", len(state.get("pending", []))),
+            ("parked", "Parked messages awaiting an operator decision", "gauge", len(state.get("parked", []))),
+            ("seen_total", "Advisory identities ever seen", "counter", len(state.get("seen", {}))),
+            ("watch_total", "CVEs under daily re-evaluation", "gauge", len(state.get("watch", {}))),
+            ("runs_total", "Passes recorded", "counter", len(runs)),
+            # 0 means "no pass yet", which is also why ready is 0; both are honest about a fresh instance.
+            (
+                "last_pass_timestamp_seconds",
+                "When the last pass finished (epoch seconds)",
+                "gauge",
+                _number(last.get("at")),
+            ),
+            ("last_pass_exit", "Exit code of the last pass", "gauge", last_pass_code(state)),
+            ("last_pass_sent", "Messages delivered by the last pass", "gauge", _number(last.get("sent"))),
+            ("last_pass_parked", "Messages parked by the last pass", "gauge", _number(last.get("parked"))),
+            ("last_pass_pending", "Messages left pending by the last pass", "gauge", _number(last.get("pending"))),
+            ("ready", "1 when the last pass is recent enough and the state is readable", "gauge", int(ok)),
         ]
+        lines: list[str] = []
+        for name, help_text, kind, value in gauges:
+            lines.append(f"# HELP advisory_radar_{name} {help_text}")
+            lines.append(f"# TYPE advisory_radar_{name} {kind}")
+            lines.append(f"advisory_radar_{name} {value}")
         return PlainTextResponse("\n".join(lines) + "\n")
 
     #: Webhook inbox bounds: an unauthenticated or abusive caller must not be able to grow the state without
