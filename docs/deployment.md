@@ -78,9 +78,17 @@ container needs:
 |---|---|
 | `ADVISORY_RADAR_AUTH_TOKEN` | Web UI login token (required for `run`) |
 | `ADVISORY_RADAR_CONFIG` | Config path (the image sets `/config/config.yml`) |
+| `ADVISORY_RADAR_PUBLIC_HTTPS` | `1` when TLS terminates in front of the container: sends HSTS. Off by default, because a wrong HSTS setting pins a browser to HTTPS |
+| `ADVISORY_RADAR_INSECURE_COOKIES` | `1` only for a plain-HTTP development instance: stops marking the session cookie `Secure` |
 | plus one per referenced secret | e.g. `DISCORD_WEBHOOK_URL`, `APPRISE_PASSWORD`, `FRESHRSS_TOKEN` |
 
 Volumes: `/config` (read-only) and `/data` (state + KEV cache).
+
+The UI is protected by the login token, a `SameSite=Lax` + `Secure` + `HttpOnly`
+session cookie, a per-session form token on every state-changing POST, and a
+throttle on failed logins (five per five minutes per peer address). Put it behind
+a TLS-terminating reverse proxy; the session cookie is only sent over HTTPS unless
+`ADVISORY_RADAR_INSECURE_COOKIES=1`.
 
 ## Multi-arch images
 
