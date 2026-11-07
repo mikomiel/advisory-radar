@@ -341,3 +341,15 @@ def test_metrics_still_answer_when_the_state_is_unreadable(tmp_path):
 def test_metrics_report_a_readable_state(tmp_path):
     client, _ = make_client(tmp_path)
     assert "advisory_radar_state_readable 1" in client.get("/metrics").text
+
+
+def test_a_malformed_runs_value_does_not_break_the_probe_or_the_scrape(tmp_path):
+    """A hand-edited document can put anything under `runs`; both endpoints must still answer."""
+    client, _ = make_client(tmp_path)
+    state = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    state["runs"] = {"at": 1, "code": 0}  # a mapping, not a list
+    save_state(tmp_path / "state.json", state)
+    assert client.get("/readyz").status_code == 503
+    metrics = client.get("/metrics")
+    assert metrics.status_code == 200
+    assert "advisory_radar_last_pass_exit -1" in metrics.text

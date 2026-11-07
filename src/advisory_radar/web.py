@@ -91,8 +91,12 @@ def _number(value: object, default: int = 0) -> int:
 
 
 def last_pass_code(state: dict) -> int:
-    runs = state.get("runs") or []
-    return _number(runs[-1].get("code"), -1) if runs and isinstance(runs[-1], dict) else -1
+    """The last pass's exit code, or -1. Normalises ``runs`` the same way ``readiness`` does: a malformed
+    document must not raise from a probe or a scrape."""
+    runs = state.get("runs")
+    if not isinstance(runs, list) or not runs or not isinstance(runs[-1], dict):
+        return -1
+    return _number(runs[-1].get("code"), -1)
 
 
 #: A pass may be this many poll intervals late before the instance is not ready. Two skipped runs of slack keeps a
