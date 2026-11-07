@@ -40,7 +40,7 @@ def review(state: str, commit: str = HEAD, login: str = REVIEWER, kind: str = "B
     }
 
 
-FILES = [".github/workflows/ci.yml"]
+FILES = [{"filename": ".github/workflows/ci.yml", "previous_filename": None}]
 
 
 def entry(
@@ -49,15 +49,18 @@ def entry(
     reviews=(),
     draft: bool = False,
     author: str = "mikomiel",
-    files: list[str] | None = None,
+    files: list[dict] | None = None,
+    changed: int | None = None,
 ) -> dict:
+    chosen = FILES if files is None else files
     return {
         "number": number,
         "head": head,
         "draft": draft,
         "author": author,
         "reviews": list(reviews),
-        "files": FILES if files is None else files,
+        "files": chosen,
+        "changed": len(chosen) if changed is None else changed,
     }
 
 
@@ -131,7 +134,14 @@ def test_the_cli_prints_one_line_per_head_and_refuses_a_bad_snapshot():
 
 def test_a_dependabot_update_needs_no_app_review():
     state, description = decisions(
-        [entry(17, reviews=[], author="app/dependabot", files=[".github/workflows/ci.yml"])]
+        [
+            entry(
+                17,
+                reviews=[],
+                author="app/dependabot",
+                files=[{"filename": ".github/workflows/ci.yml", "previous_filename": None}],
+            )
+        ]
     )[HEAD]
     assert state == "success"
     assert "not required" in description and "dependabot" in description
@@ -167,19 +177,43 @@ def test_the_exemption_can_be_disabled():
 def test_the_exemption_needs_a_dependency_only_path_set():
     # author alone would exempt a bump that reached into src/, which automerge would then take unreviewed
     reached = decisions(
-        [entry(17, reviews=[], author="app/dependabot", files=[".github/workflows/ci.yml", "src/x.py"])]
+        [
+            entry(
+                17,
+                reviews=[],
+                author="app/dependabot",
+                files=[
+                    {"filename": ".github/workflows/ci.yml", "previous_filename": None},
+                    {"filename": "src/x.py", "previous_filename": None},
+                ],
+            )
+        ]
     )
     assert reached[HEAD][0] == "pending"
     missing = decisions([entry(17, reviews=[], author="app/dependabot", files=[])])
     assert missing[HEAD][0] == "pending"
-    manifest = decisions([entry(17, reviews=[], author="app/dependabot", files=["pyproject.toml", "uv.lock"])])
+    manifest = decisions(
+        [
+            entry(
+                17,
+                reviews=[],
+                author="app/dependabot",
+                files=[
+                    {"filename": "pyproject.toml", "previous_filename": None},
+                    {"filename": "uv.lock", "previous_filename": None},
+                ],
+            )
+        ]
+    )
     assert manifest[HEAD][0] == "success"
 
 
 def test_a_shared_head_with_a_blocked_pull_request_stays_blocked():
     entries = [
-        entry(17, reviews=[], author="app/dependabot", files=["pyproject.toml"]),
-        entry(18, reviews=[], author="mikomiel", files=["src/x.py"]),
+        entry(
+            17, reviews=[], author="app/dependabot", files=[{"filename": "pyproject.toml", "previous_filename": None}]
+        ),
+        entry(18, reviews=[], author="mikomiel", files=[{"filename": "src/x.py", "previous_filename": None}]),
     ]
     state, description = decisions(entries)[HEAD]
     assert state == "pending"
@@ -197,5 +231,52 @@ def test_the_exemption_does_not_cover_a_stale_or_dismissed_verdict():
 
 def test_a_renamed_source_counts_against_the_exemption():
     # the comparison names both sides of a rename; only ``filename`` would let src/x.py become pyproject.toml
-    renamed = decisions([entry(17, reviews=[], author="app/dependabot", files=["pyproject.toml", "src/x.py"])])
+    renamed = decisions(
+        [
+            entry(
+                17,
+                reviews=[],
+                author="app/dependabot",
+                files=[{"filename": "pyproject.toml", "previous_filename": "src/x.py"}],
+            )
+        ]
+    )
     assert renamed[HEAD][0] == "pending"
+
+
+def test_a_nested_path_under_a_manifest_name_is_not_a_dependency_update():
+    # deleting Dockerfile and adding Dockerfile/evil.py must not read as a manifest-only change
+    nested = decisions(
+        [
+            entry(
+                17,
+                reviews=[],
+                author="app/dependabot",
+                files=[{"filename": "Dockerfile/evil.py", "previous_filename": None}],
+            )
+        ]
+    )
+    assert nested[HEAD][0] == "pending"
+    for name in ("pyproject.toml/evil.py", "uv.lock/evil.py", "docker-compose.yml/evil.py"):
+        got = decisions(
+            [entry(17, reviews=[], author="app/dependabot", files=[{"filename": name, "previous_filename": None}])]
+        )
+        assert got[HEAD][0] == "pending", name
+
+
+def test_a_truncated_comparison_is_not_exempt():
+    # compare caps its list at 300: a source file can hide past the cap, so a short list proves nothing
+    entry_with_short_list = entry(
+        17,
+        reviews=[],
+        author="app/dependabot",
+        files=[{"filename": "pyproject.toml", "previous_filename": None}],
+        changed=5,
+    )
+    assert decisions([entry_with_short_list])[HEAD][0] == "pending"
+
+
+def test_a_comment_holds_a_dependency_update():
+    # any review at all is used as-is; a comment is not an approval
+    commented = decisions([entry(17, reviews=[review("COMMENTED")], author="app/dependabot")])[HEAD]
+    assert commented[0] == "pending"

@@ -7,9 +7,10 @@ for both. Publishing whichever pull request was processed last would let an appr
 changes-requested one green, so this script aggregates conservatively: the worst verdict among the pull
 requests sharing a head wins, and the description names them all.
 
-Input: a JSON array of ``{number, head, draft, author, reviews, files}`` on stdin -- one entry per open pull
-request, with the reviews exactly as the API returned them and ``files`` holding every path the immutable
-``compare`` names, both sides of a rename.
+Input: a JSON array of ``{number, head, draft, author, changed, reviews, files}`` on stdin -- one entry per
+open pull request, with the reviews exactly as the API returned them, ``changed`` the pull request's own
+changed-file count, and ``files`` the entries of the immutable ``compare`` (``filename`` and
+``previous_filename``). Flattening renames is this script's job, so that it is tested.
 
 Output: one line per head, ``head<TAB>state<TAB>description``, where state is a GitHub status state. The
 caller publishes these; it decides nothing.
@@ -36,29 +37,65 @@ MAX_DESCRIPTION = 140
 #: Authors whose pull requests do not need an App review, and only while every changed path stays inside
 #: DEPENDENCY_PATHS. Dependabot's updates are mechanical and `ci` (the image build included) still has to pass.
 #: The login is GitHub's, not the pull request's, so a patch cannot claim it. A pull request the exemption
-#: covers is still never auto-merged by automerge.yml, which requires an APPROVED review decision that an
-#: exempt pull request does not have; a person merges it.
+#: covers is not taken by automerge.yml, which requires an APPROVED review decision an exempt pull request
+#: does not have. GitHub's own auto-merge switch is separate: while `allow_auto_merge` is on, a write-access
+#: user can have GitHub merge an exempt bump once its checks are green.
 EXEMPT_AUTHORS = frozenset({"app/dependabot", "dependabot[bot]"})
-#: The only paths a dependency update may touch for the exemption to apply. Checked, not assumed: the
-#: author alone would exempt a pull request that reached into `src/`, and the merge workflow would then take
-#: it without a review because it is not a guarded path.
-DEPENDENCY_PATHS = frozenset({".github/workflows", "pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml"})
+#: Paths a dependency update may touch for the exemption to apply, checked rather than assumed. Files match
+#: exactly -- ``Dockerfile/evil.py`` is somebody deleting the manifest and adding a directory of source, not a
+#: dependency update -- and only the workflow tree matches as a prefix.
+DEPENDENCY_FILES = frozenset({"pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml"})
+DEPENDENCY_DIRECTORIES = (".github/workflows/",)
 
 
-def _dependency_only(files: object) -> bool:
-    """Whether every changed path is a dependency manifest the exemption may cover.
-
-    An absent or unreadable file list is *not* exempt: the caller could not prove the pull request stays on
-    a guarded path, and a wrong exemption here is a merge nobody reviewed.
-    """
+def _changed_names(entry: dict) -> list[str]:
+    """Every path the comparison names, both sides of a rename; empty when the list is unusable."""
+    files = entry.get("files")
     if not isinstance(files, list) or not files:
-        return False
-    for name in files:
+        return []
+    names: list[str] = []
+    for item in files:
+        if not isinstance(item, dict):
+            return []
+        name = item.get("filename")
         if not isinstance(name, str) or not name:
-            return False
-        if not any(name == allowed or name.startswith(allowed + "/") for allowed in DEPENDENCY_PATHS):
-            return False
+            return []
+        names.append(name)
+        previous = item.get("previous_filename")
+        if isinstance(previous, str) and previous:
+            names.append(previous)
+    return names
+
+
+def _dependency_only(names: list[str]) -> bool:
+    """Whether every changed path is a dependency manifest the exemption may cover."""
+    if not names:
+        return False
+    for name in names:
+        if name in DEPENDENCY_FILES:
+            continue
+        if any(name.startswith(directory) for directory in DEPENDENCY_DIRECTORIES):
+            continue
+        return False
     return True
+
+
+def exempt(entry: dict, author: str, exempt_authors: frozenset[str]) -> bool:
+    """Whether the exemption covers this entry: an exempt author, on a complete, manifest-only path list.
+
+    Fail-closed in three places: an unreadable list is not exempt, a list shorter than the pull request's own
+    changed-file count is not exempt (``compare`` caps its list at 300, so a source file could hide past the
+    cap), and an empty list is not exempt.
+    """
+    if author not in exempt_authors:
+        return False
+    files = entry.get("files")
+    declared = entry.get("changed")
+    if not isinstance(files, list) or not isinstance(declared, int) or declared < 1:
+        return False
+    if len(files) < declared:
+        return False
+    return _dependency_only(_changed_names(entry))
 
 
 def merge(
@@ -81,13 +118,12 @@ def merge(
         if entry.get("draft"):
             # A draft is not mergeable; saying so revokes a success left over from before it was a draft.
             state, description = "pending", "pull request is a draft"
-        elif author in exempt_authors and _dependency_only(entry.get("files")):
-            # An exemption, not a review, and only where no eligible reviewer has said anything decisive: a
-            # stale approval, a dismissal and a comment are all "pending", and converting those to success
-            # would claim a verdict that does not exist.
+        elif exempt(entry, author, exempt_authors):
+            # An exemption, not a review, and only where no eligible reviewer has said *anything*: any review at
+            # all -- including a comment that holds the change -- is used as-is rather than read as approval.
             reviews = entry.get("reviews")
             ours = reviews if isinstance(reviews, list) else []
-            if review_state.current_verdicts(ours, reviewer, reviewer_type, associations):
+            if review_state.matching_reviews(ours, reviewer, reviewer_type, associations):
                 state, description = review_state.verdict(ours, reviewer, reviewer_type, head, associations)
             else:
                 state = "success"

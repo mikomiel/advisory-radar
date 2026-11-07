@@ -111,8 +111,13 @@ the review itself, published as a status:
   author login GitHub assigns, which a patch cannot claim, and it applies **only where no
   eligible reviewer has said anything decisive**: a stale approval, a dismissed review or a
   comment still leaves it pending, and an approval or a change request is used as-is.
-  Automerges never take an exempt pull request — automerge requires an `APPROVED` review
-  decision, which an exempt one does not have — so a person merges every bump.
+  `.github/workflows/automerge.yml` never takes an exempt pull request: it requires an
+  `APPROVED` review decision, which an exempt one does not have. **GitHub's own auto-merge
+  is a separate switch**, and while repository setting `allow_auto_merge` is on, anyone
+  with write access can enable it on an exempt bump and GitHub will merge once `ci` and
+  `review` are green — no approval involved. If "a person merges every bump" is meant
+  literally, turn that setting off: there is no other use for it here, because the merge
+  is this repository's own workflow.
 - An exempt dependency update is the one case where a green `review` means "not required"
   rather than "approved": the description says which, and the exemption applies only while
   every changed path is a dependency manifest the gate checks — a bump that reached into

@@ -3,8 +3,9 @@
 # GitHub will not let an App approval satisfy the native "require a pull request review" rule (observed on
 # this repository: the reviewer App approved #9 at its exact head and GitHub still reported
 # REVIEW_REQUIRED / BLOCKED). With one human account that rule would deadlock every maintenance PR, so the
-# review is enforced as a *status check* instead: `review` is `success` only when the configured reviewer --
-# or a maintainer -- approved this exact head commit.
+# review is enforced as a *status check* instead: `review` is `success` when the configured reviewer -- or a
+# maintainer -- approved this exact head commit, or when the pull request is an exempt dependency update
+# (Dependabot, manifest-only paths, no review at all). Every other case is `failure` or `pending`.
 #
 # What that does and does not guarantee, precisely. A commit status is a stored assertion, not a live query:
 # GitHub never expires one, so nothing revokes it when the facts change.
@@ -127,17 +128,24 @@ jobs:
               echo "::error::#${pr}: cannot read the reviews"
               exit 1
             fi
+            # The list endpoint does not carry changed_files; the single-pull endpoint does, and the count is
+            # what proves the comparison is complete. A failed read stays null, which fails closed.
+            if ! changed=$(gh api "repos/$REPO/pulls/$pr" --jq .changed_files); then
+              changed=null
+              echo "::warning::#${pr}: cannot read the changed-file count; not exempt from review"
+            fi
             # The exemption is author *and* path, and the paths come from the immutable two-SHA comparison, never
             # from /pulls/{n}/files (which follows the branch: a head that moved A -> B -> A could show B's
             # harmless files while A is evaluated). Both sides of a rename count. A failed read is not exempt.
             if ! files=$(gh api "repos/$REPO/compare/$base...$head" \
-                --jq '[.files[]? | .filename, (.previous_filename // empty)]'); then
+                --jq '[.files[]? | {filename: .filename, previous_filename: .previous_filename}]'); then
               files='[]'
               echo "::warning::#${pr}: cannot read the comparison; not exempt from review"
             fi
             jq -c -n --argjson number "$pr" --arg head "$head" --argjson draft "$draft" --arg author "$author" \
-              --argjson reviews "$reviews" --argjson files "$files" \
-              '{number: $number, head: $head, draft: $draft, author: $author, reviews: $reviews, files: $files}' >> "$snapshot"
+              --argjson changed "$changed" --argjson reviews "$reviews" --argjson files "$files" \
+              '{number: $number, head: $head, draft: $draft, author: $author, changed: $changed,
+                reviews: $reviews, files: $files}' >> "$snapshot"
           done <<<"$prs"
 
           # One status per head commit, worst verdict winning: a status is keyed by (sha, context), so two pull
