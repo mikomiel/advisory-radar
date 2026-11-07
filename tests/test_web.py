@@ -283,7 +283,7 @@ def test_readyz_reports_an_unreadable_state(tmp_path):
 def test_metrics_carry_the_watch_and_run_counts(tmp_path):
     client, _ = make_client(tmp_path, clock=1792600060)
     metrics = client.get("/metrics").text
-    assert "advisory_radar_runs_total 1" in metrics
+    assert "advisory_radar_runs_retained 1" in metrics
     assert "advisory_radar_watch_total 0" in metrics
     assert "advisory_radar_last_pass_sent 1" in metrics
     assert "advisory_radar_last_pass_exit 0" in metrics
@@ -331,6 +331,7 @@ def test_metrics_still_answer_when_the_state_is_unreadable(tmp_path):
     """The documented alert is `advisory_radar_ready == 0`; a failed scrape would produce no sample at all."""
     client, _ = make_client(tmp_path)
     (tmp_path / "state.json").write_text("{not json")
+    assert client.get("/healthz").status_code == 200  # liveness stays independent of the state
     response = client.get("/metrics")
     assert response.status_code == 200
     assert "advisory_radar_ready 0" in response.text
@@ -353,3 +354,16 @@ def test_a_malformed_runs_value_does_not_break_the_probe_or_the_scrape(tmp_path)
     metrics = client.get("/metrics")
     assert metrics.status_code == 200
     assert "advisory_radar_last_pass_exit -1" in metrics.text
+
+
+def test_a_malformed_collection_does_not_break_the_scrape(tmp_path):
+    client, _ = make_client(tmp_path)
+    state = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    state["watch"] = None
+    state["seen"] = None
+    state["pending"] = None
+    save_state(tmp_path / "state.json", state)
+    metrics = client.get("/metrics")
+    assert metrics.status_code == 200
+    assert "advisory_radar_watch_total 0" in metrics.text
+    assert "advisory_radar_pending 0" in metrics.text

@@ -90,6 +90,11 @@ def _number(value: object, default: int = 0) -> int:
         return default
 
 
+def _length(value: object) -> int:
+    """A collection's size, or 0: a malformed document must not raise from a probe or a scrape."""
+    return len(value) if isinstance(value, (list, dict, tuple, set)) else 0
+
+
 def last_pass_code(state: dict) -> int:
     """The last pass's exit code, or -1. Normalises ``runs`` the same way ``readiness`` does: a malformed
     document must not raise from a probe or a scrape."""
@@ -563,11 +568,11 @@ def create_app(
         last = runs[-1] if runs and isinstance(runs[-1], dict) else {}
         ok, _ = readiness(cfg, state, int(clock()))
         gauges = [
-            ("pending", "Pending messages awaiting delivery", "gauge", len(state.get("pending", []))),
-            ("parked", "Parked messages awaiting an operator decision", "gauge", len(state.get("parked", []))),
-            ("seen_total", "Advisory identities ever seen", "counter", len(state.get("seen", {}))),
-            ("watch_total", "CVEs under daily re-evaluation", "gauge", len(state.get("watch", {}))),
-            ("runs_total", "Passes recorded", "counter", len(runs)),
+            ("pending", "Pending messages awaiting delivery", "gauge", _length(state.get("pending"))),
+            ("parked", "Parked messages awaiting an operator decision", "gauge", _length(state.get("parked"))),
+            ("seen_total", "Advisory identities ever seen", "counter", _length(state.get("seen"))),
+            ("watch_total", "CVEs under daily re-evaluation", "gauge", _length(state.get("watch"))),
+            ("runs_retained", "Passes retained in the state (the last 200)", "gauge", len(runs)),
             # 0 means "no pass yet", which is also why ready is 0; both are honest about a fresh instance.
             (
                 "last_pass_timestamp_seconds",

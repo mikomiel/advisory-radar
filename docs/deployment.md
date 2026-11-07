@@ -58,7 +58,7 @@ answering `ok` forever.
 | Metric | Meaning |
 |---|---|
 | `advisory_radar_pending` / `_parked` | queue depth; parked messages wait for an operator decision in the UI |
-| `advisory_radar_seen_total` / `_watch_total` / `_runs_total` | identities seen, CVEs under re-evaluation, passes recorded |
+| `advisory_radar_seen_total` / `_watch_total` / `_runs_retained` | identities seen, CVEs under re-evaluation, passes retained (run history is trimmed to 200) |
 | `advisory_radar_last_pass_timestamp_seconds` | when the last pass finished (`0` = never) |
 | `advisory_radar_last_pass_exit` / `_sent` / `_parked` / `_pending` | what the last pass did |
 | `advisory_radar_ready` | `1` when `/readyz` would answer `200` |
