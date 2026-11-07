@@ -7,8 +7,9 @@ for both. Publishing whichever pull request was processed last would let an appr
 changes-requested one green, so this script aggregates conservatively: the worst verdict among the pull
 requests sharing a head wins, and the description names them all.
 
-Input: a JSON array of ``{number, head, draft, reviews}`` on stdin -- one entry per open pull request, with
-the reviews exactly as the API returned them.
+Input: a JSON array of ``{number, head, draft, author, reviews, files}`` on stdin -- one entry per open pull
+request, with the reviews exactly as the API returned them and ``files`` holding every path the immutable
+``compare`` names, both sides of a rename.
 
 Output: one line per head, ``head<TAB>state<TAB>description``, where state is a GitHub status state. The
 caller publishes these; it decides nothing.
@@ -32,18 +33,16 @@ import review_state  # noqa: E402
 #: Higher blocks more: a shared head is only green when every pull request on it is green.
 SEVERITY = {"success": 1, "pending": 2, "failure": 3}
 MAX_DESCRIPTION = 140
-#: Authors whose pull requests do not need an App review. Dependabot's updates are mechanical, its pull
-#: requests touch `.github/workflows` or the lockfile -- which the sensitive-path guard already routes to a
-#: person -- and `ci` (including the image build) still has to pass. The login is GitHub's, not the pull
-#: request's, so it cannot be claimed by a patch. A real verdict always wins: this only fills the gap where
-#: nobody reviewed the pull request.
+#: Authors whose pull requests do not need an App review, and only while every changed path stays inside
+#: DEPENDENCY_PATHS. Dependabot's updates are mechanical and `ci` (the image build included) still has to pass.
+#: The login is GitHub's, not the pull request's, so a patch cannot claim it. A pull request the exemption
+#: covers is still never auto-merged by automerge.yml, which requires an APPROVED review decision that an
+#: exempt pull request does not have; a person merges it.
 EXEMPT_AUTHORS = frozenset({"app/dependabot", "dependabot[bot]"})
 #: The only paths a dependency update may touch for the exemption to apply. Checked, not assumed: the
 #: author alone would exempt a pull request that reached into `src/`, and the merge workflow would then take
 #: it without a review because it is not a guarded path.
-DEPENDENCY_PATHS = frozenset(
-    {".github/workflows", "pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml", "requirements"}
-)
+DEPENDENCY_PATHS = frozenset({".github/workflows", "pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml"})
 
 
 def _dependency_only(files: object) -> bool:
@@ -83,12 +82,14 @@ def merge(
             # A draft is not mergeable; saying so revokes a success left over from before it was a draft.
             state, description = "pending", "pull request is a draft"
         elif author in exempt_authors and _dependency_only(entry.get("files")):
-            # An exemption, not a review: it only covers the case where no verdict exists at all.
+            # An exemption, not a review, and only where no eligible reviewer has said anything decisive: a
+            # stale approval, a dismissal and a comment are all "pending", and converting those to success
+            # would claim a verdict that does not exist.
             reviews = entry.get("reviews")
-            state, description = review_state.verdict(
-                reviews if isinstance(reviews, list) else [], reviewer, reviewer_type, head, associations
-            )
-            if state == "pending":
+            ours = reviews if isinstance(reviews, list) else []
+            if review_state.current_verdicts(ours, reviewer, reviewer_type, associations):
+                state, description = review_state.verdict(ours, reviewer, reviewer_type, head, associations)
+            else:
                 state = "success"
                 description = f"dependency update by {author}: App review not required"
         else:

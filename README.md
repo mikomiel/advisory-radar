@@ -89,9 +89,9 @@ the review itself, published as a status:
 - `.github/workflows/review-gate.yml` reads every open pull request's reviews on each
   `ci` completion, on pull-request lifecycle events (opened, reopened, ready for review,
   converted to draft, closed, pushed) and every five minutes, then publishes `review` on
-  the head commit: `success` only when there is an **approving review at that exact
-  commit**, `failure` when a reviewer's verdict is "changes requested", and `pending`
-  otherwise. The logic lives in `scripts/review_gate_plan.py`, which also aggregates
+  the head commit: `success` when there is an **approving review at that exact commit** or
+  the pull request is an exempt dependency update (below), `failure` when a reviewer's
+  verdict is "changes requested", and `pending` otherwise. The logic lives in `scripts/review_gate_plan.py`, which also aggregates
   several pull requests sharing one head — a status is keyed by commit, so the worst
   verdict must win.
 - The rule has one owner: [`scripts/review_state.py`](scripts/review_state.py), tested by
@@ -104,12 +104,15 @@ the review itself, published as a status:
   `review` status, so the merge button goes back to blocked. That is the intended
   behaviour, not an outage.
 - **Dependency updates are exempt from the App review, and nothing else is.** A pull
-  request opened by Dependabot (`app/dependabot`) gets `review: success` with the reason
-  in the description, because the update is mechanical, it always lands on a path the
-  guard already routes to a person (`.github/workflows` or the lockfile), and `ci` — the
-  image build included — still has to pass. The exemption is keyed on an author login
-  GitHub assigns, which a patch cannot claim, and it only fills the gap where no verdict
-  exists: a reviewer who has actually approved or requested changes overrules it.
+  request opened by Dependabot (`dependabot[bot]`) gets `review: success` with the reason
+  in the description, and only while *every* path the immutable `base...head` comparison
+  names — both sides of a rename — is a dependency manifest (`.github/workflows`,
+  `pyproject.toml`, `uv.lock`, `Dockerfile`, `docker-compose.yml`). It is keyed on an
+  author login GitHub assigns, which a patch cannot claim, and it applies **only where no
+  eligible reviewer has said anything decisive**: a stale approval, a dismissed review or a
+  comment still leaves it pending, and an approval or a change request is used as-is.
+  Automerges never take an exempt pull request — automerge requires an `APPROVED` review
+  decision, which an exempt one does not have — so a person merges every bump.
 - An exempt dependency update is the one case where a green `review` means "not required"
   rather than "approved": the description says which, and the exemption applies only while
   every changed path is a dependency manifest the gate checks — a bump that reached into
@@ -153,8 +156,9 @@ The workflow only runs from the default branch — `workflow_run` and `schedule`
 never `pull_request*` and not `workflow_dispatch` (a dispatcher can pick another
 ref, and that ref's copy of the file is what runs). The trade-off is latency: a merge lands
 within ~30 minutes of the approval, not at the instant of the review. Nothing
-merges without an approval from the configured reviewer at the exact head, and
-any check that is not terminal-success stops it.
+merges without an approval from the configured reviewer at the exact head — or, for an
+exempt dependency update, without one being required — and any check that is not
+terminal-success stops it.
 
 To enable the second required check on a copy of this repository
 (`contexts` replaces the whole list, so keep `ci`):
@@ -166,17 +170,6 @@ echo '{"strict": true, "contexts": ["ci", "review"]}' \
 
 Merge a change to `.github/` *before* adding `review`, or the gate cannot run and every
 pull request is blocked by a check that does not exist yet.
-
-**When the reviewer cannot complete.** The reviewer receives a diff, not a checkout, so on
-a change whose correctness depends on surrounding source it may answer
-`REVIEW_INCOMPLETE` — which posts nothing, leaving a `changes requested` or no status at
-all. With one human account that pull request can then only land through the repository
-owner's admin override (`enforce_admins` is off). That is the sanctioned escape hatch, not
-an improvisation: record in the pull request *why* — the findings that were fixed and the
-verdict the reviewer returned — so the override is auditable. The durable fix is a second
-human account or a team with another member, which makes a maintainer's approval satisfy
-the gate; that is what genuine two-person review needs and what this repository cannot
-express today.
 
 The reviewer is the Gandalf GitHub App, which posts its review through the
 `external_github_review` route; a review is requested, not spawned — the gate enforces a

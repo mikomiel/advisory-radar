@@ -184,3 +184,18 @@ def test_a_shared_head_with_a_blocked_pull_request_stays_blocked():
     state, description = decisions(entries)[HEAD]
     assert state == "pending"
     assert "#17" in description and "#18" in description
+
+
+def test_the_exemption_does_not_cover_a_stale_or_dismissed_verdict():
+    """Only an absence of verdict is exempt: "approved at another commit" and "dismissed" are not reviews."""
+    stale = decisions([entry(17, reviews=[review("APPROVED", commit="0" * 40)], author="app/dependabot")])[HEAD]
+    assert stale[0] == "pending"
+    assert "not required" not in stale[1]
+    dismissed = decisions([entry(17, reviews=[review("DISMISSED")], author="app/dependabot")])[HEAD]
+    assert dismissed[0] == "pending"
+
+
+def test_a_renamed_source_counts_against_the_exemption():
+    # the comparison names both sides of a rename; only ``filename`` would let src/x.py become pyproject.toml
+    renamed = decisions([entry(17, reviews=[], author="app/dependabot", files=["pyproject.toml", "src/x.py"])])
+    assert renamed[HEAD][0] == "pending"

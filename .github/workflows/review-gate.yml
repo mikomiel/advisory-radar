@@ -56,11 +56,6 @@ env:
   #: Reviews by somebody with repository access count too, which is how a maintainer approves a contributor's
   #: pull request the App cannot approve for its own author.
   TRUSTED_ASSOCIATIONS: OWNER,MEMBER,COLLABORATOR
-  #: Authors whose pull requests need no App review, *and* only while every changed path stays in the
-  #: dependency manifests the gate checks. Dependabot's updates are mechanical, they land on paths the
-  #: sensitive-path guard already sends to a person, and ci still has to pass. The login is GitHub's, so a pull
-  #: request cannot claim it.
-  EXEMPT_AUTHORS: app/dependabot,dependabot[bot]
   #: The required status context this workflow publishes.
   GATE_CONTEXT: review
 
@@ -106,7 +101,7 @@ jobs:
           # Complete enumeration over the REST API: `gh pr list --limit N` truncates silently, and a pull request
           # pushed out of the window would keep an old success that no sweep ever revisits.
           if ! prs=$(gh api --paginate "repos/$REPO/pulls?state=open&base=main&per_page=100" \
-              --jq '.[] | [.number, .head.sha, (.draft|tostring), .user.login] | @tsv'); then
+              --jq '.[] | [.number, .head.sha, .base.sha, (.draft|tostring), .user.login] | @tsv'); then
             echo "::error::cannot enumerate open pull requests; no status can be re-confirmed"
             exit 1
           fi
@@ -119,12 +114,12 @@ jobs:
             exit 0
           fi
 
-          while IFS=$'\t' read -r pr head draft author; do
+          while IFS=$'\t' read -r pr head base draft author; do
             [ -n "$pr" ] || continue
             if ! reviews=$(gh api --paginate "repos/$REPO/pulls/$pr/reviews?per_page=100" | jq -s -c 'add'); then
               # An incomplete snapshot must not leave a success standing: revoke every head we were about to
               # re-confirm, then fail. The next sweep republishes what is true.
-              while IFS=$'\t' read -r _other revoke_head _draft _author; do
+              while IFS=$'\t' read -r _other revoke_head _base _draft _author; do
                 if [ -n "$revoke_head" ]; then
                   publish "$revoke_head" pending "could not read the reviews; the next run decides" || true
                 fi
@@ -132,11 +127,13 @@ jobs:
               echo "::error::#${pr}: cannot read the reviews"
               exit 1
             fi
-            # The exemption is author *and* path: a dependency update that reached outside the manifests is
-            # not exempt, and a failed file read is not exempt either (an empty list fails closed).
-            if ! files=$(gh api --paginate "repos/$REPO/pulls/$pr/files?per_page=100" --jq '[.[].filename]' | jq -s 'add'); then
+            # The exemption is author *and* path, and the paths come from the immutable two-SHA comparison, never
+            # from /pulls/{n}/files (which follows the branch: a head that moved A -> B -> A could show B's
+            # harmless files while A is evaluated). Both sides of a rename count. A failed read is not exempt.
+            if ! files=$(gh api "repos/$REPO/compare/$base...$head" \
+                --jq '[.files[]? | .filename, (.previous_filename // empty)]'); then
               files='[]'
-              echo "::warning::#${pr}: cannot read the changed files; not exempt from review"
+              echo "::warning::#${pr}: cannot read the comparison; not exempt from review"
             fi
             jq -c -n --argjson number "$pr" --arg head "$head" --argjson draft "$draft" --arg author "$author" \
               --argjson reviews "$reviews" --argjson files "$files" \
@@ -148,8 +145,7 @@ jobs:
           # The snapshot is one JSON object per line; the plan script takes one array.
           jq -s '.' "$snapshot" | python3 scripts/review_gate_plan.py \
             --reviewer "$REVIEWER_LOGIN" --type "$REVIEWER_TYPE" \
-            --trusted-associations "$TRUSTED_ASSOCIATIONS" \
-            --exempt-authors "$EXEMPT_AUTHORS" > "$plan"
+            --trusted-associations "$TRUSTED_ASSOCIATIONS" > "$plan"
 
           while IFS=$'\t' read -r head state description; do
             [ -n "$head" ] || continue
