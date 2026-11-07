@@ -90,6 +90,68 @@ CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-u
 #: so throttling only has to make online guessing pointless, not impossible.
 LOGIN_WINDOW_SECONDS = 300
 LOGIN_MAX_FAILURES = 5
+#: Peers the throttle remembers. Bounded because a rotating-address attacker must not turn it into unbounded
+#: memory; see LoginThrottle for why the oldest peer is evicted rather than a new peer refused.
+LOGIN_MAX_PEERS = 1024
+
+
+class LoginThrottle:
+    """Failed sign-in attempts per peer inside a rolling window.
+
+    Two properties the endpoint depends on:
+
+    * :meth:`refusal` reflects every failure recorded *so far*, so the handler can call it again after the
+      body arrived and immediately before comparing credentials -- a check made before an attacker-controlled
+      wait cannot be the only one.
+    * the map is bounded. At the cap the least recently failing peer is evicted rather than a new peer being
+      refused: refusing newcomers would let an attacker who fills the map lock the operator out, and the
+      secret being guessed is 24 random bytes that no rate of online guessing reaches.
+    """
+
+    def __init__(
+        self,
+        window: float = LOGIN_WINDOW_SECONDS,
+        attempts: int = LOGIN_MAX_FAILURES,
+        peers: int = LOGIN_MAX_PEERS,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._window = window
+        self._attempts = attempts
+        self._peers = peers
+        self._clock = clock
+        self._failures: dict[str, list[float]] = {}
+
+    @property
+    def tracked(self) -> int:
+        """How many peers are being remembered (a test, and an operator reading a debugger, both want this)."""
+        return len(self._failures)
+
+    def _prune(self, now: float) -> None:
+        """Forget every peer whose newest failure has left the window, not only the caller's."""
+        stale = [peer for peer, stamps in self._failures.items() if not stamps or now - stamps[-1] >= self._window]
+        for peer in stale:
+            self._failures.pop(peer, None)
+
+    def refusal(self, peer: str) -> int | None:
+        """Seconds until this peer may try again, or None when it may try now."""
+        now = self._clock()
+        self._prune(now)
+        recent = [stamp for stamp in self._failures.get(peer, ()) if now - stamp < self._window]
+        if recent:
+            self._failures[peer] = recent
+        if len(recent) < self._attempts:
+            return None
+        return max(1, int(self._window - (now - recent[0])))
+
+    def failed(self, peer: str) -> None:
+        now = self._clock()
+        self._prune(now)
+        self._failures.setdefault(peer, []).append(now)
+        while len(self._failures) > self._peers:
+            self._failures.pop(min(self._failures, key=lambda name: self._failures[name][-1]), None)
+
+    def succeeded(self, peer: str) -> None:
+        self._failures.pop(peer, None)
 
 
 class BodyTooLarge(Exception):
@@ -195,22 +257,14 @@ def create_app(
         if not supplied:
             form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
             supplied = (form.get(CSRF_FIELD) or [""])[0]
-        if not supplied or not hmac.compare_digest(csrf_token(request), supplied):
+        # Compared as bytes: hmac.compare_digest raises TypeError on a non-ASCII str, and a form field is
+        # attacker-supplied -- "%C3%A9" must be a refused token, not a 500.
+        if not supplied or not hmac.compare_digest(
+            csrf_token(request).encode(), supplied.encode("utf-8", "surrogatepass")
+        ):
             raise HTTPException(status_code=403, detail="invalid form token; reload the page and try again")
 
-    #: Failed logins per peer address, pruned on every check so the map stays tiny.
-    failures: dict[str, list[float]] = {}
-
-    def login_refusal(peer: str, now: float) -> int | None:
-        """Seconds until the next attempt is allowed, or None when this peer may try now."""
-        recent = [stamp for stamp in failures.get(peer, ()) if now - stamp < LOGIN_WINDOW_SECONDS]
-        if recent:
-            failures[peer] = recent
-        else:
-            failures.pop(peer, None)
-        if len(recent) < LOGIN_MAX_FAILURES:
-            return None
-        return max(1, int(LOGIN_WINDOW_SECONDS - (now - recent[0])))
+    throttle = LoginThrottle()
 
     def require_auth(request: Request) -> bool:
         return auth.valid(request)
@@ -232,16 +286,19 @@ def create_app(
     @app.post("/login")
     async def login(request: Request):
         peer = request.client.host if request.client else "unknown"
-        now = time.time()
-        wait = login_refusal(peer, now)
-        if wait is not None:
-            # Refuse before reading the body: a throttled peer costs this process nothing.
+
+        def throttled(wait: int):
             return page(
                 "Too many attempts",
                 "<p>Too many failed sign-in attempts. Try again shortly.</p>",
                 status_code=429,
                 headers={"Retry-After": str(wait)},
             )
+
+        wait = throttle.refusal(peer)
+        if wait is not None:
+            # Refuse before reading the body: a throttled peer costs this process nothing.
+            return throttled(wait)
         # parse the urlencoded body by hand: no python-multipart dependency
         try:
             raw = await _body(request, LOGIN_BODY_LIMIT)
@@ -249,10 +306,15 @@ def create_app(
             return PlainTextResponse("payload too large", status_code=413)
         form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
         supplied = (form.get("token") or [""])[0]
+        # Re-check with a fresh timestamp now the body has arrived: the first check happened before a wait the
+        # caller controls, so concurrent requests could all have passed it and then guessed.
+        wait = throttle.refusal(peer)
+        if wait is not None:
+            return throttled(wait)
         expected = env.get("ADVISORY_RADAR_AUTH_TOKEN", "")
         # constant-time compare: a byte-by-byte comparison leaks how much of the token matched
         if supplied and expected and hmac.compare_digest(supplied.encode(), expected.encode()):
-            failures.pop(peer, None)
+            throttle.succeeded(peer)
             response = RedirectResponse("/", status_code=303)
             # Secure by default: without it a browser may send a seven-day session over plaintext HTTP to the
             # same host. ADVISORY_RADAR_INSECURE_COOKIES=1 opts out, for a plain-HTTP development instance only.
@@ -264,7 +326,7 @@ def create_app(
                 secure=not _insecure_cookies(os.environ),
             )
             return response
-        failures.setdefault(peer, []).append(now)
+        throttle.failed(peer)
         return page(
             "Login",
             '<p>Wrong token.</p><form method="post" action="/login">'

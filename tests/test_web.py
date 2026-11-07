@@ -9,8 +9,8 @@ from fastapi.testclient import TestClient
 
 from advisory_radar import core
 from advisory_radar.config import load_config
-from advisory_radar.state import save_state
-from advisory_radar.web import create_app
+from advisory_radar.state import load_state_document, save_state
+from advisory_radar.web import LoginThrottle, create_app
 
 
 def make_client(tmp_path: Path, token: str = "secret-token"):
@@ -159,3 +159,84 @@ def test_sign_out_clears_the_session(tmp_path):
     assert "advisory_radar_session=" in cleared
     assert "Max-Age=0" in cleared
     assert "HttpOnly" in cleared
+
+
+# --- the login throttle's contract (the merge review found the first version bypassable) -------------
+
+
+def test_the_throttle_reflects_failures_recorded_after_an_earlier_check():
+    """The endpoint checks before and after reading the body; the second check must see the first's outcome."""
+    now = [1000.0]
+    throttle = LoginThrottle(window=60, attempts=2, clock=lambda: now[0])
+    assert throttle.refusal("peer") is None
+    throttle.failed("peer")
+    assert throttle.refusal("peer") is None  # one failure: still allowed
+    throttle.failed("peer")
+    assert throttle.refusal("peer") is not None  # the re-check refuses without waiting for the window
+
+
+def test_the_throttle_forgets_every_expired_peer_not_just_the_caller():
+    now = [1000.0]
+    throttle = LoginThrottle(window=60, attempts=1, clock=lambda: now[0])
+    throttle.failed("peer")
+    assert throttle.refusal("peer") is not None
+    now[0] += 61
+    assert throttle.refusal("peer") is None
+    assert throttle.tracked == 0  # a peer that never returns must not be remembered forever
+
+
+def test_the_throttle_is_bounded_and_evicts_the_least_recent_peer():
+    now = [1000.0]
+    throttle = LoginThrottle(window=60, attempts=5, peers=2, clock=lambda: now[0])
+    throttle.failed("a")
+    throttle.failed("b")
+    assert throttle.tracked == 2
+    now[0] += 1
+    throttle.failed("c")
+    assert throttle.tracked == 2  # bounded: a rotating-address attacker cannot grow it
+    assert throttle.refusal("a") is None  # the least recently failing peer is evicted, a new one is not refused
+
+
+def test_a_success_clears_the_peer():
+    now = [1000.0]
+    throttle = LoginThrottle(window=60, attempts=2, clock=lambda: now[0])
+    throttle.failed("peer")
+    throttle.succeeded("peer")
+    assert throttle.refusal("peer") is None
+    assert throttle.tracked == 0
+
+
+def test_a_non_ascii_form_token_is_refused_not_a_server_error(tmp_path):
+    client, token = make_client(tmp_path)
+    csrf = signed_in(client, token)
+    # "%C3%A9" reached hmac.compare_digest as a str and raised TypeError before this was fixed
+    assert client.post("/run", data={"csrf": "é"}, follow_redirects=False).status_code == 403
+    assert client.post("/run", data={"csrf": csrf}, follow_redirects=False).status_code == 303
+
+
+def test_a_refused_post_leaves_the_queue_untouched(tmp_path):
+    """A rejected token must be a rejected action, not a rejected-but-executed one."""
+    client, token = make_client(tmp_path)
+    state = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    state["parked"] = [
+        {
+            "kind": "new",
+            "tag": "warning",
+            "title": "P",
+            "body": "b",
+            "ids": ["CVE-2026-3"],
+            "cves": [],
+            "levels": {},
+            "source": "s",
+            "link": "",
+            "attempts": 3,
+            "first_attempt_at": 1792600000,
+            "parked_at": 1792600000,
+        }
+    ]
+    save_state(tmp_path / "state.json", state)
+    csrf = signed_in(client, token)
+    assert client.post("/parked/release", follow_redirects=False).status_code == 403
+    assert len(load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")["parked"]) == 1
+    assert client.post("/parked/release", data={"csrf": csrf}, follow_redirects=False).status_code == 303
+    assert load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")["parked"] == []
