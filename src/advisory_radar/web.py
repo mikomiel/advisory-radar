@@ -74,10 +74,17 @@ def _public_url(url: str) -> str:
 
 
 def _number(value: object, default: int = 0) -> int:
-    """A state value as an integer: a hand-edited or older state must not break a probe or a scrape."""
+    """A state value as an integer: a hand-edited or older state must not break a probe or a scrape.
+
+    ``NaN`` and ``inf`` are floats that ``int()`` refuses (and that Python's JSON reader accepts), so the
+    conversion is guarded too -- that is the whole point of this helper.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return default
-    return int(value)
+    try:
+        return int(value)
+    except (ValueError, OverflowError):
+        return default
 
 
 def last_pass_code(state: dict) -> int:
@@ -90,6 +97,8 @@ def last_pass_code(state: dict) -> int:
 READY_AGE_FACTOR = 3
 #: Floor for the staleness limit: a 30 s poll interval must not declare itself unready between two passes.
 READY_MIN_AGE_SECONDS = 300
+#: A run timestamp further ahead than this is a copied state file or a clock that moved, not a fresh pass.
+READY_CLOCK_SKEW_SECONDS = 60
 
 
 def readiness(cfg: Config, state: dict, now: int) -> tuple[bool, str]:
@@ -103,6 +112,10 @@ def readiness(cfg: Config, state: dict, now: int) -> tuple[bool, str]:
         return False, "not ready: the last run record has no timestamp"
     limit = max(READY_AGE_FACTOR * cfg.poll_interval_seconds, READY_MIN_AGE_SECONDS)
     age = now - at
+    if age < -READY_CLOCK_SKEW_SECONDS:
+        # A future timestamp is not freshness: it would hide a stopped scheduler until that moment, so it is
+        # reported rather than trusted.
+        return False, f"not ready: the last run is recorded {-age // 60} min in the future (state replaced?)"
     if age > limit:
         return False, f"not ready: the last pass finished {age // 60} min ago (limit {limit // 60} min)"
     return True, "ready"

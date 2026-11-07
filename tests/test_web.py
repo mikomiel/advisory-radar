@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from advisory_radar import core
 from advisory_radar.config import load_config
 from advisory_radar.state import load_state_document, save_state
-from advisory_radar.web import LoginThrottle, create_app
+from advisory_radar.web import LoginThrottle, create_app, readiness
 
 
 def make_client(tmp_path: Path, token: str = "secret-token", clock: float | None = None):
@@ -252,7 +252,9 @@ def test_readyz_is_ready_just_after_a_pass(tmp_path):
 
 
 def test_readyz_reports_a_stale_pass(tmp_path):
-    client, _ = make_client(tmp_path)  # real clock: the recorded pass is long past
+    # The fixture's pass is at 1792600000; inject a clock past the limit (3 x 900 s) instead of relying on the
+    # wall clock being later than a fixed timestamp, which would make this test time-travel-dependent.
+    client, _ = make_client(tmp_path, clock=1792600000 + 3000)
     response = client.get("/readyz")
     assert response.status_code == 503
     assert "the last pass finished" in response.text
@@ -285,3 +287,41 @@ def test_metrics_carry_the_watch_and_run_counts(tmp_path):
     assert "advisory_radar_watch_total 0" in metrics
     assert "advisory_radar_last_pass_sent 1" in metrics
     assert "advisory_radar_last_pass_exit 0" in metrics
+
+
+def test_readyz_treats_a_future_run_as_unready(tmp_path):
+    """A replaced state file or a clock jump must not hide a stopped scheduler."""
+    client, _ = make_client(tmp_path, clock=1792600000 - 600)
+    response = client.get("/readyz")
+    assert response.status_code == 503
+    assert "in the future" in response.text
+
+
+def cfg_with_interval(tmp_path: Path, interval: str):
+    path = tmp_path / f"c-{interval}.yml"
+    path.write_text(f"sources: []\nnotifiers: []\npoll_interval: {interval}\nstate_path: {tmp_path}/s.json\n")
+    return load_config(path, {})
+
+
+def test_readiness_uses_three_intervals_with_a_five_minute_floor(tmp_path):
+    now = 1792600000
+    state = {"runs": [{"at": now - 299, "code": 0}]}
+    # a 30 s interval: 3 x 30 s would be 90 s, and the 300 s floor keeps a fast poll from flapping
+    assert readiness(cfg_with_interval(tmp_path, "30s"), state, now)[0] is True
+    assert readiness(cfg_with_interval(tmp_path, "30s"), {"runs": [{"at": now - 301, "code": 0}]}, now)[0] is False
+    # a 15 m interval: 3 x 900 s = 2700 s, and both sides of that boundary are exact
+    fifteen = cfg_with_interval(tmp_path, "15m")
+    assert readiness(fifteen, {"runs": [{"at": now - 2700, "code": 0}]}, now)[0] is True
+    assert readiness(fifteen, {"runs": [{"at": now - 2701, "code": 0}]}, now)[0] is False
+
+
+def test_a_nan_timestamp_does_not_break_the_probe_or_the_scrape(tmp_path):
+    """Python's JSON reader accepts NaN; int(nan) raises, which would turn a scrape into a 500."""
+    client, _ = make_client(tmp_path)
+    state = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    state["runs"] = [{"at": float("nan"), "code": 0}]
+    save_state(tmp_path / "state.json", state)
+    assert client.get("/readyz").status_code == 503  # no usable timestamp is not readiness
+    metrics = client.get("/metrics")
+    assert metrics.status_code == 200
+    assert "advisory_radar_last_pass_timestamp_seconds 0" in metrics.text
