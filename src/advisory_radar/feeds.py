@@ -332,7 +332,7 @@ def fetch_rss(http: Http, url: str, validators: Mapping[str, str] | None = None)
         headers.update(validators)
     status, response_headers, body = http("GET", url, headers, None)
     if status == 304:
-        return FeedExport((), False), {}
+        return FeedExport((), False), None
     if status != 200:
         raise RssError(f"feed answered HTTP {status}" if status else "feed is unreachable")
     stored: dict[str, str] = {}

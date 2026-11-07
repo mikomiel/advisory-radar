@@ -47,14 +47,20 @@ class RssSource:
     def fetch(self, http: Http, state: dict) -> SourceWindow:
         stored = state.get("feeds", {}).get(self.id)
         validators: dict[str, str] = {}
-        if isinstance(stored, dict):
+        # The validators belong to the URL that issued them. An operator may repoint a source id at another
+        # feed, and an ``ETag`` is unique per resource, not per repository: sending the old one to the new URL
+        # can earn a legitimate ``304`` for a feed that was never read, which silently drops its advisories.
+        if isinstance(stored, dict) and stored.get("url") == self.url:
             if isinstance(stored.get("etag"), str):
                 validators["If-None-Match"] = stored["etag"]
             if isinstance(stored.get("last_modified"), str):
                 validators["If-Modified-Since"] = stored["last_modified"]
         export, fresh = feeds.fetch_rss(http, self.url, validators)
-        if fresh:
-            state.setdefault("feeds", {})[self.id] = fresh
+        if fresh is not None:  # None means 304: keep what is stored
+            if fresh:
+                state.setdefault("feeds", {})[self.id] = {"url": self.url, **fresh}
+            elif state.get("feeds"):
+                state["feeds"].pop(self.id, None)  # a 200 without validators replaces them with nothing
         return SourceWindow(self.id, _items(export), export.truncated, _host(self.url))
 
 

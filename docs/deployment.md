@@ -75,8 +75,9 @@ a TLS-terminating reverse proxy; the session cookie is only sent over HTTPS unle
 Two upstreams reward configuration rather than credentials:
 
 - **NVD key.** `nvd_api_key: ${NVD_API_KEY}` in the config raises NVD's anonymous limit from 5 requests per
-  30 s to 50 (free, requested at <https://nvd.nist.gov/developers/request-an-api-key>). Without it the pass
-  still works, it just scores fewer CVEs of a large advisory before the budget moves on.
+  30 s to 50 (free, requested at <https://nvd.nist.gov/developers/request-an-api-key>). The per-pass budget
+  (`MAX_NVD_CALLS`) is unchanged, so a key buys **time, not breadth**: the same lookups take about 6 s each
+  instead of 60 s, and a pass finishes sooner.
 - **Conditional GET.** RSS/Atom sources keep the publisher's `ETag`/`Last-Modified` in the state, so an
   unchanged feed answers `304` and costs one round trip instead of the whole document.
 
