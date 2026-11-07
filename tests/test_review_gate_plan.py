@@ -15,6 +15,7 @@ from pathlib import Path
 
 HEAD = "195e30d8b02d5ba36e30caf889bb6bb3b1be92e2"
 OTHER = "5753428684342e7e0fb38a10426a342ec61ffaaa"
+BASE = "2c673bb56bf216ad60928dd9703143ac41f052ec"
 REVIEWER = "review-bot[bot]"
 
 
@@ -51,16 +52,23 @@ def entry(
     author: str = "mikomiel",
     files: list[dict] | None = None,
     changed: int | None = None,
+    base: str = BASE,
+    count_head: str | None = None,
+    count_base: str | None = None,
 ) -> dict:
     chosen = FILES if files is None else files
     return {
         "number": number,
         "head": head,
+        "base": base,
         "draft": draft,
         "author": author,
         "reviews": list(reviews),
         "files": chosen,
         "changed": len(chosen) if changed is None else changed,
+        # A coherent snapshot: the count describes the same two commits as the comparison.
+        "count_head": head if count_head is None else count_head,
+        "count_base": base if count_base is None else count_base,
     }
 
 
@@ -274,6 +282,21 @@ def test_a_truncated_comparison_is_not_exempt():
         changed=5,
     )
     assert decisions([entry_with_short_list])[HEAD][0] == "pending"
+
+
+def test_a_count_from_another_commit_pair_is_not_exempt():
+    """The count and the comparison are two reads: a branch that moved between them proves nothing.
+
+    Pairing the pinned comparison of head A (truncated at the comparison cap) with the smaller count of a
+    newer head B would let an omitted source path pass the short-list check that exists to catch it.
+    """
+    files = [{"filename": "pyproject.toml", "previous_filename": None}]
+    coherent = entry(17, reviews=[], author="app/dependabot", files=files, changed=1)
+    assert decisions([coherent])[HEAD][0] == "success"
+    moved_head = entry(17, reviews=[], author="app/dependabot", files=files, changed=1, count_head=OTHER)
+    assert decisions([moved_head])[HEAD][0] == "pending"
+    moved_base = entry(17, reviews=[], author="app/dependabot", files=files, changed=1, count_base="0" * 40)
+    assert decisions([moved_base])[HEAD][0] == "pending"
 
 
 def test_a_comment_holds_a_dependency_update():

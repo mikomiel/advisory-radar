@@ -107,7 +107,10 @@ the review itself, published as a status:
   request opened by Dependabot (`dependabot[bot]`) gets `review: success` with the reason
   in the description, and only while *every* path the immutable `base...head` comparison
   names — both sides of a rename — is a dependency manifest (`.github/workflows`,
-  `pyproject.toml`, `uv.lock`, `Dockerfile`, `docker-compose.yml`). It is keyed on an
+  `pyproject.toml`, `uv.lock`, `Dockerfile`, `docker-compose.yml`), and only while the
+  changed-file count that proves that list complete describes the *same* two commits as
+  the comparison: the count is read separately, so a branch that moved in between is not
+  exempt. It is keyed on an
   author login GitHub assigns, which a patch cannot claim, and it applies **only where no
   eligible reviewer has said anything decisive**: a stale approval, a dismissed review or a
   comment still leaves it pending, and an approval or a change request is used as-is.

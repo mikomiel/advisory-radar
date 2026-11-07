@@ -83,11 +83,21 @@ def _dependency_only(names: list[str]) -> bool:
 def exempt(entry: dict, author: str, exempt_authors: frozenset[str]) -> bool:
     """Whether the exemption covers this entry: an exempt author, on a complete, manifest-only path list.
 
-    Fail-closed in three places: an unreadable list is not exempt, a list shorter than the pull request's own
+    Fail-closed in four places: an unreadable list is not exempt, a list shorter than the pull request's own
     changed-file count is not exempt (``compare`` caps its list at 300, so a source file could hide past the
-    cap), and an empty list is not exempt.
+    cap), a count that does not describe the same commit pair as the comparison is not exempt, and an empty
+    list is not exempt.
     """
     if author not in exempt_authors:
+        return False
+    # The count proves the comparison complete only for the commits it describes. The two arrive in different
+    # responses, so a head that moved in between would pair the pinned comparison with the newer, smaller
+    # count -- and a truncated old list would then pass the short-list check it exists to fail.
+    head = entry.get("head")
+    base = entry.get("base")
+    if not isinstance(head, str) or not isinstance(base, str) or not base:
+        return False
+    if entry.get("count_head") != head or entry.get("count_base") != base:
         return False
     files = entry.get("files")
     declared = entry.get("changed")
