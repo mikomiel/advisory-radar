@@ -1,0 +1,93 @@
+# The review gate: the required `review` status, reported from the same rule the merge uses.
+#
+# GitHub will not let an App approval satisfy the native "require a pull request review" rule (observed on
+# this repository: the reviewer App approved #9 at its exact head and GitHub still reported
+# REVIEW_REQUIRED / BLOCKED). With one human account that rule would deadlock every maintenance PR, so the
+# review is enforced as a *status check* instead: this workflow reads the reviews and reports
+# `success` only when the configured reviewer approved this exact head.
+#
+# That is what makes the merge button honest. Branch protection requires `ci` and `review` (strict), so a
+# pull request with a green ci and no review is not mergeable -- by automerge, by a person, or by an
+# admin bypass (enforce_admins is off).
+#
+# Fail-closed by construction: an unreadable review list, an API error, or a missing workflow all leave the
+# status absent or non-success, and an absent required status is not green.
+name: review-gate
+
+# Same trusted triggers as the merge workflow: only workflow_run and schedule run this file from the default
+# branch. `pull_request` would run the head's copy, which a pull request could rewrite.
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+  schedule:
+    - cron: "*/10 * * * *"   # a review posted after ci finished must turn the status green without a push
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write      # the whole point: publish the required context on the head commit
+
+concurrency:
+  group: review-gate
+  cancel-in-progress: false
+
+env:
+  # The reviewing identity, matched against the REST representation (the "[bot]" suffix and the user type
+  # are what stop a human account with the same name from passing).
+  REVIEWER_LOGIN: ecomwizards-gandalf[bot]
+  REVIEWER_TYPE: Bot
+  #: The required status context this workflow publishes.
+  GATE_CONTEXT: review
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      # The rule is a tested script on the default branch; this workflow only supplies the API data.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Publish `review` for every open pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # An enumeration failure must fail the job: an unstated "no open pull requests" would let the
+          # statuses go stale without anyone noticing.
+          if ! listing=$(gh pr list --repo "$REPO" --state open --base main --limit 200 \
+            --json number,isDraft,headRefOid --jq '.[] | [.number, (.isDraft|tostring), .headRefOid] | @tsv'); then
+            echo "::error::cannot enumerate open pull requests"
+            exit 1
+          fi
+          if [ -z "$listing" ]; then
+            echo "no open pull requests"
+            exit 0
+          fi
+          while IFS=$'\t' read -r pr draft head; do
+            [ -n "$pr" ] || continue
+            if [ "$draft" = "true" ]; then
+              echo "skip #$pr: draft"
+              continue
+            fi
+            reviews=$(gh api --paginate "repos/$REPO/pulls/$pr/reviews?per_page=100" | jq -s -c 'add')
+            # The rule never exits 0 unless the head carries an approval; its exit code is not what we
+            # publish, its first field is.
+            review_line=$(printf '%s' "$reviews" | python3 scripts/review_state.py \
+              --reviewer "$REVIEWER_LOGIN" --type "$REVIEWER_TYPE" --head "$head") || true
+            state=${review_line%%$'\t'*}
+            description=${review_line#*$'\t'}
+            if [ -z "$state" ] || [ "$state" = "$review_line" ]; then
+              # No usable answer: do not publish a success. Leave the status to the next run.
+              echo "::error::#${pr}: review_state.py produced no state; not publishing a status"
+              exit 1
+            fi
+            gh api -X POST "repos/$REPO/statuses/$head" \
+              -f state="$state" \
+              -f context="$GATE_CONTEXT" \
+              -f description="${description:0:140}" >/dev/null
+            echo "#$pr at $head: $state - $description"
+          done <<<"$listing"

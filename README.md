@@ -82,42 +82,46 @@ turns critical, and never re-sends what you already received.
 
 ## Review and merge automation
 
-`main` is protected: a pull request needs **an approving review from the review App**
-and a green `ci` run. The workflow below then performs the merge itself.
+`main` is protected by **two required status checks**, `ci` and `review`, both strict
+(require the branch to be up to date). `review` is not a workflow that runs tests — it is
+the review itself, published as a status:
 
-**A person merges anything that widens what the automation can reach.** A pull request
-touching `.github/` (including the workflows and this automation), `Dockerfile`,
-`docker-compose.yml`, `deploy/`, `pyproject.toml`, `.gitleaks.toml` or `tests/` is
-never auto-merged — the workflow skips it and a human merges it. The repository has
-one human account, which cannot approve its own pull requests, so a "require code
-owner approval" rule would deadlock maintenance instead of adding a check. The path
-guard therefore means "a person merges these", not "a second person approved them".
+- `.github/workflows/review-gate.yml` reads every open pull request's reviews on each
+  `ci` completion and every 10 minutes, and publishes `review` on the head commit:
+  `success` only when there is an **approving review at that exact commit**, `failure`
+  when the latest verdict is "changes requested", and `pending` otherwise.
+- The rule has one owner: [`scripts/review_state.py`](scripts/review_state.py), tested by
+  [`tests/test_review_state.py`](tests/test_review_state.py) and used by both the gate and
+  the merge workflow, so the two cannot disagree. A review counts when it comes from the
+  configured reviewer App, or from someone with repository access
+  (`OWNER`/`MEMBER`/`COLLABORATOR`) — the second route is how a maintainer approves a
+  contributor's pull request.
+- A review is *about one commit*. A push after the review leaves the new head with no
+  `review` status, so the merge button goes back to blocked. That is the intended
+  behaviour, not an outage.
 
-**The day this repository is shared, turn on one branch-protection rule.**
+Why a status instead of GitHub's own "require a pull request review": when that rule was
+enabled here on 2026-11-06, the reviewer App approved pull request #9 at its exact head
+and GitHub still reported `reviewDecision: REVIEW_REQUIRED` and
+`mergeStateStatus: BLOCKED` — an App approval does not satisfy it, and with one human
+account (which cannot approve its own pull requests) the rule blocked all maintenance.
+The status-based gate expresses the same requirement in a way this repository can satisfy.
+Two-person review still needs a second human account or a team with another member, plus
+`.github/CODEOWNERS`; that is a separate step, and the gate does not pretend to replace it.
 
-```
-gh api -X PATCH repos/mikomiel/advisory-radar/branches/main/protection/required_pull_request_reviews \
-  -F required_approving_review_count=1 -F dismiss_stale_reviews=true
-```
+**A person merges anything that widens what the automation can reach.** The list lives in
+[`scripts/guard_sensitive_paths.py`](scripts/guard_sensitive_paths.py) — `.github/`
+(including the workflows and this automation), `Dockerfile`, `docker-compose.yml`,
+`deploy/`, `pyproject.toml`, `.gitleaks.toml` and `tests/` — and
+[`tests/test_guard_sensitive_paths.py`](tests/test_guard_sensitive_paths.py) pins it. A
+pull request touching one of those paths is never auto-merged: the workflow skips it and a
+human merges it. The guard therefore means "a person merges these", not "a second person
+approved them".
 
-What we know about that rule here, rather than what it is supposed to do: when it was
-enabled on 2026-11-06, the review App approved pull request #9 at its exact head and
-GitHub still reported `reviewDecision: REVIEW_REQUIRED` and `mergeStateStatus: BLOCKED`
-— the App's approval did not satisfy it, and only a person's approval would have. That
-is why the rule is off today: this repository has one human account, it authors every
-pull request, and GitHub does not let an author approve their own pull request, so the
-rule blocked all maintenance. The day other people can open pull requests that deadlock
-disappears and the rule is the right one.
-
-If a future GitHub change lets an App approval satisfy the rule, the stricter
-configuration is *Require review from Code Owners* with a `.github/CODEOWNERS` entry for
-a second human account or a team with another member — which is also what genuine
-two-person review needs, and what this repository cannot express with one account.
-
-`.github/workflows/automerge.yml` then does the merging itself: an approved
-pull request whose checks are green is squash-merged (with `--match-head-commit`,
-so a head that moved is refused) when `ci` finishes or on a 30-minute sweep. Branch deletion follows the repository's *automatically delete head
-branches* setting.
+`.github/workflows/automerge.yml` does the merging itself: an approved pull request whose
+checks are green is squash-merged (with `--match-head-commit`, so a head that moved is
+refused) when `ci` finishes or on a 30-minute sweep. Branch deletion follows the
+repository's *automatically delete head branches* setting.
 
 The workflow only runs from the default branch — `workflow_run` and `schedule`,
 never `pull_request*` and not `workflow_dispatch` (a dispatcher can pick another
@@ -126,9 +130,22 @@ within ~30 minutes of the approval, not at the instant of the review. Nothing
 merges without an approval from the configured reviewer at the exact head, and
 any check that is not terminal-success stops it.
 
+To enable the second required check on a copy of this repository
+(`contexts` replaces the whole list, so keep `ci`):
+
+```
+echo '{"strict": true, "contexts": ["ci", "review"]}' \
+  | gh api -X PATCH repos/<owner>/<repo>/branches/main/protection/required_status_checks --input -
+```
+
+Merge a change to `.github/` *before* adding `review`, or the gate cannot run and every
+pull request is blocked by a check that does not exist yet.
+
 The reviewer is the Gandalf GitHub App, which posts its review through the
-`external_github_review` route. Contributors can of course review each other;
-the point is that no human has to click merge.
+`external_github_review` route; a review is requested, not spawned — the gate enforces a
+review, it does not write one. Contributors can of course review each other, and a
+maintainer's approval satisfies the gate on a contributor's pull request; the point is
+that no human has to click merge.
 
 ## Development
 
