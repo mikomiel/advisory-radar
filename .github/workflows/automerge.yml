@@ -50,15 +50,23 @@ env:
   # the "[bot]" suffix, the actor type and a stable numeric id: a human account with the same name cannot pass.
   REVIEWER_LOGIN: ecomwizards-gandalf[bot]
   REVIEWER_TYPE: Bot
-  #: Anything that widens what this workflow can reach: the workflows themselves, this file, and the
-  #: published artifact with its packaging. A PR matching this is never auto-merged.
-  SENSITIVE_PATHS: '^\.github/|^Dockerfile$|^docker-compose\.yml$|^deploy/|^pyproject\.toml$|^\.gitleaks\.toml$|^tests/' 
+  #: Anything that widens what this workflow can reach -- the workflows themselves, this file, the published
+  #: artifact with its packaging, and the tests that decide what `ci` accepts -- is listed in
+  #: scripts/guard_sensitive_paths.py, where tests/test_guard_sensitive_paths.py pins it. A pull request matching
+  #: one of those paths is never auto-merged.
   REQUIRED_CHECK: ci
 
 jobs:
   merge:
     runs-on: ubuntu-latest
     steps:
+      # The guard and approval rules live in tested scripts on the default branch -- the same trust level this
+      # workflow already runs at, since it only ever runs from there. No credentials are persisted, so the
+      # checkout itself cannot push.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
       - name: Merge approved pull requests whose required check is green at the same head
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -92,24 +100,17 @@ jobs:
               continue
             fi
 
-            # The configured reviewer's own latest review decides, and only if it approved this exact head.
+            # The approval rule has one owner: scripts/review_state.py, tested by tests/test_review_state.py
+            # and shared with review-gate.yml, which reports the required `review` status from it. Two
+            # copies of this rule is how a status says "approved" while the merge refuses, or the reverse.
             # Read over REST: .user.type distinguishes an App bot from a human account of the same name, and
             # .user.login keeps the "[bot]" suffix that the GraphQL shape drops.
             # jq -s 'add': --paginate emits one JSON array per page, and selecting the latest review per page
             # would return several answers (an eligible approval on a later page would look like a mismatch).
             reviews=$(gh api --paginate "repos/$REPO/pulls/$pr/reviews?per_page=100" | jq -s -c 'add')
-            reviewer_state=$(jq -r --arg reviewer "$REVIEWER_LOGIN" --arg type "$REVIEWER_TYPE" '
-              [.[] | select(.user.login == $reviewer and .user.type == $type)]
-              | sort_by(.submitted_at) | last | .state // ""' <<<"$reviews")
-            reviewer_head=$(jq -r --arg reviewer "$REVIEWER_LOGIN" --arg type "$REVIEWER_TYPE" '
-              [.[] | select(.user.login == $reviewer and .user.type == $type)]
-              | sort_by(.submitted_at) | last | .commit_id // ""' <<<"$reviews")
-            if [ "$reviewer_state" != "APPROVED" ]; then
-              echo "skip #$pr: $REVIEWER_LOGIN's latest review is '${reviewer_state:-none}', not APPROVED"
-              continue
-            fi
-            if [ "$reviewer_head" != "$head" ]; then
-              echo "skip #$pr: $REVIEWER_LOGIN approved $reviewer_head, head is $head (stale approval)"
+            if ! review_line=$(printf '%s' "$reviews" | python3 scripts/review_state.py \
+                 --reviewer "$REVIEWER_LOGIN" --type "$REVIEWER_TYPE" --head "$head"); then
+              echo "skip #$pr: ${review_line#*$'\t'}"
               continue
             fi
 
@@ -148,19 +149,11 @@ jobs:
             # B's harmless files while A merges. Both sides of a rename count (previous_filename).
             base=$(jq -r '.baseRefOid' <<<"$meta")
             # The comparison carries its file list on the first page only; following pages paginate commits
-            # without a `files` array. One request, then the completeness check below covers the cap.
-            files=$(gh api "repos/$REPO/compare/$base...$head" | jq -c '.files // []')
-            listed=$(jq 'length' <<<"$files")
+            # without a `files` array. One request, and the script refuses a list it cannot trust.
             declared=$(jq -r '.changedFiles // 0' <<<"$meta")
-            if [ "$listed" -lt "$declared" ]; then
-              # compare caps its file list (300); a shorter list means the guard cannot see everything.
-              echo "skip #$pr: comparison lists $listed of $declared changed files, cannot verify the guard"
-              continue
-            fi
-            touched=$(jq -r '.[] | .filename, (.previous_filename // empty)' <<<"$files")
-            sensitive=$(printf '%s\n' "$touched" | grep -E "$SENSITIVE_PATHS" || true)
-            if [ -n "$sensitive" ]; then
-              echo "skip #$pr: needs a human merge, it touches: $(echo "$sensitive" | tr '\n' ' ')"
+            if ! gh api "repos/$REPO/compare/$base...$head" \
+                 | python3 scripts/guard_sensitive_paths.py --declared "$declared"; then
+              echo "skip #$pr: a person merges this one (the guard's reason is on the line above)"
               continue
             fi
 
