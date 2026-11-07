@@ -99,7 +99,7 @@ def _run_pass(
     gap = False
     source_ok = True
     kev, kev_known = load_kev(http, cfg.state_path.with_name(KEV_CACHE_NAME), save=not dry_run)
-    intel = core.Intel(http, cache, clock, sleep)
+    intel = core.Intel(http, cache, clock, sleep, nvd_key=cfg.nvd_api_key)
     # Re-evaluate before classification: both share one NVD budget, and a busy news day must not starve a due
     # watch of the measurement that could escalate it. A watch created later this pass is evaluated next pass.
     core.reevaluate(state, intel, kev, kev_known, now, "")

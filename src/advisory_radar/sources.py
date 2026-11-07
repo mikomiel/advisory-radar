@@ -31,7 +31,12 @@ def _items(export: feeds.FeedExport) -> tuple[Item, ...]:
 
 
 class RssSource:
-    """Any RSS 2.0 / Atom feed URL; the whole feed is read in one GET."""
+    """Any RSS 2.0 / Atom feed URL; the whole feed is read in one GET.
+
+    The publisher's ``ETag``/``Last-Modified`` are kept per source, so an unchanged feed answers ``304`` - the
+    common case for a feed polled every 15 minutes, and the one that keeps a free publisher's bandwidth ours
+    rather than theirs.
+    """
 
     kind = "feed"
 
@@ -40,7 +45,16 @@ class RssSource:
         self.url = url
 
     def fetch(self, http: Http, state: dict) -> SourceWindow:
-        export = feeds.fetch_rss(http, self.url)
+        stored = state.get("feeds", {}).get(self.id)
+        validators: dict[str, str] = {}
+        if isinstance(stored, dict):
+            if isinstance(stored.get("etag"), str):
+                validators["If-None-Match"] = stored["etag"]
+            if isinstance(stored.get("last_modified"), str):
+                validators["If-Modified-Since"] = stored["last_modified"]
+        export, fresh = feeds.fetch_rss(http, self.url, validators)
+        if fresh:
+            state.setdefault("feeds", {})[self.id] = fresh
         return SourceWindow(self.id, _items(export), export.truncated, _host(self.url))
 
 
