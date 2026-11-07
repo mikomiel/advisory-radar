@@ -1,17 +1,25 @@
-# The review gate: the required `review` status, reported from the same rule the merge uses.
+# The review gate: the required `review` status, published from the same rule the merge uses.
 #
 # GitHub will not let an App approval satisfy the native "require a pull request review" rule (observed on
 # this repository: the reviewer App approved #9 at its exact head and GitHub still reported
 # REVIEW_REQUIRED / BLOCKED). With one human account that rule would deadlock every maintenance PR, so the
-# review is enforced as a *status check* instead: this workflow reads the reviews and reports
-# `success` only when the configured reviewer approved this exact head.
+# review is enforced as a *status check* instead: `review` is `success` only when the configured reviewer --
+# or a maintainer -- approved this exact head commit.
 #
-# That is what makes the merge button honest. Branch protection requires `ci` and `review` (strict), so a
-# pull request with a green ci and no review is not mergeable -- by automerge, by a person, or by an
-# admin bypass (enforce_admins is off).
+# What that does and does not guarantee, precisely. A commit status is a stored assertion, not a live query:
+# GitHub never expires one, so nothing revokes it when the facts change.
 #
-# Fail-closed by construction: an unreadable review list, an API error, or a missing workflow all leave the
-# status absent or non-success, and an absent required status is not green.
+#   * Automated merges are exact. automerge.yml re-reads the reviews with the same rule immediately before
+#     merging, so a withdrawn approval cannot be merged by the automation.
+#   * A *manual* merge relies on the status this workflow published, and a dismissal or a change request
+#     cannot trigger this workflow: `pull_request_review` would run the pull request's own copy of this file,
+#     which a pull request could rewrite to publish its own success. Revocation is therefore eventual --
+#     within one sweep interval (five minutes) or on the next `ci` completion. If you withdraw an approval and
+#     intend to merge by hand, wait for the next sweep.
+#
+# Fail-closed where it can be: an unreadable review list revokes every success in the snapshot and fails the
+# job; an unreadable snapshot publishes nothing and fails. An enumeration failure is the one case this
+# workflow cannot repair, and it fails loudly instead of reporting a clean sweep.
 name: review-gate
 
 # Same trusted triggers as the merge workflow: only workflow_run and schedule run this file from the default
@@ -21,7 +29,7 @@ on:
     workflows: [ci]
     types: [completed]
   schedule:
-    - cron: "*/10 * * * *"   # a review posted after ci finished must turn the status green without a push
+    - cron: "*/5 * * * *"   # a review posted, withdrawn or dismissed turns the status within five minutes
 
 permissions:
   contents: read
@@ -33,10 +41,13 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # The reviewing identity, matched against the REST representation (the "[bot]" suffix and the user type
-  # are what stop a human account with the same name from passing).
+  # The reviewing identity, matched against the REST representation (the "[bot]" suffix and the user type are
+  # what stop a human account with the same name from passing).
   REVIEWER_LOGIN: ecomwizards-gandalf[bot]
   REVIEWER_TYPE: Bot
+  #: Reviews by somebody with repository access count too, which is how a maintainer approves a contributor's
+  #: pull request the App cannot approve for its own author.
+  TRUSTED_ASSOCIATIONS: OWNER,MEMBER,COLLABORATOR
   #: The required status context this workflow publishes.
   GATE_CONTEXT: review
 
@@ -44,7 +55,7 @@ jobs:
   gate:
     runs-on: ubuntu-latest
     steps:
-      # The rule is a tested script on the default branch; this workflow only supplies the API data.
+      # The rules are tested scripts on the default branch; this workflow only supplies the API data.
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.repository.default_branch }}
@@ -56,61 +67,64 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          # An enumeration failure must fail the job: an unstated "no open pull requests" would let the
-          # statuses go stale without anyone noticing.
-          if ! listing=$(gh pr list --repo "$REPO" --state open --base main --limit 200 \
-            --json number,isDraft,headRefOid --jq '.[] | [.number, (.isDraft|tostring), .headRefOid] | @tsv'); then
-            echo "::error::cannot enumerate open pull requests"
-            exit 1
-          fi
-          if [ -z "$listing" ]; then
-            echo "no open pull requests"
-            exit 0
-          fi
-          # Publish only when the verdict changed. GitHub keeps at most 1000 statuses per SHA and context, and a
-          # ten-minute sweep over an unchanged pull request would exhaust that in about a week -- after which
-          # the gate could neither approve nor revoke anything on that head.
-          publish() {  # <pr> <head> <state> <description>
-            local pr=$1 head=$2 state=$3 description=${4:0:140} previous
+          snapshot=$(mktemp)
+          plan=$(mktemp)
+          trap 'rm -f "$snapshot" "$plan"' EXIT
+          : > "$snapshot"
+
+          # Publish only when the verdict changed. GitHub keeps at most 1000 statuses per SHA and context, so a
+          # sweep that republished an unchanged verdict would exhaust that in days -- after which the gate could
+          # neither approve nor revoke anything on that head.
+          publish() {  # <head> <state> <description>
+            local head=$1 state=$2 description=${3:0:140} previous
             previous=$(gh api "repos/$REPO/commits/$head/statuses?per_page=100" \
               --jq "[.[] | select(.context == \"$GATE_CONTEXT\")][0] | \"\(.state)\t\(.description)\"" 2>/dev/null || true)
             if [ "$previous" = "$(printf '%s\t%s' "$state" "$description")" ]; then
-              echo "#$pr at $head: $state (unchanged)"
+              echo "$head: $state (unchanged)"
               return 0
             fi
             gh api -X POST "repos/$REPO/statuses/$head" \
-              -f state="$state" \
-              -f context="$GATE_CONTEXT" \
-              -f description="$description" >/dev/null
-            echo "#$pr at $head: $state - $description"
+              -f state="$state" -f context="$GATE_CONTEXT" -f description="$description" >/dev/null
+            echo "$head: $state - $description"
           }
-          while IFS=$'\t' read -r pr draft head; do
+
+          # Complete enumeration over the REST API: `gh pr list --limit N` truncates silently, and a pull request
+          # pushed out of the window would keep an old success that no sweep ever revisits.
+          if ! prs=$(gh api --paginate "repos/$REPO/pulls?state=open&base=main&per_page=100" \
+              --jq '.[] | [.number, .head.sha, (.draft|tostring)] | @tsv'); then
+            echo "::error::cannot enumerate open pull requests; no status can be re-confirmed"
+            exit 1
+          fi
+          if [ -z "$prs" ]; then
+            echo "no open pull requests"
+            exit 0
+          fi
+
+          while IFS=$'\t' read -r pr head draft; do
             [ -n "$pr" ] || continue
-            if [ "$draft" = "true" ]; then
-              echo "skip #$pr: draft"
-              continue
-            fi
             if ! reviews=$(gh api --paginate "repos/$REPO/pulls/$pr/reviews?per_page=100" | jq -s -c 'add'); then
-              # A success already standing on this head must not outlive a fetch we could not complete: an
-              # approval can be withdrawn while the fetch fails, and the old status is what protection reads.
-              publish "$pr" "$head" pending "could not read the reviews; the next run decides" || true
+              # An incomplete snapshot must not leave a success standing: revoke every head we were about to
+              # re-confirm, then fail. The next sweep republishes what is true.
+              while IFS=$'\t' read -r _other revoke_head _draft; do
+                if [ -n "$revoke_head" ]; then
+                  publish "$revoke_head" pending "could not read the reviews; the next run decides" || true
+                fi
+              done <<<"$prs"
               echo "::error::#${pr}: cannot read the reviews"
               exit 1
             fi
-            # The rule never exits 0 unless the head carries an approval; its exit code is not what we
-            # publish, its first field is.
-            review_line=$(printf '%s' "$reviews" | python3 scripts/review_state.py \
-              --reviewer "$REVIEWER_LOGIN" --type "$REVIEWER_TYPE" --head "$head") || true
-            state=${review_line%%$'\t'*}
-            description=${review_line#*$'\t'}
-            case "$state" in
-              success|failure|pending) ;;
-              *)
-                # An unreadable answer is not an approval: replace any success with pending, and say so.
-                state=pending
-                description="could not evaluate the reviews"
-                echo "::warning::#${pr}: review_state.py produced no usable state"
-                ;;
-            esac
-            publish "$pr" "$head" "$state" "$description"
-          done <<<"$listing"
+            jq -c -n --argjson number "$pr" --arg head "$head" --argjson draft "$draft" --argjson reviews "$reviews" \
+              '{number: $number, head: $head, draft: $draft, reviews: $reviews}' >> "$snapshot"
+          done <<<"$prs"
+
+          # One status per head commit, worst verdict winning: a status is keyed by (sha, context), so two pull
+          # requests on the same head must not be able to overrule each other.
+          # The snapshot is one JSON object per line; the plan script takes one array.
+          jq -s '.' "$snapshot" | python3 scripts/review_gate_plan.py \
+            --reviewer "$REVIEWER_LOGIN" --type "$REVIEWER_TYPE" \
+            --trusted-associations "$TRUSTED_ASSOCIATIONS" > "$plan"
+
+          while IFS=$'\t' read -r head state description; do
+            [ -n "$head" ] || continue
+            publish "$head" "$state" "$description"
+          done < "$plan"

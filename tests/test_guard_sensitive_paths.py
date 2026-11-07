@@ -52,6 +52,7 @@ def run(*paths: str, declared: int | None = None, payload: str | None = None) ->
         # the workflows execute scripts/ on the default branch: the guard and the approval rule are policy
         "scripts/guard_sensitive_paths.py",
         "scripts/review_state.py",
+        "scripts/review_gate_plan.py",
         "scripts/check_no_estate_identifiers.py",
     ],
 )

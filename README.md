@@ -99,6 +99,14 @@ the review itself, published as a status:
 - A review is *about one commit*. A push after the review leaves the new head with no
   `review` status, so the merge button goes back to blocked. That is the intended
   behaviour, not an outage.
+- The guarantee is bounded, because a status is stored rather than re-evaluated at merge
+  time: **automated merges are exact** (the merge workflow re-reads the reviews with the
+  same rule immediately before merging), while a **manual** merge may rely on a status
+  published up to one sweep earlier — five minutes, or the next `ci` completion. A
+  dismissed approval revokes the status then, not instantly. The event that would close
+  that window, `pull_request_review`, runs the pull request's own copy of the workflow, so
+  a pull request could rewrite it to publish its own success; the window is the price of
+  not running head-controlled code.
 
 Why a status instead of GitHub's own "require a pull request review": when that rule was
 enabled here on 2026-11-06, the reviewer App approved pull request #9 at its exact head
