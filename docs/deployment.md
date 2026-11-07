@@ -36,18 +36,36 @@ image's user to yours so both `~/.config/advisory-radar` (read-only config) and
 
 The container is a plain single-process app: one Deployment with a
 `config` ConfigMap (read-only) and a `data` PersistentVolumeClaim, plus a
-Service on 8080. `/healthz` is the probe, `/metrics` the Prometheus scrape
-endpoint.
+Service on 8080. `/healthz` is the liveness probe, `/readyz` the readiness
+probe, `/metrics` the Prometheus scrape endpoint.
 
 ## Monitoring (Beszel and friends)
 
 Run the usual `beszel-agent` on the same host — the container's own CPU/RAM/
-disk are covered by host metrics. For app-level signal, scrape
-`http://<host>:8080/metrics` with any Prometheus-compatible scraper
-(`advisory_radar_pending`, `advisory_radar_parked`, `advisory_radar_seen_total`,
-`advisory_radar_last_pass_exit`), and alert on `/healthz` failing or
-`advisory_radar_parked > 0` (parked messages wait for an operator decision in
-the UI).
+disk are covered by host metrics. For app-level signal there are two probes:
+
+| Endpoint | Means | Use it for |
+|---|---|---|
+| `/healthz` | the process answers HTTP | liveness, the image's `HEALTHCHECK` |
+| `/readyz` | a pass finished recently and the state is readable; otherwise `503` with the reason | orchestrator readiness, uptime monitors |
+
+Readiness goes stale when the last pass is older than three poll intervals
+(never fewer than five minutes), so a stopped scheduler surfaces instead of
+answering `ok` forever.
+
+`/metrics` is Prometheus text for any compatible scraper:
+
+| Metric | Meaning |
+|---|---|
+| `advisory_radar_pending` / `_parked` | queue depth; parked messages wait for an operator decision in the UI |
+| `advisory_radar_seen_total` / `_watch_total` / `_runs_total` | identities seen, CVEs under re-evaluation, passes recorded |
+| `advisory_radar_last_pass_timestamp_seconds` | when the last pass finished (`0` = never) |
+| `advisory_radar_last_pass_exit` / `_sent` / `_parked` / `_pending` | what the last pass did |
+| `advisory_radar_ready` | `1` when `/readyz` would answer `200` |
+
+Alert on `advisory_radar_ready == 0`, `advisory_radar_parked > 0`, and — for the
+earliest signal — on `time() - advisory_radar_last_pass_timestamp_seconds`
+exceeding a few poll intervals.
 
 ## Configuration
 
