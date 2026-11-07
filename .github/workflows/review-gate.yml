@@ -11,25 +11,33 @@
 #
 #   * Automated merges are exact. automerge.yml re-reads the reviews with the same rule immediately before
 #     merging, so a withdrawn approval cannot be merged by the automation.
-#   * A *manual* merge relies on the status this workflow published, and a dismissal or a change request
-#     cannot trigger this workflow: `pull_request_review` would run the pull request's own copy of this file,
-#     which a pull request could rewrite to publish its own success. Revocation is therefore eventual --
-#     within one sweep interval (five minutes) or on the next `ci` completion. If you withdraw an approval and
-#     intend to merge by hand, wait for the next sweep.
+#   * A *manual* merge relies on the status this workflow published. It is refreshed on lifecycle events
+#     (open, ready, close, draft, push) and by a five-minute sweep, so it is current to the last evaluation --
+#     not to the moment you click. A green `review` means "approved at this commit when last evaluated".
+#     `pull_request_review` is the one event that cannot be used: it runs the pull request's own copy of this
+#     file, which a pull request could rewrite to publish its own success. If you withdraw an approval, expect
+#     up to five minutes before the status follows.
 #
 # Fail-closed where it can be: an unreadable review list revokes every success in the snapshot and fails the
 # job; an unreadable snapshot publishes nothing and fails. An enumeration failure is the one case this
 # workflow cannot repair, and it fails loudly instead of reporting a clean sweep.
 name: review-gate
 
-# Same trusted triggers as the merge workflow: only workflow_run and schedule run this file from the default
-# branch. `pull_request` would run the head's copy, which a pull request could rewrite.
+# Trusted triggers only, all of them running this file from the default branch: `workflow_run`, `schedule`,
+# and `pull_request_target` for lifecycle events. `pull_request` is deliberately absent -- it runs the head's
+# copy, which a pull request could rewrite to publish its own success. `pull_request_target` runs the *base*
+# branch's copy with a write token, which is safe here only because this job never checks out or executes
+# anything from the pull request: it reads API metadata and runs default-branch scripts.
 on:
   workflow_run:
     workflows: [ci]
     types: [completed]
+  # A closed or reused head must not keep a success: without these, a pull request opened on a commit an
+  # earlier, approved pull request left behind would inherit its green status.
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, converted_to_draft, closed, synchronize]
   schedule:
-    - cron: "*/5 * * * *"   # a review posted, withdrawn or dismissed turns the status within five minutes
+    - cron: "*/5 * * * *"   # the backstop: a review posted, withdrawn or dismissed turns the status within 5 min
 
 permissions:
   contents: read
@@ -65,6 +73,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          #: Empty for workflow_run and schedule; the pull request's head for a lifecycle event.
+          EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           snapshot=$(mktemp)
@@ -97,6 +107,10 @@ jobs:
           fi
           if [ -z "$prs" ]; then
             echo "no open pull requests"
+            # A closed pull request's head is not in the snapshot, and its status must not survive it.
+            if [ -n "${EVENT_HEAD:-}" ]; then
+              publish "$EVENT_HEAD" pending "no open pull request carries this commit"
+            fi
             exit 0
           fi
 
@@ -128,3 +142,9 @@ jobs:
             [ -n "$head" ] || continue
             publish "$head" "$state" "$description"
           done < "$plan"
+
+          # A commit an approved pull request left behind can be reused by a new, unreviewed one: that head is
+          # then not in the snapshot and would keep its success. The event names it, so revoke it here.
+          if [ -n "${EVENT_HEAD:-}" ] && ! cut -f1 "$plan" | grep -qx "$EVENT_HEAD"; then
+            publish "$EVENT_HEAD" pending "no open pull request carries this commit"
+          fi

@@ -87,9 +87,13 @@ turns critical, and never re-sends what you already received.
 the review itself, published as a status:
 
 - `.github/workflows/review-gate.yml` reads every open pull request's reviews on each
-  `ci` completion and every 10 minutes, and publishes `review` on the head commit:
-  `success` only when there is an **approving review at that exact commit**, `failure`
-  when the latest verdict is "changes requested", and `pending` otherwise.
+  `ci` completion, on pull-request lifecycle events (opened, reopened, ready for review,
+  converted to draft, closed, pushed) and every five minutes, then publishes `review` on
+  the head commit: `success` only when there is an **approving review at that exact
+  commit**, `failure` when a reviewer's verdict is "changes requested", and `pending`
+  otherwise. The logic lives in `scripts/review_gate_plan.py`, which also aggregates
+  several pull requests sharing one head — a status is keyed by commit, so the worst
+  verdict must win.
 - The rule has one owner: [`scripts/review_state.py`](scripts/review_state.py), tested by
   [`tests/test_review_state.py`](tests/test_review_state.py) and used by both the gate and
   the merge workflow, so the two cannot disagree. A review counts when it comes from the
@@ -99,14 +103,15 @@ the review itself, published as a status:
 - A review is *about one commit*. A push after the review leaves the new head with no
   `review` status, so the merge button goes back to blocked. That is the intended
   behaviour, not an outage.
-- The guarantee is bounded, because a status is stored rather than re-evaluated at merge
-  time: **automated merges are exact** (the merge workflow re-reads the reviews with the
-  same rule immediately before merging), while a **manual** merge may rely on a status
-  published up to one sweep earlier — five minutes, or the next `ci` completion. A
-  dismissed approval revokes the status then, not instantly. The event that would close
-  that window, `pull_request_review`, runs the pull request's own copy of the workflow, so
-  a pull request could rewrite it to publish its own success; the window is the price of
-  not running head-controlled code.
+- What a green `review` proves, exactly: that this commit was approved **when last
+  evaluated**. It is a stored assertion, not a live query, so it is not a proof at the
+  instant you click merge. Automerges re-read the reviews with the same rule immediately
+  before merging, so a withdrawal before that read stops them. A withdrawal *after* the
+  read, or a manual merge before the next evaluation, can still land — the window is
+  bounded by event delivery and by the five-minute sweep, not eliminated. The event that
+  would close it, `pull_request_review`, runs the pull request's own copy of the workflow,
+  so a pull request could rewrite it to publish its own success; the window is the price of
+  never running head-controlled code.
 
 Why a status instead of GitHub's own "require a pull request review": when that rule was
 enabled here on 2026-11-06, the reviewer App approved pull request #9 at its exact head
