@@ -40,8 +40,25 @@ def review(state: str, commit: str = HEAD, login: str = REVIEWER, kind: str = "B
     }
 
 
-def entry(number: int, head: str = HEAD, reviews=(), draft: bool = False, author: str = "mikomiel") -> dict:
-    return {"number": number, "head": head, "draft": draft, "author": author, "reviews": list(reviews)}
+FILES = [".github/workflows/ci.yml"]
+
+
+def entry(
+    number: int,
+    head: str = HEAD,
+    reviews=(),
+    draft: bool = False,
+    author: str = "mikomiel",
+    files: list[str] | None = None,
+) -> dict:
+    return {
+        "number": number,
+        "head": head,
+        "draft": draft,
+        "author": author,
+        "reviews": list(reviews),
+        "files": FILES if files is None else files,
+    }
 
 
 def decisions(entries: list[dict]) -> dict[str, tuple[str, str]]:
@@ -113,7 +130,9 @@ def test_the_cli_prints_one_line_per_head_and_refuses_a_bad_snapshot():
 
 
 def test_a_dependabot_update_needs_no_app_review():
-    state, description = decisions([entry(17, reviews=[], author="app/dependabot")])[HEAD]
+    state, description = decisions(
+        [entry(17, reviews=[], author="app/dependabot", files=[".github/workflows/ci.yml"])]
+    )[HEAD]
     assert state == "success"
     assert "not required" in description and "dependabot" in description
 
@@ -143,3 +162,25 @@ def test_the_exemption_can_be_disabled():
         [entry(17, reviews=[], author="app/dependabot")], REVIEWER, "Bot", frozenset({"OWNER"}), frozenset()
     )
     assert got[0][1] == "pending"
+
+
+def test_the_exemption_needs_a_dependency_only_path_set():
+    # author alone would exempt a bump that reached into src/, which automerge would then take unreviewed
+    reached = decisions(
+        [entry(17, reviews=[], author="app/dependabot", files=[".github/workflows/ci.yml", "src/x.py"])]
+    )
+    assert reached[HEAD][0] == "pending"
+    missing = decisions([entry(17, reviews=[], author="app/dependabot", files=[])])
+    assert missing[HEAD][0] == "pending"
+    manifest = decisions([entry(17, reviews=[], author="app/dependabot", files=["pyproject.toml", "uv.lock"])])
+    assert manifest[HEAD][0] == "success"
+
+
+def test_a_shared_head_with_a_blocked_pull_request_stays_blocked():
+    entries = [
+        entry(17, reviews=[], author="app/dependabot", files=["pyproject.toml"]),
+        entry(18, reviews=[], author="mikomiel", files=["src/x.py"]),
+    ]
+    state, description = decisions(entries)[HEAD]
+    assert state == "pending"
+    assert "#17" in description and "#18" in description

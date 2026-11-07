@@ -38,6 +38,28 @@ MAX_DESCRIPTION = 140
 #: request's, so it cannot be claimed by a patch. A real verdict always wins: this only fills the gap where
 #: nobody reviewed the pull request.
 EXEMPT_AUTHORS = frozenset({"app/dependabot", "dependabot[bot]"})
+#: The only paths a dependency update may touch for the exemption to apply. Checked, not assumed: the
+#: author alone would exempt a pull request that reached into `src/`, and the merge workflow would then take
+#: it without a review because it is not a guarded path.
+DEPENDENCY_PATHS = frozenset(
+    {".github/workflows", "pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml", "requirements"}
+)
+
+
+def _dependency_only(files: object) -> bool:
+    """Whether every changed path is a dependency manifest the exemption may cover.
+
+    An absent or unreadable file list is *not* exempt: the caller could not prove the pull request stays on
+    a guarded path, and a wrong exemption here is a merge nobody reviewed.
+    """
+    if not isinstance(files, list) or not files:
+        return False
+    for name in files:
+        if not isinstance(name, str) or not name:
+            return False
+        if not any(name == allowed or name.startswith(allowed + "/") for allowed in DEPENDENCY_PATHS):
+            return False
+    return True
 
 
 def merge(
@@ -60,7 +82,7 @@ def merge(
         if entry.get("draft"):
             # A draft is not mergeable; saying so revokes a success left over from before it was a draft.
             state, description = "pending", "pull request is a draft"
-        elif author in exempt_authors:
+        elif author in exempt_authors and _dependency_only(entry.get("files")):
             # An exemption, not a review: it only covers the case where no verdict exists at all.
             reviews = entry.get("reviews")
             state, description = review_state.verdict(

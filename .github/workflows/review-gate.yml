@@ -56,9 +56,10 @@ env:
   #: Reviews by somebody with repository access count too, which is how a maintainer approves a contributor's
   #: pull request the App cannot approve for its own author.
   TRUSTED_ASSOCIATIONS: OWNER,MEMBER,COLLABORATOR
-  #: Authors whose pull requests need no App review. Dependabot's updates are mechanical, they touch
-  #: `.github/workflows` or the lockfile -- which the sensitive-path guard already sends to a person -- and ci
-  #: still has to pass. The login is GitHub's, so a pull request cannot claim it.
+  #: Authors whose pull requests need no App review, *and* only while every changed path stays in the
+  #: dependency manifests the gate checks. Dependabot's updates are mechanical, they land on paths the
+  #: sensitive-path guard already sends to a person, and ci still has to pass. The login is GitHub's, so a pull
+  #: request cannot claim it.
   EXEMPT_AUTHORS: app/dependabot,dependabot[bot]
   #: The required status context this workflow publishes.
   GATE_CONTEXT: review
@@ -131,9 +132,15 @@ jobs:
               echo "::error::#${pr}: cannot read the reviews"
               exit 1
             fi
+            # The exemption is author *and* path: a dependency update that reached outside the manifests is
+            # not exempt, and a failed file read is not exempt either (an empty list fails closed).
+            if ! files=$(gh api --paginate "repos/$REPO/pulls/$pr/files?per_page=100" --jq '[.[].filename]' | jq -s 'add'); then
+              files='[]'
+              echo "::warning::#${pr}: cannot read the changed files; not exempt from review"
+            fi
             jq -c -n --argjson number "$pr" --arg head "$head" --argjson draft "$draft" --arg author "$author" \
-              --argjson reviews "$reviews" \
-              '{number: $number, head: $head, draft: $draft, author: $author, reviews: $reviews}' >> "$snapshot"
+              --argjson reviews "$reviews" --argjson files "$files" \
+              '{number: $number, head: $head, draft: $draft, author: $author, reviews: $reviews, files: $files}' >> "$snapshot"
           done <<<"$prs"
 
           # One status per head commit, worst verdict winning: a status is keyed by (sha, context), so two pull
