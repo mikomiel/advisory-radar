@@ -319,7 +319,9 @@ def parse_rss(body: bytes) -> FeedExport:
     return FeedExport(tuple(items), False)
 
 
-def fetch_rss(http: Http, url: str, validators: Mapping[str, str] | None = None) -> tuple[FeedExport, dict[str, str]]:
+def fetch_rss(
+    http: Http, url: str, validators: Mapping[str, str] | None = None
+) -> tuple[FeedExport, dict[str, str] | None]:
     """One RSS/Atom GET, plus the caching validators to keep for the next one.
 
     A ``304 Not Modified`` is an empty export, not an error: the publisher says nothing changed, so no cursor

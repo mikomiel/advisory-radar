@@ -43,6 +43,8 @@ class RssSource:
     def __init__(self, source_id: str, url: str) -> None:
         self.id = source_id
         self.url = url
+        #: Validators from this window, stored only by ``commit`` once the pipeline captured the candidates.
+        self._store: dict[str, str] | None = None
 
     def fetch(self, http: Http, state: dict) -> SourceWindow:
         stored = state.get("feeds", {}).get(self.id)
@@ -56,12 +58,26 @@ class RssSource:
             if isinstance(stored.get("last_modified"), str):
                 validators["If-Modified-Since"] = stored["last_modified"]
         export, fresh = feeds.fetch_rss(http, self.url, validators)
-        if fresh is not None:  # None means 304: keep what is stored
-            if fresh:
-                state.setdefault("feeds", {})[self.id] = {"url": self.url, **fresh}
-            elif state.get("feeds"):
-                state["feeds"].pop(self.id, None)  # a 200 without validators replaces them with nothing
+        # ``None`` is a 304: keep what is stored. Anything else is this window's validators -- held until
+        # ``commit``, because a window whose candidates never reached pending or carry must be read in full again.
+        self._store = fresh
         return SourceWindow(self.id, _items(export), export.truncated, _host(self.url))
+
+    def commit(self, state: dict) -> None:
+        """Advance the stored validators only once the pipeline has captured this window's candidates.
+
+        The same rule the changedetection cursor follows: arming the ``304`` fast path before the work is
+        durable would make an unchanged feed return an empty window for advisories that were never queued.
+        """
+        fresh, self._store = self._store, None
+        if fresh is None:
+            return  # a 304 carries no validators and must not forget the stored ones
+        if fresh:
+            state.setdefault("feeds", {})[self.id] = {"url": self.url, **fresh}
+        elif state.get("feeds"):
+            # A 200 without validators replaces the stored ones with nothing: keeping them would send a stale
+            # If-None-Match for a feed that has stopped offering one.
+            state["feeds"].pop(self.id, None)
 
 
 class FreshRssSource:
