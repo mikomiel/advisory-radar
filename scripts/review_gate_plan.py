@@ -32,10 +32,20 @@ import review_state  # noqa: E402
 #: Higher blocks more: a shared head is only green when every pull request on it is green.
 SEVERITY = {"success": 1, "pending": 2, "failure": 3}
 MAX_DESCRIPTION = 140
+#: Authors whose pull requests do not need an App review. Dependabot's updates are mechanical, its pull
+#: requests touch `.github/workflows` or the lockfile -- which the sensitive-path guard already routes to a
+#: person -- and `ci` (including the image build) still has to pass. The login is GitHub's, not the pull
+#: request's, so it cannot be claimed by a patch. A real verdict always wins: this only fills the gap where
+#: nobody reviewed the pull request.
+EXEMPT_AUTHORS = frozenset({"app/dependabot", "dependabot[bot]"})
 
 
 def merge(
-    entries: list[object], reviewer: str, reviewer_type: str, associations: frozenset[str]
+    entries: list[object],
+    reviewer: str,
+    reviewer_type: str,
+    associations: frozenset[str],
+    exempt_authors: frozenset[str] = EXEMPT_AUTHORS,
 ) -> list[tuple[str, str, str]]:
     """``(head, state, description)`` for every head in the snapshot, worst verdict winning."""
     decisions: dict[str, dict] = {}
@@ -46,9 +56,19 @@ def merge(
         if not head:
             continue
         number = entry.get("number")
+        author = str(entry.get("author") or "")
         if entry.get("draft"):
             # A draft is not mergeable; saying so revokes a success left over from before it was a draft.
             state, description = "pending", "pull request is a draft"
+        elif author in exempt_authors:
+            # An exemption, not a review: it only covers the case where no verdict exists at all.
+            reviews = entry.get("reviews")
+            state, description = review_state.verdict(
+                reviews if isinstance(reviews, list) else [], reviewer, reviewer_type, head, associations
+            )
+            if state == "pending":
+                state = "success"
+                description = f"dependency update by {author}: App review not required"
         else:
             reviews = entry.get("reviews")
             state, description = review_state.verdict(
@@ -78,6 +98,11 @@ def main(argv: list[str] | None = None, stdin=None) -> int:
     parser.add_argument("--reviewer", required=True)
     parser.add_argument("--type", default="Bot")
     parser.add_argument("--trusted-associations", default=",".join(sorted(review_state.TRUSTED_ASSOCIATIONS)))
+    parser.add_argument(
+        "--exempt-authors",
+        default=",".join(sorted(EXEMPT_AUTHORS)),
+        help="comma-separated authors whose pull requests need no App review; empty disables the exemption",
+    )
     arguments = parser.parse_args(argv)
     associations = frozenset(
         value.strip().upper() for value in arguments.trusted_associations.split(",") if value.strip()
@@ -91,7 +116,8 @@ def main(argv: list[str] | None = None, stdin=None) -> int:
     if not isinstance(document, list):
         print("::error::the snapshot is not an array")
         return 1
-    for head, state, description in merge(document, arguments.reviewer, arguments.type, associations):
+    exempt_authors = frozenset(value.strip() for value in arguments.exempt_authors.split(",") if value.strip())
+    for head, state, description in merge(document, arguments.reviewer, arguments.type, associations, exempt_authors):
         print(f"{head}\t{state}\t{description}")
     return 0
 

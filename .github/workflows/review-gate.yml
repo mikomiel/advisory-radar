@@ -56,6 +56,10 @@ env:
   #: Reviews by somebody with repository access count too, which is how a maintainer approves a contributor's
   #: pull request the App cannot approve for its own author.
   TRUSTED_ASSOCIATIONS: OWNER,MEMBER,COLLABORATOR
+  #: Authors whose pull requests need no App review. Dependabot's updates are mechanical, they touch
+  #: `.github/workflows` or the lockfile -- which the sensitive-path guard already sends to a person -- and ci
+  #: still has to pass. The login is GitHub's, so a pull request cannot claim it.
+  EXEMPT_AUTHORS: app/dependabot,dependabot[bot]
   #: The required status context this workflow publishes.
   GATE_CONTEXT: review
 
@@ -101,7 +105,7 @@ jobs:
           # Complete enumeration over the REST API: `gh pr list --limit N` truncates silently, and a pull request
           # pushed out of the window would keep an old success that no sweep ever revisits.
           if ! prs=$(gh api --paginate "repos/$REPO/pulls?state=open&base=main&per_page=100" \
-              --jq '.[] | [.number, .head.sha, (.draft|tostring)] | @tsv'); then
+              --jq '.[] | [.number, .head.sha, (.draft|tostring), .user.login] | @tsv'); then
             echo "::error::cannot enumerate open pull requests; no status can be re-confirmed"
             exit 1
           fi
@@ -114,12 +118,12 @@ jobs:
             exit 0
           fi
 
-          while IFS=$'\t' read -r pr head draft; do
+          while IFS=$'\t' read -r pr head draft author; do
             [ -n "$pr" ] || continue
             if ! reviews=$(gh api --paginate "repos/$REPO/pulls/$pr/reviews?per_page=100" | jq -s -c 'add'); then
               # An incomplete snapshot must not leave a success standing: revoke every head we were about to
               # re-confirm, then fail. The next sweep republishes what is true.
-              while IFS=$'\t' read -r _other revoke_head _draft; do
+              while IFS=$'\t' read -r _other revoke_head _draft _author; do
                 if [ -n "$revoke_head" ]; then
                   publish "$revoke_head" pending "could not read the reviews; the next run decides" || true
                 fi
@@ -127,8 +131,9 @@ jobs:
               echo "::error::#${pr}: cannot read the reviews"
               exit 1
             fi
-            jq -c -n --argjson number "$pr" --arg head "$head" --argjson draft "$draft" --argjson reviews "$reviews" \
-              '{number: $number, head: $head, draft: $draft, reviews: $reviews}' >> "$snapshot"
+            jq -c -n --argjson number "$pr" --arg head "$head" --argjson draft "$draft" --arg author "$author" \
+              --argjson reviews "$reviews" \
+              '{number: $number, head: $head, draft: $draft, author: $author, reviews: $reviews}' >> "$snapshot"
           done <<<"$prs"
 
           # One status per head commit, worst verdict winning: a status is keyed by (sha, context), so two pull
@@ -136,7 +141,8 @@ jobs:
           # The snapshot is one JSON object per line; the plan script takes one array.
           jq -s '.' "$snapshot" | python3 scripts/review_gate_plan.py \
             --reviewer "$REVIEWER_LOGIN" --type "$REVIEWER_TYPE" \
-            --trusted-associations "$TRUSTED_ASSOCIATIONS" > "$plan"
+            --trusted-associations "$TRUSTED_ASSOCIATIONS" \
+            --exempt-authors "$EXEMPT_AUTHORS" > "$plan"
 
           while IFS=$'\t' read -r head state description; do
             [ -n "$head" ] || continue

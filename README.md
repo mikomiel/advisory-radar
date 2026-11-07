@@ -103,6 +103,13 @@ the review itself, published as a status:
 - A review is *about one commit*. A push after the review leaves the new head with no
   `review` status, so the merge button goes back to blocked. That is the intended
   behaviour, not an outage.
+- **Dependency updates are exempt from the App review, and nothing else is.** A pull
+  request opened by Dependabot (`app/dependabot`) gets `review: success` with the reason
+  in the description, because the update is mechanical, it always lands on a path the
+  guard already routes to a person (`.github/workflows` or the lockfile), and `ci` — the
+  image build included — still has to pass. The exemption is keyed on an author login
+  GitHub assigns, which a patch cannot claim, and it only fills the gap where no verdict
+  exists: a reviewer who has actually approved or requested changes overrules it.
 - What a green `review` proves, exactly: that this commit was approved **when last
   evaluated**. It is a stored assertion, not a live query, so it is not a proof at the
   instant you click merge. Automerges re-read the reviews with the same rule immediately

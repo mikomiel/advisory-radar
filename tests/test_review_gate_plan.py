@@ -40,8 +40,8 @@ def review(state: str, commit: str = HEAD, login: str = REVIEWER, kind: str = "B
     }
 
 
-def entry(number: int, head: str = HEAD, reviews=(), draft: bool = False) -> dict:
-    return {"number": number, "head": head, "draft": draft, "reviews": list(reviews)}
+def entry(number: int, head: str = HEAD, reviews=(), draft: bool = False, author: str = "mikomiel") -> dict:
+    return {"number": number, "head": head, "draft": draft, "author": author, "reviews": list(reviews)}
 
 
 def decisions(entries: list[dict]) -> dict[str, tuple[str, str]]:
@@ -110,3 +110,36 @@ def test_the_cli_prints_one_line_per_head_and_refuses_a_bad_snapshot():
     assert head == HEAD and state == "success" and "approved" in description
     assert plan.main(["--reviewer", REVIEWER], stdin=io.StringIO("{not json")) == 1
     assert plan.main(["--reviewer", REVIEWER], stdin=io.StringIO("{}")) == 1
+
+
+def test_a_dependabot_update_needs_no_app_review():
+    state, description = decisions([entry(17, reviews=[], author="app/dependabot")])[HEAD]
+    assert state == "success"
+    assert "not required" in description and "dependabot" in description
+
+
+def test_the_other_dependabot_login_is_recognised():
+    assert decisions([entry(17, reviews=[], author="dependabot[bot]")])[HEAD][0] == "success"
+
+
+def test_an_ordinary_author_is_not_exempt():
+    assert decisions([entry(18, reviews=[], author="mikomiel")])[HEAD][0] == "pending"
+
+
+def test_a_real_verdict_wins_over_the_exemption():
+    # an exemption fills the gap where nobody reviewed; it never overrules a reviewer who did
+    changed = decisions([entry(17, reviews=[review("CHANGES_REQUESTED")], author="app/dependabot")])[HEAD]
+    assert changed[0] == "failure"
+    approved = decisions([entry(17, reviews=[review("APPROVED")], author="app/dependabot")])[HEAD]
+    assert approved[0] == "success" and "approved at" in approved[1]
+
+
+def test_a_draft_dependabot_update_is_still_a_draft():
+    assert decisions([entry(17, reviews=[], author="app/dependabot", draft=True)])[HEAD][0] == "pending"
+
+
+def test_the_exemption_can_be_disabled():
+    got = plan.merge(
+        [entry(17, reviews=[], author="app/dependabot")], REVIEWER, "Bot", frozenset({"OWNER"}), frozenset()
+    )
+    assert got[0][1] == "pending"
