@@ -49,6 +49,10 @@ def run(*paths: str, declared: int | None = None, payload: str | None = None) ->
         "pyproject.toml",
         ".gitleaks.toml",
         "tests/test_core.py",
+        # the workflows execute scripts/ on the default branch: the guard and the approval rule are policy
+        "scripts/guard_sensitive_paths.py",
+        "scripts/review_state.py",
+        "scripts/check_no_estate_identifiers.py",
     ],
 )
 def test_these_paths_need_a_human_merge(path: str):
@@ -65,7 +69,6 @@ def test_these_paths_need_a_human_merge(path: str):
         "docs/Dockerfile.md",  # the anchor is the whole filename, not a substring
         "src/advisory_radar/tests_helper.py",
         "docs/tests/notes.md",  # only a top-level tests/ tree is the suite that decides what ci accepts
-        "scripts/check_no_estate_identifiers.py",
     ],
 )
 def test_these_paths_may_merge_without_a_person(path: str):
@@ -111,4 +114,5 @@ def test_the_policy_is_the_documented_one():
         r"^pyproject\.toml$",
         r"^\.gitleaks\.toml$",
         r"^tests/",
+        r"^scripts/",
     )

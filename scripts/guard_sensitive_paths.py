@@ -41,6 +41,10 @@ SENSITIVE_PATTERNS: tuple[str, ...] = (
     r"^pyproject\.toml$",
     r"^\.gitleaks\.toml$",
     r"^tests/",
+    # The workflows execute scripts/ on the default branch: this guard, and the approval rule the gate and
+    # the merge both apply. Leaving them out of their own guard would let one approved pull request disable
+    # the guard, and every pull request after it merge without a person.
+    r"^scripts/",
 )
 SENSITIVE = re.compile("|".join(SENSITIVE_PATTERNS))
 

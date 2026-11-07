@@ -46,8 +46,8 @@ def review(
     }
 
 
-def maintainer(state: str, commit: str = HEAD, association: str = "OWNER") -> dict:
-    return review(state, commit=commit, login="a-maintainer", kind="User", association=association)
+def maintainer(state: str, commit: str = HEAD, association: str = "OWNER", at: str = "2026-11-07T00:10:00Z") -> dict:
+    return review(state, commit=commit, login="a-maintainer", kind="User", association=association, at=at)
 
 
 def state_of(reviews: list[dict], head: str = HEAD) -> tuple[str, str]:
@@ -157,3 +157,41 @@ def test_the_description_names_who_approved():
 def test_the_association_route_can_be_disabled():
     reviews = [maintainer("APPROVED")]
     assert rule.verdict(reviews, REVIEWER, "Bot", HEAD, frozenset())[0] == "pending"
+
+
+def test_one_reviewers_approval_does_not_withdraw_anothers_change_request():
+    """The reachable bug the merge review found: the maintainer route made this possible."""
+    reviews = [
+        review("CHANGES_REQUESTED", at="2026-11-07T00:10:00Z"),
+        maintainer("APPROVED", at="2026-11-07T00:20:00Z"),
+    ]
+    assert state_of(reviews)[0] == "failure"
+
+
+def test_one_reviewers_change_request_blocks_a_previous_approval():
+    reviews = [
+        review("APPROVED", at="2026-11-07T00:10:00Z"),
+        maintainer("CHANGES_REQUESTED", at="2026-11-07T00:20:00Z"),
+    ]
+    assert state_of(reviews)[0] == "failure"
+
+
+def test_two_approvals_at_the_head_are_a_success():
+    reviews = [review("APPROVED", at="2026-11-07T00:10:00Z"), maintainer("APPROVED", at="2026-11-07T00:20:00Z")]
+    assert state_of(reviews)[0] == "success"
+
+
+def test_one_dismissal_does_not_erase_anothers_approval():
+    reviews = [
+        review("DISMISSED", at="2026-11-07T00:10:00Z"),
+        maintainer("APPROVED", at="2026-11-07T00:20:00Z"),
+    ]
+    assert state_of(reviews)[0] == "success"
+
+
+def test_a_comment_by_a_second_reviewer_does_not_disturb_the_firsts_verdict():
+    reviews = [
+        review("APPROVED", at="2026-11-07T00:10:00Z"),
+        maintainer("COMMENTED", at="2026-11-07T00:20:00Z"),
+    ]
+    assert state_of(reviews)[0] == "success"

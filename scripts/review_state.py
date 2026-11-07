@@ -70,18 +70,43 @@ def matching_reviews(
     return sorted(kept, key=_submitted)
 
 
+def current_verdicts(
+    reviews: Iterable[object],
+    reviewer: str,
+    reviewer_type: str,
+    associations: frozenset[str] = TRUSTED_ASSOCIATIONS,
+) -> dict[str, dict]:
+    """Each eligible identity's latest decisive review, keyed by login.
+
+    Per reviewer, not globally: one person approving must not silently withdraw another person's outstanding
+    change request, and one person dismissing a review must not erase another's approval. That is also how
+    GitHub treats them -- every reviewer keeps their own verdict on the pull request.
+    """
+    latest: dict[str, dict] = {}
+    for review in matching_reviews(reviews, reviewer, reviewer_type, associations):
+        if str(review.get("state") or "").upper() not in DECISIVE:
+            continue  # a comment is not a verdict and never replaces one
+        latest[str((review.get("user") or {}).get("login") or "")] = review
+    return latest
+
+
 def deciding_review(
     reviews: Iterable[object],
     reviewer: str,
     reviewer_type: str,
     associations: frozenset[str] = TRUSTED_ASSOCIATIONS,
 ) -> dict:
-    """The review that decides the outcome: the last decisive one, else the last one at all."""
-    ours = matching_reviews(reviews, reviewer, reviewer_type, associations)
-    decisive = [review for review in ours if str(review.get("state") or "").upper() in DECISIVE]
-    if decisive:
-        return decisive[-1]
-    return ours[-1] if ours else {}
+    """The review behind the verdict: an outstanding change request, else the approval, else the last one."""
+    verdicts = list(current_verdicts(reviews, reviewer, reviewer_type, associations).values())
+    for wanted in ("CHANGES_REQUESTED", "APPROVED"):
+        matching = [review for review in verdicts if str(review.get("state") or "").upper() == wanted]
+        if matching:
+            return max(matching, key=_submitted)
+    return max(verdicts, key=_submitted) if verdicts else {}
+
+
+def _who(review: dict, fallback: str) -> str:
+    return str((review.get("user") or {}).get("login") or fallback)
 
 
 def verdict(
@@ -92,22 +117,30 @@ def verdict(
     associations: frozenset[str] = TRUSTED_ASSOCIATIONS,
 ) -> tuple[str, str]:
     """``(state, description)`` for one head: can a merge rely on this review, and what should we say?"""
-    review = deciding_review(reviews, reviewer, reviewer_type, associations)
-    state = str(review.get("state") or "").upper()
-    if not review:
-        return PENDING, f"awaiting a review from {reviewer} or a maintainer"
-    who = str((review.get("user") or {}).get("login") or reviewer)
-    commit = str(review.get("commit_id") or "")
+    verdicts = current_verdicts(reviews, reviewer, reviewer_type, associations)
     short_head = head[:12]
-    if state == "APPROVED":
-        if commit == head:
-            return SUCCESS, f"approved at {short_head} by {who}"
-        return PENDING, f"{who} approved {commit[:12]}, head is {short_head}: a fresh review is needed"
-    if state == "CHANGES_REQUESTED":
-        return FAILURE, f"changes requested at {commit[:12]} by {who}"
-    if state == "DISMISSED":
-        return PENDING, f"{who}'s review was dismissed; a new review is needed"
-    return PENDING, f"{who}'s latest review is {state.lower() or 'unreadable'}, not an approval"
+    outstanding = [
+        review for review in verdicts.values() if str(review.get("state") or "").upper() == "CHANGES_REQUESTED"
+    ]
+    if outstanding:
+        review = max(outstanding, key=_submitted)
+        commit = str(review.get("commit_id") or "")
+        return FAILURE, f"changes requested at {commit[:12]} by {_who(review, reviewer)}"
+    approved = [review for review in verdicts.values() if str(review.get("state") or "").upper() == "APPROVED"]
+    at_head = [review for review in approved if str(review.get("commit_id") or "") == head]
+    if at_head:
+        return SUCCESS, f"approved at {short_head} by {_who(max(at_head, key=_submitted), reviewer)}"
+    if approved:
+        review = max(approved, key=_submitted)
+        commit = str(review.get("commit_id") or "")
+        return (
+            PENDING,
+            f"{_who(review, reviewer)} approved {commit[:12]}, head is {short_head}: a fresh review is needed",
+        )
+    if verdicts:
+        review = max(verdicts.values(), key=_submitted)
+        return PENDING, f"{_who(review, reviewer)}'s review was dismissed; a new review is needed"
+    return PENDING, f"awaiting a review from {reviewer} or a maintainer"
 
 
 def main(argv: Sequence[str] | None = None, stdin=None) -> int:

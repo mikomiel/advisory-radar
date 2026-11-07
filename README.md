@@ -112,7 +112,9 @@ Two-person review still needs a second human account or a team with another memb
 **A person merges anything that widens what the automation can reach.** The list lives in
 [`scripts/guard_sensitive_paths.py`](scripts/guard_sensitive_paths.py) — `.github/`
 (including the workflows and this automation), `Dockerfile`, `docker-compose.yml`,
-`deploy/`, `pyproject.toml`, `.gitleaks.toml` and `tests/` — and
+`deploy/`, `pyproject.toml`, `.gitleaks.toml`, `tests/` and `scripts/` (the guard and the
+approval rule are policy too: the workflows execute them from the default branch, so they
+need the same human merge as the workflows themselves) — and
 [`tests/test_guard_sensitive_paths.py`](tests/test_guard_sensitive_paths.py) pins it. A
 pull request touching one of those paths is never auto-merged: the workflow skips it and a
 human merges it. The guard therefore means "a person merges these", not "a second person

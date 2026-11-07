@@ -67,27 +67,50 @@ jobs:
             echo "no open pull requests"
             exit 0
           fi
+          # Publish only when the verdict changed. GitHub keeps at most 1000 statuses per SHA and context, and a
+          # ten-minute sweep over an unchanged pull request would exhaust that in about a week -- after which
+          # the gate could neither approve nor revoke anything on that head.
+          publish() {  # <pr> <head> <state> <description>
+            local pr=$1 head=$2 state=$3 description=${4:0:140} previous
+            previous=$(gh api "repos/$REPO/commits/$head/statuses?per_page=100" \
+              --jq "[.[] | select(.context == \"$GATE_CONTEXT\")][0] | \"\(.state)\t\(.description)\"" 2>/dev/null || true)
+            if [ "$previous" = "$(printf '%s\t%s' "$state" "$description")" ]; then
+              echo "#$pr at $head: $state (unchanged)"
+              return 0
+            fi
+            gh api -X POST "repos/$REPO/statuses/$head" \
+              -f state="$state" \
+              -f context="$GATE_CONTEXT" \
+              -f description="$description" >/dev/null
+            echo "#$pr at $head: $state - $description"
+          }
           while IFS=$'\t' read -r pr draft head; do
             [ -n "$pr" ] || continue
             if [ "$draft" = "true" ]; then
               echo "skip #$pr: draft"
               continue
             fi
-            reviews=$(gh api --paginate "repos/$REPO/pulls/$pr/reviews?per_page=100" | jq -s -c 'add')
+            if ! reviews=$(gh api --paginate "repos/$REPO/pulls/$pr/reviews?per_page=100" | jq -s -c 'add'); then
+              # A success already standing on this head must not outlive a fetch we could not complete: an
+              # approval can be withdrawn while the fetch fails, and the old status is what protection reads.
+              publish "$pr" "$head" pending "could not read the reviews; the next run decides" || true
+              echo "::error::#${pr}: cannot read the reviews"
+              exit 1
+            fi
             # The rule never exits 0 unless the head carries an approval; its exit code is not what we
             # publish, its first field is.
             review_line=$(printf '%s' "$reviews" | python3 scripts/review_state.py \
               --reviewer "$REVIEWER_LOGIN" --type "$REVIEWER_TYPE" --head "$head") || true
             state=${review_line%%$'\t'*}
             description=${review_line#*$'\t'}
-            if [ -z "$state" ] || [ "$state" = "$review_line" ]; then
-              # No usable answer: do not publish a success. Leave the status to the next run.
-              echo "::error::#${pr}: review_state.py produced no state; not publishing a status"
-              exit 1
-            fi
-            gh api -X POST "repos/$REPO/statuses/$head" \
-              -f state="$state" \
-              -f context="$GATE_CONTEXT" \
-              -f description="${description:0:140}" >/dev/null
-            echo "#$pr at $head: $state - $description"
+            case "$state" in
+              success|failure|pending) ;;
+              *)
+                # An unreadable answer is not an approval: replace any success with pending, and say so.
+                state=pending
+                description="could not evaluate the reviews"
+                echo "::warning::#${pr}: review_state.py produced no usable state"
+                ;;
+            esac
+            publish "$pr" "$head" "$state" "$description"
           done <<<"$listing"
