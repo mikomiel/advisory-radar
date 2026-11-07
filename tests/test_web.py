@@ -325,3 +325,19 @@ def test_a_nan_timestamp_does_not_break_the_probe_or_the_scrape(tmp_path):
     metrics = client.get("/metrics")
     assert metrics.status_code == 200
     assert "advisory_radar_last_pass_timestamp_seconds 0" in metrics.text
+
+
+def test_metrics_still_answer_when_the_state_is_unreadable(tmp_path):
+    """The documented alert is `advisory_radar_ready == 0`; a failed scrape would produce no sample at all."""
+    client, _ = make_client(tmp_path)
+    (tmp_path / "state.json").write_text("{not json")
+    response = client.get("/metrics")
+    assert response.status_code == 200
+    assert "advisory_radar_ready 0" in response.text
+    assert "advisory_radar_state_readable 0" in response.text
+    assert "advisory_radar_pending" not in response.text  # unknown, not zero
+
+
+def test_metrics_report_a_readable_state(tmp_path):
+    client, _ = make_client(tmp_path)
+    assert "advisory_radar_state_readable 1" in client.get("/metrics").text

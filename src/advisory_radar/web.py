@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import html
 import json
+import logging
 import os
 import time
 import urllib.parse
@@ -23,6 +24,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from itsdangerous import BadSignature, URLSafeSerializer
 
 from .config import Config
+
+LOG = logging.getLogger("advisory_radar")
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>advisory-radar</title>
 <style>
@@ -536,8 +539,23 @@ def create_app(
 
     @app.get("/metrics", response_class=PlainTextResponse)
     def metrics():
-        state = load_state()
-        runs = state.get("runs") or []
+        from .state import SourceError
+
+        try:
+            state = load_state()
+        except SourceError as exc:
+            # The documented alert is `advisory_radar_ready == 0`, and a failed scrape produces no sample at all:
+            # an unreadable state must still answer, with the one thing it can honestly report. Nothing else is
+            # fabricated, because without the state every other number is unknown rather than zero.
+            LOG.warning("metrics: state unreadable: %s", exc)
+            return PlainTextResponse(
+                "# HELP advisory_radar_ready 1 when the last pass is recent enough and the state is readable\n"
+                "# TYPE advisory_radar_ready gauge\nadvisory_radar_ready 0\n"
+                "# HELP advisory_radar_state_readable 1 when the state document could be read\n"
+                "# TYPE advisory_radar_state_readable gauge\nadvisory_radar_state_readable 0\n"
+            )
+        raw_runs = state.get("runs")
+        runs = raw_runs if isinstance(raw_runs, list) else []
         last = runs[-1] if runs and isinstance(runs[-1], dict) else {}
         ok, _ = readiness(cfg, state, int(clock()))
         gauges = [
@@ -557,6 +575,7 @@ def create_app(
             ("last_pass_sent", "Messages delivered by the last pass", "gauge", _number(last.get("sent"))),
             ("last_pass_parked", "Messages parked by the last pass", "gauge", _number(last.get("parked"))),
             ("last_pass_pending", "Messages left pending by the last pass", "gauge", _number(last.get("pending"))),
+            ("state_readable", "1 when the state document could be read", "gauge", 1),
             ("ready", "1 when the last pass is recent enough and the state is readable", "gauge", int(ok)),
         ]
         lines: list[str] = []

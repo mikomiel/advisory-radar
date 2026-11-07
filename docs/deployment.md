@@ -62,6 +62,8 @@ answering `ok` forever.
 | `advisory_radar_last_pass_timestamp_seconds` | when the last pass finished (`0` = never) |
 | `advisory_radar_last_pass_exit` / `_sent` / `_parked` / `_pending` | what the last pass did |
 | `advisory_radar_ready` | `1` when `/readyz` would answer `200` |
+| `advisory_radar_state_readable` | `1` when the state document could be read; `0` means the scrape is
+  answering with only these two gauges, because every other number is unknown rather than zero |
 
 Alert on `advisory_radar_ready == 0`, `advisory_radar_parked > 0`, and — for the
 earliest signal — on `time() - advisory_radar_last_pass_timestamp_seconds`
