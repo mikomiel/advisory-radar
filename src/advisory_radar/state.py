@@ -37,6 +37,10 @@ def load_state_document(path: Path, schema: str, owner: str) -> dict | None:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
+    except (OSError, UnicodeDecodeError) as exc:
+        # A directory, a permission error or invalid UTF-8 is an unreadable owner, not an absent one. The
+        # probes have to be able to report that; letting it escape turns a scrape into a 500 with no sample.
+        raise SourceError(f"{owner} {path} cannot be read: {exc}") from exc
     try:
         document = json.loads(text)
     except ValueError as exc:
