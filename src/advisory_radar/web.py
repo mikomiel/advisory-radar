@@ -119,7 +119,10 @@ def readiness(cfg: Config, state: dict, now: int) -> tuple[bool, str]:
     if not isinstance(runs, list) or not runs:
         return False, "not ready: no pass has completed yet"
     last = runs[-1]
-    at = _number(last.get("at")) if isinstance(last, dict) else 0
+    at = 0
+    if isinstance(last, dict):
+        # ``at`` is when the pass started; a record written before completion times existed falls back to it.
+        at = _number(last.get("finished_at")) or _number(last.get("at"))
     if not at:
         return False, "not ready: the last run record has no timestamp"
     limit = max(READY_AGE_FACTOR * cfg.poll_interval_seconds, READY_MIN_AGE_SECONDS)
@@ -578,7 +581,7 @@ def create_app(
                 "last_pass_timestamp_seconds",
                 "When the last pass finished (epoch seconds)",
                 "gauge",
-                _number(last.get("at")),
+                _number(last.get("finished_at")) or _number(last.get("at")),
             ),
             ("last_pass_exit", "Exit code of the last pass", "gauge", last_pass_code(state)),
             ("last_pass_sent", "Messages delivered by the last pass", "gauge", _number(last.get("sent"))),

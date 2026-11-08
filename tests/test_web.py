@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from pathlib import Path
@@ -278,6 +279,36 @@ def test_readyz_reports_an_unreadable_state(tmp_path):
     response = client.get("/readyz")
     assert response.status_code == 503
     assert response.text.startswith("not ready:")
+
+
+def test_readyz_reports_a_state_path_that_is_a_directory(tmp_path):
+    """A state path that cannot be read is unreadable, not absent: the probe must still answer."""
+    client, _ = make_client(tmp_path)
+    (tmp_path / "state.json").unlink()
+    (tmp_path / "state.json").mkdir()
+    response = client.get("/readyz")
+    assert response.status_code == 503
+    assert response.text.startswith("not ready:")
+    assert "advisory_radar_ready 0" in client.get("/metrics").text
+
+
+def test_readyz_reports_invalid_utf8(tmp_path):
+    client, _ = make_client(tmp_path)
+    (tmp_path / "state.json").write_bytes(b"\xff\xfe\x00")
+    assert client.get("/readyz").status_code == 503
+    assert "advisory_radar_state_readable 0" in client.get("/metrics").text
+
+
+def test_readiness_uses_the_completion_time_not_the_start(tmp_path):
+    """A pass slower than the limit must not be stale the moment it completes."""
+    client, _ = make_client(tmp_path, clock=1792600000 + 400)
+    state = json.loads((tmp_path / "state.json").read_text())
+    state["runs"][-1]["at"] = 1792600000 - 600  # started ten minutes ago
+    state["runs"][-1]["finished_at"] = 1792600000 + 390  # finished ten seconds before the clock
+    (tmp_path / "state.json").write_text(json.dumps(state))
+    response = client.get("/readyz")
+    assert response.status_code == 200
+    assert "advisory_radar_last_pass_timestamp_seconds 1792600390" in client.get("/metrics").text
 
 
 def test_metrics_carry_the_watch_and_run_counts(tmp_path):

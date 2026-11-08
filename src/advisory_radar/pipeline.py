@@ -325,7 +325,18 @@ def _run_pass(
         )
     code = 0 if delivered and not state["parked"] and not gap and adobe_ok and source_ok else 1
     runs = state.setdefault("runs", [])
-    runs.append({"at": now, "sent": sent, "parked": newly_parked, "pending": len(state["pending"]), "code": code})
+    runs.append(
+        {
+            # ``at`` is the pass start, which is what the record has always held; ``finished_at`` is what
+            # readiness and the metric must measure, or a slow pass reports itself stale on completion.
+            "at": now,
+            "finished_at": int(clock()),
+            "sent": sent,
+            "parked": newly_parked,
+            "pending": len(state["pending"]),
+            "code": code,
+        }
+    )
     del runs[:-200]
     save_state(cfg.state_path, state)  # the run record is part of the state, so it must be saved
     return code
