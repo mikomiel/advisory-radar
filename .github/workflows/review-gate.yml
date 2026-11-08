@@ -22,8 +22,9 @@
 # Fail-closed where it can be: an unreadable review list revokes every success in the snapshot and fails the
 # job; an unreadable snapshot publishes nothing and fails. An enumeration failure is the one case this
 # workflow cannot repair, and it fails loudly instead of reporting a clean sweep. A snapshot that reports no
-# open pull requests while a lifecycle event names one is treated the same way: it fails, and it writes
-# nothing, rather than revoking a head whose verdict another run may have just published.
+# open pull requests while a lifecycle event that is not a close names one is treated the same way: it fails
+# and writes nothing, rather than revoking a head whose verdict another run may have just published. Only a
+# close may leave a head behind with no open pull request, so only a close revokes it.
 name: review-gate
 
 # Trusted triggers only, all of them running this file from the default branch: `workflow_run`, `schedule`,
