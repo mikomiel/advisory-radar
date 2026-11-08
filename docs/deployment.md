@@ -91,6 +91,15 @@ throttle on failed logins (five per five minutes per peer address). Put it behin
 a TLS-terminating reverse proxy; the session cookie is only sent over HTTPS unless
 `ADVISORY_RADAR_INSECURE_COOKIES=1`.
 
+Two upstreams reward configuration rather than credentials:
+
+- **NVD key.** `nvd_api_key: ${NVD_API_KEY}` in the config raises NVD's anonymous limit from 5 requests per
+  30 s to 50 (free, requested at <https://nvd.nist.gov/developers/request-an-api-key>). The per-pass budget
+  (`MAX_NVD_CALLS`) is unchanged, so a key buys **time, not breadth**: the same lookups wait 0.6 s
+  each instead of 6 s, so a pass finishes sooner.
+- **Conditional GET.** RSS/Atom sources keep the publisher's `ETag`/`Last-Modified` in the state, so an
+  unchanged feed answers `304` and costs one round trip instead of the whole document.
+
 ## Multi-arch images
 
 Releases publish `linux/amd64` and `linux/arm64`, so the same tag runs on a
