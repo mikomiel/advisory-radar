@@ -24,7 +24,8 @@
 # workflow cannot repair, and it fails loudly instead of reporting a clean sweep. A snapshot that reports no
 # open pull requests while a lifecycle event that is not a close names one is treated the same way: it fails
 # and writes nothing, rather than revoking a head whose verdict another run may have just published. Only a
-# close may leave a head behind with no open pull request, so only a close revokes it.
+# close may leave a head behind with no open pull request, so only a close revokes it; a lifecycle event whose
+# pull request has moved on is recognised as stale and never blocks the snapshot that superseded it.
 name: review-gate
 
 # Trusted triggers only, all of them running this file from the default branch: `workflow_run`, `schedule`,
@@ -81,6 +82,8 @@ jobs:
           EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
           #: The lifecycle action. Only ``closed`` may revoke a head that the snapshot does not carry.
           EVENT_ACTION: ${{ github.event.action }}
+          #: The pull request the lifecycle event is about; empty for workflow_run and schedule.
+          EVENT_PR: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           snapshot=$(mktemp)
@@ -179,6 +182,22 @@ jobs:
           jq -s '.' "$snapshot" | python3 scripts/review_gate_plan.py \
             --reviewer "$REVIEWER_LOGIN" --type "$REVIEWER_TYPE" \
             --trusted-associations "$TRUSTED_ASSOCIATIONS" > "$plan"
+
+          # An event that names a head the snapshot does not carry is either an incomplete read or a stale
+          # event (the pull request moved or closed since). Publishing in the first case would leave that head's
+          # old verdict standing with no signal, so ask the event's own pull request which it is -- and fail
+          # before anything is written, rather than trusting either snapshot blindly.
+          if [ -n "${EVENT_PR:-}" ] && [ -n "${EVENT_HEAD:-}" ] && [ "${EVENT_ACTION:-}" != "closed" ] \
+              && ! cut -f1 "$plan" | grep -qx "$EVENT_HEAD"; then
+            live=$(gh api "repos/$REPO/pulls/$EVENT_PR" --jq '[.state, .head.sha] | @tsv' || true)
+            live_state=$(printf '%s' "$live" | cut -f1)
+            live_head=$(printf '%s' "$live" | cut -f2)
+            if [ "$live_state" = "open" ] && [ "$live_head" = "$EVENT_HEAD" ]; then
+              echo "::error::#${EVENT_PR} is open at ${EVENT_HEAD} but the snapshot does not carry it; refusing to publish"
+              exit 1
+            fi
+            echo "::warning::the ${EVENT_ACTION:-?} event for #${EVENT_PR} is stale (state=${live_state:-unknown}); the snapshot decides"
+          fi
 
           while IFS=$'\t' read -r head state description; do
             [ -n "$head" ] || continue
