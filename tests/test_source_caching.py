@@ -193,3 +193,14 @@ def test_a_policy_change_drops_the_conditional_request_state():
     assert state["feeds"] == {"nodejs": {"url_digest": "x", "etag": "e"}}
     pipeline._reset_validators_on_policy_change(state, _policy("postgresql"))
     assert state["feeds"] == {}
+
+
+def test_disabling_a_source_drops_its_validators_with_its_carry():
+    # keeping the validators would let a re-enabled, unchanged feed answer 304 for work just discarded
+    state = {
+        "carry": {"feed": [{"guid": "g"}], "other": [{"guid": "h"}]},
+        "feeds": {"feed": {"url_digest": "d", "etag": "e"}, "other": {"url_digest": "x"}},
+    }
+    pipeline._drop_disabled_sources(state, {"other"})
+    assert state["carry"] == {"other": [{"guid": "h"}]}
+    assert state["feeds"] == {"other": {"url_digest": "x"}}

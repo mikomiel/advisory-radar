@@ -23,6 +23,21 @@ LOG = logging.getLogger("advisory_radar")
 KEV_CACHE_NAME = "kev.json"
 
 
+def _drop_disabled_sources(state: dict, enabled_ids: set[str]) -> None:
+    """Discard a removed source's unclassified work *and* its stored validators.
+
+    The two have to go together. Dropping the carry while keeping the validators lets a re-enabled source with
+    an unchanged feed answer ``304`` on its next read, so the candidates just discarded could not be recovered
+    from the feed at all. ``carry`` is the source of truth for what is still owed.
+    """
+    carried = state.setdefault("carry", {})
+    feeds = state.get("feeds")
+    for stale in [source_id for source_id in carried if source_id not in enabled_ids]:
+        carried.pop(stale, None)
+        if isinstance(feeds, dict):
+            feeds.pop(stale, None)
+
+
 def _reset_validators_on_policy_change(state: dict, policy: object) -> None:
     """Drop stored feed validators when the scope changed.
 
@@ -161,9 +176,9 @@ def _run_pass(
     carried = state.setdefault("carry", {})
     enabled_ids = {source.id for source in sources}
     answered_now = {source.id for source, _ in answered}
-    # Only a source that still exists may push work through carry.
-    for stale in [sid for sid in carried if sid not in enabled_ids]:
-        carried.pop(stale, None)
+    # Only a source that still exists may push work through carry, or keep a cached answer to it.
+    _drop_disabled_sources(state, enabled_ids)
+    carried = state["carry"]
 
     # One work list for fairness: freshly fetched sources and sources whose only remaining work is carried
     # candidates. A busy healthy source must not take every slot while a failed source's captured candidates
