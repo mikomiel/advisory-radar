@@ -75,6 +75,8 @@ MAX_NODEJS_PAGE_BYTES = 2 * 1024 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 #: NVD admits 5 requests per 30 s without a key; the worker waits this long before every call.
 NVD_PACE_SECONDS = 6.0
+#: With a free API key NVD admits 50 requests per 30 s, so the same wait would waste nine tenths of the budget.
+NVD_KEY_PACE_SECONDS = 0.6
 
 DAY = 86400
 CACHE_TTL = DAY
@@ -599,12 +601,21 @@ class Intel:
     """The lookups behind a verdict, cached in the state file for 24 hours."""
 
     def __init__(
-        self, http: Http, cache: dict[str, dict], clock: Callable[[], float], sleep: Callable[[float], None]
+        self,
+        http: Http,
+        cache: dict[str, dict],
+        clock: Callable[[], float],
+        sleep: Callable[[float], None],
+        *,
+        nvd_key: str = "",
     ) -> None:
         self._http = http
         self._cache = cache
         self._clock = clock
         self._sleep = sleep
+        #: A free NVD API key raises the limit from 5 to 50 requests per 30 s, so the pace follows the key.
+        self._nvd_key = nvd_key
+        self._nvd_pace = NVD_KEY_PACE_SECONDS if nvd_key else NVD_PACE_SECONDS
         self._nvd_left = MAX_NVD_CALLS
         #: Enrichment pages this pass may still fetch: tracker pages (``dsa_cves``), ChangeLogs (``php_cves``) and
         #: Node.js posts (``nodejs_page``).
@@ -614,8 +625,11 @@ class Intel:
         #: The Node.js posts read in this pass by slug, ``None`` after a fault. Never in the state file.
         self._nodejs: dict[str, NodejsRelease | None] = {}
 
-    def _get(self, url: str) -> tuple[int, object]:
-        status, _, body = self._http("GET", url, {"Accept": "application/json"}, None)
+    def _get(self, url: str, extra_headers: Mapping[str, str] | None = None) -> tuple[int, object]:
+        headers = {"Accept": "application/json"}
+        if extra_headers:
+            headers.update(extra_headers)
+        status, _, body = self._http("GET", url, headers, None)
         return status, (parse_json(body) if status == 200 else None)
 
     def _fresh(self, key: str, force: bool) -> dict | None:
@@ -640,8 +654,12 @@ class Intel:
         return (not malformed, cvss, ssvc, remote)
 
     def _nvd(self, cve: str) -> tuple[bool, float | None, bool]:
-        self._sleep(NVD_PACE_SECONDS)
-        status, document = self._get(NVD_URL + cve)
+        self._sleep(self._nvd_pace)
+        # Without a key this sends no header at all: NVD then applies its anonymous limit, and the pace above
+        # already respects it.
+        status, document = (
+            self._get(NVD_URL + cve, {"apiKey": self._nvd_key}) if self._nvd_key else self._get(NVD_URL + cve)
+        )
         if status == 404:
             return True, None, False
         # A 200 must carry the NVD envelope for *this* CVE: an error body, {} or another CVE's record is a

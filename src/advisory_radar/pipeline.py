@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from collections.abc import Callable, Mapping
@@ -20,6 +21,35 @@ from .watchlist import load_policy
 LOG = logging.getLogger("advisory_radar")
 
 KEV_CACHE_NAME = "kev.json"
+
+
+def _drop_disabled_sources(state: dict, enabled_ids: set[str]) -> None:
+    """Discard a removed source's unclassified work *and* its stored validators.
+
+    The two have to go together. Dropping the carry while keeping the validators lets a re-enabled source with
+    an unchanged feed answer ``304`` on its next read, so the candidates just discarded could not be recovered
+    from the feed at all. ``carry`` is the source of truth for what is still owed.
+    """
+    carried = state.setdefault("carry", {})
+    feeds = state.get("feeds")
+    for stale in [source_id for source_id in carried if source_id not in enabled_ids]:
+        carried.pop(stale, None)
+        if isinstance(feeds, dict):
+            feeds.pop(stale, None)
+
+
+def _reset_validators_on_policy_change(state: dict, policy: object) -> None:
+    """Drop stored feed validators when the scope changed.
+
+    A ``304`` means "the feed is unchanged", not "nothing in it is new to you": an entry outside the old
+    policy was dropped before classification, so after a watchlist change the cached answer hides exactly the
+    advisory that just became in scope. One full read per source after a change is the price of not missing it.
+    """
+    digest = hashlib.sha256(repr(policy).encode("utf-8")).hexdigest()
+    if state.get("policy_digest") == digest:
+        return
+    state["feeds"] = {}
+    state["policy_digest"] = digest
 
 
 def _namespaced(item: core.Item, source_id: str) -> core.Item:
@@ -88,6 +118,7 @@ def _run_pass(
     core.HIDDEN_SOURCE_HOSTS = cfg.hidden_source_hosts
 
     state = core.new_state() if stored is None else stored
+    _reset_validators_on_policy_change(state, policy)
     state.setdefault("parked", [])
     core._prune(state, now)
     # Both of these must come from the state document that is actually written: a detached dict never
@@ -99,7 +130,7 @@ def _run_pass(
     gap = False
     source_ok = True
     kev, kev_known = load_kev(http, cfg.state_path.with_name(KEV_CACHE_NAME), save=not dry_run)
-    intel = core.Intel(http, cache, clock, sleep)
+    intel = core.Intel(http, cache, clock, sleep, nvd_key=cfg.nvd_api_key)
     # Re-evaluate before classification: both share one NVD budget, and a busy news day must not starve a due
     # watch of the measurement that could escalate it. A watch created later this pass is evaluated next pass.
     core.reevaluate(state, intel, kev, kev_known, now, "")
@@ -145,9 +176,9 @@ def _run_pass(
     carried = state.setdefault("carry", {})
     enabled_ids = {source.id for source in sources}
     answered_now = {source.id for source, _ in answered}
-    # Only a source that still exists may push work through carry.
-    for stale in [sid for sid in carried if sid not in enabled_ids]:
-        carried.pop(stale, None)
+    # Only a source that still exists may push work through carry, or keep a cached answer to it.
+    _drop_disabled_sources(state, enabled_ids)
+    carried = state["carry"]
 
     # One work list for fairness: freshly fetched sources and sources whose only remaining work is carried
     # candidates. A busy healthy source must not take every slot while a failed source's captured candidates
