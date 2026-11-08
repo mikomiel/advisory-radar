@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 
-from .http import parse_json
+from .http import header, parse_json
 
 Http = Callable[[str, str, Mapping[str, str], bytes | None], tuple[int, dict[str, str], bytes]]
 FEED_ITEMS = 100
@@ -319,10 +319,34 @@ def parse_rss(body: bytes) -> FeedExport:
     return FeedExport(tuple(items), False)
 
 
-def fetch_rss(http: Http, url: str) -> FeedExport:
-    status, _, body = http(
-        "GET", url, {"Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml"}, None
-    )
+def fetch_rss(
+    http: Http, url: str, validators: Mapping[str, str] | None = None
+) -> tuple[FeedExport, dict[str, str] | None]:
+    """One RSS/Atom GET, plus the caching validators to keep for the next one.
+
+    A ``304 Not Modified`` is an empty export, not an error: the publisher says nothing changed, so no cursor
+    moves and no window gap is implied. Sending ``If-None-Match``/``If-Modified-Since`` turns most polls of an
+    unchanged feed into that answer instead of the whole body, which is the difference between a poll every 15
+    minutes and one a publisher is happy to serve.
+    """
+    headers = {"Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml"}
+    if validators:
+        headers.update(validators)
+    status, response_headers, body = http("GET", url, headers, None)
+    if status == 304:
+        if not validators:
+            # A 304 answers a conditional request. Without one the publisher -- or a proxy in front of it --
+            # never told us what the feed holds, and reading it as "unchanged" would mark an unread source
+            # healthy and seed it with nothing.
+            raise RssError("feed answered 304 to an unconditional request")
+        return FeedExport((), False), None
     if status != 200:
         raise RssError(f"feed answered HTTP {status}" if status else "feed is unreachable")
-    return parse_rss(body)
+    stored: dict[str, str] = {}
+    etag = header(response_headers, "ETag")
+    if etag:
+        stored["etag"] = etag
+    modified = header(response_headers, "Last-Modified")
+    if modified:
+        stored["last_modified"] = modified
+    return parse_rss(body), stored

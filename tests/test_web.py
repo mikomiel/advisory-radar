@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -10,10 +12,10 @@ from fastapi.testclient import TestClient
 from advisory_radar import core
 from advisory_radar.config import load_config
 from advisory_radar.state import load_state_document, save_state
-from advisory_radar.web import LoginThrottle, create_app
+from advisory_radar.web import LoginThrottle, create_app, readiness
 
 
-def make_client(tmp_path: Path, token: str = "secret-token"):
+def make_client(tmp_path: Path, token: str = "secret-token", clock: float | None = None):
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text(f"sources: []\nnotifiers: []\nstate_path: {tmp_path}/state.json\nweb:\n  port: 8080\n")
     cfg = load_config(cfg_path, {})
@@ -34,7 +36,7 @@ def make_client(tmp_path: Path, token: str = "secret-token"):
     )
     state.setdefault("runs", []).append({"at": 1792600000, "sent": 1, "parked": 0, "pending": 1, "code": 0})
     save_state(cfg.state_path, state)
-    app = create_app(cfg, {"ADVISORY_RADAR_AUTH_TOKEN": token})
+    app = create_app(cfg, {"ADVISORY_RADAR_AUTH_TOKEN": token}, clock=(lambda: clock) if clock else time.time)
     return TestClient(app), token
 
 
@@ -240,3 +242,159 @@ def test_a_refused_post_leaves_the_queue_untouched(tmp_path):
     assert len(load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")["parked"]) == 1
     assert client.post("/parked/release", data={"csrf": csrf}, follow_redirects=False).status_code == 303
     assert load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")["parked"] == []
+
+
+def test_readyz_is_ready_just_after_a_pass(tmp_path):
+    client, _ = make_client(tmp_path, clock=1792600060)  # one minute after the recorded pass
+    response = client.get("/readyz")
+    assert response.status_code == 200
+    assert response.text == "ready"
+    assert "advisory_radar_ready 1" in client.get("/metrics").text
+
+
+def test_readyz_reports_a_stale_pass(tmp_path):
+    # The fixture's pass is at 1792600000; inject a clock past the limit (3 x 900 s) instead of relying on the
+    # wall clock being later than a fixed timestamp, which would make this test time-travel-dependent.
+    client, _ = make_client(tmp_path, clock=1792600000 + 3000)
+    response = client.get("/readyz")
+    assert response.status_code == 503
+    assert "the last pass finished" in response.text
+    metrics = client.get("/metrics").text
+    assert "advisory_radar_ready 0" in metrics
+    assert "advisory_radar_last_pass_timestamp_seconds 1792600000" in metrics
+
+
+def test_readyz_without_a_recorded_pass(tmp_path):
+    client, _ = make_client(tmp_path)
+    state = core.new_state()  # a fresh instance: nothing has run yet
+    save_state(tmp_path / "state.json", state)
+    response = client.get("/readyz")
+    assert response.status_code == 503
+    assert "no pass has completed yet" in response.text
+
+
+def test_readyz_reports_an_unreadable_state(tmp_path):
+    client, _ = make_client(tmp_path)
+    (tmp_path / "state.json").write_text("{not json")
+    response = client.get("/readyz")
+    assert response.status_code == 503
+    assert response.text.startswith("not ready:")
+
+
+def test_readyz_reports_a_state_path_that_is_a_directory(tmp_path):
+    """A state path that cannot be read is unreadable, not absent: the probe must still answer."""
+    client, _ = make_client(tmp_path)
+    (tmp_path / "state.json").unlink()
+    (tmp_path / "state.json").mkdir()
+    response = client.get("/readyz")
+    assert response.status_code == 503
+    assert response.text.startswith("not ready:")
+    assert "advisory_radar_ready 0" in client.get("/metrics").text
+
+
+def test_readyz_reports_invalid_utf8(tmp_path):
+    client, _ = make_client(tmp_path)
+    (tmp_path / "state.json").write_bytes(b"\xff\xfe\x00")
+    assert client.get("/readyz").status_code == 503
+    assert "advisory_radar_state_readable 0" in client.get("/metrics").text
+
+
+def test_readiness_uses_the_completion_time_not_the_start(tmp_path):
+    """A pass slower than the limit must not be stale the moment it completes."""
+    client, _ = make_client(tmp_path, clock=1792600000 + 400)
+    state = json.loads((tmp_path / "state.json").read_text())
+    state["runs"][-1]["at"] = 1792600000 - 600  # started ten minutes ago
+    state["runs"][-1]["finished_at"] = 1792600000 + 390  # finished ten seconds before the clock
+    (tmp_path / "state.json").write_text(json.dumps(state))
+    response = client.get("/readyz")
+    assert response.status_code == 200
+    assert "advisory_radar_last_pass_timestamp_seconds 1792600390" in client.get("/metrics").text
+
+
+def test_metrics_carry_the_watch_and_run_counts(tmp_path):
+    client, _ = make_client(tmp_path, clock=1792600060)
+    metrics = client.get("/metrics").text
+    assert "advisory_radar_runs_retained 1" in metrics
+    assert "advisory_radar_watch_total 0" in metrics
+    assert "advisory_radar_last_pass_sent 1" in metrics
+    assert "advisory_radar_last_pass_exit 0" in metrics
+
+
+def test_readyz_treats_a_future_run_as_unready(tmp_path):
+    """A replaced state file or a clock jump must not hide a stopped scheduler."""
+    client, _ = make_client(tmp_path, clock=1792600000 - 600)
+    response = client.get("/readyz")
+    assert response.status_code == 503
+    assert "in the future" in response.text
+
+
+def cfg_with_interval(tmp_path: Path, interval: str):
+    path = tmp_path / f"c-{interval}.yml"
+    path.write_text(f"sources: []\nnotifiers: []\npoll_interval: {interval}\nstate_path: {tmp_path}/s.json\n")
+    return load_config(path, {})
+
+
+def test_readiness_uses_three_intervals_with_a_five_minute_floor(tmp_path):
+    now = 1792600000
+    state = {"runs": [{"at": now - 299, "code": 0}]}
+    # a 30 s interval: 3 x 30 s would be 90 s, and the 300 s floor keeps a fast poll from flapping
+    assert readiness(cfg_with_interval(tmp_path, "30s"), state, now)[0] is True
+    assert readiness(cfg_with_interval(tmp_path, "30s"), {"runs": [{"at": now - 301, "code": 0}]}, now)[0] is False
+    # a 15 m interval: 3 x 900 s = 2700 s, and both sides of that boundary are exact
+    fifteen = cfg_with_interval(tmp_path, "15m")
+    assert readiness(fifteen, {"runs": [{"at": now - 2700, "code": 0}]}, now)[0] is True
+    assert readiness(fifteen, {"runs": [{"at": now - 2701, "code": 0}]}, now)[0] is False
+
+
+def test_a_nan_timestamp_does_not_break_the_probe_or_the_scrape(tmp_path):
+    """Python's JSON reader accepts NaN; int(nan) raises, which would turn a scrape into a 500."""
+    client, _ = make_client(tmp_path)
+    state = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    state["runs"] = [{"at": float("nan"), "code": 0}]
+    save_state(tmp_path / "state.json", state)
+    assert client.get("/readyz").status_code == 503  # no usable timestamp is not readiness
+    metrics = client.get("/metrics")
+    assert metrics.status_code == 200
+    assert "advisory_radar_last_pass_timestamp_seconds 0" in metrics.text
+
+
+def test_metrics_still_answer_when_the_state_is_unreadable(tmp_path):
+    """The documented alert is `advisory_radar_ready == 0`; a failed scrape would produce no sample at all."""
+    client, _ = make_client(tmp_path)
+    (tmp_path / "state.json").write_text("{not json")
+    assert client.get("/healthz").status_code == 200  # liveness stays independent of the state
+    response = client.get("/metrics")
+    assert response.status_code == 200
+    assert "advisory_radar_ready 0" in response.text
+    assert "advisory_radar_state_readable 0" in response.text
+    assert "advisory_radar_pending" not in response.text  # unknown, not zero
+
+
+def test_metrics_report_a_readable_state(tmp_path):
+    client, _ = make_client(tmp_path)
+    assert "advisory_radar_state_readable 1" in client.get("/metrics").text
+
+
+def test_a_malformed_runs_value_does_not_break_the_probe_or_the_scrape(tmp_path):
+    """A hand-edited document can put anything under `runs`; both endpoints must still answer."""
+    client, _ = make_client(tmp_path)
+    state = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    state["runs"] = {"at": 1, "code": 0}  # a mapping, not a list
+    save_state(tmp_path / "state.json", state)
+    assert client.get("/readyz").status_code == 503
+    metrics = client.get("/metrics")
+    assert metrics.status_code == 200
+    assert "advisory_radar_last_pass_exit -1" in metrics.text
+
+
+def test_a_malformed_collection_does_not_break_the_scrape(tmp_path):
+    client, _ = make_client(tmp_path)
+    state = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    state["watch"] = None
+    state["seen"] = None
+    state["pending"] = None
+    save_state(tmp_path / "state.json", state)
+    metrics = client.get("/metrics")
+    assert metrics.status_code == 200
+    assert "advisory_radar_watch_total 0" in metrics.text
+    assert "advisory_radar_pending 0" in metrics.text
