@@ -21,7 +21,9 @@
 #
 # Fail-closed where it can be: an unreadable review list revokes every success in the snapshot and fails the
 # job; an unreadable snapshot publishes nothing and fails. An enumeration failure is the one case this
-# workflow cannot repair, and it fails loudly instead of reporting a clean sweep.
+# workflow cannot repair, and it fails loudly instead of reporting a clean sweep. A snapshot that reports no
+# open pull requests while a lifecycle event names one is treated the same way: it fails, and it writes
+# nothing, rather than revoking a head whose verdict another run may have just published.
 name: review-gate
 
 # Trusted triggers only, all of them running this file from the default branch: `workflow_run`, `schedule`,
@@ -76,6 +78,8 @@ jobs:
           REPO: ${{ github.repository }}
           #: Empty for workflow_run and schedule; the pull request's head for a lifecycle event.
           EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+          #: The lifecycle action. Only ``closed`` may revoke a head that the snapshot does not carry.
+          EVENT_ACTION: ${{ github.event.action }}
         run: |
           set -euo pipefail
           snapshot=$(mktemp)
@@ -108,9 +112,16 @@ jobs:
           fi
           if [ -z "$prs" ]; then
             echo "no open pull requests"
-            # A closed pull request's head is not in the snapshot, and its status must not survive it.
+            # A closed pull request's head is not in the snapshot, and its status must not survive it. Every
+            # other lifecycle action carries a pull request that is open, so an empty snapshot contradicts the
+            # event -- and a write here would overwrite whatever another run had just published for that head.
             if [ -n "${EVENT_HEAD:-}" ]; then
-              publish "$EVENT_HEAD" pending "no open pull request carries this commit"
+              if [ "${EVENT_ACTION:-}" = "closed" ]; then
+                publish "$EVENT_HEAD" pending "the pull request was closed"
+              else
+                echo "::error::no open pull requests, but the event carries ${EVENT_HEAD} as ${EVENT_ACTION}; refusing to revoke"
+                exit 1
+              fi
             fi
             exit 0
           fi
@@ -174,7 +185,9 @@ jobs:
           done < "$plan"
 
           # A commit an approved pull request left behind can be reused by a new, unreviewed one: that head is
-          # then not in the snapshot and would keep its success. The event names it, so revoke it here.
-          if [ -n "${EVENT_HEAD:-}" ] && ! cut -f1 "$plan" | grep -qx "$EVENT_HEAD"; then
+          # then not in the snapshot and would keep its success. Only a close can leave such a head behind: for
+          # every other action the event's head is carried by an open pull request, so a revocation here could
+          # only overwrite that pull request's own verdict.
+          if [ "${EVENT_ACTION:-}" = "closed" ] && [ -n "${EVENT_HEAD:-}" ] && ! cut -f1 "$plan" | grep -qx "$EVENT_HEAD"; then
             publish "$EVENT_HEAD" pending "no open pull request carries this commit"
           fi
