@@ -8,6 +8,12 @@ poll_interval: 15m
 # Where state is kept inside the container.
 state_path: /data/state.json
 
+# Optional: a free NVD API key. NVD admits 5 requests per 30 s anonymously and
+# 50 with a key; the per-pass lookup budget is the same either way, so a key
+# buys time (about 0.6 s per call instead of 6 s), not breadth.
+# Request one at https://nvd.nist.gov/developers/request-an-api-key
+# nvd_api_key: ${NVD_API_KEY}
+
 sources:
   - id: nodejs-security
     type: rss
