@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from collections.abc import Callable, Mapping
@@ -20,6 +21,20 @@ from .watchlist import load_policy
 LOG = logging.getLogger("advisory_radar")
 
 KEV_CACHE_NAME = "kev.json"
+
+
+def _reset_validators_on_policy_change(state: dict, policy: object) -> None:
+    """Drop stored feed validators when the scope changed.
+
+    A ``304`` means "the feed is unchanged", not "nothing in it is new to you": an entry outside the old
+    policy was dropped before classification, so after a watchlist change the cached answer hides exactly the
+    advisory that just became in scope. One full read per source after a change is the price of not missing it.
+    """
+    digest = hashlib.sha256(repr(policy).encode("utf-8")).hexdigest()
+    if state.get("policy_digest") == digest:
+        return
+    state["feeds"] = {}
+    state["policy_digest"] = digest
 
 
 def _namespaced(item: core.Item, source_id: str) -> core.Item:
@@ -88,6 +103,7 @@ def _run_pass(
     core.HIDDEN_SOURCE_HOSTS = cfg.hidden_source_hosts
 
     state = core.new_state() if stored is None else stored
+    _reset_validators_on_policy_change(state, policy)
     state.setdefault("parked", [])
     core._prune(state, now)
     # Both of these must come from the state document that is actually written: a detached dict never

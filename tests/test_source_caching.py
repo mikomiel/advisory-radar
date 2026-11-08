@@ -12,10 +12,14 @@ whole document from a publisher who owes us nothing. The risky half is the other
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 import pytest
 
-from advisory_radar import feeds
+from advisory_radar import feeds, pipeline
 from advisory_radar.sources import RssSource
+from advisory_radar.watchlist import Policy, Product
 
 FEED = b"""<?xml version="1.0"?>
 <rss version="2.0"><channel><title>Vendor</title><link>https://vendor.example.com/</link>
@@ -46,7 +50,11 @@ def test_an_unchanged_feed_answers_304_and_keeps_its_validators():
     first = source.fetch(http_with(calls, [200, 304]), state)
     assert [item.guid for item in first.items] == ["https://lists.debian.org/dsa-6558"]
     source.commit(state)
-    assert state["feeds"]["nodejs"] == {"url": URL, "etag": ETAG, "last_modified": MODIFIED}
+    assert state["feeds"]["nodejs"] == {
+        "url_digest": hashlib.sha256(URL.encode()).hexdigest(),
+        "etag": ETAG,
+        "last_modified": MODIFIED,
+    }
     second = source.fetch(http_with(calls, [200, 304]), state)
     assert second.items == ()  # not an error: the publisher says nothing changed
     assert calls[1]["If-None-Match"] == ETAG
@@ -84,7 +92,7 @@ def test_a_changed_url_does_not_inherit_the_previous_urls_validators():
     second.commit(state)
     assert calls[1][0] == "https://b.example.com/feed.xml"
     assert "If-None-Match" not in calls[1][1]  # not this resource's validator, so it must not be sent
-    assert state["feeds"]["vendor"]["url"] == "https://b.example.com/feed.xml"
+    assert state["feeds"]["vendor"]["url_digest"] == hashlib.sha256(b"https://b.example.com/feed.xml").hexdigest()
 
 
 def test_a_200_without_validators_forgets_the_stored_ones():
@@ -131,7 +139,8 @@ def test_a_stored_validator_that_is_not_a_string_is_ignored():
     calls: list[dict[str, str]] = []
     source = RssSource("nodejs", URL)
     # a hand-edited state: the URL matches, so the type checks are what reject each validator
-    state = {"feeds": {"nodejs": {"url": URL, "etag": 7, "last_modified": None}}}
+    stored = {"url_digest": hashlib.sha256(URL.encode()).hexdigest(), "etag": 7, "last_modified": None}
+    state = {"feeds": {"nodejs": stored}}
     source.fetch(http_with(calls, [200]), state)
     assert "If-None-Match" not in calls[0]
     assert "If-Modified-Since" not in calls[0]
@@ -151,3 +160,36 @@ def test_fetch_rss_returns_the_validators_and_refuses_an_error_status():
 
     with pytest.raises(feeds.RssError):
         feeds.fetch_rss(unavailable, URL)
+
+
+def test_the_stored_validators_never_contain_the_feed_url():
+    # a subscription URL can carry a credential: ?token=${FEED_TOKEN} is expanded before the source is built
+    secret_url = "https://feeds.example.com/rss?token=super-secret-token"
+    source = RssSource("paid", secret_url)
+    state: dict = {}
+    source.fetch(http_with([], [200]), state)
+    source.commit(state)
+    persisted = json.dumps(state)
+    assert "super-secret-token" not in persisted
+    assert secret_url not in persisted
+    assert state["feeds"]["paid"]["url_digest"] == hashlib.sha256(secret_url.encode()).hexdigest()
+
+
+def _policy(product: str) -> Policy:
+    return Policy(
+        debian_source_packages=(),
+        excluded_products=(),
+        products=(Product(id=product, aliases=(), domains=(), metadata_only=False),),
+    )
+
+
+def test_a_policy_change_drops_the_conditional_request_state():
+    # a 304 says the feed is unchanged, not that nothing in it became in scope
+    state: dict = {"feeds": {"nodejs": {"url_digest": "x", "etag": "e"}}}
+    pipeline._reset_validators_on_policy_change(state, _policy("nodejs"))
+    assert state["feeds"] == {}
+    state["feeds"] = {"nodejs": {"url_digest": "x", "etag": "e"}}
+    pipeline._reset_validators_on_policy_change(state, _policy("nodejs"))
+    assert state["feeds"] == {"nodejs": {"url_digest": "x", "etag": "e"}}
+    pipeline._reset_validators_on_policy_change(state, _policy("postgresql"))
+    assert state["feeds"] == {}
