@@ -334,6 +334,11 @@ def fetch_rss(
         headers.update(validators)
     status, response_headers, body = http("GET", url, headers, None)
     if status == 304:
+        if not validators:
+            # A 304 answers a conditional request. Without one the publisher -- or a proxy in front of it --
+            # never told us what the feed holds, and reading it as "unchanged" would mark an unread source
+            # healthy and seed it with nothing.
+            raise RssError("feed answered 304 to an unconditional request")
         return FeedExport((), False), None
     if status != 200:
         raise RssError(f"feed answered HTTP {status}" if status else "feed is unreachable")

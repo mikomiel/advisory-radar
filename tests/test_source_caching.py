@@ -3,7 +3,8 @@
 A feed polled every 15 minutes is read 96 times a day; without validators every one of those transfers the
 whole document from a publisher who owes us nothing. The risky half is the other side:
 
-* a 304 must be an empty window, never an error, and must not forget the validators;
+* a 304 to a conditional request must be an empty window, never an error, and must not forget the
+  validators -- while a 304 to an unconditional request is a source error, not a healthy empty feed;
 * the validators belong to the URL that issued them, because an ETag is unique per resource -- repointing a
   source id at another feed must not send the old one and earn a legitimate 304 for a feed never read;
 * they are stored by ``commit``, after the pipeline captured the candidates, so a window whose advisories were
@@ -149,11 +150,18 @@ def test_a_stored_validator_that_is_not_a_string_is_ignored():
 def test_fetch_rss_returns_the_validators_and_refuses_an_error_status():
     def not_modified(method, url, headers, body):
         assert headers["Accept"].startswith("application/rss+xml")
+        assert headers["If-None-Match"] == '"abc"'  # a 304 only answers a conditional request
         return 304, {}, b""
 
-    export, stored = feeds.fetch_rss(not_modified, URL)
+    export, stored = feeds.fetch_rss(not_modified, URL, {"If-None-Match": '"abc"'})
     assert export.items == () and not export.truncated
     assert stored is None  # 304: keep the validators already stored, do not forget them
+
+    def unsolicited(method, url, headers, body):
+        return 304, {}, b""
+
+    with pytest.raises(feeds.RssError):
+        feeds.fetch_rss(unsolicited, URL)
 
     def unavailable(method, url, headers, body):
         return 503, {}, b""
