@@ -7,8 +7,10 @@ for both. Publishing whichever pull request was processed last would let an appr
 changes-requested one green, so this script aggregates conservatively: the worst verdict among the pull
 requests sharing a head wins, and the description names them all.
 
-Input: a JSON array of ``{number, head, draft, reviews}`` on stdin -- one entry per open pull request, with
-the reviews exactly as the API returned them.
+Input: a JSON array of ``{number, head, draft, author, changed, reviews, files}`` on stdin -- one entry per
+open pull request, with the reviews exactly as the API returned them, ``changed`` the pull request's own
+changed-file count, and ``files`` the entries of the immutable ``compare`` (``filename`` and
+``previous_filename``). Flattening renames is this script's job, so that it is tested.
 
 Output: one line per head, ``head<TAB>state<TAB>description``, where state is a GitHub status state. The
 caller publishes these; it decides nothing.
@@ -32,10 +34,86 @@ import review_state  # noqa: E402
 #: Higher blocks more: a shared head is only green when every pull request on it is green.
 SEVERITY = {"success": 1, "pending": 2, "failure": 3}
 MAX_DESCRIPTION = 140
+#: Authors whose pull requests do not need an App review, and only while every changed path stays inside
+#: DEPENDENCY_PATHS. Dependabot's updates are mechanical and `ci` (the image build included) still has to pass.
+#: The login is GitHub's, not the pull request's, so a patch cannot claim it. A pull request the exemption
+#: covers is not taken by automerge.yml, which requires an APPROVED review decision an exempt pull request
+#: does not have. GitHub's own auto-merge switch is separate: while `allow_auto_merge` is on, a write-access
+#: user can have GitHub merge an exempt bump once its checks are green.
+EXEMPT_AUTHORS = frozenset({"app/dependabot", "dependabot[bot]"})
+#: Paths a dependency update may touch for the exemption to apply, checked rather than assumed. Files match
+#: exactly -- ``Dockerfile/evil.py`` is somebody deleting the manifest and adding a directory of source, not a
+#: dependency update -- and only the workflow tree matches as a prefix.
+DEPENDENCY_FILES = frozenset({"pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml"})
+DEPENDENCY_DIRECTORIES = (".github/workflows/",)
+
+
+def _changed_names(entry: dict) -> list[str]:
+    """Every path the comparison names, both sides of a rename; empty when the list is unusable."""
+    files = entry.get("files")
+    if not isinstance(files, list) or not files:
+        return []
+    names: list[str] = []
+    for item in files:
+        if not isinstance(item, dict):
+            return []
+        name = item.get("filename")
+        if not isinstance(name, str) or not name:
+            return []
+        names.append(name)
+        previous = item.get("previous_filename")
+        if isinstance(previous, str) and previous:
+            names.append(previous)
+    return names
+
+
+def _dependency_only(names: list[str]) -> bool:
+    """Whether every changed path is a dependency manifest the exemption may cover."""
+    if not names:
+        return False
+    for name in names:
+        if name in DEPENDENCY_FILES:
+            continue
+        if any(name.startswith(directory) for directory in DEPENDENCY_DIRECTORIES):
+            continue
+        return False
+    return True
+
+
+def exempt(entry: dict, author: str, exempt_authors: frozenset[str]) -> bool:
+    """Whether the exemption covers this entry: an exempt author, on a complete, manifest-only path list.
+
+    Fail-closed in four places: an unreadable list is not exempt, a list shorter than the pull request's own
+    changed-file count is not exempt (``compare`` caps its list at 300, so a source file could hide past the
+    cap), a count that does not describe the same commit pair as the comparison is not exempt, and an empty
+    list is not exempt.
+    """
+    if author not in exempt_authors:
+        return False
+    # The count proves the comparison complete only for the commits it describes. The two arrive in different
+    # responses, so a head that moved in between would pair the pinned comparison with the newer, smaller
+    # count -- and a truncated old list would then pass the short-list check it exists to fail.
+    head = entry.get("head")
+    base = entry.get("base")
+    if not isinstance(head, str) or not isinstance(base, str) or not base:
+        return False
+    if entry.get("count_head") != head or entry.get("count_base") != base:
+        return False
+    files = entry.get("files")
+    declared = entry.get("changed")
+    if not isinstance(files, list) or not isinstance(declared, int) or declared < 1:
+        return False
+    if len(files) < declared:
+        return False
+    return _dependency_only(_changed_names(entry))
 
 
 def merge(
-    entries: list[object], reviewer: str, reviewer_type: str, associations: frozenset[str]
+    entries: list[object],
+    reviewer: str,
+    reviewer_type: str,
+    associations: frozenset[str],
+    exempt_authors: frozenset[str] = EXEMPT_AUTHORS,
 ) -> list[tuple[str, str, str]]:
     """``(head, state, description)`` for every head in the snapshot, worst verdict winning."""
     decisions: dict[str, dict] = {}
@@ -46,9 +124,20 @@ def merge(
         if not head:
             continue
         number = entry.get("number")
+        author = str(entry.get("author") or "")
         if entry.get("draft"):
             # A draft is not mergeable; saying so revokes a success left over from before it was a draft.
             state, description = "pending", "pull request is a draft"
+        elif exempt(entry, author, exempt_authors):
+            # An exemption, not a review, and only where no eligible reviewer has said *anything*: any review at
+            # all -- including a comment that holds the change -- is used as-is rather than read as approval.
+            reviews = entry.get("reviews")
+            ours = reviews if isinstance(reviews, list) else []
+            if review_state.matching_reviews(ours, reviewer, reviewer_type, associations):
+                state, description = review_state.verdict(ours, reviewer, reviewer_type, head, associations)
+            else:
+                state = "success"
+                description = f"dependency update by {author}: App review not required"
         else:
             reviews = entry.get("reviews")
             state, description = review_state.verdict(
@@ -78,6 +167,11 @@ def main(argv: list[str] | None = None, stdin=None) -> int:
     parser.add_argument("--reviewer", required=True)
     parser.add_argument("--type", default="Bot")
     parser.add_argument("--trusted-associations", default=",".join(sorted(review_state.TRUSTED_ASSOCIATIONS)))
+    parser.add_argument(
+        "--exempt-authors",
+        default=",".join(sorted(EXEMPT_AUTHORS)),
+        help="comma-separated authors whose pull requests need no App review; empty disables the exemption",
+    )
     arguments = parser.parse_args(argv)
     associations = frozenset(
         value.strip().upper() for value in arguments.trusted_associations.split(",") if value.strip()
@@ -91,7 +185,8 @@ def main(argv: list[str] | None = None, stdin=None) -> int:
     if not isinstance(document, list):
         print("::error::the snapshot is not an array")
         return 1
-    for head, state, description in merge(document, arguments.reviewer, arguments.type, associations):
+    exempt_authors = frozenset(value.strip() for value in arguments.exempt_authors.split(",") if value.strip())
+    for head, state, description in merge(document, arguments.reviewer, arguments.type, associations, exempt_authors):
         print(f"{head}\t{state}\t{description}")
     return 0
 
