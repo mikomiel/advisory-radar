@@ -10,8 +10,10 @@ contribution-friendly; the rules below keep it safe for everyone.
    (`feat:`, `fix:`, `docs:`, `test:`, `chore:`, ...). One logical change per
    commit; no force-push after review starts.
 3. Open a pull request against `main`. Describe the change, the reason, and how
-   you tested it. `main` is protected: CI must be green and one approving
-   review is required.
+   you tested it. `main` is protected: CI must be green and the `review` status
+   must be green — an approving review at the exact head commit, or (for a
+   Dependabot dependency update that touches only manifests) no review required,
+   as `README.md` describes under "Review and merge automation".
 4. Keep PRs small and focused; a reviewer should be able to judge the whole
    diff in one read.
 
