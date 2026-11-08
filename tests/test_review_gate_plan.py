@@ -15,6 +15,7 @@ from pathlib import Path
 
 HEAD = "195e30d8b02d5ba36e30caf889bb6bb3b1be92e2"
 OTHER = "5753428684342e7e0fb38a10426a342ec61ffaaa"
+BASE = "2c673bb56bf216ad60928dd9703143ac41f052ec"
 REVIEWER = "review-bot[bot]"
 
 
@@ -40,8 +41,35 @@ def review(state: str, commit: str = HEAD, login: str = REVIEWER, kind: str = "B
     }
 
 
-def entry(number: int, head: str = HEAD, reviews=(), draft: bool = False) -> dict:
-    return {"number": number, "head": head, "draft": draft, "reviews": list(reviews)}
+FILES = [{"filename": ".github/workflows/ci.yml", "previous_filename": None}]
+
+
+def entry(
+    number: int,
+    head: str = HEAD,
+    reviews=(),
+    draft: bool = False,
+    author: str = "mikomiel",
+    files: list[dict] | None = None,
+    changed: int | None = None,
+    base: str = BASE,
+    count_head: str | None = None,
+    count_base: str | None = None,
+) -> dict:
+    chosen = FILES if files is None else files
+    return {
+        "number": number,
+        "head": head,
+        "base": base,
+        "draft": draft,
+        "author": author,
+        "reviews": list(reviews),
+        "files": chosen,
+        "changed": len(chosen) if changed is None else changed,
+        # A coherent snapshot: the count describes the same two commits as the comparison.
+        "count_head": head if count_head is None else count_head,
+        "count_base": base if count_base is None else count_base,
+    }
 
 
 def decisions(entries: list[dict]) -> dict[str, tuple[str, str]]:
@@ -110,3 +138,168 @@ def test_the_cli_prints_one_line_per_head_and_refuses_a_bad_snapshot():
     assert head == HEAD and state == "success" and "approved" in description
     assert plan.main(["--reviewer", REVIEWER], stdin=io.StringIO("{not json")) == 1
     assert plan.main(["--reviewer", REVIEWER], stdin=io.StringIO("{}")) == 1
+
+
+def test_a_dependabot_update_needs_no_app_review():
+    state, description = decisions(
+        [
+            entry(
+                17,
+                reviews=[],
+                author="app/dependabot",
+                files=[{"filename": ".github/workflows/ci.yml", "previous_filename": None}],
+            )
+        ]
+    )[HEAD]
+    assert state == "success"
+    assert "not required" in description and "dependabot" in description
+
+
+def test_the_other_dependabot_login_is_recognised():
+    assert decisions([entry(17, reviews=[], author="dependabot[bot]")])[HEAD][0] == "success"
+
+
+def test_an_ordinary_author_is_not_exempt():
+    assert decisions([entry(18, reviews=[], author="mikomiel")])[HEAD][0] == "pending"
+
+
+def test_a_real_verdict_wins_over_the_exemption():
+    # an exemption fills the gap where nobody reviewed; it never overrules a reviewer who did
+    changed = decisions([entry(17, reviews=[review("CHANGES_REQUESTED")], author="app/dependabot")])[HEAD]
+    assert changed[0] == "failure"
+    approved = decisions([entry(17, reviews=[review("APPROVED")], author="app/dependabot")])[HEAD]
+    assert approved[0] == "success" and "approved at" in approved[1]
+
+
+def test_a_draft_dependabot_update_is_still_a_draft():
+    assert decisions([entry(17, reviews=[], author="app/dependabot", draft=True)])[HEAD][0] == "pending"
+
+
+def test_the_exemption_can_be_disabled():
+    got = plan.merge(
+        [entry(17, reviews=[], author="app/dependabot")], REVIEWER, "Bot", frozenset({"OWNER"}), frozenset()
+    )
+    assert got[0][1] == "pending"
+
+
+def test_the_exemption_needs_a_dependency_only_path_set():
+    # author alone would exempt a bump that reached into src/, which automerge would then take unreviewed
+    reached = decisions(
+        [
+            entry(
+                17,
+                reviews=[],
+                author="app/dependabot",
+                files=[
+                    {"filename": ".github/workflows/ci.yml", "previous_filename": None},
+                    {"filename": "src/x.py", "previous_filename": None},
+                ],
+            )
+        ]
+    )
+    assert reached[HEAD][0] == "pending"
+    missing = decisions([entry(17, reviews=[], author="app/dependabot", files=[])])
+    assert missing[HEAD][0] == "pending"
+    manifest = decisions(
+        [
+            entry(
+                17,
+                reviews=[],
+                author="app/dependabot",
+                files=[
+                    {"filename": "pyproject.toml", "previous_filename": None},
+                    {"filename": "uv.lock", "previous_filename": None},
+                ],
+            )
+        ]
+    )
+    assert manifest[HEAD][0] == "success"
+
+
+def test_a_shared_head_with_a_blocked_pull_request_stays_blocked():
+    entries = [
+        entry(
+            17, reviews=[], author="app/dependabot", files=[{"filename": "pyproject.toml", "previous_filename": None}]
+        ),
+        entry(18, reviews=[], author="mikomiel", files=[{"filename": "src/x.py", "previous_filename": None}]),
+    ]
+    state, description = decisions(entries)[HEAD]
+    assert state == "pending"
+    assert "#17" in description and "#18" in description
+
+
+def test_the_exemption_does_not_cover_a_stale_or_dismissed_verdict():
+    """Only an absence of verdict is exempt: "approved at another commit" and "dismissed" are not reviews."""
+    stale = decisions([entry(17, reviews=[review("APPROVED", commit="0" * 40)], author="app/dependabot")])[HEAD]
+    assert stale[0] == "pending"
+    assert "not required" not in stale[1]
+    dismissed = decisions([entry(17, reviews=[review("DISMISSED")], author="app/dependabot")])[HEAD]
+    assert dismissed[0] == "pending"
+
+
+def test_a_renamed_source_counts_against_the_exemption():
+    # the comparison names both sides of a rename; only ``filename`` would let src/x.py become pyproject.toml
+    renamed = decisions(
+        [
+            entry(
+                17,
+                reviews=[],
+                author="app/dependabot",
+                files=[{"filename": "pyproject.toml", "previous_filename": "src/x.py"}],
+            )
+        ]
+    )
+    assert renamed[HEAD][0] == "pending"
+
+
+def test_a_nested_path_under_a_manifest_name_is_not_a_dependency_update():
+    # deleting Dockerfile and adding Dockerfile/evil.py must not read as a manifest-only change
+    nested = decisions(
+        [
+            entry(
+                17,
+                reviews=[],
+                author="app/dependabot",
+                files=[{"filename": "Dockerfile/evil.py", "previous_filename": None}],
+            )
+        ]
+    )
+    assert nested[HEAD][0] == "pending"
+    for name in ("pyproject.toml/evil.py", "uv.lock/evil.py", "docker-compose.yml/evil.py"):
+        got = decisions(
+            [entry(17, reviews=[], author="app/dependabot", files=[{"filename": name, "previous_filename": None}])]
+        )
+        assert got[HEAD][0] == "pending", name
+
+
+def test_a_truncated_comparison_is_not_exempt():
+    # compare caps its list at 300: a source file can hide past the cap, so a short list proves nothing
+    entry_with_short_list = entry(
+        17,
+        reviews=[],
+        author="app/dependabot",
+        files=[{"filename": "pyproject.toml", "previous_filename": None}],
+        changed=5,
+    )
+    assert decisions([entry_with_short_list])[HEAD][0] == "pending"
+
+
+def test_a_count_from_another_commit_pair_is_not_exempt():
+    """The count and the comparison are two reads: a branch that moved between them proves nothing.
+
+    Pairing the pinned comparison of head A (truncated at the comparison cap) with the smaller count of a
+    newer head B would let an omitted source path pass the short-list check that exists to catch it.
+    """
+    files = [{"filename": "pyproject.toml", "previous_filename": None}]
+    coherent = entry(17, reviews=[], author="app/dependabot", files=files, changed=1)
+    assert decisions([coherent])[HEAD][0] == "success"
+    moved_head = entry(17, reviews=[], author="app/dependabot", files=files, changed=1, count_head=OTHER)
+    assert decisions([moved_head])[HEAD][0] == "pending"
+    moved_base = entry(17, reviews=[], author="app/dependabot", files=files, changed=1, count_base="0" * 40)
+    assert decisions([moved_base])[HEAD][0] == "pending"
+
+
+def test_a_comment_holds_a_dependency_update():
+    # any review at all is used as-is; a comment is not an approval
+    commented = decisions([entry(17, reviews=[review("COMMENTED")], author="app/dependabot")])[HEAD]
+    assert commented[0] == "pending"

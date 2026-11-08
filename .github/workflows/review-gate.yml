@@ -3,8 +3,9 @@
 # GitHub will not let an App approval satisfy the native "require a pull request review" rule (observed on
 # this repository: the reviewer App approved #9 at its exact head and GitHub still reported
 # REVIEW_REQUIRED / BLOCKED). With one human account that rule would deadlock every maintenance PR, so the
-# review is enforced as a *status check* instead: `review` is `success` only when the configured reviewer --
-# or a maintainer -- approved this exact head commit.
+# review is enforced as a *status check* instead: `review` is `success` when the configured reviewer -- or a
+# maintainer -- approved this exact head commit, or when the pull request is an exempt dependency update
+# (Dependabot, manifest-only paths, no review at all). Every other case is `failure` or `pending`.
 #
 # What that does and does not guarantee, precisely. A commit status is a stored assertion, not a live query:
 # GitHub never expires one, so nothing revokes it when the facts change.
@@ -101,7 +102,7 @@ jobs:
           # Complete enumeration over the REST API: `gh pr list --limit N` truncates silently, and a pull request
           # pushed out of the window would keep an old success that no sweep ever revisits.
           if ! prs=$(gh api --paginate "repos/$REPO/pulls?state=open&base=main&per_page=100" \
-              --jq '.[] | [.number, .head.sha, (.draft|tostring)] | @tsv'); then
+              --jq '.[] | [.number, .head.sha, .base.sha, (.draft|tostring), .user.login] | @tsv'); then
             echo "::error::cannot enumerate open pull requests; no status can be re-confirmed"
             exit 1
           fi
@@ -114,12 +115,12 @@ jobs:
             exit 0
           fi
 
-          while IFS=$'\t' read -r pr head draft; do
+          while IFS=$'\t' read -r pr head base draft author; do
             [ -n "$pr" ] || continue
             if ! reviews=$(gh api --paginate "repos/$REPO/pulls/$pr/reviews?per_page=100" | jq -s -c 'add'); then
               # An incomplete snapshot must not leave a success standing: revoke every head we were about to
               # re-confirm, then fail. The next sweep republishes what is true.
-              while IFS=$'\t' read -r _other revoke_head _draft; do
+              while IFS=$'\t' read -r _other revoke_head _base _draft _author; do
                 if [ -n "$revoke_head" ]; then
                   publish "$revoke_head" pending "could not read the reviews; the next run decides" || true
                 fi
@@ -127,8 +128,37 @@ jobs:
               echo "::error::#${pr}: cannot read the reviews"
               exit 1
             fi
-            jq -c -n --argjson number "$pr" --arg head "$head" --argjson draft "$draft" --argjson reviews "$reviews" \
-              '{number: $number, head: $head, draft: $draft, reviews: $reviews}' >> "$snapshot"
+            # The list endpoint does not carry changed_files; the single-pull endpoint does, and the count is
+            # what proves the comparison is complete. A failed read stays null, which fails closed. The count is
+            # carried with the head and base it describes: the planner refuses an exemption whose count does not
+            # name the same two commits as the comparison, so a branch that moved between the two reads cannot
+            # pair a pinned (possibly truncated) comparison with a newer, smaller count.
+            changed=null count_head="" count_base=""
+            if count=$(gh api "repos/$REPO/pulls/$pr" \
+                --jq '[.head.sha, .base.sha, (.changed_files // "null")] | @tsv'); then
+              count_head=$(printf '%s' "$count" | cut -f1)
+              count_base=$(printf '%s' "$count" | cut -f2)
+              if [ -n "$(printf '%s' "$count" | cut -f3)" ]; then
+                changed=$(printf '%s' "$count" | cut -f3)
+              fi
+            else
+              echo "::warning::#${pr}: cannot read the changed-file count; not exempt from review"
+            fi
+            # The exemption is author *and* path, and the paths come from the immutable two-SHA comparison, never
+            # from /pulls/{n}/files (which follows the branch: a head that moved A -> B -> A could show B's
+            # harmless files while A is evaluated). Both sides of a rename count. A failed read is not exempt.
+            if ! files=$(gh api "repos/$REPO/compare/$base...$head" \
+                --jq '[.files[]? | {filename: .filename, previous_filename: .previous_filename}]'); then
+              files='[]'
+              echo "::warning::#${pr}: cannot read the comparison; not exempt from review"
+            fi
+            jq -c -n --argjson number "$pr" --arg head "$head" --arg base "$base" \
+              --argjson draft "$draft" --arg author "$author" --argjson changed "$changed" \
+              --arg count_head "$count_head" --arg count_base "$count_base" \
+              --argjson reviews "$reviews" --argjson files "$files" \
+              '{number: $number, head: $head, base: $base, draft: $draft, author: $author, changed: $changed,
+                count_head: $count_head, count_base: $count_base,
+                reviews: $reviews, files: $files}' >> "$snapshot"
           done <<<"$prs"
 
           # One status per head commit, worst verdict winning: a status is keyed by (sha, context), so two pull
