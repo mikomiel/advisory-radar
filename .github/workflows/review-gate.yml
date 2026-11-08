@@ -189,14 +189,26 @@ jobs:
           # before anything is written, rather than trusting either snapshot blindly.
           if [ -n "${EVENT_PR:-}" ] && [ -n "${EVENT_HEAD:-}" ] && [ "${EVENT_ACTION:-}" != "closed" ] \
               && ! cut -f1 "$plan" | grep -qx "$EVENT_HEAD"; then
-            live=$(gh api "repos/$REPO/pulls/$EVENT_PR" --jq '[.state, .head.sha] | @tsv' || true)
-            live_state=$(printf '%s' "$live" | cut -f1)
-            live_head=$(printf '%s' "$live" | cut -f2)
-            if [ "$live_state" = "open" ] && [ "$live_head" = "$EVENT_HEAD" ]; then
-              echo "::error::#${EVENT_PR} is open at ${EVENT_HEAD} but the snapshot does not carry it; refusing to publish"
+            # The corroborating read is what makes publishing safe, so a failed or unrecognised answer is not
+            # "probably stale": it is the one case in which nothing may be written.
+            if ! live=$(gh api "repos/$REPO/pulls/$EVENT_PR" --jq '[.state, .head.sha] | @tsv'); then
+              echo "::error::cannot read #${EVENT_PR} to explain a snapshot that omits ${EVENT_HEAD}; refusing to publish"
               exit 1
             fi
-            echo "::warning::the ${EVENT_ACTION:-?} event for #${EVENT_PR} is stale (state=${live_state:-unknown}); the snapshot decides"
+            live_state=$(printf '%s' "$live" | cut -f1)
+            live_head=$(printf '%s' "$live" | cut -f2)
+            case "$live_state" in
+              closed|merged) ;;  # the event outlived its pull request; the snapshot that superseded it decides
+              open)
+                if [ "$live_head" = "$EVENT_HEAD" ]; then
+                  echo "::error::#${EVENT_PR} is open at ${EVENT_HEAD} but the snapshot does not carry it; refusing to publish"
+                  exit 1
+                fi ;;
+              *)
+                echo "::error::#${EVENT_PR} answered '${live_state:-unreadable}', so a stale event cannot be told from an incomplete snapshot; refusing to publish"
+                exit 1 ;;
+            esac
+            echo "::warning::the ${EVENT_ACTION:-?} event for #${EVENT_PR} is stale (state=${live_state}); the snapshot decides"
           fi
 
           while IFS=$'\t' read -r head state description; do

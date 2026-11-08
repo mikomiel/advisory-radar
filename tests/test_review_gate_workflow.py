@@ -37,7 +37,9 @@ case "$url" in
   *"/reviews"*) cat "$FAKE_REVIEWS" ;;
   *"/compare/"*) cat "$FAKE_COMPARE" ;;
   *"/statuses"*) cat "$FAKE_PREVIOUS" ;;
-  *"/pulls/"*) cat "$FAKE_LIVE" ;;
+  *"/pulls/"*)
+    if [ -f "${FAKE_LIVE_FAIL:-}" ]; then exit 1; fi
+    cat "$FAKE_LIVE" ;;
   *) printf 'stub: unexpected %s\\n' "$url" >&2; exit 1 ;;
 esac
 """
@@ -53,18 +55,29 @@ def _run_block() -> str:
     raise AssertionError("the gate's run block is not in the workflow")
 
 
-def _gate(tmp_path: Path, *, pulls: str = "", live: str = f"open\t{HEAD}", event_head: str = "",
-          event_action: str = "", event_pr: str = "") -> tuple[int, list[tuple[str, str]]]:
+def _gate(
+    tmp_path: Path,
+    *,
+    pulls: str = "",
+    live: str = f"open\t{HEAD}",
+    live_fails: bool = False,
+    reviews: str = "[]",
+    event_head: str = "",
+    event_action: str = "",
+    event_pr: str = "",
+) -> tuple[int, list[tuple[str, str]]]:
     (tmp_path / "gate.sh").write_text(re.sub(r"\$\{\{[^}]*\}\}", "1", _run_block()))
     files = {
         "FAKE_PULLS": pulls,
-        "FAKE_REVIEWS": "[]",
+        "FAKE_REVIEWS": reviews,
         "FAKE_COMPARE": "[]",
         "FAKE_PREVIOUS": "",
         "FAKE_LIVE": live,
     }
     for name, value in files.items():
         (tmp_path / name.lower()).write_text(value)
+    if live_fails:
+        (tmp_path / "fake_live_fail").write_text("")
     (tmp_path / "posts").write_text("")
     stub = tmp_path / "gh"
     stub.write_text(STUB)
@@ -84,6 +97,8 @@ def _gate(tmp_path: Path, *, pulls: str = "", live: str = f"open\t{HEAD}", event
         **{name: str(tmp_path / name.lower()) for name in files},
     }
     proc = subprocess.run(["bash", str(tmp_path / "gate.sh")], cwd=ROOT, env=env, capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(proc.stdout, proc.stderr)
     posted = []
     for line in (tmp_path / "posts").read_text().splitlines():
         head = line.split("statuses/")[-1].split()[0]
@@ -108,8 +123,12 @@ def test_a_close_still_revokes_the_head_it_names(tmp_path):
 def test_a_nonempty_snapshot_missing_the_event_head_fails_before_publishing(tmp_path):
     """Publishing the other heads would leave this one's old verdict standing with no signal."""
     code, posted = _gate(
-        tmp_path, pulls=f"17\t{OTHER}\t{BASE}\tfalse\tmikomiel\n",
-        event_head=HEAD, event_action="synchronize", event_pr="27", live=f"open\t{HEAD}",
+        tmp_path,
+        pulls=f"17\t{OTHER}\t{BASE}\tfalse\tmikomiel\n",
+        event_head=HEAD,
+        event_action="synchronize",
+        event_pr="27",
+        live=f"open\t{HEAD}",
     )
     assert code != 0
     assert posted == []
@@ -117,8 +136,12 @@ def test_a_nonempty_snapshot_missing_the_event_head_fails_before_publishing(tmp_
 
 def test_a_stale_event_does_not_block_the_snapshot(tmp_path):
     code, posted = _gate(
-        tmp_path, pulls=f"17\t{OTHER}\t{BASE}\tfalse\tmikomiel\n",
-        event_head=HEAD, event_action="synchronize", event_pr="27", live=f"closed\t{HEAD}",
+        tmp_path,
+        pulls=f"17\t{OTHER}\t{BASE}\tfalse\tmikomiel\n",
+        event_head=HEAD,
+        event_action="synchronize",
+        event_pr="27",
+        live=f"closed\t{HEAD}",
     )
     assert code == 0
     assert posted == [(OTHER, "pending")]  # no review at all is pending, not a failure
@@ -128,3 +151,51 @@ def test_a_schedule_writes_one_verdict_per_head(tmp_path):
     code, posted = _gate(tmp_path, pulls=f"17\t{OTHER}\t{BASE}\tfalse\tmikomiel\n")
     assert code == 0
     assert posted == [(OTHER, "pending")]
+
+
+def _approval() -> str:
+    return (
+        f'[{{"state": "APPROVED", "commit_id": "{HEAD}", "submitted_at": "2026-11-08T00:00:00Z",'
+        ' "author_association": "OWNER", "user": {"login": "review-bot[bot]", "type": "Bot"}}]'
+    )
+
+
+def test_a_lookup_failure_refuses_to_publish(tmp_path):
+    """The corroborating read is what makes publishing safe; without it, write nothing."""
+    code, posted = _gate(
+        tmp_path,
+        pulls=f"17\t{OTHER}\t{BASE}\tfalse\tmikomiel\n",
+        event_head=HEAD,
+        event_action="synchronize",
+        event_pr="27",
+        live_fails=True,
+    )
+    assert code != 0
+    assert posted == []
+
+
+def test_a_closed_head_carried_by_another_open_pull_request_is_not_revoked(tmp_path):
+    """The reused-head exception: the plan's verdict stands and nothing revokes it."""
+    code, posted = _gate(
+        tmp_path,
+        pulls=f"18\t{HEAD}\t{BASE}\tfalse\tmikomiel\n",
+        reviews=_approval(),
+        event_head=HEAD,
+        event_action="closed",
+        event_pr="18",
+    )
+    assert code == 0
+    assert posted == [(HEAD, "success")]
+
+
+def test_an_approval_on_the_event_head_is_published(tmp_path):
+    code, posted = _gate(
+        tmp_path,
+        pulls=f"18\t{HEAD}\t{BASE}\tfalse\tmikomiel\n",
+        reviews=_approval(),
+        event_head=HEAD,
+        event_action="synchronize",
+        event_pr="18",
+    )
+    assert code == 0
+    assert posted == [(HEAD, "success")]
