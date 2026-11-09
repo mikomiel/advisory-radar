@@ -45,7 +45,7 @@ jobs:
           printf 'list<<TAGS\n%s\nTAGS\n' "$tags" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           push: true
           # arm64 matters for self-hosters on Raspberry Pi and Apple Silicon
