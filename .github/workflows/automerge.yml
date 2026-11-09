@@ -77,9 +77,14 @@ jobs:
           # bound, not "to completion".
           # An enumeration failure must fail the job: inside process substitution its exit status is lost and
           # an API error would look like an empty queue.
+          # Selection is deliberately narrow: drafts are skipped here, and nothing else is decided by this
+          # filter. The approval rule has one owner -- scripts/review_state.py, called in the loop below -- so
+          # pre-filtering on GitHub's `reviewDecision` would be a second copy of it. That copy is also wrong:
+          # branch protection requires zero approving reviews, so GitHub reports no `reviewDecision` at all and
+          # such a filter matches nothing.
           if ! listing=$(gh pr list --repo "$REPO" --state open --base main --limit 1000 \
-            --json number,reviewDecision,mergeable,isDraft \
-            --jq '.[] | select(.isDraft == false and .reviewDecision == "APPROVED") | .number'); then
+            --json number,mergeable,isDraft \
+            --jq '.[] | select(.isDraft == false) | .number'); then
             echo "::error::cannot enumerate open pull requests"
             exit 1
           fi
