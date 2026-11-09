@@ -33,13 +33,18 @@ def test_the_relay_is_a_no_op_that_may_run_from_a_head():
 
     assert set(trigger) == {"pull_request_review"}, "only a review event may start the relay"
     assert trigger["pull_request_review"]["types"] == ["submitted", "dismissed"]
-    # It runs the head's copy of this file, so it must be able to do nothing at all. No permission means the
-    # token it receives can act on nothing even if the definition is rewritten.
+    # This file runs the head's copy of itself, so its committed shape is the whole of its safety: no
+    # permission, no environment, nothing that could read the pull request. A rewritten copy can declare its
+    # own permissions -- what it cannot do is decide anything, because the consumers re-derive every answer
+    # from the API on the default branch. So this pins the committed configuration, not a sandbox.
     assert loaded.get("permissions") == {}
-    for job in loaded["jobs"].values():
-        assert "uses" not in job, "a reusable workflow would be a second uncontrolled trigger"
+    assert "env" not in loaded, "a top-level environment could carry a secret into the no-op"
+    for job_name, job in loaded["jobs"].items():
+        assert set(job) == {"runs-on", "steps"}, f"{job_name} may declare only runs-on and steps, not {sorted(job)}"
         for step in job["steps"]:
             assert set(step) == {"name", "run"}, f"a relay step may only run a command, not {sorted(step)}"
+            assert "${{" not in step["run"], "an expression could read the pull request"
+            assert step["run"].startswith("echo "), "the relay may only print"
 
 
 def test_the_gate_wakes_on_the_relay_and_the_merge_wakes_on_the_gate():
