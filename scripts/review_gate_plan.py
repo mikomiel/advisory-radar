@@ -37,9 +37,9 @@ MAX_DESCRIPTION = 140
 #: Authors whose pull requests do not need an App review, and only while every changed path stays inside
 #: DEPENDENCY_PATHS. Dependabot's updates are mechanical and `ci` (the image build included) still has to pass.
 #: The login is GitHub's, not the pull request's, so a patch cannot claim it. A pull request the exemption
-#: covers is not taken by automerge.yml, which requires an APPROVED review decision an exempt pull request
-#: does not have. GitHub's own auto-merge switch is separate: while `allow_auto_merge` is on, a write-access
-#: user can have GitHub merge an exempt bump once its checks are green.
+#: covers is still not taken by automerge.yml: the merge asks ``review_state.py`` for an eligible approval at
+#: the exact head, and an exempt pull request has none. GitHub's own auto-merge switch is separate: while
+#: `allow_auto_merge` is on, a write-access user can have GitHub merge an exempt bump once its checks are green.
 EXEMPT_AUTHORS = frozenset({"app/dependabot", "dependabot[bot]"})
 #: Paths a dependency update may touch for the exemption to apply, checked rather than assumed. Files match
 #: exactly -- ``Dockerfile/evil.py`` is somebody deleting the manifest and adding a directory of source, not a

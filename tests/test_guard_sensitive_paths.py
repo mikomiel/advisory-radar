@@ -71,6 +71,11 @@ def test_these_paths_need_a_human_merge(path: str):
         "docs/deployment.md",
         "README.md",
         "docs/Dockerfile.md",  # the anchor is the whole filename, not a substring
+        # the new anchors are exact files too: neither a parent directory, an extension nor a suffix qualifies
+        "docs/uv.lock",
+        "uv.lock.bak",
+        "docs/.python-version",
+        ".dockerignore.example",
         "src/advisory_radar/tests_helper.py",
         "docs/tests/notes.md",  # only a top-level tests/ tree is the suite that decides what ci accepts
     ],

@@ -170,11 +170,11 @@ merges without an approval from the configured reviewer at the exact head — or
 exempt dependency update, without one being required — and any check that is not
 terminal-success stops it.
 
-To enable the second required check on a copy of this repository
-(`contexts` replaces the whole list, so keep `ci`):
+To enable the required checks on a copy of this repository
+(`contexts` replaces the whole list, so name all three):
 
 ```
-echo '{"strict": true, "contexts": ["ci", "review"]}' \
+echo '{"strict": true, "contexts": ["ci", "gate", "review"]}' \
   | gh api -X PATCH repos/<owner>/<repo>/branches/main/protection/required_status_checks --input -
 ```
 
