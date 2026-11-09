@@ -82,8 +82,8 @@ turns critical, and never re-sends what you already received.
 
 ## Review and merge automation
 
-`main` is protected by **two required status checks**, `ci` and `review`, both strict
-(require the branch to be up to date). `review` is not a workflow that runs tests — it is
+`main` is protected by **three required status checks** — `ci`, `gate` and `review` — all
+strict (require the branch to be up to date). `review` is not a workflow that runs tests — it is
 the review itself, published as a status:
 
 - `.github/workflows/review-gate.yml` reads every open pull request's reviews on each
@@ -114,11 +114,12 @@ the review itself, published as a status:
   author login GitHub assigns, which a patch cannot claim, and it applies **only where no
   eligible reviewer has said anything decisive**: a stale approval, a dismissed review or a
   comment still leaves it pending, and an approval or a change request is used as-is.
-  `.github/workflows/automerge.yml` never takes an exempt pull request: it requires an
-  `APPROVED` review decision, which an exempt one does not have. **GitHub's own auto-merge
-  is a separate switch**, and while repository setting `allow_auto_merge` is on, anyone
-  with write access can enable it on an exempt bump and GitHub will merge once `ci` and
-  `review` are green — no approval involved. If "a person merges every bump" is meant
+  `.github/workflows/automerge.yml` still never takes an exempt pull request: it holds
+  every candidate to `scripts/review_state.py`'s eligible approval at the exact head, and
+  an exempt one has none. **GitHub's own auto-merge is a separate switch**, and while
+  repository setting `allow_auto_merge` is on, anyone
+  with write access can enable it on an exempt bump and GitHub will merge once `ci`,
+  `gate` and `review` are green — no approval involved. If "a person merges every bump" is meant
   literally, turn that setting off: there is no other use for it here, because the merge
   is this repository's own workflow.
 - An exempt dependency update is the one case where a green `review` means "not required"
@@ -147,9 +148,10 @@ Two-person review still needs a second human account or a team with another memb
 **A person merges anything that widens what the automation can reach.** The list lives in
 [`scripts/guard_sensitive_paths.py`](scripts/guard_sensitive_paths.py) — `.github/`
 (including the workflows and this automation), `Dockerfile`, `docker-compose.yml`,
-`deploy/`, `pyproject.toml`, `.gitleaks.toml`, `tests/` and `scripts/` (the guard and the
-approval rule are policy too: the workflows execute them from the default branch, so they
-need the same human merge as the workflows themselves) — and
+`deploy/`, `pyproject.toml`, `uv.lock` (the lock decides what CI installs under
+`uv sync --frozen`), `.python-version`, `.dockerignore`, `.gitleaks.toml`, `tests/` and
+`scripts/` (the guard and the approval rule are policy too: the workflows execute them from
+the default branch, so they need the same human merge as the workflows themselves) — and
 [`tests/test_guard_sensitive_paths.py`](tests/test_guard_sensitive_paths.py) pins it. A
 pull request touching one of those paths is never auto-merged: the workflow skips it and a
 human merges it. The guard therefore means "a person merges these", not "a second person
@@ -168,11 +170,11 @@ merges without an approval from the configured reviewer at the exact head — or
 exempt dependency update, without one being required — and any check that is not
 terminal-success stops it.
 
-To enable the second required check on a copy of this repository
-(`contexts` replaces the whole list, so keep `ci`):
+To enable the required checks on a copy of this repository
+(`contexts` replaces the whole list, so name all three):
 
 ```
-echo '{"strict": true, "contexts": ["ci", "review"]}' \
+echo '{"strict": true, "contexts": ["ci", "gate", "review"]}' \
   | gh api -X PATCH repos/<owner>/<repo>/branches/main/protection/required_status_checks --input -
 ```
 

@@ -39,6 +39,11 @@ SENSITIVE_PATTERNS: tuple[str, ...] = (
     r"^docker-compose\.yml$",
     r"^deploy/",
     r"^pyproject\.toml$",
+    # The lock decides what CI installs under ``uv sync --frozen``, so a lock-only change can change what
+    # runs there. The interpreter pin chooses the runtime, and the ignore list decides what enters the image.
+    r"^uv\.lock$",
+    r"^\.python-version$",
+    r"^\.dockerignore$",
     r"^\.gitleaks\.toml$",
     r"^tests/",
     # The workflows execute scripts/ on the default branch: this guard, and the approval rule the gate and
