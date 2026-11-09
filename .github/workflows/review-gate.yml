@@ -203,6 +203,13 @@ jobs:
                 if [ "$live_head" = "$EVENT_HEAD" ]; then
                   echo "::error::#${EVENT_PR} is open at ${EVENT_HEAD} but the snapshot does not carry it; refusing to publish"
                   exit 1
+                fi
+                # A moved head explains the event only when the snapshot carries where it moved to. Without that
+                # the snapshot omitted this pull request entirely, which is the incomplete read -- and publishing
+                # the other heads would leave this one's old verdict standing with no signal.
+                if ! cut -f1 "$plan" | grep -qx "$live_head"; then
+                  echo "::error::#${EVENT_PR} moved to ${live_head}, which the snapshot omits too; refusing to publish"
+                  exit 1
                 fi ;;
               *)
                 echo "::error::#${EVENT_PR} answered '${live_state:-unreadable}', so a stale event cannot be told from an incomplete snapshot; refusing to publish"
