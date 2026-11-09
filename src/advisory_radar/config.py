@@ -63,6 +63,8 @@ class Config:
     state_path: Path = Path("data/state.json")
     hidden_source_hosts: frozenset[str] = frozenset()
     adobe_commerce: bool = False
+    #: A free NVD API key: raises the anonymous 5-per-30 s limit to 50 and shortens the pace in ``core.Intel``.
+    nvd_api_key: str = ""
     web_host: str = "0.0.0.0"
     web_port: int = 8080
     raw: dict = field(default_factory=dict)
@@ -104,6 +106,7 @@ _TOP_KEYS = {
     "state_path",
     "hidden_source_hosts",
     "adobe_commerce",
+    "nvd_api_key",
     "web",
 }
 
@@ -223,6 +226,10 @@ def load_config(path: Path, env: dict[str, str] | None = None, *, lenient: bool 
             "hidden_source_hosts must be a list of non-empty host names",
         )
     hidden = frozenset(host.lower() for host in (raw_hidden or []))  # compared against a lowercased URL host
+    raw_nvd_key = document.get("nvd_api_key", "")
+    # Never in the message: this value is a credential (${NVD_API_KEY}) and the CLI logs configuration errors
+    # before the redaction filter exists.
+    _require(isinstance(raw_nvd_key, str), "nvd_api_key must be a string, e.g. ${NVD_API_KEY}")
     return Config(
         sources=tuple(entry for entry in sources if entry.get("enabled", True)),
         notifiers=tuple(entry for entry in notifiers if entry.get("enabled", True)),
@@ -231,6 +238,7 @@ def load_config(path: Path, env: dict[str, str] | None = None, *, lenient: bool 
         state_path=state_path,
         hidden_source_hosts=hidden,
         adobe_commerce=_bool_option(document.get("adobe_commerce", False), "adobe_commerce"),
+        nvd_api_key=raw_nvd_key.strip(),
         web_host=web_host,
         web_port=int(web_port),
         raw=document,
