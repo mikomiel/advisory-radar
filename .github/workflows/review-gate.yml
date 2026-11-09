@@ -21,7 +21,11 @@
 #
 # Fail-closed where it can be: an unreadable review list revokes every success in the snapshot and fails the
 # job; an unreadable snapshot publishes nothing and fails. An enumeration failure is the one case this
-# workflow cannot repair, and it fails loudly instead of reporting a clean sweep.
+# workflow cannot repair, and it fails loudly instead of reporting a clean sweep. A snapshot that reports no
+# open pull requests while a lifecycle event that is not a close names one is treated the same way: it fails
+# and writes nothing, rather than revoking a head whose verdict another run may have just published. Only a
+# close may leave a head behind with no open pull request, so only a close revokes it; a lifecycle event whose
+# pull request has moved on is recognised as stale and never blocks the snapshot that superseded it.
 name: review-gate
 
 # Trusted triggers only, all of them running this file from the default branch: `workflow_run`, `schedule`,
@@ -76,6 +80,10 @@ jobs:
           REPO: ${{ github.repository }}
           #: Empty for workflow_run and schedule; the pull request's head for a lifecycle event.
           EVENT_HEAD: ${{ github.event.pull_request.head.sha }}
+          #: The lifecycle action. Only ``closed`` may revoke a head that the snapshot does not carry.
+          EVENT_ACTION: ${{ github.event.action }}
+          #: The pull request the lifecycle event is about; empty for workflow_run and schedule.
+          EVENT_PR: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           snapshot=$(mktemp)
@@ -108,9 +116,16 @@ jobs:
           fi
           if [ -z "$prs" ]; then
             echo "no open pull requests"
-            # A closed pull request's head is not in the snapshot, and its status must not survive it.
+            # A closed pull request's head is not in the snapshot, and its status must not survive it. Every
+            # other lifecycle action carries a pull request that is open, so an empty snapshot contradicts the
+            # event -- and a write here would overwrite whatever another run had just published for that head.
             if [ -n "${EVENT_HEAD:-}" ]; then
-              publish "$EVENT_HEAD" pending "no open pull request carries this commit"
+              if [ "${EVENT_ACTION:-}" = "closed" ]; then
+                publish "$EVENT_HEAD" pending "the pull request was closed"
+              else
+                echo "::error::no open pull requests, but the event carries ${EVENT_HEAD} as ${EVENT_ACTION}; refusing to revoke"
+                exit 1
+              fi
             fi
             exit 0
           fi
@@ -168,13 +183,50 @@ jobs:
             --reviewer "$REVIEWER_LOGIN" --type "$REVIEWER_TYPE" \
             --trusted-associations "$TRUSTED_ASSOCIATIONS" > "$plan"
 
+          # An event that names a head the snapshot does not carry is either an incomplete read or a stale
+          # event (the pull request moved or closed since). Publishing in the first case would leave that head's
+          # old verdict standing with no signal, so ask the event's own pull request which it is -- and fail
+          # before anything is written, rather than trusting either snapshot blindly.
+          if [ -n "${EVENT_PR:-}" ] && [ -n "${EVENT_HEAD:-}" ] && [ "${EVENT_ACTION:-}" != "closed" ] \
+              && ! cut -f1 "$plan" | grep -qx "$EVENT_HEAD"; then
+            # The corroborating read is what makes publishing safe, so a failed or unrecognised answer is not
+            # "probably stale": it is the one case in which nothing may be written.
+            if ! live=$(gh api "repos/$REPO/pulls/$EVENT_PR" --jq '[.state, .head.sha] | @tsv'); then
+              echo "::error::cannot read #${EVENT_PR} to explain a snapshot that omits ${EVENT_HEAD}; refusing to publish"
+              exit 1
+            fi
+            live_state=$(printf '%s' "$live" | cut -f1)
+            live_head=$(printf '%s' "$live" | cut -f2)
+            case "$live_state" in
+              closed|merged) ;;  # the event outlived its pull request; the snapshot that superseded it decides
+              open)
+                if [ "$live_head" = "$EVENT_HEAD" ]; then
+                  echo "::error::#${EVENT_PR} is open at ${EVENT_HEAD} but the snapshot does not carry it; refusing to publish"
+                  exit 1
+                fi
+                # A moved head explains the event only when the snapshot carries where it moved to. Without that
+                # the snapshot omitted this pull request entirely, which is the incomplete read -- and publishing
+                # the other heads would leave this one's old verdict standing with no signal.
+                if ! cut -f1 "$plan" | grep -qx "$live_head"; then
+                  echo "::error::#${EVENT_PR} moved to ${live_head}, which the snapshot omits too; refusing to publish"
+                  exit 1
+                fi ;;
+              *)
+                echo "::error::#${EVENT_PR} answered '${live_state:-unreadable}', so a stale event cannot be told from an incomplete snapshot; refusing to publish"
+                exit 1 ;;
+            esac
+            echo "::warning::the ${EVENT_ACTION:-?} event for #${EVENT_PR} is stale (state=${live_state}); the snapshot decides"
+          fi
+
           while IFS=$'\t' read -r head state description; do
             [ -n "$head" ] || continue
             publish "$head" "$state" "$description"
           done < "$plan"
 
           # A commit an approved pull request left behind can be reused by a new, unreviewed one: that head is
-          # then not in the snapshot and would keep its success. The event names it, so revoke it here.
-          if [ -n "${EVENT_HEAD:-}" ] && ! cut -f1 "$plan" | grep -qx "$EVENT_HEAD"; then
+          # then not in the snapshot and would keep its success. Only a close can leave such a head behind: for
+          # every other action the event's head is carried by an open pull request, so a revocation here could
+          # only overwrite that pull request's own verdict.
+          if [ "${EVENT_ACTION:-}" = "closed" ] && [ -n "${EVENT_HEAD:-}" ] && ! cut -f1 "$plan" | grep -qx "$EVENT_HEAD"; then
             publish "$EVENT_HEAD" pending "no open pull request carries this commit"
           fi
