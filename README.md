@@ -118,8 +118,8 @@ the review itself, published as a status:
   every candidate to `scripts/review_state.py`'s eligible approval at the exact head, and
   an exempt one has none. **GitHub's own auto-merge is a separate switch**, and while
   repository setting `allow_auto_merge` is on, anyone
-  with write access can enable it on an exempt bump and GitHub will merge once `ci` and
-  `review` are green — no approval involved. If "a person merges every bump" is meant
+  with write access can enable it on an exempt bump and GitHub will merge once `ci`,
+  `gate` and `review` are green — no approval involved. If "a person merges every bump" is meant
   literally, turn that setting off: there is no other use for it here, because the merge
   is this repository's own workflow.
 - An exempt dependency update is the one case where a green `review` means "not required"
