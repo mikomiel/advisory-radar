@@ -44,7 +44,10 @@ def test_the_relay_is_a_no_op_that_may_run_from_a_head():
         for step in job["steps"]:
             assert set(step) == {"name", "run"}, f"a relay step may only run a command, not {sorted(step)}"
             assert "${{" not in step["run"], "an expression could read the pull request"
-            assert step["run"].startswith("echo "), "the relay may only print"
+            # Startswith would also accept "echo x; id" and "echo \"$(id)\"", so pin the one command exactly.
+            assert step["run"] == 'echo "review event relayed to review-gate and automerge"', (
+                "the relay may only print its one line"
+            )
 
 
 def test_the_gate_wakes_on_the_relay_and_the_merge_wakes_on_the_gate():

@@ -8,8 +8,10 @@
 # it cannot do is decide anything downstream, because the two consumers below run the default branch's copy and
 # derive every answer again from the GitHub API.
 #
-# Its only product is a completed run. `workflow_run` starts `review-gate` and `automerge` from the default
-# branch when it completes, and those two are where the privileged work happens.
+# Its only product is a completed run. That completion starts `review-gate`, and `review-gate`'s own completion
+# starts `automerge`: each hop runs the default branch's copy, and those two are where the privileged work
+# happens. Nothing downstream reads this workflow's result as a verdict -- a review is a reason to look again,
+# not an answer.
 #
 # A review posted through the reviewer App's installation token does start this workflow. A status or comment
 # written with `GITHUB_TOKEN` would not: GitHub never starts a workflow from an event the repository's own token
