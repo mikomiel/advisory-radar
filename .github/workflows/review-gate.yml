@@ -33,9 +33,12 @@ name: review-gate
 # copy, which a pull request could rewrite to publish its own success. `pull_request_target` runs the *base*
 # branch's copy with a write token, which is safe here only because this job never checks out or executes
 # anything from the pull request: it reads API metadata and runs default-branch scripts.
+#
+# A review has no trusted trigger of its own for the same reason, so `review-signal` relays it: that workflow
+# does nothing and holds no permissions, and its completion starts this one from the default branch.
 on:
   workflow_run:
-    workflows: [ci]
+    workflows: [ci, review-signal]
     types: [completed]
   # A closed or reused head must not keep a success: without these, a pull request opened on a commit an
   # earlier, approved pull request left behind would inherit its green status.
