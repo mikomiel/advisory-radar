@@ -7,6 +7,20 @@ operator action, and the release workflow then builds and pushes the image to
 
 ## [Unreleased]
 
+### Fixed
+- `automerge.yml` selected no pull request at all. It pre-filtered candidates on
+  GitHub's `reviewDecision`, which is empty because branch protection requires
+  zero approving reviews. Selection now skips only drafts and leaves the approval
+  decision to `scripts/review_state.py`, its single owner, inside the loop.
+
+### Changed
+- The sensitive-path guard also covers `uv.lock`, `.python-version` and
+  `.dockerignore`: the lock decides what `uv sync --frozen` installs in CI, and
+  the pin and the ignore list change the runtime and the image.
+- The README states the three required checks (`ci`, `gate`, `review`) in the
+  policy paragraph and in the setup example, and the guard test now checks that
+  every guarded pattern is documented in that paragraph.
+
 ## [0.1.0] - 2026-11-06
 
 The first public release: the extracted security-advisory notifier, packaged as a
