@@ -12,6 +12,11 @@ operator action, and the release workflow then builds and pushes the image to
   GitHub's `reviewDecision`, which is empty because branch protection requires
   zero approving reviews. Selection now skips only drafts and leaves the approval
   decision to `scripts/review_state.py`, its single owner, inside the loop.
+- An approval that arrived after `ci` had already completed was not seen until the
+  next scheduled run, and GitHub runs those schedules hours apart. A review now
+  relays through a no-op `review-signal` workflow, `review-gate` re-evaluates when
+  it completes, and `automerge` merges when `review-gate` completes instead of
+  waiting for a sweep. The schedules stay as the backstop.
 
 ### Changed
 - The sensitive-path guard also covers `uv.lock`, `.python-version` and

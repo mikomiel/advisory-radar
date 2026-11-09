@@ -26,11 +26,13 @@ name: automerge
 # workflow definition from the pull request itself, so a same-repository PR could rewrite this script and
 # trigger it with a comment-only review, executing attacker-controlled code with a write token. `workflow_run`,
 # `schedule` always runs the default branch's definition. `workflow_dispatch` does not qualify: the dispatcher
-# picks the ref, and that ref's copy of this file is what runs. The cost is latency: a merge
-# happens at the next `ci` completion, the next sweep, or on demand - never within the reviewed PR.
+# picks the ref, and that ref's copy of this file is what runs. A merge therefore happens when `ci` completes,
+# when `review-gate` completes, at a sweep, or on demand - never within the reviewed PR.
 on:
   workflow_run:
-    workflows: [ci]
+    # `review-gate` is here so a fresh `review: success` is merged at once instead of on the next sweep: an
+    # approval that arrives after `ci` has finished would otherwise wait for a schedule GitHub runs hours late.
+    workflows: [ci, review-gate]
     types: [completed]
   schedule:
     - cron: "*/30 * * * *"   # sweep: pick up approvals
