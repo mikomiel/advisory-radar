@@ -120,10 +120,11 @@ is refused: a save shows the configuration error and writes nothing, and a reloa
 configuration. A pass holds the state lock for its whole transaction, so a reload waits
 for it (`SIGHUP`) or answers `409` (the UI), and a pass that already started finishes
 with the configuration it started with. Pending and parked messages are not touched by a
-reload. Changing an environment variable that a `${NAME}` reference reads still needs a
-restart. A reload applies the overlay only, so moving `state_path` (a YAML key) still
-needs a restart, and the overlay itself is capped at 64 KiB: a value that would make the
-file larger is refused instead of written.
+reload. A reload re-reads the YAML and the overlay, so an edit to `config.yml` is picked
+up too; `state_path` is the one key it refuses to move (it would lock one file and write
+the other), and environment variables are read at start, so changing one still needs a
+restart. The overlay itself is capped at 64 KiB: a value that would make the file larger
+is refused instead of written.
 
 Two upstreams reward configuration rather than credentials:
 

@@ -63,8 +63,10 @@ is added, edited or disabled — and while the overlay holds a notifier list, th
 the notifier list: the YAML's `notifiers` is not used until that section is removed from
 the overlay. A save writes `settings.json` next to the state file (on the `/data`
 volume) and applies immediately when the state lock is free; if a pass holds the lock, the
-page says the revision is not live yet, and Reload applies it when the pass finishes. `SIGHUP` reloads the same overlay for a configuration edited by
-hand. Every other setting stays in `config/config.yml` and still needs a restart.
+page says the revision is not live yet, and Reload applies it when the pass finishes.
+`SIGHUP` re-reads `config.yml` and the overlay, for a configuration edited by hand. Every
+other setting stays in `config/config.yml`; editing it needs a reload (the button or
+`SIGHUP`), not a restart.
 
 Secrets stay in the environment. The overlay stores a notifier's `url`, `key`,
 `password` or `token` only as a `${NAME}` or `${NAME_FILE}` reference, refuses a literal
@@ -74,8 +76,10 @@ needs a restart, because the process reads the environment when it starts.
 A reload builds the new configuration and its plugins before it swaps them in under the
 state lock. An invalid overlay is refused with the same error the YAML would give, and
 the running configuration stays; a pass that already started finishes with the
-configuration it started with, and the next pass uses the reloaded one. A reload applies
-the overlay and nothing else, so moving `state_path` still needs a restart.
+configuration it started with, and the next pass uses the reloaded one. A reload re-reads
+both files; `state_path` is the one key it refuses to move (it would lock one file and
+write the other), and environment variables are read at start, so changing one still
+needs a restart.
 
 ### Gap detection
 
