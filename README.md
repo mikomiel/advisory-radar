@@ -103,6 +103,17 @@ the review itself, published as a status:
 - A review is *about one commit*. A push after the review leaves the new head with no
   `review` status, so the merge button goes back to blocked. That is the intended
   behaviour, not an outage.
+- **A review is acted on at once, not at the next sweep.** `pull_request_review` cannot run the
+  gate itself: like `pull_request`, it would execute the head's copy of the workflow that declares
+  it. So a no-op workflow, `review-signal`, listens for `submitted` and `dismissed` — no checkout,
+  no secret, `permissions: {}` as committed, one line of output — and its completion is the signal
+  the default branch acts on. `review-signal` starts `review-gate`, which republishes the status, and
+  `review-gate`'s completion starts `automerge`, which asks for a fresh merge attempt. For an
+  otherwise eligible pull request — approval at the exact head, checks green, no sensitive path — the
+  expected merge latency is minutes, not a guarantee: anything under `scripts/`, `tests/` or
+  `.github/` is for a person either way. The `*/5` and `*/30` schedules remain only as a backstop: GitHub
+  runs fixed crons late, and an approval that arrives after `ci` has finished would otherwise wait
+  hours for one.
 - **Dependency updates are exempt from the App review, and nothing else is.** A pull
   request opened by Dependabot (`dependabot[bot]`) gets `review: success` with the reason
   in the description, and only while *every* path the immutable `base...head` comparison
@@ -159,13 +170,14 @@ approved them".
 
 `.github/workflows/automerge.yml` does the merging itself: an approved pull request whose
 checks are green is squash-merged (with `--match-head-commit`, so a head that moved is
-refused) when `ci` finishes or on a 30-minute sweep. Branch deletion follows the
-repository's *automatically delete head branches* setting.
+refused) when `ci` finishes, when `review-gate` finishes, or on a 30-minute sweep. Branch
+deletion follows the repository's *automatically delete head branches* setting.
 
 The workflow only runs from the default branch — `workflow_run` and `schedule`,
 never `pull_request*` and not `workflow_dispatch` (a dispatcher can pick another
-ref, and that ref's copy of the file is what runs). The trade-off is latency: a merge lands
-within ~30 minutes of the approval, not at the instant of the review. Nothing
+ref, and that ref's copy of the file is what runs). Expected latency for an otherwise
+eligible pull request is therefore minutes, because a review starts the relay above; the
+schedules are the backstop, not the mechanism, and GitHub runs fixed crons late. Nothing
 merges without an approval from the configured reviewer at the exact head — or, for an
 exempt dependency update, without one being required — and any check that is not
 terminal-success stops it.
