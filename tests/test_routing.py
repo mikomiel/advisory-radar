@@ -57,6 +57,24 @@ class TestSelect:
         assert routing.select({"products": ["magento", "php"]}, routes, (), ENABLED) == (["matrix"], "route 1")
         assert routing.select({"products": ["php"]}, routes, (), ENABLED) == (ENABLED, "all")
 
+    def test_all_four_keys_in_one_rule_must_match(self):
+        entry = {"source_id": "php", "tag": "critical", "products": ["magento"], "ids": ["CVE-2026-1"]}
+        route = [
+            {
+                "match": {"source": "php", "tag": "critical", "product": "magento", "ids": "cve-2026-*"},
+                "notifiers": ["phone"],
+            }
+        ]
+        assert routing.select(entry, route, ("discord",), ENABLED) == (["phone"], "route 1")
+        for key, changes in (
+            ("source", {"source_id": "nodejs"}),
+            ("tag", {"tag": "warning"}),
+            ("product", {"products": ["php"]}),
+            ("ids", {"ids": ["GHSA-1"]}),
+        ):
+            changed = {**entry, **changes}
+            assert routing.select(changed, route, ("discord",), ENABLED) == (["discord"], "default"), key
+
     def test_ids_match_a_wildcard_case_insensitively(self):
         routes = [{"match": {"ids": "cve-2026-*"}, "notifiers": ["phone"]}]
         assert routing.select({"ids": ["CVE-2026-4242"]}, routes, (), ENABLED) == (["phone"], "route 1")
@@ -116,6 +134,33 @@ def write_config(tmp_path: Path, extra: str = "") -> Path:
         f"{extra}"
     )
     return path
+
+
+def test_a_secret_in_a_route_selection_is_never_echoed(tmp_path, caplog):
+    # A selection value can be a reference that expanded to a credential. The configuration error and the CLI
+    # log both happen before any redaction filter exists, so neither may contain the value.
+    import logging
+
+    from advisory_radar import cli
+
+    secret = "https://hooks.example.net/SUPERSECRET-SELECTION"
+    path = write_config(
+        tmp_path,
+        "  - id: hook\n    type: webhook\n    url: ${HOOK}\n"
+        "routes:\n"
+        "  - match: {tag: critical}\n"
+        '    notifiers: ["${HOOK}"]\n'
+        'default: ["${HOOK}"]\n',
+    )
+    environment = {"HOOK": secret}
+    with pytest.raises(ConfigError) as caught:
+        load_config(path, environment)
+    assert secret not in str(caught.value)
+    assert "position 1" in str(caught.value)
+    with caplog.at_level(logging.ERROR, logger="advisory_radar"):
+        assert cli.main(["--config", str(path), "once"], env=environment) == 1
+    assert secret not in caplog.text
+    assert "not an enabled notifier" in caplog.text
 
 
 def test_a_valid_block_loads_into_the_config(tmp_path):

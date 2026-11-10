@@ -241,9 +241,13 @@ def _notifier_selection(value: object, where: str, enabled_ids: list[str]) -> tu
     valid = isinstance(value, list) and all(isinstance(identifier, str) and identifier for identifier in value)
     _require(valid and bool(value), f"{where} must be a non-empty list of notifier ids")
     known = set(enabled_ids)
-    # Only ids reach the message: an id is validated to [A-Za-z0-9._-] after expansion, and no value is echoed.
-    unknown = [identifier for identifier in value if identifier not in known]
-    _require(not unknown, f"{where}: not an enabled notifier: {unknown}")
+    # A selection value can be a ${...} reference that expanded to a credential (someone wrote
+    # ``default: ["${DISCORD_WEBHOOK_URL}"]``), and this message is logged before any redaction exists. Name the
+    # position, never the value.
+    unknown = [position for position, identifier in enumerate(value, start=1) if identifier not in known]
+    if unknown:
+        # Built only when it is raised: formatting the message eagerly would index an empty list.
+        raise ConfigError(f"{where}: id at position {unknown[0]} is not an enabled notifier")
     return tuple(value)
 
 
