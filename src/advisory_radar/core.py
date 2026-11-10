@@ -1327,11 +1327,39 @@ def _prune(state: dict, now: int) -> None:
     state["cache"] = {key: entry for key, entry in state["cache"].items() if now - entry["at"] < CACHE_TTL}
 
 
-def _delivered(state: dict, entry: dict, now: int, outcome: str = "delivered") -> None:
-    """Advance state for one message the gateway accepted, or (``outcome="dropped"``) the operator discarded."""
+def _delivery_snapshot(entry: dict, delivered_to: Sequence[str]) -> dict:
+    """The compact record of one delivered message, copied off the queue entry so a later edit cannot reach it.
+
+    ``tag``/``source``/``levels``/``scores`` are the classification the message was sent with, which the seen
+    record previously dropped. The body is deliberately absent: it is the rendered text, not a stored fact.
+    """
+    return {
+        "tag": entry.get("tag", ""),
+        "source": entry.get("source", ""),
+        "title": entry.get("title", ""),
+        "link": entry.get("link", ""),
+        # Stored too, because the snapshot's meaning depends on which kind of message produced it.
+        "kind": entry.get("kind", ""),
+        "levels": dict(entry.get("levels") or {}),
+        "scores": dict(entry.get("scores") or {}),
+        "delivered_to": list(delivered_to),
+    }
+
+
+def _delivered(
+    state: dict, entry: dict, now: int, outcome: str = "delivered", delivered_to: Sequence[str] = ()
+) -> None:
+    """Advance state for one message the gateway accepted, or (``outcome="dropped"``) the operator discarded.
+
+    ``delivered_to`` names the notifiers that accepted the message; ``deliver`` clears ``sent_to`` from the
+    entry before calling this, so the accepted ids are passed in rather than read back off it.
+    """
     if entry["kind"] == "new":
+        snapshot = _delivery_snapshot(entry, delivered_to)
         for identifier in entry["ids"]:
-            state["seen"].setdefault(identifier, {"at": now, "outcome": outcome})
+            # The first record wins: an identifier keeps what was sent for it first, even when a later message
+            # about the same advisory is dropped or delivered again from another source.
+            state["seen"].setdefault(identifier, {"at": now, "outcome": outcome, **snapshot})
         kev_only = set(entry.get("kev_only") or ())
         for cve, level in entry["levels"].items() if outcome == "delivered" else ():
             # A message the operator dropped was never sent, so no later escalation may refer to it as sent.
@@ -2178,9 +2206,10 @@ def deliver(
                     persist()
             statuses.append(status)
         if all(200 <= status < 300 for status in statuses):
+            accepted = sorted(already)
             entry.pop("sent_to", None)
             state["pending"].remove(entry)
-            _delivered(state, entry, now)
+            _delivered(state, entry, now, delivered_to=accepted)
             LOG.info(
                 "delivered %s %s %s (HTTP %s): %s",
                 entry["tag"],
@@ -2237,6 +2266,15 @@ def _park(state: dict, entry: dict, status: int, now: int) -> bool:
     return True
 
 
+#: The fields a released message loses: they describe the failed attempts, not the advisory.
+PARKED_ATTEMPT_KEYS = ("attempts", "first_attempt_at", "parked_at")
+
+
+def _released(entry: dict) -> dict:
+    """A parked message as it goes back to the queue: no retry history, so the next pass starts fresh."""
+    return {key: value for key, value in entry.items() if key not in PARKED_ATTEMPT_KEYS}
+
+
 def manage_parked(state_path: Path, release: bool, now: int) -> int:
     """The operator's decision on the parked messages; sends nothing and needs no secret."""
     try:
@@ -2249,11 +2287,7 @@ def manage_parked(state_path: Path, release: bool, now: int) -> int:
         return 1
     parked = state.setdefault("parked", [])
     if release:
-        released = [
-            {key: value for key, value in entry.items() if key not in ("attempts", "first_attempt_at", "parked_at")}
-            for entry in parked
-        ]
-        state["pending"] = [*released, *state["pending"]]
+        state["pending"] = [*map(_released, parked), *state["pending"]]
     else:
         for entry in parked:
             _delivered(state, entry, now, outcome="dropped")
@@ -2266,6 +2300,41 @@ def manage_parked(state_path: Path, release: bool, now: int) -> int:
         "; ".join(_audit_ids(entry) for entry in parked) or "none",
     )
     return 0
+
+
+def manage_parked_entry(state_path: Path, index: int, release: bool, now: int) -> bool:
+    """The operator's decision on one parked message, by its position in ``state["parked"]``.
+
+    The same effect as :func:`manage_parked` for one entry. False when the state cannot be read or that
+    position no longer exists: the page that offered the button may be older than the queue, and a stale
+    index must refuse rather than act on whatever message moved into it. The caller holds the state lock,
+    exactly as for the bulk action.
+    """
+    try:
+        state = load_state_document(state_path, STATE_SCHEMA, "advisory state")
+    except SourceError as exc:
+        LOG.error("%s", exc)
+        return False
+    if state is None:
+        LOG.error("no state file at %s; nothing is parked", state_path)
+        return False
+    parked = state.get("parked")
+    if not isinstance(parked, list) or not 0 <= index < len(parked):
+        LOG.warning("no parked message at position %d; the queue changed since the page was rendered", index)
+        return False
+    entry = parked.pop(index)
+    if release:
+        state["pending"] = [_released(entry), *state["pending"]]
+    else:
+        _delivered(state, entry, now, outcome="dropped")
+    save_state(state_path, state)
+    LOG.info(
+        "%s parked message at position %d: %s",
+        "released" if release else "dropped",
+        index,
+        _audit_ids(entry),
+    )
+    return True
 
 
 def _audit_ids(entry: dict) -> str:
