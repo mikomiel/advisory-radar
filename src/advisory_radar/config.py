@@ -71,6 +71,11 @@ class Config:
     adobe_commerce: bool = False
     #: A free NVD API key: raises the anonymous 5-per-30 s limit to 50 and shortens the pace in ``core.Intel``.
     nvd_api_key: str = ""
+    #: Ordered routing rules, first match wins. Empty means every message goes to every enabled notifier,
+    #: exactly as it did before routing existed.
+    routes: tuple[dict, ...] = ()
+    #: Notifier ids for a message no route matches; empty means every enabled notifier.
+    default_notifiers: tuple[str, ...] = ()
     web_host: str = "0.0.0.0"
     web_port: int = 8080
     raw: dict = field(default_factory=dict)
@@ -117,8 +122,13 @@ _TOP_KEYS = {
     "hidden_source_hosts",
     "adobe_commerce",
     "nvd_api_key",
+    "routes",
+    "default",
     "web",
 }
+#: The keys a routing rule's ``match`` mapping may carry (see ``routing.py``).
+_MATCH_KEYS = frozenset({"source", "tag", "product", "ids"})
+_ROUTE_KEYS = frozenset({"match", "notifiers"})
 
 
 #: Spellings accepted for a boolean option that came from the environment (expansion yields strings).
@@ -226,6 +236,64 @@ def load_config(
     return config_from_document(load_document(path, settings=settings), path, env, lenient=lenient)
 
 
+def _notifier_selection(value: object, where: str, enabled_ids: list[str], *, strict: bool = True) -> tuple[str, ...]:
+    """A non-empty list of ids that all name an enabled notifier in this same configuration.
+
+    ``strict=False`` is the state-only load (``release-parked``/``drop-parked``): it reads the YAML without the
+    settings overlay, and a route may name a notifier the overlay adds. Recovery needs the state path, not a
+    delivery target, so the shape is still checked and the membership is not.
+    """
+    valid = isinstance(value, list) and all(isinstance(identifier, str) and identifier for identifier in value)
+    _require(valid and bool(value), f"{where} must be a non-empty list of notifier ids")
+    if not strict:
+        return tuple(value)
+    known = set(enabled_ids)
+    # A selection value can be a ${...} reference that expanded to a credential (someone wrote
+    # ``default: ["${DISCORD_WEBHOOK_URL}"]``), and this message is logged before any redaction exists. Name the
+    # position, never the value.
+    unknown = [position for position, identifier in enumerate(value, start=1) if identifier not in known]
+    if unknown:
+        # Built only when it is raised: formatting the message eagerly would index an empty list.
+        raise ConfigError(f"{where}: id at position {unknown[0]} is not an enabled notifier")
+    return tuple(value)
+
+
+def _routing(document: dict, notifiers: list[dict], *, strict: bool = True) -> tuple[tuple[dict, ...], tuple[str, ...]]:
+    """Validate ``routes``/``default`` after expansion, when a notifier id is the final value in use.
+
+    Called by the one validator with the expanded, enabled-only notifier list: an id that is not configured
+    here, or is disabled, is a configuration error rather than a message nobody receives.
+    """
+    enabled_ids = [entry["id"] for entry in notifiers]
+    raw = document.get("routes")
+    if raw is None:
+        raw = []
+    _require(isinstance(raw, list), "routes must be a list")
+    routes = []
+    for index, route in enumerate(raw, start=1):
+        where = f"routes[{index}]"
+        _require(isinstance(route, dict), f"{where} must be a mapping")
+        unknown = set(route) - _ROUTE_KEYS
+        _require(not unknown, f"{where}: unknown keys {sorted(unknown)}")
+        match = route.get("match")
+        _require(isinstance(match, dict) and bool(match), f"{where}: match must be a non-empty mapping")
+        unknown_match = set(match) - _MATCH_KEYS
+        _require(not unknown_match, f"{where}: unknown match keys {sorted(unknown_match)}")
+        for key, value in match.items():
+            _require(isinstance(value, str) and bool(value), f"{where}: match.{key} must be a non-empty string")
+        routes.append(
+            {
+                "match": dict(match),
+                "notifiers": _notifier_selection(
+                    route.get("notifiers"), f"{where}: notifiers", enabled_ids, strict=strict
+                ),
+            }
+        )
+    raw_default = document.get("default")
+    default = () if raw_default is None else _notifier_selection(raw_default, "default", enabled_ids, strict=strict)
+    return tuple(routes), default
+
+
 def config_from_document(
     document: dict, path: Path, env: dict[str, str] | None = None, *, lenient: bool = False
 ) -> Config:
@@ -279,6 +347,9 @@ def config_from_document(
         len(expanded_ids) == len(set(expanded_ids)),
         "two plugin ids expand to the same value; ids must stay unique after ${...} expansion",
     )
+    # Routing is validated here, after expansion and after the disabled entries were dropped, so a route names
+    # a notifier that will actually be built. An absent or empty block keeps the pre-routing behaviour.
+    routes, default_notifiers = _routing(document, notifiers, strict=not lenient)
 
     poll = document.get("poll_interval", "15m")
     match = re.fullmatch(r"(\d+)([smh])", str(poll))
@@ -330,6 +401,8 @@ def config_from_document(
         hidden_source_hosts=hidden,
         adobe_commerce=_bool_option(document.get("adobe_commerce", False), "adobe_commerce"),
         nvd_api_key=raw_nvd_key.strip(),
+        routes=routes,
+        default_notifiers=default_notifiers,
         web_host=web_host,
         web_port=int(web_port),
         raw=document,

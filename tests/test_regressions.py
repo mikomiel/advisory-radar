@@ -985,6 +985,100 @@ def test_delivery_persists_each_acknowledgement():
     assert state["pending"][0]["sent_to"] == ["fake"]
 
 
+# ---------------------------------------------------------------------------
+# Notification routing (#29)
+
+
+class TargetNotifier(Notifier):
+    """A notifier with its own id, so a routing test can see which channels received a message."""
+
+    def __init__(self, notifier_id: str, status: int = 200) -> None:
+        super().__init__(status)
+        self.id = notifier_id
+
+
+def queue_message(state: dict, *, tag: str = "critical", ids: list[str] | None = None) -> dict:
+    """One pending message, so a delivery test controls exactly what routing sees."""
+    entry = {
+        "kind": "new",
+        "tag": tag,
+        "title": "t",
+        "body": "b",
+        "ids": ids or ["src:x"],
+        "cves": [],
+        "levels": {},
+        "source": "s",
+        "link": "",
+    }
+    state["pending"].append(entry)
+    return entry
+
+
+def test_a_route_sends_a_matching_message_only_to_its_notifiers():
+    state = core.new_state()
+    queue_message(state, tag="critical", ids=["CVE-2026-1"])
+    discord, matrix = TargetNotifier("discord"), TargetNotifier("matrix")
+    routes = [{"match": {"tag": "critical"}, "notifiers": ["matrix"]}]
+    assert core.deliver(state, [discord, matrix], http_for({}), NOW, routes=routes) is True
+    assert [message["ids"] for message in matrix.sent] == [["CVE-2026-1"]]
+    assert discord.sent == []
+    assert state["pending"] == []
+
+
+def test_an_unmatched_message_goes_to_the_default():
+    state = core.new_state()
+    queue_message(state, tag="warning", ids=["CVE-2026-2"])
+    discord, matrix = TargetNotifier("discord"), TargetNotifier("matrix")
+    routes = [{"match": {"tag": "critical"}, "notifiers": ["matrix"]}]
+    assert core.deliver(state, [discord, matrix], http_for({}), NOW, routes=routes, default=["discord"]) is True
+    assert len(discord.sent) == 1
+    assert matrix.sent == []
+
+
+def test_a_message_routed_to_no_enabled_notifier_stays_queued():
+    state = core.new_state()
+    entry = queue_message(state, tag="critical", ids=["CVE-2026-3"])
+    discord = TargetNotifier("discord")
+    routes = [{"match": {"tag": "critical"}, "notifiers": ["gone"]}]
+    assert core.deliver(state, [discord], http_for({}), NOW, routes=routes) is False
+    assert discord.sent == []
+    assert state["pending"] == [entry], "a message routed to no enabled notifier is a failed pass, never silence"
+    assert "sent_to" not in entry, "nothing accepted the message, so no channel may be recorded as done"
+    assert "attempts" not in entry, "a routing fault is a configuration error, not a delivery attempt"
+
+
+def test_only_the_failed_routed_leg_is_retried():
+    state = core.new_state()
+    queue_message(state, tag="critical", ids=["CVE-2026-4"])
+    accepted, failing = TargetNotifier("discord"), TargetNotifier("phone", status=500)
+    routes = [{"match": {"tag": "critical"}, "notifiers": ["discord", "phone"]}]
+    assert core.deliver(state, [accepted, failing], http_for({}), NOW, routes=routes) is False
+    failing.status = 200
+    assert core.deliver(state, [accepted, failing], http_for({}), NOW, routes=routes) is True
+    assert len(accepted.sent) == 1, "a channel that already accepted the message must not receive it again"
+    assert len(failing.sent) == 2, "the failed leg is retried once and then the pass completes"
+    assert state["pending"] == []
+
+
+def test_without_routes_every_enabled_notifier_receives_the_message():
+    state = core.new_state()
+    queue_message(state, tag="warning", ids=["CVE-2026-5"])
+    discord, matrix = TargetNotifier("discord"), TargetNotifier("matrix")
+    assert core.deliver(state, [discord, matrix], http_for({}), NOW) is True
+    assert len(discord.sent) == 1
+    assert len(matrix.sent) == 1
+
+
+def test_an_empty_route_list_ignores_the_default_and_notifies_everyone():
+    """An empty ``routes`` block is the pre-routing behaviour, so a default alone cannot narrow it."""
+    state = core.new_state()
+    queue_message(state, tag="warning", ids=["CVE-2026-6"])
+    discord, matrix = TargetNotifier("discord"), TargetNotifier("matrix")
+    assert core.deliver(state, [discord, matrix], http_for({}), NOW, routes=[], default=["discord"]) is True
+    assert len(discord.sent) == 1
+    assert len(matrix.sent) == 1
+
+
 def test_an_empty_kev_cache_is_not_a_known_catalog(tmp_path):
     from advisory_radar.kev import KEV_CACHE_SCHEMA, load_kev
     from advisory_radar.state import save_state

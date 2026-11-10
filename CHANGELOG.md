@@ -36,6 +36,12 @@ operator action, and the release workflow then builds and pushes the image to
   of the configuration it was rendered from, so a stale tab — after another save, a YAML
   edit, or an overlay deleted and recreated — is refused instead of overwriting it, and a
   notifier's `headers` stay in the YAML while the overlay edits its enablement.
+- Notification routing: an ordered `routes` list in `config.yml` matches a message on `source`,
+  `tag`, watched `product` or an `ids` pattern (first match wins) and sends it to only the
+  notifiers named by that rule, with an optional `default` and no change at all when no rules
+  are configured. A selection that names no enabled notifier fails the pass rather than
+  silencing the message, and a delivery retry re-sends only to the channels that have not
+  accepted it yet.
 
 ### Fixed
 - An automerge left its head branch behind: the repository's *automatically delete head branches*

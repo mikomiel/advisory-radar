@@ -237,6 +237,8 @@ def _run_pass(
             policy,
             share=max(1, core.DELIVERY_CAP // max(1, len(units))),
             trusted=trusted,
+            # Recorded on every queued message so routing can match on the source and its products.
+            source_id=source.id,
         )
         if left:
             carried[source.id] = [core.item_to_state(item) for item in left]
@@ -312,7 +314,15 @@ def _run_pass(
         )
         delivered = False
     else:
-        delivered = core.deliver(state, notifiers, http, now, persist=lambda: save_state(cfg.state_path, state))
+        delivered = core.deliver(
+            state,
+            notifiers,
+            http,
+            now,
+            persist=lambda: save_state(cfg.state_path, state),
+            routes=cfg.routes,
+            default=cfg.default_notifiers,
+        )
     save_state(cfg.state_path, state)
     newly_parked = len(state["parked"]) - parked_before
     sent = queued - len(state["pending"]) - newly_parked
