@@ -9,9 +9,11 @@ operator action, and the release workflow then builds and pushes the image to
 
 ### Fixed
 - The web UI printed stored timestamps as raw epoch seconds (`1792600000`). The dashboard,
-  `/alerts` and `/runs` render a UTC `YYYY-MM-DD HH:MM` instead, and a state value that is not a
-  usable timestamp renders blank instead of failing the page — the dashboard's "seen in the last
-  24h" count compared a stored string against an epoch and raised, and `/alerts` sorted mixed types.
+  `/alerts` and `/runs` render a UTC `YYYY-MM-DD HH:MM` instead. A state value that is not a
+  usable timestamp is blank in the tables (the dashboard's last pass says `never`) rather than
+  failing the page: its "seen in the last 24h" count compared a stored string against an epoch and
+  raised, `/alerts` sorted mixed types, and a run record that was not an object broke `/` and
+  `/runs`. Such a value is also not counted as recent.
 - `automerge.yml` selected no pull request at all. It pre-filtered candidates on
   GitHub's `reviewDecision`, which is empty because branch protection requires
   zero approving reviews. Selection now skips only drafts and leaves the approval

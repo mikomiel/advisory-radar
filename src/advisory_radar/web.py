@@ -96,19 +96,32 @@ def _length(value: object) -> int:
     return len(value) if isinstance(value, (list, dict, tuple, set)) else 0
 
 
+def _epoch(value: object) -> int | None:
+    """A stored epoch second this process can render, or None when the state holds nothing usable.
+
+    ``_when`` and the dashboard's 24-hour count share this one check, so a value the page cannot print is never
+    counted as a time either.
+    """
+    stamp = _number(value, -1)
+    if stamp < 0:
+        return None
+    try:
+        datetime.fromtimestamp(stamp, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return stamp
+
+
 def _when(value: object) -> str:
     """A stored epoch second as a UTC date and time, or empty when the state holds nothing usable.
 
     Every page prints state as it was written, and a hand-edited or older state can hold a string, a ``NaN`` or a
     timestamp outside the representable range. A page that raised would take the whole UI down for one bad field.
     """
-    stamp = _number(value, -1)
-    if stamp < 0:
+    stamp = _epoch(value)
+    if stamp is None:
         return ""
-    try:
-        return datetime.fromtimestamp(stamp, tz=UTC).strftime("%Y-%m-%d %H:%M")
-    except (OverflowError, OSError, ValueError):
-        return ""
+    return datetime.fromtimestamp(stamp, tz=UTC).strftime("%Y-%m-%d %H:%M")
 
 
 def last_pass_code(state: dict) -> int:
@@ -433,14 +446,17 @@ def create_app(
         pending, parked = state.get("pending", []), state.get("parked", [])
         seen = state.get("seen")
         seen = seen if isinstance(seen, dict) else {}
+        runs = state.get("runs")
+        runs = runs if isinstance(runs, list) else []
+        last = runs[-1] if runs and isinstance(runs[-1], dict) else {}
         today = int(time.time()) - 86400
-        # ``seen`` is state as it was written: an entry that is not an object, or whose ``at`` is a string, must
-        # not take the page down. A record with no usable timestamp is simply not "seen today".
-        today_seen = sum(
-            1 for record in seen.values() if isinstance(record, dict) and _number(record.get("at"), -1) >= today
-        )
-        runs = state.get("runs", [])
-        last = runs[-1] if runs else {}
+        # ``seen`` is state as it was written: a record that is not an object, or whose ``at`` is not a time this
+        # process can render, is simply not "seen today" -- it must never take the page down or inflate the count.
+        today_seen = 0
+        for record in seen.values():
+            stamp = _epoch(record.get("at")) if isinstance(record, dict) else None
+            if stamp is not None and stamp >= today:
+                today_seen += 1
         body = (
             f"<p>Pending: <b>{len(pending)}</b> · Parked: <b>{len(parked)}</b> · "
             f"Seen in last 24h: <b>{today_seen}</b> · Total seen: <b>{len(seen)}</b></p>"
@@ -542,10 +558,13 @@ def create_app(
     def runs_page(request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
+        runs = load_state().get("runs")
+        runs = runs if isinstance(runs, list) else []
         rows = "".join(
             f"<tr><td>{esc(_when(r.get('at')))}</td><td>{r.get('sent', 0)}</td><td>{r.get('parked', 0)}</td>"
             f"<td>{r.get('pending', 0)}</td><td>{r.get('code', '')}</td></tr>"
-            for r in reversed(load_state().get("runs", []))
+            for r in reversed(runs)
+            if isinstance(r, dict)
         )
         return page(
             "Runs",
