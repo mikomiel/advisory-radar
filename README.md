@@ -80,6 +80,21 @@ turns critical, and never re-sends what you already received.
 - Docker and Podman deployment (compose file + quadlet/kube YAML), `/healthz` and `/metrics`
 - Secrets via environment / `_FILE` only; redaction filter on logs; fail-closed source errors
 
+## Screenshots
+
+The UI is server-rendered: there is no JavaScript build step. These are from a
+local run with demo data, so the advisories in them are not real findings.
+
+![Dashboard: pending, parked and recently seen counts with the last pass result](docs/screenshots/dashboard.png)
+
+| Alerts | Configuration |
+|---|---|
+| ![Alert history: advisory id, outcome and UTC first-seen time](docs/screenshots/alerts.png) | ![Configuration: sources, notifiers and the poll interval](docs/screenshots/config.png) |
+
+| Parked messages | Runs |
+|---|---|
+| ![Parked queue: severity, title and advisory ids, with bulk release and drop actions](docs/screenshots/parked.png) | ![Run history: sent, parked, pending and exit code per pass](docs/screenshots/runs.png) |
+
 ## Review and merge automation
 
 `main` is protected by **three required status checks** — `ci`, `gate` and `review` — all
