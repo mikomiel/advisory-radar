@@ -451,6 +451,16 @@ def test_a_message_delivered_by_this_version_appears_and_filters_in_the_list(tmp
     save_state(tmp_path / "state.json", stored)
     degraded = client.get("/alerts").text
     assert "CVE-2026-1234" in degraded
+    # Without the snapshot the identifier, outcome and date still filter; the snapshot's fields no longer do.
+    assert "/advisories/" not in client.get("/alerts", params={"tag": "critical"}).text
+    assert "/advisories/" not in client.get("/alerts", params={"q": "widget"}).text
+    assert "/advisories/" in client.get("/alerts", params={"outcome": "delivered"}).text
+
+    # A hand-edited delivery reference of the wrong type degrades instead of taking the page down.
+    stored["seen"]["CVE-2026-1234"]["delivery"] = []
+    save_state(tmp_path / "state.json", stored)
+    assert client.get("/alerts").status_code == 200
+    assert client.get(f"/advisories/{advisory_token('CVE-2026-1234')}").status_code == 200
 
 
 def test_a_dropped_message_with_no_acceptor_says_so_on_the_page(tmp_path):
@@ -606,6 +616,42 @@ def test_a_default_without_a_rule_is_refused_not_silently_discarded(tmp_path):
     )
     assert response.status_code == 400
     assert "needs at least one rule" in response.text
+
+
+def test_more_than_three_rules_round_trip_through_the_form(tmp_path):
+    body = ROUTES_CONFIG.replace(
+        "default: [ops]",
+        "  - match: {product: magento}\n"
+        "    notifiers: [ops]\n"
+        "  - match: {ids: 'GHSA-*'}\n"
+        "    notifiers: [ops, phone]\n"
+        "  - match: {source: debian}\n"
+        "    notifiers: [ops]\n"
+        "default: [ops]",
+    )
+    client, token, runtime = make_client(tmp_path, body=body, environment=CHANNEL_ENV)
+    csrf, fingerprint = config_form(client, token)
+    saved = client.post(
+        "/config/routes",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "route:1:tag": "critical",
+            "route:1:notifiers": ["phone"],
+            "route:2:product": "magento",
+            "route:2:notifiers": ["ops"],
+            "route:3:ids": "GHSA-*",
+            "route:3:notifiers": ["ops", "phone"],
+            "route:4:source": "debian",
+            "route:4:notifiers": ["ops"],
+            "default": ["ops"],
+        },
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303
+    overlay = load_settings(settings_path(runtime.cfg.state_path))
+    assert len(overlay["routes"]) == 4, "a rule beyond the fixed rows must survive the save"
+    assert overlay["routes"][3] == {"match": {"source": "debian"}, "notifiers": ["ops"]}
 
 
 def test_clearing_the_default_with_rules_kept_means_no_fallback(tmp_path):

@@ -819,7 +819,8 @@ def create_app(
 
             A record written before the delivery table has no ``delivery`` key and is rendered as it is.
             """
-            snapshot = deliveries.get(record.get("delivery"))
+            reference = record.get("delivery")
+            snapshot = deliveries.get(reference) if isinstance(reference, str) else None
             if not isinstance(snapshot, dict):
                 return record
             return {**snapshot, "at": record.get("at"), "outcome": record.get("outcome")}
@@ -899,7 +900,10 @@ def create_app(
         if isinstance(seen, dict) and isinstance(seen.get(identifier), dict):
             record = seen[identifier]
             deliveries = state.get("deliveries")
-            snapshot = deliveries.get(record.get("delivery")) if isinstance(deliveries, dict) else None
+            reference = record.get("delivery")
+            snapshot = (
+                deliveries.get(reference) if isinstance(deliveries, dict) and isinstance(reference, str) else None
+            )
             body = _seen_advisory(record, snapshot if isinstance(snapshot, dict) else None)
             return page(f"Advisory {identifier}", body, nav_extra=sign_out_form(request))
         for label, queue in (("pending", state.get("pending")), ("parked", state.get("parked"))):
