@@ -169,6 +169,12 @@ class Runtime:
             raise ConfigError("this runtime has no configuration file; reload is unavailable")
         candidate = type(self).build(self.config_path, self.environment, clock=self.clock)
         try:
+            if candidate.cfg.state_path != self.cfg.state_path:
+                # The overlay cannot move the state file, but the YAML can, and a reload would then take one
+                # file's lock, read that file and write the document to the other path. That is a restart's job.
+                raise ConfigError(
+                    "state_path is file-only and a reload cannot move it; restart to use a new state file"
+                )
             with state_lock(self.cfg.state_path, blocking=blocking):
                 state = load_state_document(self.cfg.state_path, core.STATE_SCHEMA, "advisory state")
                 if state is None:

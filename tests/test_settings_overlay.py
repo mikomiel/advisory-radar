@@ -391,6 +391,19 @@ def test_a_reload_with_an_unreadable_state_is_refused(tmp_path):
         runtime.detach_redaction()
 
 
+def test_a_reload_cannot_move_the_state_file(tmp_path):
+    # A hand-edited YAML can move the state path; reloading would lock one file, read it and write the
+    # resulting document to the other path, which is a different instance's state. Refuse and keep running.
+    path = write_config(tmp_path, {})
+    runtime = Runtime.build(path, {})
+    write_config(tmp_path, {"state_path": str(tmp_path / "moved.json")})
+    with pytest.raises(ConfigError) as caught:
+        runtime.reload(blocking=False)
+    assert "state_path" in str(caught.value)
+    assert runtime.cfg.state_path == tmp_path / "state.json"
+    assert not (tmp_path / "moved.json").exists()
+
+
 def test_sighup_reloads_the_running_process(tmp_path, monkeypatch):
     path = write_config(tmp_path, {})
     runtime = Runtime.build(path, {})
