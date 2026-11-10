@@ -111,13 +111,14 @@ atomically (a temporary file in the same directory, `fsync`, `os.replace`), so a
 half-written file cannot brick a start. `/config` stays read-only: the overlay holds
 only four keys — `notifiers`, per-source `enabled`/`tag`, `poll_interval` and
 `hidden_source_hosts` — and the YAML owns everything else. While the overlay holds a
-`notifiers` list it replaces the YAML's, so a notifier added to the YAML later is not
-used until that section is removed from the overlay.
+`notifiers` list it replaces the YAML's membership and ordinary fields, so a notifier
+added to the YAML later is not used until that section is removed from the overlay; a
+notifier's `headers` are the exception, staying in the YAML and carried over by id.
 
 The overlay is optional; without it the YAML is the whole configuration. An invalid one
-is refused: a save shows the configuration error and writes nothing, and a reload — the
-*Reload configuration* button or `kill -HUP <pid>` — logs the error and keeps the running
-configuration. A pass holds the state lock for its whole transaction, so a reload waits
+is refused: a save shows the configuration error and writes nothing, the *Reload
+configuration* button shows the refusal, `kill -HUP <pid>` logs its reason, and either
+way the running configuration stays. A pass holds the state lock for its whole transaction, so a reload waits
 for it (`SIGHUP`) or answers `409` (the UI), and a pass that already started finishes
 with the configuration it started with. Each settings form carries the revision it was
 rendered from, so a save from a page that has not seen a newer one is refused (`409`)
