@@ -109,11 +109,15 @@ in the container, `~/.local/share/advisory-radar/settings.json` for the rootless
 quadlet). It is created with mode `0600`, owned by the container user, and replaced
 atomically (a temporary file in the same directory, `fsync`, `os.replace`), so a
 half-written file cannot brick a start. `/config` stays read-only: the overlay holds
-only four keys — `notifiers`, per-source `enabled`/`tag`, `poll_interval` and
-`hidden_source_hosts` — and the YAML owns everything else. While the overlay holds a
+only six keys — `notifiers`, per-source `enabled`/`tag`, `poll_interval`,
+`hidden_source_hosts`, and the routing `routes`/`default` block — and the YAML owns
+everything else. While the overlay holds a
 `notifiers` list it replaces the YAML's membership and ordinary fields, so a notifier
 added to the YAML later is not used until that section is removed from the overlay; a
-notifier's `headers` are the exception, staying in the YAML and carried over by id.
+notifier's `headers` are the exception, staying in the YAML and carried over by id. A
+`routes` block saved by the form replaces the YAML's rules as a whole; the form's rows are
+prefilled from the saved overlay, or from the merged YAML when the overlay holds none, and
+a form with every row empty leaves the YAML's rules in force.
 
 The overlay is optional; without it the YAML is the whole configuration. An invalid one
 is refused: a save shows the configuration error and writes nothing, the *Reload
@@ -147,8 +151,9 @@ Two upstreams reward configuration rather than credentials:
 
 ### Routing
 
-Notification routing lives in `config.yml`, not in the settings overlay: an ordered `routes` list plus an
-optional `default`, each naming notifier ids. Every id must name an enabled notifier in the effective merged
+Notification routing lives in `config.yml` by default: an ordered `routes` list plus an
+optional `default`, each naming notifier ids. The same block can be saved to the settings
+overlay from `/config`, where it then replaces the YAML's rules. Every id must name an enabled notifier in the effective merged
 configuration (a notifier the overlay adds counts, one it disables does not), or the configuration is refused
 when it loads; `release-parked` and `drop-parked` read the YAML alone and do not enforce that membership, so a
 route to an overlay-only channel cannot block queue recovery. With no `routes` block every message still goes
@@ -156,6 +161,26 @@ to every enabled notifier. Delivery records on the message which channels alread
 a retry re-sends the message only to the channels that have not had it — the failed channel is retried, the
 others are not repeated. The README's [Routing](../README.md#routing) section lists the match keys and an
 example.
+
+### Lists, the advisory page and screenshots
+
+`/alerts` keeps its filters in the URL (`tag`, `source`, `outcome`, `q`, `since` and
+`until`, the dates as inclusive UTC days) and pages by keyset cursor rather than an offset,
+so a reload, a bookmark or a shared link shows the same rows and adding an advisory cannot
+shift a page. Each row links to `/advisories/<id>`, which shows the stored classification
+and delivery record — tag, source, title, per-CVE level and CVSS, the notifiers that
+accepted the message — and says the details were not recorded for a seen record written by
+an older version, instead of inventing them. The message body is not retained and is not
+shown. `/parked` releases or drops one message per row as well as the whole queue, and
+`/runs` filters by exit code and day; the state keeps only the last 200 passes, so the page
+states that cap instead of paging.
+
+The README screenshots are written by an opt-in script, never by the application:
+`uv run --with playwright python scripts/capture_screenshots.py` (add
+`--output-dir` to write elsewhere) builds a demo configuration and state in a temporary
+directory, serves the app on `127.0.0.1` with a throwaway token and captures the five pages
+through the real login form. Playwright is not a project dependency; install the browser
+once with `uv run --with playwright playwright install chromium`. No CI job runs it.
 
 ## Multi-arch images
 
