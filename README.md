@@ -56,12 +56,12 @@ ones you do not run. Package patterns filter Debian DSA titles.
 
 ### Gap detection
 
-A source that knows its own page size (a FreshRSS export, a changedetection
-watch) reports a truncated window, and the pass fails loudly when a full window
-shares nothing with the previous one — that is how silently missed advisories
-surface. An RSS/Atom feed is bounded by its publisher instead, so a skipped item
-there cannot be detected; poll those feeds often enough that rotation is
-unlikely.
+A source that knows its own page size (a FreshRSS export) reports a truncated
+window, and the pass fails loudly when a full window shares nothing with the
+previous one — that is how silently missed advisories surface. An RSS/Atom feed
+is bounded by its publisher, and the changedetection.io source reports no
+truncation at all, so a skipped item there cannot be detected; poll those sources
+often enough that rotation is unlikely.
 
 ## Why
 
@@ -94,6 +94,32 @@ local run with demo data, so the advisories in them are not real findings.
 | Parked messages | Runs |
 |---|---|
 | ![Parked queue: severity, title and advisory ids, with bulk release and drop actions](docs/screenshots/parked.png) | ![Run history: sent, parked, pending and exit code per pass](docs/screenshots/runs.png) |
+
+## Sources
+
+Four source types are built in, and the table below is the whole catalogue: a
+**required** key has no default, an **optional** one may be left out. The same
+catalogue is on the `/sources` page of the web UI and in
+`advisory-radar sources list`, which needs no config file.
+
+`advisory-radar sources test <id>` fetches one *configured* source, prints its
+items and whether its window was truncated, and exits non-zero when it was or
+when the fetch failed. It sends no notification and writes no state, so it is
+safe to run while the service is polling. A `webhook` source is read from an
+empty inbox, so it prints no items: the command checks configuration, not intake.
+
+| Kind | Summary | Required keys | Optional keys |
+|---|---|---|---|
+| `rss` | Any RSS 2.0 or Atom feed URL, read in one conditional GET. | `url` | `tag`, `enabled` |
+| `freshrss` | A FreshRSS shared query, read through its GReader JSON export. | `url`, `token` | `user`, `enabled` |
+| `changedetection` | Poll a changedetection.io instance; every watch whose page changed becomes one item. | `url`, `api_key` | `tag`, `enabled` |
+| `webhook` | Items pushed to this instance's `/webhooks/<id>` endpoint, read from the state inbox. | — | `tag`, `enabled` |
+
+An accepted key is not always read by every kind: `tag` scopes a
+changedetection.io poll to one watch tag, `user` names the FreshRSS account, and
+`enabled: false` keeps an entry in the file without building it. An RSS/Atom feed
+and a changedetection.io poll return the whole response, so the FreshRSS GReader
+export is the only built-in that reports a truncated window.
 
 ## Review and merge automation
 

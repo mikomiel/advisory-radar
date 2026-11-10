@@ -39,9 +39,20 @@ both fail the build on them.
   real consumer.
 - Tests next to the behavior they pin (`tests/`); property-style fixtures over
   mocks where practical.
-- New source/enricher/notifier plugins implement the protocol in
-  `advisory_radar/plugins/` and register in the built-in registry; add tests
-  with synthetic fixtures only (no real credentials, no live estate data).
+- A new source plugin takes four edits: a builder (and its `SOURCE_BUILDERS`
+  entry) in `advisory_radar/sources.py`, one `SourceSpec` in
+  `advisory_radar/catalogue.py`, one row in the README `## Sources` table, and a
+  fixture test in `tests/`. The config key allowlist, the `/sources` page and
+  `advisory-radar sources list` are derived from the catalogue; the README row is
+  written by hand, and `tests/test_catalogue.py` fails if any kind, summary or key
+  differs, so the registry stays the one owner of those facts.
+  `advisory-radar sources test <id>` fetches a configured source and prints its
+  items and truncation flag without delivering or saving anything — useful while
+  you are writing that fixture. A `webhook` source always prints nothing there:
+  the command gives the source an empty inbox, so it checks the configuration, not
+  the live intake. Notifier plugins implement
+  `advisory_radar.plugins.Notifier` and are registered in `notifiers.py`. Tests
+  use synthetic fixtures only (no real credentials, no live estate data).
 
 ## Reporting security issues
 
