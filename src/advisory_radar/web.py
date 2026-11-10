@@ -20,10 +20,12 @@ import urllib.parse
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 
+import yaml
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from itsdangerous import BadSignature, URLSafeSerializer
 
+from .catalogue import SOURCE_SPECS
 from .config import Config
 
 LOG = logging.getLogger("advisory_radar")
@@ -35,7 +37,7 @@ nav a{{margin-right:1rem}} table{{border-collapse:collapse}} td,th{{border:1px s
 .tag-critical{{color:#b00020;font-weight:bold}} .tag-warning{{color:#9a6700}} .muted{{color:#666}}
 form{{display:inline}} button{{cursor:pointer}}
 </style></head><body><nav><a href="/">Dashboard</a><a href="/alerts">Alerts</a>
-<a href="/parked">Parked</a><a href="/config">Config</a><a href="/runs">Runs</a>
+<a href="/parked">Parked</a><a href="/config">Config</a><a href="/sources">Sources</a><a href="/runs">Runs</a>
 <a href="/healthz">healthz</a>{nav_extra}</nav><h1>{title}</h1>{body}</body></html>"""
 
 
@@ -553,6 +555,33 @@ def create_app(
             "environment only.</p>"
         )
         return page("Configuration", body, nav_extra=sign_out_form(request))
+
+    @app.get("/sources", response_class=HTMLResponse)
+    def sources_page(request: Request):
+        """The whole built-in catalogue, rendered from its one owner, plus what this instance configured."""
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        rows = []
+        for spec in SOURCE_SPECS.values():
+            example = yaml.safe_dump(spec.example, sort_keys=False)
+            rows.append(
+                f"<tr><td><b>{esc(spec.kind)}</b></td><td>{esc(spec.summary)}</td>"
+                f"<td>{esc(', '.join(spec.required) or '(none)')}</td>"
+                f"<td>{esc(', '.join(spec.optional) or '(none)')}</td>"
+                f"<td><pre>{esc(example)}</pre></td><td><code>{esc(spec.docs_anchor)}</code></td></tr>"
+            )
+        configured = "".join(
+            f"<li><b>{esc(source['id'])}</b> ({esc(source.get('type', ''))})</li>" for source in cfg.sources
+        )
+        body = (
+            "<p>Every built-in source type, its keys and an example. Required keys have no default.</p>"
+            "<table><tr><th>Kind</th><th>Summary</th><th>Required</th><th>Optional</th>"
+            f"<th>Example</th><th>Docs</th></tr>{''.join(rows)}</table>"
+            f"<h2>Configured sources</h2><ul>{configured or '<li>(none)</li>'}</ul>"
+            "<p class='muted'>Try one without delivering anything: "
+            "<code>advisory-radar sources test &lt;id&gt;</code>.</p>"
+        )
+        return page("Sources", body, nav_extra=sign_out_form(request))
 
     @app.get("/runs", response_class=HTMLResponse)
     def runs_page(request: Request):

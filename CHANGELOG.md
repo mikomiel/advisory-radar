@@ -7,6 +7,18 @@ operator action, and the release workflow then builds and pushes the image to
 
 ## [Unreleased]
 
+### Added
+- A source catalogue (`advisory_radar/catalogue.py`): one `SourceSpec` per
+  built-in kind with its summary, required and optional keys, a tested example
+  and a docs anchor. The config key allowlist is derived from it instead of
+  being repeated by hand.
+- `advisory-radar sources list` (every built-in kind and its keys, no config
+  file or secret needed) and `advisory-radar sources test <id> --limit N`
+  (fetch one configured source, print its items and truncation flag, deliver
+  nothing, write no state).
+- A `/sources` page rendered from the catalogue, and a README source table kept
+  equal to it by `tests/test_catalogue.py`.
+
 ### Fixed
 - The web UI printed stored timestamps as raw epoch seconds (`1792600000`). The dashboard,
   `/alerts` and `/runs` render a UTC `YYYY-MM-DD HH:MM` instead. A state value that is not a

@@ -1,4 +1,4 @@
-"""Command line: run | once | dry-run | test-notify | release-parked | drop-parked."""
+"""Command line: run | once | dry-run | test-notify | release-parked | drop-parked | sources."""
 
 from __future__ import annotations
 
@@ -10,12 +10,20 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from . import core, pipeline
-from .config import ConfigError, load_config, secret_values
+from .catalogue import SOURCE_SPECS
+from .config import Config, ConfigError, load_config, secret_values
 from .http import Http, urllib_http
 from .state import state_lock
 
 LOG = logging.getLogger("advisory_radar")
 DEFAULT_CONFIG = Path("config/config.yml")
+
+
+def _non_negative(text: str) -> int:
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return value
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -40,7 +48,52 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("test-notify", help="send one test message through every notifier")
     sub.add_parser("release-parked", help="queue the parked messages again and exit")
     sub.add_parser("drop-parked", help="record the parked messages as handled and discard them")
+    sources = sub.add_parser("sources", help="inspect the built-in source catalogue, or test one configured source")
+    sources_sub = sources.add_subparsers(dest="sources_command", required=True)
+    sources_sub.add_parser("list", help="print every built-in kind with its keys (no config file needed)")
+    test = sources_sub.add_parser("test", help="fetch one configured source and print its items; nothing is sent")
+    test.add_argument("id", help="the id of the configured source")
+    test.add_argument("--limit", type=_non_negative, default=10, metavar="N", help="items to print (default 10)")
     return parser
+
+
+def _list_sources() -> int:
+    """The catalogue without a config file or any secret, so it is dispatched before ``load_config``."""
+    for kind, spec in SOURCE_SPECS.items():
+        print(f"{kind}: {spec.summary}")
+        print(f"  required: {', '.join(spec.required) or '(none)'}")
+        print(f"  optional: {', '.join(spec.optional) or '(none)'}")
+        print(f"  docs: {spec.docs_anchor}")
+    return 0
+
+
+def _test_source(cfg: Config, args: argparse.Namespace, http: Http, environment: Mapping[str, str]) -> int:
+    """Fetch one source with empty state, print what it returns, and touch nothing else.
+
+    The empty state makes the fetch unconditional (no stored ``ETag``/cursor) and nothing is committed: no
+    ``save_state``, no ``source.commit``, not even the state lock. A fault or a truncated window is the exit
+    code, because a full window proves the source held more than it returned.
+    """
+    from .sources import build_source
+
+    entry = next((dict(candidate) for candidate in cfg.sources if candidate["id"] == args.id), None)
+    if entry is None:
+        LOG.error("sources test: no enabled source has id %r", args.id)
+        return 1
+    try:
+        source = build_source(entry, environment)
+    except (ValueError, KeyError) as exc:
+        LOG.error("sources test: %s: %s", type(exc).__name__, exc)
+        return 1
+    try:
+        window = source.fetch(http, {})
+    except Exception as exc:  # the command reports a source fault as its exit code, not a traceback
+        LOG.error("sources test: %s: %s: %s", args.id, type(exc).__name__, exc)
+        return 1
+    for item in window.items[: args.limit]:
+        print(f"{item.guid}\t{item.title}\t{item.link}")
+    print(f"{args.id}: {len(window.items)} item(s); truncated: {'yes' if window.truncated else 'no'}")
+    return 1 if window.truncated else 0
 
 
 def main(
@@ -57,6 +110,10 @@ def main(
     args = _parser().parse_args(argv)
     if not LOG.handlers and not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="advisory-radar: %(message)s", stream=sys.stderr)
+    # The catalogue is static and needs neither the config file nor a secret: listing it must not require
+    # either, so it is dispatched before load_config.
+    if args.command == "sources" and args.sources_command == "list":
+        return _list_sources()
     state_only = args.command in {"release-parked", "drop-parked"}
     try:
         cfg = load_config(args.config, environment, lenient=state_only)
@@ -65,6 +122,8 @@ def main(
         return 1
     redactor = pipeline.attach_redaction(secret_values(cfg))
     try:
+        if args.command == "sources":
+            return _test_source(cfg, args, http, environment)
         # These only touch the state document: no source or notifier is built, so an unrelated plugin with a
         # missing credential cannot block recovery of an existing parked queue.
         if args.command == "release-parked":

@@ -94,6 +94,30 @@ local run with demo data, so the advisories in them are not real findings.
 | Parked messages | Runs |
 |---|---|
 | ![Parked queue: severity, title and advisory ids, with bulk release and drop actions](docs/screenshots/parked.png) | ![Run history: sent, parked, pending and exit code per pass](docs/screenshots/runs.png) |
+## Sources
+
+Four source types are built in, and the table below is the whole catalogue: a
+**required** key has no default, an **optional** one may be left out. The same
+catalogue is on the `/sources` page of the web UI and in
+`advisory-radar sources list`, which needs no config file.
+
+`advisory-radar sources test <id>` fetches one *configured* source, prints its
+items and whether its window was truncated, and exits non-zero when it was or
+when the fetch failed. It sends no notification and writes no state, so it is
+safe to run while the service is polling.
+
+| Kind | Summary | Required keys | Optional keys |
+|---|---|---|---|
+| `rss` | Any RSS 2.0 or Atom feed URL, read in one conditional GET. | `url` | `tag`, `enabled` |
+| `freshrss` | A FreshRSS shared query, read through its GReader JSON export. | `url`, `token` | `user`, `enabled` |
+| `changedetection` | Poll a changedetection.io instance; every watch whose page changed becomes one item. | `url`, `api_key` | `tag`, `enabled` |
+| `webhook` | Items pushed to this instance's `/webhooks/<id>` endpoint, read from the state inbox. | — | `tag`, `enabled` |
+
+An accepted key is not always read by every kind: `tag` scopes a
+changedetection.io poll to one watch tag, `user` names the FreshRSS account, and
+`enabled: false` keeps an entry in the file without building it. An RSS/Atom feed
+and a changedetection.io poll return the whole response, so the FreshRSS GReader
+export is the only built-in that reports a truncated window.
 
 ## Review and merge automation
 
