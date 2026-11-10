@@ -18,6 +18,7 @@ import os
 import time
 import urllib.parse
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
@@ -93,6 +94,34 @@ def _number(value: object, default: int = 0) -> int:
 def _length(value: object) -> int:
     """A collection's size, or 0: a malformed document must not raise from a probe or a scrape."""
     return len(value) if isinstance(value, (list, dict, tuple, set)) else 0
+
+
+def _epoch(value: object) -> int | None:
+    """A stored epoch second this process can render, or None when the state holds nothing usable.
+
+    ``_when`` and the dashboard's 24-hour count share this one check, so a value the page cannot print is never
+    counted as a time either.
+    """
+    stamp = _number(value, -1)
+    if stamp < 0:
+        return None
+    try:
+        datetime.fromtimestamp(stamp, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return stamp
+
+
+def _when(value: object) -> str:
+    """A stored epoch second as a UTC date and time, or empty when the state holds nothing usable.
+
+    Every page prints state as it was written, and a hand-edited or older state can hold a string, a ``NaN`` or a
+    timestamp outside the representable range. A page that raised would take the whole UI down for one bad field.
+    """
+    stamp = _epoch(value)
+    if stamp is None:
+        return ""
+    return datetime.fromtimestamp(stamp, tz=UTC).strftime("%Y-%m-%d %H:%M")
 
 
 def last_pass_code(state: dict) -> int:
@@ -414,15 +443,24 @@ def create_app(
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         state = load_state()
-        pending, parked, seen = state.get("pending", []), state.get("parked", []), state.get("seen", {})
+        pending, parked = state.get("pending", []), state.get("parked", [])
+        seen = state.get("seen")
+        seen = seen if isinstance(seen, dict) else {}
+        runs = state.get("runs")
+        runs = runs if isinstance(runs, list) else []
+        last = runs[-1] if runs and isinstance(runs[-1], dict) else {}
         today = int(time.time()) - 86400
-        today_seen = sum(1 for v in seen.values() if v.get("at", 0) >= today)
-        runs = state.get("runs", [])
-        last = runs[-1] if runs else {}
+        # ``seen`` is state as it was written: a record that is not an object, or whose ``at`` is not a time this
+        # process can render, is simply not "seen today" -- it must never take the page down or inflate the count.
+        today_seen = 0
+        for record in seen.values():
+            stamp = _epoch(record.get("at")) if isinstance(record, dict) else None
+            if stamp is not None and stamp >= today:
+                today_seen += 1
         body = (
             f"<p>Pending: <b>{len(pending)}</b> · Parked: <b>{len(parked)}</b> · "
             f"Seen in last 24h: <b>{today_seen}</b> · Total seen: <b>{len(seen)}</b></p>"
-            f"<p class='muted'>Last pass: {esc(last.get('at', 'never'))} — sent {last.get('sent', 0)}, "
+            f"<p class='muted'>Last pass: {esc(_when(last.get('at')) or 'never')} — sent {last.get('sent', 0)}, "
             f"parked {last.get('parked', 0)}, exit {last.get('code', '?')}</p>"
             f'<form method="post" action="/run">{csrf_field(request)}<button>Run a pass now</button></form>'
         )
@@ -440,15 +478,21 @@ def create_app(
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         state = load_state()
+        seen = state.get("seen")
+        seen = seen if isinstance(seen, dict) else {}
         rows = []
-        for identifier, record in sorted(
-            state.get("seen", {}).items(), key=lambda kv: kv[1].get("at", 0), reverse=True
-        )[:200]:
+        # A record that is not an object, or whose timestamp is not a number, is skipped by the sort key rather
+        # than raising: one hand-edited field must not hide every advisory behind a 500.
+        ordered = sorted(
+            ((identifier, record) for identifier, record in seen.items() if isinstance(record, dict)),
+            key=lambda kv: (-_number(kv[1].get("at"), 0), kv[0]),
+        )
+        for identifier, record in ordered[:200]:
             rows.append(
                 f"<tr><td>{esc(identifier)}</td><td>{esc(record.get('outcome', ''))}</td>"
-                f"<td class='muted'>{esc(record.get('at', ''))}</td></tr>"
+                f"<td class='muted'>{esc(_when(record.get('at')))}</td></tr>"
             )
-        body = "<table><tr><th>ID</th><th>Outcome</th><th>First seen (epoch)</th></tr>" + "".join(rows) + "</table>"
+        body = "<table><tr><th>ID</th><th>Outcome</th><th>First seen (UTC)</th></tr>" + "".join(rows) + "</table>"
         return page("Alerts", body, nav_extra=sign_out_form(request))
 
     @app.get("/parked", response_class=HTMLResponse)
@@ -514,15 +558,18 @@ def create_app(
     def runs_page(request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
+        runs = load_state().get("runs")
+        runs = runs if isinstance(runs, list) else []
         rows = "".join(
-            f"<tr><td>{esc(r.get('at', ''))}</td><td>{r.get('sent', 0)}</td><td>{r.get('parked', 0)}</td>"
+            f"<tr><td>{esc(_when(r.get('at')))}</td><td>{r.get('sent', 0)}</td><td>{r.get('parked', 0)}</td>"
             f"<td>{r.get('pending', 0)}</td><td>{r.get('code', '')}</td></tr>"
-            for r in reversed(load_state().get("runs", []))
+            for r in reversed(runs)
+            if isinstance(r, dict)
         )
         return page(
             "Runs",
             nav_extra=sign_out_form(request),
-            body="<table><tr><th>At</th><th>Sent</th><th>Parked</th><th>Pending</th><th>Exit</th></tr>"
+            body="<table><tr><th>At (UTC)</th><th>Sent</th><th>Parked</th><th>Pending</th><th>Exit</th></tr>"
             + rows
             + "</table>",
         )

@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from advisory_radar import core
 from advisory_radar.config import load_config
 from advisory_radar.state import load_state_document, save_state
-from advisory_radar.web import LoginThrottle, create_app, readiness
+from advisory_radar.web import LoginThrottle, _epoch, _when, create_app, readiness
 
 
 def make_client(tmp_path: Path, token: str = "secret-token", clock: float | None = None):
@@ -75,6 +75,75 @@ def test_login_and_dashboard(tmp_path):
     other, _ = make_client(tmp_path, token="other")
     bad = other.post("/login", data={"token": "nope"})
     assert "Wrong token" in bad.text
+
+
+def test_pages_render_timestamps_as_utc_dates(tmp_path):
+    client, token = make_client(tmp_path)
+    signed_in(client, token)
+    for path in ("/", "/alerts", "/runs"):
+        page = client.get(path).text
+        assert "2026-10-21 16:26" in page, path
+        assert "1792600000" not in page, f"{path} still prints the raw epoch"
+    assert "First seen (UTC)" in client.get("/alerts").text
+    assert "At (UTC)" in client.get("/runs").text
+
+
+def test_the_time_helper_survives_a_value_it_cannot_render():
+    assert _when(1792600000) == "2026-10-21 16:26"
+    assert _epoch(1792600000) == 1792600000
+    # A hand-edited or older state can hold any of these; a page must render rather than take the UI down.
+    for unusable in (None, "never", "", float("nan"), float("inf"), 10**20, -1, True):
+        assert _when(unusable) == "", repr(unusable)
+        assert _epoch(unusable) is None, repr(unusable)
+
+
+def test_pages_tolerate_records_that_are_not_objects_or_not_times(tmp_path):
+    client, token = make_client(tmp_path)
+    state = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    assert state is not None
+    valid_run = {"at": 1792600000, "sent": 1, "parked": 0, "pending": 0, "code": 0}
+    # A malformed entry before a valid latest one must not hide the valid one, and the record that is not an
+    # object must be skipped by the alerts sort rather than raising from the comparison.
+    state["runs"] = [None, "nope", valid_run]
+    # Replace the fixture's seen map rather than adding to it: the expected count must not depend on when the
+    # suite happens to run, and the fixture's 2026-10-21 timestamp is inside 24h on an earlier wall clock.
+    state["seen"] = {
+        "CVE-2026-3": "not-an-object",
+        # A timestamp outside the representable range is blank on the page, so it must not be counted as recent.
+        "CVE-2026-4": {"at": 10**20, "outcome": "delivered"},
+        # A string timestamp inside an object reaches the same sort key as the integers: mixed types must not raise.
+        "CVE-2026-6": {"at": "yesterday", "outcome": "delivered"},
+        "CVE-2026-5": {"at": int(time.time()), "outcome": "delivered"},
+    }
+    save_state(tmp_path / "state.json", state)
+    signed_in(client, token)
+
+    dashboard = client.get("/")
+    assert dashboard.status_code == 200
+    assert "Last pass: 2026-10-21 16:26" in dashboard.text
+    assert "Seen in last 24h: <b>1</b>" in dashboard.text
+
+    alerts = client.get("/alerts")
+    assert alerts.status_code == 200
+    assert "not-an-object" not in alerts.text
+    assert "yesterday" not in alerts.text  # unreadable time renders blank, it is not copied into the table
+    assert "CVE-2026-5" in alerts.text and "CVE-2026-6" in alerts.text
+
+    runs = client.get("/runs")
+    assert runs.status_code == 200 and "At (UTC)" in runs.text
+    assert "2026-10-21 16:26" in runs.text
+    assert "None" not in runs.text and "nope" not in runs.text
+
+
+def test_a_last_run_that_is_not_an_object_renders_as_never(tmp_path):
+    client, token = make_client(tmp_path)
+    state = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    assert state is not None
+    state["runs"] = [None, "nope"]
+    save_state(tmp_path / "state.json", state)
+    signed_in(client, token)
+    assert "Last pass: never" in client.get("/").text
+    assert client.get("/runs").status_code == 200
 
 
 CSRF_RE = re.compile(r'name="csrf" value="([0-9a-f]{64})"')
