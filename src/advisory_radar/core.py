@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import datetime
 import fnmatch
+import hashlib
+import hmac
+import json
 import logging
 import math
 import re
@@ -1327,11 +1330,70 @@ def _prune(state: dict, now: int) -> None:
     state["cache"] = {key: entry for key, entry in state["cache"].items() if now - entry["at"] < CACHE_TTL}
 
 
-def _delivered(state: dict, entry: dict, now: int, outcome: str = "delivered") -> None:
-    """Advance state for one message the gateway accepted, or (``outcome="dropped"``) the operator discarded."""
+def _stored_list(value: object) -> list[str]:
+    """A list of identifier strings off a queue entry; anything else is stored as the empty list.
+
+    The entry came through the state document, where a hand edit can turn a list into a string; splitting that
+    into characters would put nonsense on the advisory page.
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def _delivery_snapshot(entry: dict, delivered_to: Sequence[str]) -> dict:
+    """The compact record of one delivered message, copied off the queue entry so a later edit cannot reach it.
+
+    ``tag``/``source``/``levels``/``scores`` are the classification the message was sent with, which the seen
+    record previously dropped, and the identifiers, KEV-only CVEs and matched products answer the rest of the
+    advisory page from the record alone. The body is deliberately absent: it is the rendered text, not a fact.
+    """
+    return {
+        "tag": entry.get("tag", ""),
+        "source": entry.get("source", ""),
+        "title": entry.get("title", ""),
+        "link": entry.get("link", ""),
+        # Stored too, because the snapshot's meaning depends on which kind of message produced it.
+        "kind": entry.get("kind", ""),
+        "ids": _stored_list(entry.get("ids")),
+        "cves": _stored_list(entry.get("cves")),
+        "kev_only": _stored_list(entry.get("kev_only")),
+        "products": _stored_list(entry.get("products")),
+        "levels": dict(entry.get("levels") or {}),
+        "scores": dict(entry.get("scores") or {}),
+        "delivered_to": list(delivered_to),
+    }
+
+
+def _snapshot_id(snapshot: dict) -> str:
+    """A stable id for one delivery snapshot, so its collections are stored once rather than per identifier."""
+    material = json.dumps(snapshot, sort_keys=True, default=str)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def _delivered(
+    state: dict, entry: dict, now: int, outcome: str = "delivered", delivered_to: Sequence[str] = ()
+) -> None:
+    """Advance state for one message the gateway accepted, or (``outcome="dropped"``) the operator discarded.
+
+    ``delivered_to`` names the notifiers that accepted the message; ``deliver`` clears ``sent_to`` from the
+    entry before calling this, so the accepted ids are passed in rather than read back off it.
+
+    The snapshot is stored once under ``state["deliveries"]`` and each seen identifier points at it. Copying it
+    into every identifier's record would be quadratic: one accepted message can name thousands of identifiers,
+    each of which would then carry a copy of the full list.
+    """
     if entry["kind"] == "new":
-        for identifier in entry["ids"]:
-            state["seen"].setdefault(identifier, {"at": now, "outcome": outcome})
+        snapshot = _delivery_snapshot(entry, delivered_to)
+        fresh = [identifier for identifier in entry["ids"] if identifier not in state["seen"]]
+        if fresh:
+            deliveries = state.setdefault("deliveries", {})
+            snapshot_id = _snapshot_id(snapshot)
+            deliveries[snapshot_id] = snapshot
+            for identifier in fresh:
+                # The first record wins: an identifier keeps what was sent for it first, even when a later
+                # message about the same advisory is dropped or delivered again from another source.
+                state["seen"][identifier] = {"at": now, "outcome": outcome, "delivery": snapshot_id}
         kev_only = set(entry.get("kev_only") or ())
         for cve, level in entry["levels"].items() if outcome == "delivered" else ():
             # A message the operator dropped was never sent, so no later escalation may refer to it as sent.
@@ -2178,9 +2240,10 @@ def deliver(
                     persist()
             statuses.append(status)
         if all(200 <= status < 300 for status in statuses):
+            accepted = sorted(already)
             entry.pop("sent_to", None)
             state["pending"].remove(entry)
-            _delivered(state, entry, now)
+            _delivered(state, entry, now, delivered_to=accepted)
             LOG.info(
                 "delivered %s %s %s (HTTP %s): %s",
                 entry["tag"],
@@ -2237,6 +2300,15 @@ def _park(state: dict, entry: dict, status: int, now: int) -> bool:
     return True
 
 
+#: The fields a released message loses: they describe the failed attempts, not the advisory.
+PARKED_ATTEMPT_KEYS = ("attempts", "first_attempt_at", "parked_at")
+
+
+def _released(entry: dict) -> dict:
+    """A parked message as it goes back to the queue: no retry history, so the next pass starts fresh."""
+    return {key: value for key, value in entry.items() if key not in PARKED_ATTEMPT_KEYS}
+
+
 def manage_parked(state_path: Path, release: bool, now: int) -> int:
     """The operator's decision on the parked messages; sends nothing and needs no secret."""
     try:
@@ -2249,14 +2321,10 @@ def manage_parked(state_path: Path, release: bool, now: int) -> int:
         return 1
     parked = state.setdefault("parked", [])
     if release:
-        released = [
-            {key: value for key, value in entry.items() if key not in ("attempts", "first_attempt_at", "parked_at")}
-            for entry in parked
-        ]
-        state["pending"] = [*released, *state["pending"]]
+        state["pending"] = [*map(_released, parked), *state["pending"]]
     else:
         for entry in parked:
-            _delivered(state, entry, now, outcome="dropped")
+            _delivered(state, entry, now, outcome="dropped", delivered_to=entry.get("sent_to") or ())
     state["parked"] = []
     save_state(state_path, state)
     LOG.info(
@@ -2266,6 +2334,65 @@ def manage_parked(state_path: Path, release: bool, now: int) -> int:
         "; ".join(_audit_ids(entry) for entry in parked) or "none",
     )
     return 0
+
+
+def parked_token(entry: Mapping) -> str:
+    """A stable identity for one parked message, so an old row button cannot act on a different one.
+
+    The position alone is not enough: a page offers "Drop" for the row it rendered, and a release or a second
+    tap can move another message into that position before the form is submitted. The token covers the parts
+    of the entry an operator saw (its time, identifiers, title and link) and moves with it.
+    """
+    material = [entry.get("parked_at"), entry.get("ids"), entry.get("title"), entry.get("link")]
+    return hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+
+def manage_parked_entry(state_path: Path, index: int, release: bool, now: int, *, expected: str | None = None) -> bool:
+    """The operator's decision on one parked message, by its position in ``state["parked"]``.
+
+    The same effect as :func:`manage_parked` for one entry. False when the state cannot be read, that
+    position no longer exists, or ``expected`` names a different message: the page that offered the button
+    may be older than the queue, and a stale row must refuse rather than act on whatever message moved into
+    it. The caller holds the state lock, exactly as for the bulk action.
+    """
+    try:
+        state = load_state_document(state_path, STATE_SCHEMA, "advisory state")
+    except SourceError as exc:
+        LOG.error("%s", exc)
+        return False
+    if state is None:
+        LOG.error("no state file at %s; nothing is parked", state_path)
+        return False
+    parked = state.get("parked")
+    if not isinstance(parked, list) or not 0 <= index < len(parked):
+        LOG.warning("no parked message at position %d; the queue changed since the page was rendered", index)
+        return False
+    entry = parked[index]
+    # The shape is checked before the compare: ``compare_digest`` raises on non-ASCII input, and a token this
+    # page never produced cannot name the row.
+    if expected is not None and (
+        not re.fullmatch(r"[0-9a-f]{16}", expected) or not hmac.compare_digest(parked_token(entry), expected)
+    ):
+        LOG.warning(
+            "the message at parked position %d is not the one the page offered; the queue was not changed",
+            index,
+        )
+        return False
+    parked.pop(index)
+    if release:
+        state["pending"] = [_released(entry), *state["pending"]]
+    else:
+        # A partial delivery may already have been accepted by one notifier: the record keeps that fact even
+        # though no escalation state may advance for a dropped message.
+        _delivered(state, entry, now, outcome="dropped", delivered_to=entry.get("sent_to") or ())
+    save_state(state_path, state)
+    LOG.info(
+        "%s parked message at position %d: %s",
+        "released" if release else "dropped",
+        index,
+        _audit_ids(entry),
+    )
+    return True
 
 
 def _audit_ids(entry: dict) -> str:

@@ -181,7 +181,7 @@ def load_document(path: Path, *, settings: dict | None = None) -> dict:
 
 
 def _merge_settings(document: dict, settings: dict) -> None:
-    """Overlay the four writable keys onto the raw YAML document, in place."""
+    """Overlay the six writable keys onto the raw YAML document, in place."""
     from .settings import validate_settings  # lazy: settings.py imports ConfigError from this module
 
     validate_settings(settings)
@@ -207,6 +207,12 @@ def _merge_settings(document: dict, settings: dict) -> None:
         document["poll_interval"] = settings["poll_interval"]
     if "hidden_source_hosts" in settings:
         document["hidden_source_hosts"] = settings["hidden_source_hosts"]
+    if "routes" in settings:
+        # A full replacement, like the notifier list: the rules are edited as one ordered block, and the
+        # merged validator then judges their shape and whether every id names an enabled notifier.
+        document["routes"] = settings["routes"]
+    if "default" in settings:
+        document["default"] = settings["default"]
 
 
 def _merge_sources(raw: object, overlay: dict) -> object:
@@ -290,7 +296,13 @@ def _routing(document: dict, notifiers: list[dict], *, strict: bool = True) -> t
             }
         )
     raw_default = document.get("default")
-    default = () if raw_default is None else _notifier_selection(raw_default, "default", enabled_ids, strict=strict)
+    # An empty list says "no default" (the fallback is every enabled notifier), which an overlay uses to clear
+    # a default it inherited from the YAML; only a non-empty selection needs ids checked.
+    default = (
+        ()
+        if raw_default is None or raw_default == []
+        else _notifier_selection(raw_default, "default", enabled_ids, strict=strict)
+    )
     return tuple(routes), default
 
 

@@ -42,6 +42,39 @@ operator action, and the release workflow then builds and pushes the image to
   are configured. A selection that names no enabled notifier fails the pass rather than
   silencing the message, and a delivery retry re-sends only to the channels that have not
   accepted it yet.
+- `/alerts` filters by severity tag, recorded source, outcome, a text search over the
+  identifier and title, and an inclusive UTC day range (`since`/`until`). Every filter is in
+  the URL, so a reload or a shared link keeps it, and the list pages with a keyset cursor
+  (50 rows, newest first by time then identifier) instead of the fixed 200-row cap. `/runs`
+  filters by exit code and the same day range; it has no pager because the state keeps only
+  the last 200 passes, and the page says so.
+- A delivery record on a seen advisory: a delivered `new` message also stores its tag,
+  source heading, title, link, kind, per-CVE levels and CVSS scores, and the notifier ids
+  that accepted it, the identifiers and CVEs, KEV-only CVEs and the matched watchlist
+  products (never the message body). The first record for an identifier is kept.
+  The snapshot is stored once per message under `deliveries` and each identifier's
+  record points at it, so a message naming thousands of identifiers does not store
+  thousands of copies of its own lists. The first record for an identifier is kept.
+- `/advisories/<identifier>` shows what the state holds for one advisory, looked up in the
+  seen record, then a pending message, then a parked one: tag, source, title, per-CVE levels
+  and scores, KEV-only CVEs, accepted or already-sent notifiers, attempt count and timestamps.
+  Records written by an older version say their details were not recorded; unknown
+  identifiers are a 404 page. The page never renders the message body: a delivered record
+  does not retain it, while a pending or parked entry still carries its body in the queue
+  until it leaves.
+- Per-entry release and drop on `/parked` (`POST /parked/<index>/release` and
+  `/parked/<index>/drop`), CSRF-protected, with each form carrying a row token: a stale row
+  is refused with `404`, a missing or malformed token with `400`, and a pass holding the
+  state lock with `409`. The bulk actions stay, and dropping a partially delivered message
+  keeps the channel that had already accepted it.
+- The routing `routes`/`default` block is editable on `/config`, with three fixed rule rows
+  plus a default selection, the same fingerprint/stale-form refusal and validate-and-build
+  path as the other forms. An empty form keeps the YAML's rules; a partly filled row is saved
+  as written and the merged validator reports what is wrong.
+- `scripts/capture_screenshots.py`: an opt-in script that builds demo config and state in a
+  temporary directory, serves the app on loopback, signs in through the real login form with
+  Playwright and writes the five README screenshots at 1024 px wide, cropped to the page.
+  Playwright is not a project dependency, and no CI job runs it.
 
 ### Fixed
 - An automerge left its head branch behind: the repository's *automatically delete head branches*

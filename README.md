@@ -5,9 +5,9 @@ Self-hostable security advisory watcher. Point it at the sources you care about
 enrich every finding with CVE.org / NVD CVSS, EPSS, CISA KEV and OSV, decide a
 severity per CVE, and deliver one deduplicated alert per new advisory to the
 channels you configure (Discord, Matrix, ntfy, Gotify, Apprise, generic webhook,
-SMTP). A built-in web UI shows alerts, sources, notifiers, the parked queue and
-run history. One container, one process, JSON state on a volume, YAML + environment
-configuration.
+SMTP). A built-in web UI shows a filterable alert history, a page per advisory,
+the parked queue, sources, notifiers and run history. One container, one process,
+JSON state on a volume, YAML + environment configuration.
 
 ## Quickstart
 
@@ -20,7 +20,8 @@ docker compose up -d
 ```
 
 Then open http://localhost:8080 (sign in with `ADVISORY_RADAR_AUTH_TOKEN`) for the
-dashboard, alert history, parked queue, run log and config overview. `/healthz`
+dashboard, alert history and its filters, a page per advisory, the parked queue, run log
+and config overview. `/healthz`
 and `/metrics` (Prometheus text) are unauthenticated for probes and scrapers.
 Configuration lives in `config/` on the mounted volume (see `examples/config.yml`);
 secrets come from environment variables or a `${NAME_FILE}` reference to a file, never
@@ -83,17 +84,46 @@ routes:
 default: [discord-security]
 ```
 
-With no `routes` block at all — or an empty list — nothing changes: every message goes to
-every enabled notifier. So does a message that matches no rule when no `default` is set
+The form refuses a default selection with no rule at all (with no rules every enabled
+notifier receives every message). With no `routes` block at all — or an empty list —
+nothing changes: every message goes to every enabled notifier. So does a message that matches no rule when no `default` is set
 (`default` applies while at least one route is configured). A route that leaves a message
 with no notifier is a **failed pass**, not silence: delivery logs the error and the message
 stays queued until the configuration is fixed.
 
+The same rules are editable on `/config`: three fixed rows (a source id, a severity tag, a
+product id, an ids pattern and the notifiers to send to) plus a default selection. Saving
+replaces the whole block in the overlay, so a form with every row empty keeps the YAML's
+rules; a partly filled row is saved as written and the validator reports what is wrong. The
+notifier membership is judged once, after the merge, so a rule may select a notifier the
+overlay itself adds.
+
+### Advisories, filters and the queue
+
+`/alerts` filters the seen advisories by severity tag, recorded source, outcome, a
+case-insensitive text search (identifier and title) and an inclusive UTC day range. Every
+filter lives in the URL query string, so a reload or a shared link keeps it. The list is
+paged with a keyset cursor (50 rows, newest first by time then identifier) instead of a
+fixed cap, and each row links to the advisory's page (the identifier is encoded in the path,
+so a stored GUID or URL containing slashes still opens). `/advisories/<id>` shows the stored
+classification — tag, source, title, the identifiers and CVEs, whether any was KEV-only,
+the watchlist products the item matched, the per-CVE levels and CVSS, and the notifiers
+that accepted the message — for a delivered message, a pending one or a parked one. It never
+renders the message body: a delivered record does not retain it, and a pending or parked
+queue entry still carries its own body only until it leaves the queue. The record is stored
+once per delivered message and each identifier points at it, so an advisory that names
+thousands of identifiers does not multiply it. A record written by an older version says its
+details were not recorded instead of inventing them. `/parked` releases or drops a
+single message per row while keeping the bulk actions, and `/runs` filters by exit code and
+day; the writer keeps only the last 200 passes, so that page states the cap rather than
+paging.
+
 ### Settings without a restart
 
-The `/config` page changes four things without editing the YAML or restarting the
-container: `notifiers`, each source's `enabled` flag and `tag`, `poll_interval`, and
-`hidden_source_hosts`. The notifier form manages the whole list — that is how a channel
+The `/config` page changes six things without editing the YAML or restarting the
+container: `notifiers`, each source's `enabled` flag and `tag`, `poll_interval`,
+`hidden_source_hosts`, and the routing `routes`/`default` block. The notifier form manages
+the whole list — that is how a channel
 is added, edited or disabled — and while the overlay holds a notifier list, that list
 replaces the YAML's membership and ordinary fields; only a notifier's `headers` stay in
 the YAML and are carried over by id, because the overlay may not store a mapping that can
@@ -148,24 +178,33 @@ turns critical, and never re-sends what you already received.
 - Enrichment plugins: CVE.org, NVD, FIRST EPSS, CISA KEV, OSV, Debian security tracker
 - Notifier plugins: Discord webhook, Matrix (Hookshot), ntfy, Gotify, Apprise, generic webhook, SMTP
 - Severity decision per CVE with re-evaluation window and one escalation per level
+- Filterable `/alerts` and `/runs` lists with their state in the URL, keyset pagination for
+  the alert history, and a per-advisory page (`/advisories/<id>`) showing the stored
+  classification and delivery record
 - Web UI + REST API, in-process scheduler (default every 15 min), atomic JSON state on a volume
+- Per-entry release/drop on the parked queue, next to the bulk actions; `routes`/`default`
+  editable on `/config` with the other settings
 - Docker and Podman deployment (compose file + quadlet/kube YAML), `/healthz` and `/metrics`
 - Secrets via environment / `${NAME_FILE}` references only; redaction filter on logs; fail-closed source errors
 
 ## Screenshots
 
 The UI is server-rendered: there is no JavaScript build step. These are from a
-local run with demo data, so the advisories in them are not real findings.
+local run with demo data, so the advisories in them are not real findings. The set is
+reproducible: `uv run --with playwright python scripts/capture_screenshots.py` builds the
+demo config and state in a temporary directory, serves the app on loopback and writes the
+five PNGs (Playwright is opt-in and not a project dependency; see
+`docs/deployment.md`).
 
 ![Dashboard: pending, parked and recently seen counts with the last pass result](docs/screenshots/dashboard.png)
 
 | Alerts | Configuration |
 |---|---|
-| ![Alert history: advisory id, outcome and UTC first-seen time](docs/screenshots/alerts.png) | ![Configuration: sources, notifiers and the poll interval](docs/screenshots/config.png) |
+| ![Alert history: URL filters for tag, source, outcome, text and date, with the advisory rows linked to their detail page](docs/screenshots/alerts.png) | ![Configuration: sources, notifiers, routes, the poll interval and the settings overlay status](docs/screenshots/config.png) |
 
 | Parked messages | Runs |
 |---|---|
-| ![Parked queue: severity, title and advisory ids, with bulk release and drop actions](docs/screenshots/parked.png) | ![Run history: sent, parked, pending and exit code per pass](docs/screenshots/runs.png) |
+| ![Parked queue: severity, title and advisory ids, with per-entry release and drop plus the bulk actions](docs/screenshots/parked.png) | ![Run history: sent, parked, pending and exit code per pass, filtered by exit code and day](docs/screenshots/runs.png) |
 
 ## Sources
 
