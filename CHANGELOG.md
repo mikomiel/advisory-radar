@@ -27,9 +27,10 @@ operator action, and the release workflow then builds and pushes the image to
   `${NAME}`/`${NAME_FILE}` reference, a source edit is `enabled`/`tag` only, and `headers`
   may not be written — so no credential reaches the file.
 - Hot reload: a saved overlay, `POST /reload` and `SIGHUP` rebuild the plugins off to the
-  side and swap them under the state lock, and the scheduler reads the configuration per
-  pass. A refused overlay keeps the running configuration, and pending and parked
-  messages are untouched.
+  side and swap them under the state lock; the scheduler reads the configuration per pass,
+  and the wait between passes restarts on a reload so a shorter `poll_interval` takes
+  effect without sleeping out the old one. A refused overlay keeps the running
+  configuration, and pending and parked messages are untouched.
 - `/config` edits those settings with plain forms (poll interval, hidden hosts, sources,
   notifiers) and shows which saved overlay revision is live. Each form carries a fingerprint
   of the configuration it was rendered from, so a stale tab — after another save, a YAML

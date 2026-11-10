@@ -120,7 +120,9 @@ is refused: a save shows the configuration error and writes nothing, the *Reload
 configuration* button shows the refusal, `kill -HUP <pid>` logs its reason, and either
 way the running configuration stays. A pass holds the state lock for its whole transaction, so a reload waits
 for it (`SIGHUP`) or answers `409` (the UI), and a pass that already started finishes
-with the configuration it started with. Each settings form carries a fingerprint of the
+with the configuration it started with; the wait between passes follows the live interval,
+so a shortened `poll_interval` does not sleep out the old one. Each settings form carries a
+fingerprint of the
 configuration it was rendered from, so a save from a page that has not seen a newer
 configuration — another save, a YAML edit, or an overlay deleted and recreated — is
 refused (`409`) rather than overwriting it. The notifier form rewrites the whole list, so
