@@ -15,6 +15,8 @@ from pathlib import Path
 
 import yaml
 
+from .catalogue import SOURCE_SPECS
+
 _ENV_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?:_FILE)?\}")
 
 
@@ -74,10 +76,14 @@ class Config:
     secret_values: tuple[str, ...] = ()
 
 
-#: Every key a built-in source or notifier builder reads. A key the builder needs but this set rejects is an
-#: integration nobody can configure, so the two are kept together and `tests/test_integrations.py` loads one
-#: complete YAML per built-in through ``load_config`` and ``build_plugins``.
-_SOURCE_KEYS = {"id", "type", "url", "token", "user", "api_key", "tag", "enabled"}
+#: The keys a source entry may carry: the structural ones plus every key the catalogue documents for a
+#: built-in. A key a builder needs but this set rejects is an integration nobody can configure, so the
+#: allowlist is derived rather than repeated; ``tests/test_catalogue.py`` pins it to the registry and
+#: ``tests/test_integrations.py`` loads one complete YAML per built-in through ``load_config`` and
+#: ``build_plugins``.
+_SOURCE_KEYS = {"id", "type", "enabled"} | {
+    key for spec in SOURCE_SPECS.values() for key in (*spec.required, *spec.optional)
+}
 _NOTIFIER_KEYS = {
     "id",
     "type",

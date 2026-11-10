@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 
 from . import feeds
+from .catalogue import SOURCE_SPECS
 from .core import Item, _host, dsa_id, extract_ids
 from .http import Http, parse_json
 from .plugins import Source, SourceWindow
@@ -241,7 +242,10 @@ def webhook_item_from_payload(payload: object) -> dict | None:
 
 
 #: Config ``type`` -> builder(config dict, env) -> Source. Secret fields are
-#: ``${VAR}`` placeholders resolved by config.load_config at load time.
+#: ``${VAR}`` placeholders resolved by config.load_config at load time. The
+#: catalogue (``catalogue.py``) owns every other fact about a kind -- summary,
+#: keys, example and docs anchor -- and is re-exported here for callers that
+#: already import this module.
 SOURCE_BUILDERS = {
     "rss": lambda cfg, env: RssSource(cfg["id"], cfg["url"]),
     "freshrss": lambda cfg, env: FreshRssSource(cfg["id"], cfg["url"], cfg["token"], cfg.get("user", "admin")),
@@ -263,6 +267,7 @@ __all__ = [
     "FreshRssSource",
     "RssSource",
     "SOURCE_BUILDERS",
+    "SOURCE_SPECS",
     "WebhookSource",
     "build_source",
     "webhook_item_from_payload",
