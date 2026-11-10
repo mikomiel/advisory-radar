@@ -109,7 +109,9 @@ quadlet). It is created with mode `0600`, owned by the container user, and repla
 atomically (a temporary file in the same directory, `fsync`, `os.replace`), so a
 half-written file cannot brick a start. `/config` stays read-only: the overlay holds
 only four keys — `notifiers`, per-source `enabled`/`tag`, `poll_interval` and
-`hidden_source_hosts` — and the YAML owns everything else.
+`hidden_source_hosts` — and the YAML owns everything else. While the overlay holds a
+`notifiers` list it replaces the YAML's, so a notifier added to the YAML later is not
+used until that section is removed from the overlay.
 
 The overlay is optional; without it the YAML is the whole configuration. An invalid one
 is refused: a save shows the configuration error and writes nothing, and a reload — the

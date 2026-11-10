@@ -57,11 +57,13 @@ ones you do not run. Package patterns filter Debian DSA titles.
 ### Settings without a restart
 
 The `/config` page changes four things without editing the YAML or restarting the
-container: `notifiers` (the whole list, which is how a channel is added, edited or
-disabled), each source's `enabled` flag and `tag`, `poll_interval`, and
-`hidden_source_hosts`. A save writes `settings.json` next to the state file (on the
-`/data` volume) and applies it as soon as the state lock is free; the page shows which
-saved revision is live. `SIGHUP` reloads the same overlay for a configuration edited by
+container: `notifiers`, each source's `enabled` flag and `tag`, `poll_interval`, and
+`hidden_source_hosts`. The notifier form manages the whole list — that is how a channel
+is added, edited or disabled — and while the overlay holds a notifier list, that list is
+the notifier list: the YAML's `notifiers` is not used until that section is removed from
+the overlay. A save writes `settings.json` next to the state file (on the `/data`
+volume) and applies immediately when the state lock is free; if a pass holds the lock, the
+page says the revision is not live yet, and Reload applies it when the pass finishes. `SIGHUP` reloads the same overlay for a configuration edited by
 hand. Every other setting stays in `config/config.yml` and still needs a restart.
 
 Secrets stay in the environment. The overlay stores a notifier's `url`, `key`,
