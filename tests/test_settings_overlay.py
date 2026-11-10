@@ -588,6 +588,28 @@ def test_a_pass_queued_before_a_reload_keeps_its_redaction(tmp_path, caplog):
     assert old_only not in caplog.text, "the old snapshot's secrets are still filtered after the swap"
 
 
+def test_a_queued_pass_with_an_overlapping_secret_stays_redacted(tmp_path, caplog):
+    # The old value is a prefix of the new one. Two filters applied in sequence would let the old one replace
+    # "feed" and leave "_private_value" for the new filter to miss; one cumulative filter, longest first,
+    # redacts the whole value.
+    path = write_config(
+        tmp_path,
+        {"sources": [{"id": "${OLD_ID}", "type": "rss", "url": "https://feeds.example.net/x"}]},
+    )
+    # the same process environment serves both configurations; only the references differ
+    runtime = Runtime.build(path, {"OLD_ID": "feed", "NEW_ID": "feed_private_value"})
+    write_config(
+        tmp_path,
+        {"sources": [{"id": "${NEW_ID}", "type": "rss", "url": "https://feeds.example.net/y"}]},
+    )
+    save_overlay(tmp_path, {"poll_interval": "30s"})
+    runtime.reload(blocking=False)
+    with caplog.at_level(logging.ERROR, logger="advisory_radar"):
+        LOG.error("source %s failed", "feed_private_value")  # the queued pass, running after the swap
+    assert "private_value" not in caplog.text, "a short old secret must not hide the tail of a new one"
+    assert "[redacted]" in caplog.text
+
+
 def test_sighup_reloads_the_running_process(tmp_path, monkeypatch):
     path = write_config(tmp_path, {})
     runtime = Runtime.build(path, {})
