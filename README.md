@@ -103,6 +103,15 @@ the review itself, published as a status:
 - A review is *about one commit*. A push after the review leaves the new head with no
   `review` status, so the merge button goes back to blocked. That is the intended
   behaviour, not an outage.
+- **A review is acted on at once, not at the next sweep.** `pull_request_review` cannot run the
+  gate itself: like `pull_request`, it would execute the head's copy of the workflow that declares
+  it. So a no-op workflow, `review-signal`, listens for `submitted` and `dismissed` — no checkout,
+  no secret, `permissions: {}`, one line of output — and its completion is the signal the default
+  branch acts on. `review-signal` starts `review-gate`, which republishes the status, and
+  `review-gate`'s completion starts `automerge`, so an approval turns the status and merges the
+  pull request within minutes. The `*/5` and `*/30` schedules remain only as a backstop: GitHub
+  runs fixed crons late, and an approval that arrives after `ci` has finished would otherwise wait
+  hours for one.
 - **Dependency updates are exempt from the App review, and nothing else is.** A pull
   request opened by Dependabot (`dependabot[bot]`) gets `review: success` with the reason
   in the description, and only while *every* path the immutable `base...head` comparison
