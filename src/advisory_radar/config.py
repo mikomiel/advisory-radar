@@ -236,10 +236,17 @@ def load_config(
     return config_from_document(load_document(path, settings=settings), path, env, lenient=lenient)
 
 
-def _notifier_selection(value: object, where: str, enabled_ids: list[str]) -> tuple[str, ...]:
-    """A non-empty list of ids that all name an enabled notifier in this same configuration."""
+def _notifier_selection(value: object, where: str, enabled_ids: list[str], *, strict: bool = True) -> tuple[str, ...]:
+    """A non-empty list of ids that all name an enabled notifier in this same configuration.
+
+    ``strict=False`` is the state-only load (``release-parked``/``drop-parked``): it reads the YAML without the
+    settings overlay, and a route may name a notifier the overlay adds. Recovery needs the state path, not a
+    delivery target, so the shape is still checked and the membership is not.
+    """
     valid = isinstance(value, list) and all(isinstance(identifier, str) and identifier for identifier in value)
     _require(valid and bool(value), f"{where} must be a non-empty list of notifier ids")
+    if not strict:
+        return tuple(value)
     known = set(enabled_ids)
     # A selection value can be a ${...} reference that expanded to a credential (someone wrote
     # ``default: ["${DISCORD_WEBHOOK_URL}"]``), and this message is logged before any redaction exists. Name the
@@ -251,7 +258,7 @@ def _notifier_selection(value: object, where: str, enabled_ids: list[str]) -> tu
     return tuple(value)
 
 
-def _routing(document: dict, notifiers: list[dict]) -> tuple[tuple[dict, ...], tuple[str, ...]]:
+def _routing(document: dict, notifiers: list[dict], *, strict: bool = True) -> tuple[tuple[dict, ...], tuple[str, ...]]:
     """Validate ``routes``/``default`` after expansion, when a notifier id is the final value in use.
 
     Called by the one validator with the expanded, enabled-only notifier list: an id that is not configured
@@ -277,11 +284,13 @@ def _routing(document: dict, notifiers: list[dict]) -> tuple[tuple[dict, ...], t
         routes.append(
             {
                 "match": dict(match),
-                "notifiers": _notifier_selection(route.get("notifiers"), f"{where}: notifiers", enabled_ids),
+                "notifiers": _notifier_selection(
+                    route.get("notifiers"), f"{where}: notifiers", enabled_ids, strict=strict
+                ),
             }
         )
     raw_default = document.get("default")
-    default = () if raw_default is None else _notifier_selection(raw_default, "default", enabled_ids)
+    default = () if raw_default is None else _notifier_selection(raw_default, "default", enabled_ids, strict=strict)
     return tuple(routes), default
 
 
@@ -340,7 +349,7 @@ def config_from_document(
     )
     # Routing is validated here, after expansion and after the disabled entries were dropped, so a route names
     # a notifier that will actually be built. An absent or empty block keeps the pre-routing behaviour.
-    routes, default_notifiers = _routing(document, notifiers)
+    routes, default_notifiers = _routing(document, notifiers, strict=not lenient)
 
     poll = document.get("poll_interval", "15m")
     match = re.fullmatch(r"(\d+)([smh])", str(poll))

@@ -69,7 +69,10 @@ wins**, so the most specific rule goes first. A rule matches on one or more of:
 
 Every key present in one rule must match. `notifiers` names the enabled channels the
 message goes to, and `default` is used when no rule matches. Every id must name an
-**enabled** notifier, or the configuration is refused when it loads.
+**enabled** notifier in the effective configuration — one the settings overlay adds counts,
+one it disables does not — or the configuration is refused when it loads. The `release-parked`
+and `drop-parked` recovery commands read the YAML alone and do not enforce that membership:
+they need the state path, not a delivery target.
 
 ```yaml
 routes:

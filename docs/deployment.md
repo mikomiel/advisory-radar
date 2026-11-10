@@ -148,9 +148,11 @@ Two upstreams reward configuration rather than credentials:
 ### Routing
 
 Notification routing lives in `config.yml`, not in the settings overlay: an ordered `routes` list plus an
-optional `default`, each naming notifier ids. Every id must name an enabled notifier in the same file, or the
-configuration is refused when it loads, and with no `routes` block every message still goes to every enabled
-notifier. Delivery records on the message which channels already accepted it, so when one routed channel fails
+optional `default`, each naming notifier ids. Every id must name an enabled notifier in the effective merged
+configuration (a notifier the overlay adds counts, one it disables does not), or the configuration is refused
+when it loads; `release-parked` and `drop-parked` read the YAML alone and do not enforce that membership, so a
+route to an overlay-only channel cannot block queue recovery. With no `routes` block every message still goes
+to every enabled notifier. Delivery records on the message which channels already accepted it, so when one routed channel fails
 a retry re-sends the message only to the channels that have not had it — the failed channel is retried, the
 others are not repeated. The README's [Routing](../README.md#routing) section lists the match keys and an
 example.

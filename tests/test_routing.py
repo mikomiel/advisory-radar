@@ -136,7 +136,14 @@ def write_config(tmp_path: Path, extra: str = "") -> Path:
     return path
 
 
-def test_a_secret_in_a_route_selection_is_never_echoed(tmp_path, caplog):
+@pytest.mark.parametrize(
+    "block",
+    [
+        'routes:\n  - match: {tag: critical}\n    notifiers: ["${HOOK}"]\n',
+        'default: ["${HOOK}"]\n',
+    ],
+)
+def test_a_secret_in_a_selection_is_never_echoed(tmp_path, caplog, block):
     # A selection value can be a reference that expanded to a credential. The configuration error and the CLI
     # log both happen before any redaction filter exists, so neither may contain the value.
     import logging
@@ -144,14 +151,7 @@ def test_a_secret_in_a_route_selection_is_never_echoed(tmp_path, caplog):
     from advisory_radar import cli
 
     secret = "https://hooks.example.net/SUPERSECRET-SELECTION"
-    path = write_config(
-        tmp_path,
-        "  - id: hook\n    type: webhook\n    url: ${HOOK}\n"
-        "routes:\n"
-        "  - match: {tag: critical}\n"
-        '    notifiers: ["${HOOK}"]\n'
-        'default: ["${HOOK}"]\n',
-    )
+    path = write_config(tmp_path, "  - id: hook\n    type: webhook\n    url: ${HOOK}\n" + block)
     environment = {"HOOK": secret}
     with pytest.raises(ConfigError) as caught:
         load_config(path, environment)
@@ -161,6 +161,28 @@ def test_a_secret_in_a_route_selection_is_never_echoed(tmp_path, caplog):
         assert cli.main(["--config", str(path), "once"], env=environment) == 1
     assert secret not in caplog.text
     assert "not an enabled notifier" in caplog.text
+
+
+def test_a_route_to_an_overlay_added_notifier_does_not_block_state_recovery(tmp_path):
+    from advisory_radar import cli
+
+    path = write_config(
+        tmp_path,
+        f"  - id: hook\n    type: webhook\n    url: https://hooks.example.com/h\n"
+        "routes:\n"
+        "  - match: {tag: critical}\n"
+        "    notifiers: [ops]\n"
+        f"state_path: {tmp_path}/state.json\n",
+    )
+    overlay = {"notifiers": [{"id": "ops", "type": "webhook", "url": "${OPS_HOOK}"}]}
+    # The merged configuration is what startup and reload validate, so the overlay-only id is accepted.
+    merged = load_config(path, {"OPS_HOOK": "https://hooks.example.com/o"}, settings=overlay)
+    assert merged.routes[0]["notifiers"] == ("ops",)
+    # The state-only recovery commands read the YAML without the overlay: they still load, because recovery
+    # needs the state path and not a delivery target.
+    assert load_config(path, {}, lenient=True).routes[0]["notifiers"] == ("ops",)
+    assert cli.main(["--config", str(path), "release-parked"], env={}) in {0, 1}
+    assert cli.main(["--config", str(path), "drop-parked"], env={}) in {0, 1}
 
 
 def test_a_valid_block_loads_into_the_config(tmp_path):
