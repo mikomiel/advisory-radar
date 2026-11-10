@@ -8,6 +8,11 @@ operator action, and the release workflow then builds and pushes the image to
 ## [Unreleased]
 
 ### Fixed
+- An automerge left its head branch behind: a merge made through the API does not honour the
+  repository's *automatically delete head branches* setting, so the branch of an automerged pull
+  request survived with the setting on. The workflow now deletes the merged head ref itself — only
+  for a same-repository head whose name passes a conservative check, and a branch that stays is a
+  warning, never a failed run after the merge.
 - The web UI printed stored timestamps as raw epoch seconds (`1792600000`). The dashboard,
   `/alerts` and `/runs` render a UTC `YYYY-MM-DD HH:MM` instead. A state value that is not a
   usable timestamp is blank in the tables (the dashboard's last pass says `never`) rather than

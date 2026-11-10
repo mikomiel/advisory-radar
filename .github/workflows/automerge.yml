@@ -38,7 +38,7 @@ on:
     - cron: "*/30 * * * *"   # sweep: pick up approvals
 
 permissions:
-  contents: write        # merge + GitHub's own branch delete
+  contents: write        # merge, and delete the head branch the merge leaves behind
   pull-requests: write   # merge, read reviews
   checks: read
   statuses: read         # legacy commit-status contexts are invisible without this
@@ -98,7 +98,7 @@ jobs:
 
           for pr in "${candidates[@]}"; do
             meta=$(gh pr view "$pr" --repo "$REPO" \
-              --json headRefOid,baseRefOid,mergeable,reviews,statusCheckRollup,changedFiles)
+              --json headRefOid,baseRefOid,mergeable,reviews,statusCheckRollup,changedFiles,headRefName,isCrossRepository)
 
             head=$(jq -r '.headRefOid' <<<"$meta")
             mergeable=$(jq -r '.mergeable' <<<"$meta")
@@ -179,6 +179,22 @@ jobs:
             # instead of merging a commit the reviewer never saw.
             if gh pr merge "$pr" --repo "$REPO" --squash --match-head-commit "$head"; then
               echo "merged #$pr at $head (approval by $REVIEWER_LOGIN)"
+              # The repository setting delete_branch_on_merge does not cover a merge made through this API: the
+              # branch of an automerged pull request survived with the setting on, so the head ref is deleted
+              # here. A pull request from a fork keeps its branch in another repository, and its headRefName may
+              # name an unrelated branch of this one, so only a same-repository head is touched, and only after
+              # the name passes a conservative check. The delete is best-effort: the merge already happened, and
+              # a branch that stays is reported rather than failing the run that merged.
+              branch=$(jq -r '.headRefName' <<<"$meta")
+              if [ "$(jq -r '.isCrossRepository' <<<"$meta")" != "false" ]; then
+                echo "merged #$pr from another repository; its head branch is not ours to delete"
+              elif ! [[ "$branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || [[ "$branch" == *..* ]] || [[ "$branch" == *//* ]]; then
+                echo "::warning::merged #$pr; refusing to delete the head branch name it reports"
+              elif gh api -X DELETE "repos/$REPO/git/refs/heads/$branch" >/dev/null; then
+                echo "deleted head branch $branch"
+              else
+                echo "::warning::merged #$pr but the head branch $branch could not be deleted"
+              fi
               gh pr comment "$pr" --repo "$REPO" \
                 --body "Merged by automerge: $REQUIRED_CHECK green and approved at \`$head\` by $REVIEWER_LOGIN." || true
             else

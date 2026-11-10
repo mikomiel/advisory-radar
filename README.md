@@ -185,8 +185,11 @@ approved them".
 
 `.github/workflows/automerge.yml` does the merging itself: an approved pull request whose
 checks are green is squash-merged (with `--match-head-commit`, so a head that moved is
-refused) when `ci` finishes, when `review-gate` finishes, or on a 30-minute sweep. Branch
-deletion follows the repository's *automatically delete head branches* setting.
+refused) when `ci` finishes, when `review-gate` finishes, or on a 30-minute sweep. It also
+deletes the head branch: the *automatically delete head branches* setting does not cover a merge
+made through the API, so the workflow removes the merged ref itself — only for a same-repository
+head whose name passes a conservative check, and a branch that stays is a warning, not a failed
+run after the merge.
 
 The workflow only runs from the default branch — `workflow_run` and `schedule`,
 never `pull_request*` and not `workflow_dispatch` (a dispatcher can pick another
