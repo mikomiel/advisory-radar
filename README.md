@@ -108,8 +108,10 @@ the review itself, published as a status:
   it. So a no-op workflow, `review-signal`, listens for `submitted` and `dismissed` — no checkout,
   no secret, `permissions: {}` as committed, one line of output — and its completion is the signal
   the default branch acts on. `review-signal` starts `review-gate`, which republishes the status, and
-  `review-gate`'s completion starts `automerge`, so an approval turns the status and merges the
-  pull request within minutes. The `*/5` and `*/30` schedules remain only as a backstop: GitHub
+  `review-gate`'s completion starts `automerge`, which asks for a fresh merge attempt. For an
+  otherwise eligible pull request — approval at the exact head, checks green, no sensitive path — the
+  expected merge latency is minutes, not a guarantee: anything under `scripts/`, `tests/` or
+  `.github/` is for a person either way. The `*/5` and `*/30` schedules remain only as a backstop: GitHub
   runs fixed crons late, and an approval that arrives after `ci` has finished would otherwise wait
   hours for one.
 - **Dependency updates are exempt from the App review, and nothing else is.** A pull
