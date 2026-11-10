@@ -71,8 +71,9 @@ exceeding a few poll intervals.
 ## Configuration
 
 One YAML file (`/config/config.yml`, see `examples/config.yml`). Secrets are
-`${VAR}` placeholders resolved from the environment at startup; `${VAR}_FILE`
-reads the value from a file (Docker secrets / Podman secrets pattern). The
+`${VAR}` placeholders resolved from the environment at startup; `${VAR_FILE}`
+reads the value from the file named by the `VAR_FILE` environment variable (Docker
+secrets / Podman secrets pattern). The
 container needs:
 
 | Env var | Purpose |
@@ -120,7 +121,9 @@ configuration. A pass holds the state lock for its whole transaction, so a reloa
 for it (`SIGHUP`) or answers `409` (the UI), and a pass that already started finishes
 with the configuration it started with. Pending and parked messages are not touched by a
 reload. Changing an environment variable that a `${NAME}` reference reads still needs a
-restart.
+restart. A reload applies the overlay only, so moving `state_path` (a YAML key) still
+needs a restart, and the overlay itself is capped at 64 KiB: a value that would make the
+file larger is refused instead of written.
 
 Two upstreams reward configuration rather than credentials:
 

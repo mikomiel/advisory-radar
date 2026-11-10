@@ -22,7 +22,7 @@ operator action, and the release workflow then builds and pushes the image to
   validation: `notifiers` (a full replacement, so a channel can be added, edited or
   disabled), per-source `enabled`/`tag`, `poll_interval` and `hidden_source_hosts`. A bad
   value fails with the same `ConfigError` the YAML gives; secret-bearing notifier keys are
-  only `${NAME}`/`${NAME}_FILE` references and `headers` is not writable, so no credential
+  only `${NAME}`/`${NAME_FILE}` references and `headers` is not writable, so no credential
   reaches the file.
 - Hot reload: a saved overlay, `POST /reload` and `SIGHUP` rebuild the plugins off to the
   side and swap them under the state lock, and the scheduler reads the configuration per

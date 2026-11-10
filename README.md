@@ -23,8 +23,8 @@ Then open http://localhost:8080 (sign in with `ADVISORY_RADAR_AUTH_TOKEN`) for t
 dashboard, alert history, parked queue, run log and config overview. `/healthz`
 and `/metrics` (Prometheus text) are unauthenticated for probes and scrapers.
 Configuration lives in `config/` on the mounted volume (see `examples/config.yml`);
-secrets come from environment variables or `<NAME>_FILE` files, never from
-committed files.
+secrets come from environment variables or a `${NAME_FILE}` reference to a file, never
+from committed files.
 
 ```yaml
 # examples/config.yml (abridged)
@@ -67,14 +67,15 @@ page says the revision is not live yet, and Reload applies it when the pass fini
 hand. Every other setting stays in `config/config.yml` and still needs a restart.
 
 Secrets stay in the environment. The overlay stores a notifier's `url`, `key`,
-`password` or `token` only as a `${NAME}` or `${NAME}_FILE` reference, refuses a literal
+`password` or `token` only as a `${NAME}` or `${NAME_FILE}` reference, refuses a literal
 value, and does not accept `headers` at all. Changing an environment variable still
 needs a restart, because the process reads the environment when it starts.
 
 A reload builds the new configuration and its plugins before it swaps them in under the
 state lock. An invalid overlay is refused with the same error the YAML would give, and
 the running configuration stays; a pass that already started finishes with the
-configuration it started with, and the next pass uses the reloaded one.
+configuration it started with, and the next pass uses the reloaded one. A reload applies
+the overlay and nothing else, so moving `state_path` still needs a restart.
 
 ### Gap detection
 
@@ -100,7 +101,7 @@ turns critical, and never re-sends what you already received.
 - Severity decision per CVE with re-evaluation window and one escalation per level
 - Web UI + REST API, in-process scheduler (default every 15 min), atomic JSON state on a volume
 - Docker and Podman deployment (compose file + quadlet/kube YAML), `/healthz` and `/metrics`
-- Secrets via environment / `_FILE` only; redaction filter on logs; fail-closed source errors
+- Secrets via environment / `${NAME_FILE}` references only; redaction filter on logs; fail-closed source errors
 
 ## Screenshots
 

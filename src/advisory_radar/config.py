@@ -1,9 +1,10 @@
 """Configuration: one YAML file plus environment expansion, validated into dataclasses.
 
 Secrets are never written to the config file: a string ``${NAME}`` is replaced
-from the process environment, and ``${NAME}_FILE`` reads the secret from a
-file (Docker/Podman secrets pattern). Unknown keys are refused, so a typo
-fails at startup instead of silently doing nothing.
+from the process environment, and a ``${NAME_FILE}`` reference reads the secret from
+the file the ``NAME_FILE`` environment variable names (Docker/Podman secrets
+pattern). Unknown keys are refused, so a typo fails at startup instead of silently
+doing nothing.
 """
 
 from __future__ import annotations
@@ -73,7 +74,7 @@ class Config:
     raw: dict = field(default_factory=dict)
     #: ``${NAME}`` references read from the file *before* expansion, for log redaction.
     secret_names: tuple[str, ...] = ()
-    #: The values those references expanded to, including the contents of a ``${NAME}_FILE``.
+    #: The values those references expanded to, including the contents of a ``${NAME_FILE}``.
     secret_values: tuple[str, ...] = ()
 
 
