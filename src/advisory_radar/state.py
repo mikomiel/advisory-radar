@@ -48,14 +48,23 @@ def load_state_document(path: Path, schema: str, owner: str) -> dict | None:
     return expect_schema(document, schema, f"{owner} {path}")
 
 
-def save_state(path: Path, state: dict) -> None:
-    """Atomic replace, mode 0600: a crash mid-write leaves the previous state."""
+def serialize_json(document: dict) -> str:
+    """The exact text ``save_json`` writes, so a caller can size-check a document before replacing a file."""
+    return json.dumps(document, indent=2, sort_keys=True) + "\n"
+
+
+def save_json(path: Path, document: dict) -> None:
+    """Atomic replace, mode 0600: a crash mid-write leaves the previous document.
+
+    The one implementation behind both documents on the data volume: the state file and the settings
+    overlay must not have two half-correct writers.
+    """
+    payload = serialize_json(document)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=".state-", dir=path.parent)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.stem}-", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(state, stream, indent=2, sort_keys=True)
-            stream.write("\n")
+            stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, 0o600)
@@ -63,6 +72,11 @@ def save_state(path: Path, state: dict) -> None:
     except BaseException:
         Path(temporary).unlink(missing_ok=True)
         raise
+
+
+def save_state(path: Path, state: dict) -> None:
+    """Atomic replace, mode 0600: a crash mid-write leaves the previous state."""
+    save_json(path, state)
 
 
 class LockBusy(RuntimeError):

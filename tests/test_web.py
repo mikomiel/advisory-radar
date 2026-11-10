@@ -3,22 +3,45 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from advisory_radar import core
 from advisory_radar.config import load_config
-from advisory_radar.state import load_state_document, save_state
+from advisory_radar.http import RedactFilter
+from advisory_radar.runtime import Runtime
+from advisory_radar.settings import load_settings, load_settings_document, save_settings, settings_path
+from advisory_radar.state import load_state_document, save_state, state_lock
 from advisory_radar.web import LoginThrottle, _epoch, _when, create_app, readiness
 
+LOG = logging.getLogger("advisory_radar")
 
-def make_client(tmp_path: Path, token: str = "secret-token", clock: float | None = None):
+
+@pytest.fixture(autouse=True)
+def _detach_log_redaction():
+    """A runtime installs a log filter; one test's secrets must not redact the next test's output."""
+    yield
+    for installed in list(LOG.filters):
+        if isinstance(installed, RedactFilter):
+            LOG.removeFilter(installed)
+
+
+def make_app_client(
+    tmp_path: Path,
+    token: str = "secret-token",
+    clock: float | None = None,
+    environment: dict[str, str] | None = None,
+):
+    """A signed-out client, its token and the runtime the app serves."""
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text(f"sources: []\nnotifiers: []\nstate_path: {tmp_path}/state.json\nweb:\n  port: 8080\n")
-    cfg = load_config(cfg_path, {})
+    env = {"ADVISORY_RADAR_AUTH_TOKEN": token, **(environment or {})}
+    runtime = Runtime.build(cfg_path, env, clock=(lambda: clock) if clock else time.time)
     state = core.new_state()
     state["seen"]["CVE-2026-1"] = {"at": 1792600000, "outcome": "delivered"}
     state["pending"].append(
@@ -35,9 +58,14 @@ def make_client(tmp_path: Path, token: str = "secret-token", clock: float | None
         }
     )
     state.setdefault("runs", []).append({"at": 1792600000, "sent": 1, "parked": 0, "pending": 1, "code": 0})
-    save_state(cfg.state_path, state)
-    app = create_app(cfg, {"ADVISORY_RADAR_AUTH_TOKEN": token}, clock=(lambda: clock) if clock else time.time)
-    return TestClient(app), token
+    save_state(runtime.cfg.state_path, state)
+    app = create_app(runtime, env, clock=(lambda: clock) if clock else time.time)
+    return TestClient(app), token, runtime
+
+
+def make_client(tmp_path: Path, token: str = "secret-token", clock: float | None = None):
+    client, token, _ = make_app_client(tmp_path, token, clock)
+    return client, token
 
 
 def test_healthz_and_metrics_open(tmp_path):
@@ -149,6 +177,18 @@ def test_a_last_run_that_is_not_an_object_renders_as_never(tmp_path):
 CSRF_RE = re.compile(r'name="csrf" value="([0-9a-f]{64})"')
 
 
+FINGERPRINT_RE = re.compile(r"name='fingerprint' value='([0-9a-f]{64})'")
+
+
+def config_form(client, token: str) -> tuple[str, str]:
+    """Log in, load /config and return its form token and the fingerprint of the configuration it renders."""
+    csrf = signed_in(client, token)
+    page = client.get("/config").text
+    match = FINGERPRINT_RE.search(page)
+    assert match, "every settings form must carry the configuration fingerprint"
+    return csrf, match.group(1)
+
+
 def signed_in(client, token: str) -> str:
     """Log in and return the CSRF token the dashboard rendered."""
     response = client.post("/login", data={"token": token}, follow_redirects=False)
@@ -176,9 +216,8 @@ def test_security_headers_are_sent_with_every_response(tmp_path):
 def test_hsts_is_opt_in(tmp_path):
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text(f"sources: []\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
-    from advisory_radar.config import load_config as load
-
-    app = create_app(load(cfg_path, {}), {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_PUBLIC_HTTPS": "1"})
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_PUBLIC_HTTPS": "1"}
+    app = create_app(Runtime.build(cfg_path, environment), environment)
     response = TestClient(app).get("/healthz")
     assert response.headers["strict-transport-security"] == "max-age=31536000"
 
@@ -467,3 +506,559 @@ def test_a_malformed_collection_does_not_break_the_scrape(tmp_path):
     assert metrics.status_code == 200
     assert "advisory_radar_watch_total 0" in metrics.text
     assert "advisory_radar_pending 0" in metrics.text
+
+
+# --- the settings overlay: /config, its POSTs and /reload -------------------------------------
+
+
+def test_two_saved_notifiers_survive_while_the_application_is_blocked(tmp_path):
+    client, token, runtime = make_app_client(tmp_path, environment={"HOOK": "https://hooks.example.net/x"})
+    with state_lock(runtime.cfg.state_path):  # a pass holds the lock, so neither save can be applied
+        csrf, fingerprint = config_form(client, token)
+        first = client.post(
+            "/config/notifiers",
+            data={
+                "csrf": csrf,
+                "fingerprint": fingerprint,
+                "new:id": "first",
+                "new:type": "ntfy",
+                "new:reference": "${HOOK}",
+                "new:topic": "advisories",
+            },
+            follow_redirects=False,
+        )
+        assert first.status_code == 303
+        # the redirect reloads the page: the second save carries the revision the first one produced
+        csrf, fingerprint = config_form(client, token)
+        second = client.post(
+            "/config/notifiers",
+            data={
+                "csrf": csrf,
+                "fingerprint": fingerprint,
+                # the page re-rendered the first notifier's row; a browser submits those fields too
+                "enabled:first": "1",
+                "field:first:topic": "advisories",
+                "new:id": "second",
+                "new:type": "ntfy",
+                "new:reference": "${HOOK}",
+                "new:topic": "alerts",
+            },
+            follow_redirects=False,
+        )
+        assert second.status_code == 303
+    overlay = load_settings(settings_path(runtime.cfg.state_path))
+    assert [(entry["id"], entry.get("enabled", True), entry["topic"]) for entry in overlay["notifiers"]] == [
+        ("first", True, "advisories"),
+        ("second", True, "alerts"),
+    ], "the second save must not disable or strip the first notifier"
+    runtime.reload(blocking=False)
+    assert [notifier.id for notifier in runtime.notifiers] == ["first", "second"]
+
+
+def test_a_yaml_notifier_with_headers_can_still_be_edited_from_the_form(tmp_path):
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "sources: []\nnotifiers:\n  - id: hook\n    type: webhook\n    url: ${HOOK}\n"
+        "    headers:\n      Authorization: Bearer ${TOKEN}\n"
+        f"state_path: {tmp_path}/state.json\n"
+    )
+    environment = {
+        "ADVISORY_RADAR_AUTH_TOKEN": "t",
+        "HOOK": "https://hooks.example.net/x",
+        "TOKEN": "tok",
+    }
+    runtime = Runtime.build(cfg_path, environment)
+    client = TestClient(create_app(runtime, environment))
+    csrf, fingerprint = config_form(client, "t")
+    response = client.post(
+        "/config/notifiers",
+        data={"csrf": csrf, "fingerprint": fingerprint, "field:hook:url": "${HOOK}"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303, "the YAML headers must not make every notifier save fail"
+    saved = load_settings(settings_path(runtime.cfg.state_path))
+    assert "headers" not in saved["notifiers"][0], "the overlay never stores a header mapping"
+    assert saved["notifiers"][0].get("enabled") is False, "the form did not submit the enable checkbox"
+    assert runtime.notifiers == [], "the disabled notifier is gone from the live runtime"
+    from advisory_radar.config import load_document
+
+    merged = load_document(cfg_path, settings=saved)
+    assert merged["notifiers"][0]["headers"] == {"Authorization": "Bearer ${TOKEN}"}, (
+        "the YAML headers must still reach the builder"
+    )
+
+
+def test_a_failing_reference_does_not_echo_the_environment_value(tmp_path, caplog):
+    # A *_FILE variable can wrongly hold the credential itself; the expansion error names the variable, and
+    # must not print what it held, on the page or in a SIGHUP log.
+    from advisory_radar import cli
+
+    secret = "https://hooks.example.net/SUPERSECRET-FROM-ENV"
+    client, token, runtime = make_app_client(tmp_path, environment={"HOOK_FILE": secret})
+    csrf, fingerprint = config_form(client, token)
+    response = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "new:id": "hook",
+            "new:type": "webhook",
+            "new:reference": "${HOOK_FILE}",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 400
+    assert "no readable file" in response.text
+    assert "SUPERSECRET-FROM-ENV" not in response.text
+    save_settings(
+        settings_path(runtime.cfg.state_path),
+        {"notifiers": [{"id": "hook", "type": "webhook", "url": "${HOOK_FILE}"}]},
+        now=1,
+    )
+    try:
+        with caplog.at_level(logging.ERROR, logger="advisory_radar"):
+            cli._reload_blocking(runtime)
+        assert "no readable file" in caplog.text
+        assert "SUPERSECRET-FROM-ENV" not in caplog.text
+    finally:
+        runtime.detach_redaction()
+
+
+def test_an_omitted_optional_notifier_field_can_be_set_cleared_and_restored(tmp_path):
+    client, token, runtime = make_app_client(tmp_path, environment={"HOOK": "https://ntfy.example.net/x"})
+    csrf, fingerprint = config_form(client, token)
+    added = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "new:id": "phone",
+            "new:type": "ntfy",
+            "new:reference": "${HOOK}",
+            "new:topic": "advisories",
+        },
+        follow_redirects=False,
+    )
+    assert added.status_code == 303
+    page = client.get("/config").text
+    assert "name='field:phone:priority'" in page, "a defaulted field must still be offered"
+    csrf, fingerprint = config_form(client, token)
+    set_priority = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "enabled:phone": "1",
+            "field:phone:topic": "advisories",
+            "field:phone:priority": "4",
+        },
+        follow_redirects=False,
+    )
+    assert set_priority.status_code == 303
+    assert runtime.notifiers[0].priority == 4
+    csrf, fingerprint = config_form(client, token)
+    cleared = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "enabled:phone": "1",
+            "field:phone:topic": "advisories",
+        },
+        follow_redirects=False,
+    )
+    assert cleared.status_code == 303
+    assert "name='field:phone:priority'" in client.get("/config").text, "a cleared field must stay editable"
+    csrf, fingerprint = config_form(client, token)
+    restored = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "enabled:phone": "1",
+            "field:phone:topic": "advisories",
+            "field:phone:priority": "2",
+        },
+        follow_redirects=False,
+    )
+    assert restored.status_code == 303
+    assert runtime.notifiers[0].priority == 2
+
+
+def test_a_stale_notifier_form_is_refused(tmp_path):
+    # Two tabs opened before either save: the second one would rewrite the whole list from rows that do not
+    # know about the first save, disabling it and dropping its fields. The revision it carries is the check.
+    client, token, runtime = make_app_client(tmp_path, environment={"HOOK": "https://hooks.example.net/x"})
+    csrf, stale_fingerprint = config_form(client, token)
+    first = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": stale_fingerprint,
+            "new:id": "first",
+            "new:type": "ntfy",
+            "new:reference": "${HOOK}",
+            "new:topic": "advisories",
+        },
+        follow_redirects=False,
+    )
+    assert first.status_code == 303
+    stale = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": stale_fingerprint,
+            "new:id": "second",
+            "new:type": "ntfy",
+            "new:reference": "${HOOK}",
+            "new:topic": "alerts",
+        },
+        follow_redirects=False,
+    )
+    assert stale.status_code == 409
+    overlay = load_settings(settings_path(runtime.cfg.state_path))
+    assert [entry["id"] for entry in overlay["notifiers"]] == ["first"], "a stale form must not rewrite the list"
+    assert overlay["notifiers"][0].get("enabled", True) is True
+    assert overlay["notifiers"][0]["topic"] == "advisories"
+
+
+def test_a_form_from_a_recreated_overlay_is_refused(tmp_path):
+    client, token, runtime = make_app_client(tmp_path, environment={"HOOK": "https://hooks.example.net/x"})
+    csrf, fingerprint = config_form(client, token)
+    first = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "new:id": "first",
+            "new:type": "ntfy",
+            "new:reference": "${HOOK}",
+            "new:topic": "advisories",
+        },
+        follow_redirects=False,
+    )
+    assert first.status_code == 303
+    csrf, old_fingerprint = config_form(client, token)  # the tab that stays open at revision 1
+    settings_path(runtime.cfg.state_path).unlink()
+    assert client.post("/reload", data={"csrf": csrf}, follow_redirects=False).status_code == 303
+    csrf, fingerprint = config_form(client, token)  # a new overlay, also revision 1
+    second = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "new:id": "second",
+            "new:type": "ntfy",
+            "new:reference": "${HOOK}",
+            "new:topic": "alerts",
+        },
+        follow_redirects=False,
+    )
+    assert second.status_code == 303
+    stale = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": old_fingerprint,
+            "new:id": "first",
+            "new:type": "ntfy",
+            "new:reference": "${HOOK}",
+            "new:topic": "advisories",
+        },
+        follow_redirects=False,
+    )
+    assert stale.status_code == 409, "a reused revision number must not validate the old form"
+    overlay = load_settings(settings_path(runtime.cfg.state_path))
+    assert [entry["id"] for entry in overlay["notifiers"]] == ["second"]
+    assert overlay["notifiers"][0].get("enabled", True) is True
+
+
+def test_a_form_is_refused_after_the_yaml_changed(tmp_path):
+    client, token, runtime = make_app_client(tmp_path)
+    csrf, fingerprint = config_form(client, token)
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        cfg_path.read_text().replace(
+            "sources: []",
+            "sources:\n  - id: added\n    type: rss\n    url: https://feeds.example.net/x.xml",
+        )
+    )
+    stale = client.post("/config/sources", data={"csrf": csrf, "fingerprint": fingerprint}, follow_redirects=False)
+    assert stale.status_code == 409, "the form never saw the source the YAML now defines"
+    assert not settings_path(runtime.cfg.state_path).exists()
+
+
+def test_deleting_the_overlay_file_is_reported_as_not_live(tmp_path):
+    client, token, runtime = make_app_client(tmp_path)
+    csrf, fingerprint = config_form(client, token)
+    saved = client.post(
+        "/config/settings",
+        data={"csrf": csrf, "fingerprint": fingerprint, "poll_interval": "30s"},
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303
+    assert runtime.cfg.poll_interval_seconds == 30, "with the lock free the save is live at once"
+    settings_path(runtime.cfg.state_path).unlink()
+    page = client.get("/config").text
+    assert "no overlay file" in page and "Reload to return to the YAML" in page
+    # The page advertises that Reload returns to the YAML; the advertised action has to work, so a missing
+    # overlay is applied as revision 0 rather than refused as an older revision.
+    reloaded = client.post("/reload", data={"csrf": csrf}, follow_redirects=False)
+    assert reloaded.status_code == 303
+    assert runtime.cfg.poll_interval_seconds == 900, "the reload must fall back to the YAML configuration"
+
+
+def test_the_config_page_and_its_posts_require_auth(tmp_path):
+    client, _ = make_client(tmp_path)
+    response = client.get("/config", follow_redirects=False)
+    assert response.status_code == 303 and response.headers["location"] == "/login"
+    # without a session a POST redirects to the login page and writes nothing
+    assert client.post("/config/settings", data={"poll_interval": "30s"}, follow_redirects=False).status_code == 303
+    assert not settings_path(tmp_path / "state.json").exists()
+
+
+def test_a_config_post_needs_the_form_token(tmp_path):
+    client, token, runtime = make_app_client(tmp_path)
+    signed_in(client, token)
+    assert client.post("/config/settings", data={"poll_interval": "30s"}).status_code == 403
+    assert client.post("/reload").status_code == 403
+    assert runtime.cfg.poll_interval_seconds == 900
+    assert not settings_path(runtime.cfg.state_path).exists()
+
+
+def test_a_refused_setting_renders_the_error_and_writes_nothing(tmp_path):
+    client, token, runtime = make_app_client(tmp_path)
+    csrf, fingerprint = config_form(client, token)
+    response = client.post(
+        "/config/settings",
+        data={"csrf": csrf, "fingerprint": fingerprint, "poll_interval": "banana", "hidden_source_hosts": ""},
+    )
+    assert response.status_code == 400
+    assert "poll_interval must look like 15m, 30s or 12h" in response.text
+    assert not settings_path(runtime.cfg.state_path).exists()
+    assert runtime.cfg.poll_interval_seconds == 900
+
+
+def test_a_saved_setting_is_live_after_the_post(tmp_path):
+    client, token, runtime = make_app_client(tmp_path, clock=1792600000.0)
+    csrf, fingerprint = config_form(client, token)
+    response = client.post(
+        "/config/settings",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "poll_interval": "30s",
+            "hidden_source_hosts": "internal.example.com\necho.example.net",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/config?saved=1"
+    assert runtime.cfg.poll_interval_seconds == 30
+    assert runtime.cfg.hidden_source_hosts == frozenset({"internal.example.com", "echo.example.net"})
+    assert load_settings_document(settings_path(runtime.cfg.state_path))["revision"] == 1
+    state = load_state_document(runtime.cfg.state_path, core.STATE_SCHEMA, "advisory state")
+    assert state["settings"]["revision"] == 1
+    assert state["settings"]["applied_at"] == 1792600000
+    assert len(state["settings"]["fingerprint"]) == 64
+    # the next pass reads this snapshot, which already carries the saved value
+    cfg, _, _ = runtime.snapshot()
+    assert cfg.poll_interval_seconds == 30
+    page = client.get("/config?saved=1").text
+    assert "saved and live" in page
+    assert "last applied" in page
+
+
+def test_a_saved_but_unapplied_setting_is_not_reported_live(tmp_path):
+    client, token, runtime = make_app_client(tmp_path)
+    csrf, fingerprint = config_form(client, token)
+    with state_lock(runtime.cfg.state_path):  # a pass holds the lock for its whole transaction
+        response = client.post(
+            "/config/settings",
+            data={"csrf": csrf, "fingerprint": fingerprint, "poll_interval": "30s"},
+            follow_redirects=False,
+        )
+    assert response.status_code == 303
+    assert runtime.cfg.poll_interval_seconds == 900, "the live configuration must not change"
+    assert load_settings(settings_path(runtime.cfg.state_path)) == {
+        "poll_interval": "30s",
+        "hidden_source_hosts": [],
+    }
+    page = client.get("/config?saved=1").text
+    assert "not live yet" in page
+    assert "saved and live" not in page
+
+
+def test_reload_refuses_with_409_while_a_pass_holds_the_lock(tmp_path):
+    client, token, runtime = make_app_client(tmp_path)
+    csrf = signed_in(client, token)
+    with state_lock(runtime.cfg.state_path):
+        response = client.post("/reload", data={"csrf": csrf})
+    assert response.status_code == 409
+    assert "A pass or another reload is running" in response.text
+
+
+def test_reload_applies_a_saved_overlay(tmp_path):
+    client, token, runtime = make_app_client(tmp_path, clock=1792600000.0)
+    csrf = signed_in(client, token)
+    save_settings(settings_path(runtime.cfg.state_path), {"poll_interval": "12h"}, now=1)
+    assert runtime.cfg.poll_interval_seconds == 900
+    response = client.post("/reload", data={"csrf": csrf}, follow_redirects=False)
+    assert response.status_code == 303
+    assert runtime.cfg.poll_interval_seconds == 12 * 3600
+    state = load_state_document(runtime.cfg.state_path, core.STATE_SCHEMA, "advisory state")
+    assert state["settings"]["revision"] == 1
+    assert state["settings"]["applied_at"] == 1792600000
+    assert len(state["settings"]["fingerprint"]) == 64
+
+
+def test_a_refused_reload_keeps_the_running_configuration(tmp_path):
+    client, token, runtime = make_app_client(tmp_path)
+    csrf = signed_in(client, token)
+    overlay = settings_path(runtime.cfg.state_path)
+    overlay.write_text(
+        json.dumps(
+            {
+                "schema": "advisory-radar-settings.v1",
+                "revision": 4,
+                "updated_at": 0,
+                "settings": {"poll_interval": "banana"},
+            }
+        )
+    )
+    response = client.post("/reload", data={"csrf": csrf})
+    assert response.status_code == 400
+    assert "poll_interval must look like 15m, 30s or 12h" in response.text
+    assert runtime.cfg.poll_interval_seconds == 900
+    assert load_settings(overlay) == {"poll_interval": "banana"}, "the file is left for the operator"
+
+
+def test_a_source_disabled_on_the_form_is_gone_from_the_next_pass(tmp_path):
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "sources:\n  - id: one\n    type: rss\n    url: https://feeds.example.com/one.xml\n"
+        "  - id: two\n    type: rss\n    url: https://feeds.example.com/two.xml\n"
+        f"notifiers: []\nstate_path: {tmp_path}/state.json\n"
+    )
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t"}
+    runtime = Runtime.build(cfg_path, environment)
+    client = TestClient(create_app(runtime, environment))
+    csrf, fingerprint = config_form(client, "t")
+    response = client.post(
+        "/config/sources",
+        data={"csrf": csrf, "fingerprint": fingerprint, "enabled:two": "1", "tag:one": "", "tag:two": "security"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert [source.id for source in runtime.sources] == ["two"]
+    sources = runtime.document["sources"]
+    assert sources[0]["enabled"] is False
+    assert sources[1]["tag"] == "security"
+
+
+def test_a_notifier_added_on_the_form_keeps_a_reference_and_live_value(tmp_path):
+    client, token, runtime = make_app_client(tmp_path, environment={"OPS_HOOK": "https://ntfy.example.com/OPS-TOPIC"})
+    csrf, fingerprint = config_form(client, token)
+    response = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "new:id": "ops",
+            "new:type": "ntfy",
+            "new:reference": "${OPS_HOOK}",
+            "new:topic": "alerts",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert [notifier.id for notifier in runtime.notifiers] == ["ops"]
+    assert runtime.notifiers[0].url == "https://ntfy.example.com/OPS-TOPIC"
+    overlay = settings_path(runtime.cfg.state_path)
+    assert load_settings(overlay) == {
+        "notifiers": [{"id": "ops", "type": "ntfy", "url": "${OPS_HOOK}", "topic": "alerts"}]
+    }
+    assert "ntfy.example.com/OPS-TOPIC" not in overlay.read_text()
+
+
+def test_editing_a_notifier_keeps_its_reference_and_never_stores_the_value(tmp_path):
+    secret = "https://hooks.example.com/SUPERSECRET"
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "sources: []\nnotifiers:\n  - id: hook\n    type: discord_webhook\n    url: ${HOOK_URL}\n"
+        f"state_path: {tmp_path}/state.json\n"
+    )
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t", "HOOK_URL": secret}
+    runtime = Runtime.build(cfg_path, environment)
+    client = TestClient(create_app(runtime, environment))
+    csrf, fingerprint = config_form(client, "t")
+    response = client.post(
+        "/config/notifiers",
+        data={"csrf": csrf, "fingerprint": fingerprint, "enabled:hook": "1"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert [notifier.id for notifier in runtime.notifiers] == ["hook"]
+    overlay = settings_path(runtime.cfg.state_path).read_text()
+    assert "${HOOK_URL}" in overlay and "SUPERSECRET" not in overlay
+    page = client.get("/config").text
+    assert "${HOOK_URL}" in page and "SUPERSECRET" not in page
+
+
+def test_no_secret_value_reaches_the_config_page_or_a_log_line(tmp_path, caplog):
+    secret = "https://hooks.example.com/SUPERSECRET-WEBHOOK"
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "sources:\n  - id: feed\n    type: rss\n"
+        "    url: https://user:pw@feeds.example.com/private/SECRET123/rss?token=SECRET456\n"
+        "notifiers:\n  - id: hook\n    type: discord_webhook\n    url: ${HOOK_URL}\n"
+        f"state_path: {tmp_path}/state.json\n"
+    )
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t", "HOOK_URL": secret}
+    runtime = Runtime.build(cfg_path, environment)
+    client = TestClient(create_app(runtime, environment))
+    csrf, fingerprint = config_form(client, "t")
+    page = client.get("/config").text
+    assert "SUPERSECRET-WEBHOOK" not in page
+    assert "SECRET123" not in page and "SECRET456" not in page and "pw@" not in page
+    assert "feeds.example.com" in page, "the public origin is still shown"
+    assert "${HOOK_URL}" in page, "the reference name is not a secret"
+    # a literal typed into the reference field is refused and never echoed
+    response = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "new:id": "extra",
+            "new:type": "discord_webhook",
+            "new:reference": secret,
+        },
+    )
+    assert response.status_code == 400
+    assert "SUPERSECRET-WEBHOOK" not in response.text
+    # a hand-edited overlay whose builder error carries an expanded value is redacted on the page and in the log
+    settings_path(runtime.cfg.state_path).write_text(
+        json.dumps(
+            {
+                "schema": "advisory-radar-settings.v1",
+                "revision": 2,
+                "updated_at": 0,
+                "settings": {
+                    "notifiers": [
+                        {
+                            "id": "n",
+                            "type": "ntfy",
+                            "url": "${HOOK_URL}",
+                            "topic": "x",
+                            "priority": "${HOOK_URL}",
+                        }
+                    ]
+                },
+            }
+        )
+    )
+    with caplog.at_level(logging.DEBUG):
+        refused = client.post("/reload", data={"csrf": csrf})
+    assert refused.status_code == 400
+    assert "SUPERSECRET-WEBHOOK" not in refused.text
+    assert "SUPERSECRET-WEBHOOK" not in caplog.text

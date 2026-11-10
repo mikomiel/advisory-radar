@@ -25,8 +25,22 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from itsdangerous import BadSignature, URLSafeSerializer
 
+from . import pipeline
 from .catalogue import SOURCE_SPECS
-from .config import Config
+from .config import Config, ConfigError, config_from_document, load_document, secret_values
+from .notifiers import NOTIFIER_BUILDERS
+from .runtime import Runtime
+from .settings import (
+    SECRET_KEYS,
+    SETTINGS_LOCK,
+    is_reference,
+    load_settings_document,
+    save_settings,
+)
+from .settings import (
+    fingerprint as settings_fingerprint,
+)
+from .state import LockBusy, SourceError
 
 LOG = logging.getLogger("advisory_radar")
 
@@ -172,6 +186,21 @@ LOGIN_BODY_LIMIT = 8 * 1024
 #: The form field and the header that carry the per-session token; a state-changing POST needs one of them.
 CSRF_FIELD = "csrf"
 CSRF_HEADER = "x-csrf-token"
+#: A settings form carries one row per configured plugin; still a bounded read, and the CSRF dependency
+#: hands the body to the handler that edits it.
+FORM_BODY_LIMIT = 64 * 1024
+#: Notifier keys the /config form edits. None of them carries a credential: a secret-bearing key is
+#: written only as an environment reference, and ``headers`` is not writable at all.
+NOTIFIER_FORM_KEYS = ("topic", "priority", "host", "port", "from", "to", "username", "use_tls", "implicit_tls")
+#: The one secret-bearing key the "new notifier" row fills, per type. ``apprise`` (url+password) and
+#: ``gotify`` (url+token) need two references each, so they are added by editing the YAML.
+NEW_NOTIFIER_REFERENCE = {
+    "discord_webhook": "url",
+    "matrix_webhook": "url",
+    "ntfy": "url",
+    "webhook": "url",
+    "smtp": "password",
+}
 #: Every page is server-rendered HTML with one inline stylesheet: no scripts, no fonts, no external origins.
 #: A page that needs any of those widens this deliberately, in the same change that adds it.
 CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
@@ -277,18 +306,27 @@ def _public_https(env: Mapping[str, str]) -> bool:
 
 
 def create_app(
-    cfg: Config,
-    env: dict[str, str],
+    runtime: Runtime | Config,
+    env: Mapping[str, str],
     *,
     run_pass: Callable[..., int] | None = None,
-    sources=None,
-    notifiers=None,
     clock: Callable[[], float] = time.time,
 ) -> FastAPI:
+    """The web UI over one live configuration.
+
+    ``runtime`` is the process's :class:`~advisory_radar.runtime.Runtime`; pages read ``runtime.cfg``
+    and the intake looks the configured sources up per request, so a reload applies without a
+    restart. A bare :class:`Config` is wrapped in a runtime that never reloads, for a caller that
+    constructs the app from an already-loaded config.
+    """
+    if not isinstance(runtime, Runtime):
+        runtime = Runtime.from_config(runtime)
     app = FastAPI(title="advisory-radar", docs_url=None, redoc_url=None)
     auth = Auth(env.get("ADVISORY_RADAR_AUTH_TOKEN", ""))
-    #: Inbound webhooks are open to a configured source id only; an unconfigured signal is refused, not stored.
-    webhook_sources = {source.id for source in (sources or []) if getattr(source, "kind", "") == "webhook"}
+
+    def webhook_source_ids() -> set[str]:
+        """Webhooks are open to a configured webhook source id only, read from the live runtime."""
+        return {source.id for source in runtime.sources if getattr(source, "kind", "") == "webhook"}
 
     token = env.get("ADVISORY_RADAR_AUTH_TOKEN", "")
     if not token:
@@ -339,15 +377,16 @@ def create_app(
         """Refuse a state-changing POST no page of ours issued.
 
         SameSite=Lax already keeps the cookie off a cross-site POST; this is the second lock, for a browser or
-        proxy that does not apply it. The body read here carries the token field only -- every endpoint using
-        this dependency acts on the session cookie and reads no body of its own.
+        proxy that does not apply it. The body is read once and kept on the request: a settings form's handler
+        edits the body this dependency has already consumed.
         """
         if not auth.valid(request):  # the endpoint itself redirects an unauthenticated caller
             return
         try:
-            raw = await _body(request, LOGIN_BODY_LIMIT)
+            raw = await _body(request, FORM_BODY_LIMIT)
         except BodyTooLarge:
             raise HTTPException(status_code=413, detail="payload too large") from None
+        request.state.form_body = raw
         supplied = request.headers.get(CSRF_HEADER, "")
         if not supplied:
             form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
@@ -368,7 +407,7 @@ def create_app(
         from . import core
         from .state import load_state_document
 
-        return load_state_document(cfg.state_path, core.STATE_SCHEMA, "advisory state") or core.new_state()
+        return load_state_document(runtime.cfg.state_path, core.STATE_SCHEMA, "advisory state") or core.new_state()
 
     @app.get("/login", response_class=HTMLResponse)
     def login_form():
@@ -523,8 +562,9 @@ def create_app(
         from . import core
         from .state import state_lock
 
-        with state_lock(cfg.state_path):
-            core.manage_parked(cfg.state_path, release=True, now=int(time.time()))
+        state_path = runtime.cfg.state_path
+        with state_lock(state_path):
+            core.manage_parked(state_path, release=True, now=int(time.time()))
         return RedirectResponse("/parked", status_code=303)
 
     @app.post("/parked/drop", dependencies=[Depends(require_csrf)])
@@ -534,25 +574,403 @@ def create_app(
         from . import core
         from .state import state_lock
 
-        with state_lock(cfg.state_path):
-            core.manage_parked(cfg.state_path, release=False, now=int(time.time()))
+        state_path = runtime.cfg.state_path
+        with state_lock(state_path):
+            core.manage_parked(state_path, release=False, now=int(time.time()))
         return RedirectResponse("/parked", status_code=303)
 
-    @app.get("/config", response_class=HTMLResponse)
-    def config_page(request: Request):
+    # --- the settings overlay: /config and the POSTs that write and apply it ---------------------
+
+    def form_body(request: Request) -> dict[str, list[str]]:
+        """The urlencoded body the CSRF dependency already read; no python-multipart dependency."""
+        raw = getattr(request.state, "form_body", b"")
+        return urllib.parse.parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True)
+
+    def first(form: dict[str, list[str]], name: str) -> str:
+        return (form.get(name) or [""])[0]
+
+    def saved_overlay() -> tuple[dict, int]:
+        """The overlay as saved and its revision.
+
+        An unreadable file counts as revision 0: the save that follows replaces it, and the page shows the
+        error. The revision is what makes a stale form detectable, so both come from one read.
+        """
+        if runtime.overlay_path is None:
+            return {}, 0
+        try:
+            stored = load_settings_document(runtime.overlay_path)
+            return dict(stored["settings"]), int(stored["revision"])
+        except ConfigError:
+            return dict(runtime.overlay["settings"]), 0
+
+    def form_fingerprint(document: dict) -> str:
+        """A stable hash of the configuration a form was rendered from.
+
+        The saved revision alone is not enough: deleting the overlay resets the counter, and a YAML edit does
+        not move it, so a form issued before either would pass a revision check and rewrite rows it never saw.
+        """
+        canonical = json.dumps(document, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def stale_form(form: dict, document: dict):
+        """Refuse a form rendered against a different configuration.
+
+        A second tab would rewrite the whole section from its own rows: the fingerprint it carries covers both
+        the saved overlay and the YAML the rows came from, so any change is a refusal rather than a silent loss.
+        """
+        if first(form, "fingerprint") == form_fingerprint(document):
+            return None
+        return page(
+            "Not saved",
+            "<p>The configuration changed since this page was loaded. Reload "
+            "<a href='/config'>the configuration page</a> and make the change again.</p>",
+            status_code=409,
+        )
+
+    def form_document(overlay: dict) -> tuple[dict, str]:
+        """The document the forms edit: the saved overlay merged over the YAML.
+
+        Not ``runtime.document``: a revision saved while a pass held the lock has not been applied yet, and
+        editing another section from the live snapshot would silently drop it. Falls back to the live
+        document, with the reason, when the saved overlay cannot be merged.
+        """
+        if runtime.config_path is None:
+            return runtime.document, ""
+        try:
+            return load_document(runtime.config_path, settings=overlay), ""
+        except ConfigError as exc:
+            return runtime.document, esc(str(exc))
+
+    def applied_settings() -> dict:
+        try:
+            value = load_state().get("settings")
+        except SourceError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def notifier_notes(entry: dict) -> str:
+        """What a notifier carries, for display: a reference by name, never a credential."""
+        notes = []
+        for key in SECRET_KEYS:
+            if key not in entry:
+                continue
+            notes.append(f"{key}={entry[key]}" if is_reference(entry[key]) else f"{key} set (not shown)")
+        if "headers" in entry:
+            notes.append("headers set in the YAML (not shown)")
+        return esc(", ".join(notes))
+
+    def notifier_form_entries(entries) -> str:
+        """One row per configured notifier: enabled, its non-secret keys, and its secret references."""
+        rows = []
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                continue
+            identifier = entry["id"]
+            checked = " checked" if entry.get("enabled", True) is not False else ""
+            # Every optional field is rendered, not only those the entry already carries: a defaulted value
+            # must be settable, and a value cleared in one save must be settable again in the next.
+            fields = " ".join(
+                f"<label>{key} <input type='text' name='field:{esc(identifier)}:{key}' "
+                f"value='{esc(entry.get(key, ''))}'></label>"
+                for key in NOTIFIER_FORM_KEYS
+            )
+            rows.append(
+                f"<tr><td><b>{esc(identifier)}</b><br><span class='muted'>{esc(entry.get('type', ''))}</span></td>"
+                f"<td><input type='checkbox' name='enabled:{esc(identifier)}' value='1'{checked}></td>"
+                f"<td>{fields}</td><td class='muted'>{notifier_notes(entry)}</td></tr>"
+            )
+        return "".join(rows)
+
+    def source_form_entries(entries) -> str:
+        """One row per configured source: its id and type, its enabled flag and its tag."""
+        rows = []
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                continue
+            identifier = entry["id"]
+            checked = " checked" if entry.get("enabled", True) is not False else ""
+            # The origin only: a source URL can carry a token in its userinfo, query or path.
+            public = _public_url(str(entry.get("url", "")))
+            rows.append(
+                f"<tr><td><b>{esc(identifier)}</b> <span class='muted'>{esc(entry.get('type', ''))}</span>"
+                + (f"<br><span class='muted'>{esc(public)}</span>" if public else "")
+                + f"</td><td><input type='checkbox' name='enabled:{esc(identifier)}' value='1'{checked}></td>"
+                f"<td><input type='text' name='tag:{esc(identifier)}' value='{esc(entry.get('tag', ''))}'></td></tr>"
+            )
+        return "".join(rows)
+
+    def commit_overlay(overlay: dict):
+        """Validate, build, save and apply one overlay; nothing is written when any step refuses.
+
+        Building the plugins here is what makes a saved overlay safe: it is the same build the next
+        start and the reload perform, so a value that would fail then is refused now, while the live
+        configuration and the file on disk are still untouched.
+        """
+        if runtime.config_path is None or runtime.overlay_path is None:
+            return page("Not saved", "<p>This instance has no configuration file to update.</p>", status_code=400)
+        values = list(secret_values(runtime.cfg))
+        candidate = None
+        try:
+            document = load_document(runtime.config_path, settings=overlay)
+            candidate = config_from_document(document, runtime.config_path, runtime.environment)
+            values += secret_values(candidate)
+            pipeline.build_plugins(candidate, runtime.environment)
+        except (ConfigError, ValueError, KeyError) as exc:
+            # Redacted before rendering: a builder error can carry a value expanded from the environment.
+            message = esc(pipeline.redact(str(exc), values))
+            return page(
+                "Not saved",
+                f"<p>{message}</p><p>The live configuration is unchanged and nothing was written.</p>",
+                status_code=400,
+            )
+        try:
+            stored = save_settings(runtime.overlay_path, overlay, now=int(clock()))
+        except ConfigError as exc:
+            return page("Not saved", f"<p>{esc(pipeline.redact(str(exc), values))}</p>", status_code=400)
+        try:
+            runtime.reload(blocking=False)
+        except LockBusy:
+            LOG.info("settings revision %d saved; a pass holds the lock, so it is not live yet", stored["revision"])
+        except (ConfigError, SourceError) as exc:
+            LOG.warning(
+                "settings revision %d saved but not applied: %s",
+                stored["revision"],
+                pipeline.redact(str(exc), values),
+            )
+        return RedirectResponse(f"/config?saved={stored['revision']}", status_code=303)
+
+    @app.post("/config/settings", dependencies=[Depends(require_csrf)])
+    def save_settings_form(request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
-        src = "".join(
-            f"<li><b>{esc(s['id'])}</b> ({esc(s.get('type', ''))}) — {esc(_public_url(s.get('url', '')))}</li>"
-            for s in cfg.sources
+        form = form_body(request)
+        with SETTINGS_LOCK:
+            overlay, revision = saved_overlay()
+            base, _ = form_document(overlay)
+            stale = stale_form(form, base)
+            if stale is not None:
+                return stale
+            poll = first(form, "poll_interval").strip()
+            if poll:
+                overlay["poll_interval"] = poll
+            else:
+                overlay.pop("poll_interval", None)  # an empty field means "use the YAML value"
+            overlay["hidden_source_hosts"] = [
+                line.strip() for line in first(form, "hidden_source_hosts").splitlines() if line.strip()
+            ]
+            return commit_overlay(overlay)
+
+    @app.post("/config/sources", dependencies=[Depends(require_csrf)])
+    def save_sources_form(request: Request):
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        form = form_body(request)
+        with SETTINGS_LOCK:
+            overlay, revision = saved_overlay()
+            base, _ = form_document(overlay)
+            stale = stale_form(form, base)
+            if stale is not None:
+                return stale
+            changes = {}
+            for entry in base.get("sources") or []:
+                if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                    continue
+                identifier = entry["id"]
+                changes[identifier] = {
+                    "enabled": f"enabled:{identifier}" in form,
+                    "tag": first(form, f"tag:{identifier}").strip(),
+                }
+            overlay["sources"] = changes
+            return commit_overlay(overlay)
+
+    @app.post("/config/notifiers", dependencies=[Depends(require_csrf)])
+    def save_notifiers_form(request: Request):
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        form = form_body(request)
+        with SETTINGS_LOCK:
+            overlay, revision = saved_overlay()
+            base, _ = form_document(overlay)
+            stale = stale_form(form, base)
+            if stale is not None:
+                return stale
+            return _save_notifiers(overlay, base, form)
+
+    def _save_notifiers(overlay: dict, base: dict, form: dict):
+        entries = []
+        for entry in base.get("notifiers") or []:
+            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                continue
+            identifier = entry["id"]
+            updated = dict(entry)
+            # headers stay in the YAML (the overlay may not store a mapping that can carry a credential) and
+            # are carried over by id when the overlay is merged.
+            updated.pop("headers", None)
+            updated["enabled"] = f"enabled:{identifier}" in form
+            for key in NOTIFIER_FORM_KEYS:
+                value = first(form, f"field:{identifier}:{key}").strip()
+                if value:
+                    updated[key] = value
+                else:
+                    updated.pop(key, None)
+            entries.append(updated)
+        identifier = first(form, "new:id").strip()
+        if identifier:
+            kind = first(form, "new:type").strip()
+            reference = first(form, "new:reference").strip()
+            secret_key = NEW_NOTIFIER_REFERENCE.get(kind)
+            if kind and secret_key is None and kind in NOTIFIER_BUILDERS:
+                return page(
+                    "Not saved",
+                    f"<p>A {esc(kind)} notifier needs more than one reference; this form collects one. "
+                    "Add it by editing the YAML. A secret stays in the environment and is only referenced.</p>",
+                    status_code=400,
+                )
+            new = {"id": identifier, "type": kind}
+            if secret_key is not None:
+                if not reference:
+                    return page(
+                        "Not saved",
+                        f"<p>A {esc(kind)} needs a reference here: enter ${{NAME}} or ${{NAME_FILE}}. "
+                        "The secret itself stays in the environment.</p>",
+                        status_code=400,
+                    )
+                new[secret_key] = reference
+            for key in NOTIFIER_FORM_KEYS:
+                value = first(form, f"new:{key}").strip()
+                if value:
+                    new[key] = value
+            entries.append(new)
+        overlay["notifiers"] = entries
+        return commit_overlay(overlay)
+
+    @app.post("/reload", dependencies=[Depends(require_csrf)])
+    def reload_configuration(request: Request):
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        if runtime.config_path is None:
+            return page("Not reloaded", "<p>This instance has no configuration file to reload.</p>", status_code=400)
+        try:
+            runtime.reload(blocking=False)
+        except LockBusy:
+            return page(
+                "Reload refused",
+                "<p>A pass or another reload is running, so the configuration was not reloaded; try again shortly.</p>"
+                '<p><a href="/config">Back to configuration</a></p>',
+                status_code=409,
+            )
+        except (ConfigError, SourceError) as exc:
+            message = esc(pipeline.redact(str(exc), secret_values(runtime.cfg)))
+            return page(
+                "Reload refused",
+                f"<p>{message}</p><p>The running configuration is unchanged.</p>",
+                status_code=400,
+            )
+        return RedirectResponse("/config", status_code=303)
+
+    @app.get("/config", response_class=HTMLResponse)
+    def config_page(request: Request, saved: int | None = None):
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        cfg = runtime.cfg
+        try:
+            saved_document = (
+                load_settings_document(runtime.overlay_path)
+                if runtime.overlay_path is not None
+                else {"revision": 0, "settings": {}}
+            )
+            overlay_error = ""
+        except ConfigError as exc:
+            saved_document, overlay_error = {"revision": 0, "settings": {}}, esc(str(exc))
+        saved_revision = int(saved_document["revision"])
+        live_revision = int(runtime.overlay.get("revision", 0))
+        # "Live" means this process loaded this file: the same revision and the same settings. A
+        # hand-edit that kept the revision number is therefore not reported as applied.
+        live_now = saved_revision == live_revision and saved_document["settings"] == runtime.overlay["settings"]
+        applied = applied_settings()
+        # The state marker can be older than the file (a save while a pass held the lock, then a restart), and a
+        # revision number can be reused after the overlay is deleted and recreated: the timestamp is only
+        # reported for the settings fingerprint the marker recorded.
+        applied_now = applied.get("fingerprint") == settings_fingerprint(saved_document["settings"])
+        applied_at = _when(applied.get("applied_at")) if applied_now else ""
+        if saved_revision == 0 and not saved_document["settings"]:
+            if live_revision:
+                status = (
+                    f"no overlay file; the live configuration still has revision <b>{live_revision}</b> — "
+                    "press Reload to return to the YAML"
+                )
+            else:
+                status = "no overlay saved; the YAML is the whole configuration"
+        else:
+            status = f"saved revision <b>{saved_revision}</b> · " + (
+                "<b>live</b>" if live_now else f"NOT live (live revision <b>{live_revision}</b>)"
+            )
+            if applied_at:
+                status += f" · last applied {esc(applied_at)}"
+        # The forms edit the saved overlay, not the live snapshot: a revision saved while a pass held the lock
+        # must stay visible and editable, and saving another section must not drop it.
+        with SETTINGS_LOCK:
+            document, form_error = form_document(dict(saved_document["settings"]))
+        if form_error and not overlay_error:
+            overlay_error = form_error
+        sources = document.get("sources")
+        sources = sources if isinstance(sources, list) else []
+        notifiers = document.get("notifiers")
+        notifiers = notifiers if isinstance(notifiers, list) else []
+        banner = ""
+        if saved is not None:
+            if live_now and saved == live_revision:
+                banner += f"<p class='tag-warning'>Revision {saved} saved and live.</p>"
+            else:
+                banner += (
+                    f"<p class='tag-warning'>Revision {saved} saved but not live yet (live revision {live_revision}); "
+                    "press Reload once the running pass finishes.</p>"
+                )
+        if overlay_error:
+            banner += f"<p class='tag-critical'>The overlay cannot be read: {overlay_error}</p>"
+        poll_text = document.get("poll_interval")
+        poll_text = poll_text if isinstance(poll_text, str) else f"{cfg.poll_interval_seconds}s"
+        hidden = document.get("hidden_source_hosts")
+        hidden_text = "\n".join(str(host) for host in hidden) if isinstance(hidden, list) else ""
+        type_options = "".join(
+            f"<option value='{esc(kind)}'>{esc(kind)}</option>" for kind in sorted(NOTIFIER_BUILDERS)
         )
-        ntf = "".join(f"<li><b>{esc(n['id'])}</b> ({esc(n.get('type', ''))})</li>" for n in cfg.notifiers)
+        new_fields = " ".join(
+            f"<label>{key} <input type='text' name='new:{key}'></label>" for key in NOTIFIER_FORM_KEYS
+        )
+        csrf = csrf_field(request)
+        fingerprint = form_fingerprint(document)
+        fingerprint_field = f"<input type='hidden' name='fingerprint' value='{fingerprint}'>"
         body = (
-            f"<h2>Sources</h2><ul>{src}</ul><h2>Notifiers</h2><ul>{ntf}</ul>"
-            f"<p class='muted'>Poll interval {cfg.poll_interval_seconds}s · state {esc(cfg.state_path)} · "
+            f"<p>Live poll interval <b>{cfg.poll_interval_seconds}s</b> · state {esc(cfg.state_path)} · "
             f"watchlist {esc(cfg.watchlist_path or 'built-in default')}</p>"
-            "<p class='muted'>Edit config/config.yml on the volume and restart; secrets come from the "
-            "environment only.</p>"
+            f"<p class='muted'>Settings overlay: {status}</p>{banner}"
+            f'<form method="post" action="/reload">{csrf}<button>Reload configuration</button></form>'
+            "<h2>Settings</h2>"
+            f'<form method="post" action="/config/settings">{csrf}{fingerprint_field}'
+            f"<p><label>Poll interval <input type='text' name='poll_interval' value='{esc(poll_text)}'></label> "
+            "(15m, 30s or 12h)</p>"
+            "<p><label>Hidden source hosts (one per line)<br>"
+            f"<textarea name='hidden_source_hosts' rows='4' cols='40'>{esc(hidden_text)}</textarea></label></p>"
+            "<button>Save settings</button></form>"
+            "<h2>Sources</h2>"
+            f'<form method="post" action="/config/sources">{csrf}{fingerprint_field}'
+            "<table><tr><th>Source</th><th>Enabled</th><th>Tag</th></tr>"
+            f"{source_form_entries(sources)}</table><button>Save sources</button></form>"
+            "<h2>Notifiers</h2>"
+            f'<form method="post" action="/config/notifiers">{csrf}{fingerprint_field}'
+            "<table><tr><th>Notifier</th><th>Enabled</th><th>Non-secret fields</th><th>Secrets</th></tr>"
+            f"{notifier_form_entries(notifiers)}</table>"
+            "<h3>New notifier</h3>"
+            "<p class='muted'>Secrets stay in the environment: the reference field takes ${NAME} or ${NAME_FILE} "
+            "and is stored instead of the value. A type that needs two references, or a header, is added by "
+            "editing the YAML.</p>"
+            "<p><label>id <input type='text' name='new:id'></label> "
+            f"<label>type <select name='new:type'>{type_options}</select></label> "
+            "<label>reference <input type='text' name='new:reference' placeholder='${NAME}'></label></p>"
+            f"<p>{new_fields}</p><button>Save notifiers</button></form>"
+            "<p class='muted'>The YAML file stays the source of every other setting; environment changes still "
+            "need a restart.</p>"
         )
         return page("Configuration", body, nav_extra=sign_out_form(request))
 
@@ -571,7 +989,7 @@ def create_app(
                 f"<td><pre>{esc(example)}</pre></td><td><code>{esc(spec.docs_anchor)}</code></td></tr>"
             )
         configured = "".join(
-            f"<li><b>{esc(source['id'])}</b> ({esc(source.get('type', ''))})</li>" for source in cfg.sources
+            f"<li><b>{esc(source['id'])}</b> ({esc(source.get('type', ''))})</li>" for source in runtime.cfg.sources
         )
         body = (
             "<p>Every built-in source type, its keys and an example. Required keys have no default.</p>"
@@ -616,19 +1034,15 @@ def create_app(
         while the process is alive, which is the only thing a liveness probe may ask. An unreadable state is
         also not ready: every page and the pass itself depend on it.
         """
-        from .state import SourceError
-
         try:
             state = load_state()
         except SourceError as exc:
             return PlainTextResponse(f"not ready: {exc}", status_code=503)
-        ok, reason = readiness(cfg, state, int(clock()))
+        ok, reason = readiness(runtime.cfg, state, int(clock()))
         return PlainTextResponse(reason, status_code=200 if ok else 503)
 
     @app.get("/metrics", response_class=PlainTextResponse)
     def metrics():
-        from .state import SourceError
-
         try:
             state = load_state()
         except SourceError as exc:
@@ -645,7 +1059,7 @@ def create_app(
         raw_runs = state.get("runs")
         runs = raw_runs if isinstance(raw_runs, list) else []
         last = runs[-1] if runs and isinstance(runs[-1], dict) else {}
-        ok, _ = readiness(cfg, state, int(clock()))
+        ok, _ = readiness(runtime.cfg, state, int(clock()))
         gauges = [
             ("pending", "Pending messages awaiting delivery", "gauge", _length(state.get("pending"))),
             ("parked", "Parked messages awaiting an operator decision", "gauge", _length(state.get("parked"))),
@@ -693,10 +1107,10 @@ def create_app(
 
         from . import core as _core
         from .sources import webhook_item_from_payload
-        from .state import LockBusy, load_state_document, save_state, state_lock
+        from .state import load_state_document, save_state, state_lock
 
         secret = env.get("ADVISORY_RADAR_WEBHOOK_SECRET", "")
-        if not secret or source_id not in webhook_sources:
+        if not secret or source_id not in webhook_source_ids():
             return JSONResponse({"error": "webhook ingestion is not configured"}, status_code=404)
         provided = request.headers.get("authorization", "")
         if not hmac.compare_digest(provided.encode(), f"Bearer {secret}".encode()):
@@ -714,16 +1128,18 @@ def create_app(
             return JSONResponse({"error": "payload has no title"}, status_code=422)
         entry.pop("explicit_ids", None)  # ids are re-extracted from text at classify time
 
+        state_path = runtime.cfg.state_path
+
         def store() -> None:
-            with state_lock(cfg.state_path, blocking=False):
-                state = load_state_document(cfg.state_path, _core.STATE_SCHEMA, "advisory state") or _core.new_state()
+            with state_lock(state_path, blocking=False):
+                state = load_state_document(state_path, _core.STATE_SCHEMA, "advisory state") or _core.new_state()
                 inbox = state.setdefault("webhook_inbox", {}).setdefault(source_id, [])
                 # A full inbox refuses the new entry rather than dropping an accepted one: an acknowledged
                 # advisory must never be discarded unprocessed.
                 if len(inbox) >= WEBHOOK_INBOX_LIMIT:
                     raise InboxFull
                 inbox.append(entry)
-                save_state(cfg.state_path, state)
+                save_state(state_path, state)
 
         try:
             await run_in_threadpool(store)

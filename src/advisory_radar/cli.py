@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -13,6 +15,7 @@ from . import core, pipeline
 from .catalogue import SOURCE_SPECS
 from .config import Config, ConfigError, load_config, secret_values
 from .http import Http, urllib_http
+from .runtime import Runtime, read_config
 from .state import state_lock
 
 LOG = logging.getLogger("advisory_radar")
@@ -121,6 +124,91 @@ def _test_source(cfg: Config, args: argparse.Namespace, http: Http, environment:
     return 1 if window.truncated else 0
 
 
+def _reload_blocking(runtime: Runtime) -> None:
+    """The SIGHUP action: rebuild off to the side and swap under the lock.
+
+    A refused reload is logged and the process keeps running with the configuration it has: a
+    typo in a mounted file must not turn a signal into an outage.
+    """
+    try:
+        runtime.reload(blocking=True)
+    except Exception as exc:  # a reload must be able to fail without taking the process down
+        # The redaction filter removes exc_info from a record, so the reason is put into the message itself:
+        # a refusal the operator cannot diagnose is barely better than a crash.
+        reason = pipeline.redact(f"{type(exc).__name__}: {exc}", secret_values(runtime.cfg))
+        LOG.error("reload refused; keeping the running configuration: %s", reason)
+    else:
+        LOG.info("reload applied: overlay revision %s", runtime.overlay["revision"])
+
+
+def sighup_handler(runtime: Runtime) -> Callable[[int, object], threading.Thread]:
+    """The SIGHUP handler: reload in a background thread and return it.
+
+    A signal handler must not run a whole pass, and the thread it starts waits for the state lock.
+    Returning the thread is harmless when a signal delivers it and lets a test join the work.
+    """
+
+    def handle(signum: int, frame: object) -> threading.Thread:
+        LOG.info("SIGHUP: reloading the configuration")
+        worker = threading.Thread(target=_reload_blocking, args=(runtime,), daemon=True)
+        worker.start()
+        return worker
+
+    return handle
+
+
+def install_sighup(runtime: Runtime) -> bool:
+    """Register the reload handler on SIGHUP where the platform has one; returns whether it did."""
+    if not hasattr(signal, "SIGHUP"):
+        return False
+    try:
+        signal.signal(signal.SIGHUP, sighup_handler(runtime))
+    except ValueError:  # a caller that runs main() off the main thread cannot own signal handlers
+        LOG.warning("SIGHUP reload is unavailable outside the main thread")
+        return False
+    return True
+
+
+def run_scheduler(
+    runtime: Runtime,
+    stopping: threading.Event,
+    *,
+    http: Http = urllib_http,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """One pass at a time, then wait the interval the live runtime reports.
+
+    The configuration and the plugins are read together at the start of each pass, so a reload
+    between two passes applies to the next one; a pass that already started keeps the plugins it
+    was given, because swapping mid-pass could deliver one advisory through two configurations.
+    """
+    while not stopping.is_set():
+        cfg, sources, notifiers = runtime.snapshot()
+        try:
+            code = pipeline.run_pass(cfg, sources, notifiers, http=http, clock=clock, sleep=sleep)
+            if code:
+                LOG.warning("pass exited %d; continuing on schedule", code)
+        except Exception:  # the schedule must survive any single bad pass
+            LOG.exception("pass raised; continuing on schedule")
+        _wait_for_next_pass(runtime, stopping)
+
+
+def _wait_for_next_pass(runtime: Runtime, stopping: threading.Event) -> None:
+    """Wait for the next pass, restarting the wait when a reload lands.
+
+    The wait follows the *live* interval, not the one the finished pass ran under: shortening the interval
+    and then sleeping out the old one would leave the scheduler idle while /readyz judges by the new
+    interval and reports a healthy instance unready. The wake event is also what shutdown sets, so a stop is
+    seen without waiting for the interval to expire.
+    """
+    while not stopping.is_set():
+        if runtime.wake.wait(runtime.cfg.poll_interval_seconds):
+            runtime.wake.clear()
+            continue
+        return
+
+
 def main(
     argv: list[str] | None = None,
     *,
@@ -139,31 +227,40 @@ def main(
     # either, so it is dispatched before load_config.
     if args.command == "sources" and args.sources_command == "list":
         return _list_sources()
-    state_only = args.command in {"release-parked", "drop-parked"}
+    if args.command in {"release-parked", "drop-parked"}:
+        # State-only recovery. It needs the state path and nothing else: no source or notifier is built,
+        # so an unrelated plugin with a missing credential cannot block recovery; the overlay cannot
+        # change the state path, and an unreadable one must not block releasing a queue.
+        try:
+            cfg = load_config(args.config, environment, lenient=True)
+        except ConfigError as exc:
+            LOG.error("config: %s", exc)
+            return 1
+        redactor = pipeline.attach_redaction(secret_values(cfg))
+        try:
+            with state_lock(cfg.state_path):
+                return core.manage_parked(cfg.state_path, release=args.command == "release-parked", now=int(clock()))
+        finally:
+            LOG.removeFilter(redactor)
+    if args.command == "sources":
+        # `sources test` builds only the source it tests: an unrelated plugin with a missing
+        # credential or an unbuildable field must not block inspecting one feed.
+        try:
+            cfg, _, _ = read_config(args.config, environment)
+        except ConfigError as exc:
+            LOG.error("config: %s", exc)
+            return 1
+        redactor = pipeline.attach_redaction(secret_values(cfg))
+        try:
+            return _test_source(cfg, args, http, environment)
+        finally:
+            LOG.removeFilter(redactor)
     try:
-        cfg = load_config(args.config, environment, lenient=state_only)
+        runtime = Runtime.build(args.config, environment, clock=clock)
     except ConfigError as exc:
         LOG.error("config: %s", exc)
         return 1
-    redactor = pipeline.attach_redaction(secret_values(cfg))
     try:
-        if args.command == "sources":
-            return _test_source(cfg, args, http, environment)
-        # These only touch the state document: no source or notifier is built, so an unrelated plugin with a
-        # missing credential cannot block recovery of an existing parked queue.
-        if args.command == "release-parked":
-            with state_lock(cfg.state_path):
-                return core.manage_parked(cfg.state_path, release=True, now=int(clock()))
-        if args.command == "drop-parked":
-            with state_lock(cfg.state_path):
-                return core.manage_parked(cfg.state_path, release=False, now=int(clock()))
-        try:
-            sources, notifiers = pipeline.build_plugins(cfg, environment)
-        except (ValueError, KeyError) as exc:
-            # Inside the redacted block: a builder error would otherwise traceback unredacted, and plugin
-            # fields are expanded from the environment.
-            LOG.error("plugin configuration: %s", exc)
-            return 1
         if args.command == "test-notify":
             entry = {
                 "kind": "test",
@@ -176,47 +273,51 @@ def main(
                 "source": "advisory-radar",
                 "link": "",
             }
-            statuses = [notifier.send(entry, http) for notifier in notifiers]
-            LOG.info("test-notify: %s", ", ".join(f"{n.id}={s}" for n, s in zip(notifiers, statuses, strict=True)))
-            return 0 if notifiers and all(200 <= s < 300 for s in statuses) else 1
+            statuses = [notifier.send(entry, http) for notifier in runtime.notifiers]
+            LOG.info(
+                "test-notify: %s", ", ".join(f"{n.id}={s}" for n, s in zip(runtime.notifiers, statuses, strict=True))
+            )
+            return 0 if runtime.notifiers and all(200 <= s < 300 for s in statuses) else 1
         if args.command == "run":
-            import threading
-
             from .web import create_app
 
             def one_pass(lock_blocking: bool = True) -> int:
+                """The web UI's "run now", from the same live snapshot the schedule uses."""
+                cfg, sources, notifiers = runtime.snapshot()
                 return pipeline.run_pass(
                     cfg, sources, notifiers, http=http, clock=clock, sleep=sleep, lock_blocking=lock_blocking
                 )
 
-            app = create_app(cfg, environment, run_pass=one_pass, sources=sources, notifiers=notifiers)
-
+            app = create_app(runtime, environment, run_pass=one_pass)
             stopping = threading.Event()
-
-            def scheduler() -> None:
-                while not stopping.is_set():
-                    try:
-                        code = one_pass()
-                        if code:
-                            LOG.warning("pass exited %d; continuing on schedule", code)
-                    except Exception:  # the schedule must survive any single bad pass
-                        LOG.exception("pass raised; continuing on schedule")
-                    stopping.wait(cfg.poll_interval_seconds)
-
-            thread = threading.Thread(target=scheduler, daemon=True)
+            thread = threading.Thread(
+                target=run_scheduler,
+                args=(runtime, stopping),
+                kwargs={"http": http, "clock": clock, "sleep": sleep},
+                daemon=True,
+            )
+            install_sighup(runtime)
             thread.start()
             import uvicorn
 
-            LOG.info("web UI on http://%s:%d", cfg.web_host, cfg.web_port)
+            LOG.info("web UI on http://%s:%d", runtime.cfg.web_host, runtime.cfg.web_port)
             try:
-                uvicorn.run(app, host=cfg.web_host, port=cfg.web_port, log_level="warning")
+                uvicorn.run(app, host=runtime.cfg.web_host, port=runtime.cfg.web_port, log_level="warning")
             finally:
-                # Shutdown is not a reason to fetch and notify again: stop the schedule and leave.
+                # Shutdown is not a reason to fetch and notify again: stop the schedule and leave. The wake
+                # event ends the wait between passes so the thread is not joined while asleep.
                 stopping.set()
+                runtime.wake.set()
                 thread.join(timeout=5)
             return 0
         return pipeline.run_pass(
-            cfg, sources, notifiers, http=http, clock=clock, sleep=sleep, dry_run=args.command == "dry-run"
+            runtime.cfg,
+            runtime.sources,
+            runtime.notifiers,
+            http=http,
+            clock=clock,
+            sleep=sleep,
+            dry_run=args.command == "dry-run",
         )
     finally:
-        LOG.removeFilter(redactor)
+        runtime.detach_redaction()

@@ -1,13 +1,15 @@
 """Configuration: one YAML file plus environment expansion, validated into dataclasses.
 
 Secrets are never written to the config file: a string ``${NAME}`` is replaced
-from the process environment, and ``${NAME}_FILE`` reads the secret from a
-file (Docker/Podman secrets pattern). Unknown keys are refused, so a typo
-fails at startup instead of silently doing nothing.
+from the process environment, and a ``${NAME_FILE}`` reference reads the secret from
+the file the ``NAME_FILE`` environment variable names (Docker/Podman secrets
+pattern). Unknown keys are refused, so a typo fails at startup instead of silently
+doing nothing.
 """
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 from dataclasses import dataclass, field
@@ -39,7 +41,9 @@ def _expand(value: object, env: dict[str, str], resolved: list[str] | None = Non
                     return contents
                 if lenient:
                     return match.group(0)  # a state-only command never builds the plugin that reads it
-                raise ConfigError(f"${{{name}_FILE}}: no readable file (env {name}_FILE={path!r})")
+                # The variable's value is not in the message: an operator can point a *_FILE variable at the
+                # secret itself by mistake, and this error is printed before any redaction exists.
+                raise ConfigError(f"${{{name}_FILE}}: no readable file")
             if name not in env:
                 if lenient:
                     return match.group(0)  # state-only commands never build the plugin that would use it
@@ -72,7 +76,7 @@ class Config:
     raw: dict = field(default_factory=dict)
     #: ``${NAME}`` references read from the file *before* expansion, for log redaction.
     secret_names: tuple[str, ...] = ()
-    #: The values those references expanded to, including the contents of a ``${NAME}_FILE``.
+    #: The values those references expanded to, including the contents of a ``${NAME_FILE}``.
     secret_values: tuple[str, ...] = ()
 
 
@@ -145,16 +149,93 @@ def _require(condition: bool, message: str) -> None:
         raise ConfigError(message)
 
 
-def load_config(path: Path, env: dict[str, str] | None = None, *, lenient: bool = False) -> Config:
-    env = os.environ if env is None else env
+def load_document(path: Path, *, settings: dict | None = None) -> dict:
+    """The YAML document with the overlay merged in, before expansion and filtering.
+
+    The overlay is merged here, before any structural check, and validated by the same validator
+    :func:`load_config` runs: an overlay value fails with the message the YAML would give.
+    ``settings`` is the overlay mapping already loaded by the caller (``settings.load_settings``);
+    ``None`` means no overlay.
+    """
     try:
         document = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
         raise ConfigError(f"cannot read {path}: {exc}") from exc
     if not isinstance(document, dict):
         raise ConfigError(f"{path} is not a mapping")
+    if settings is not None:
+        _merge_settings(document, settings)
     unknown = set(document) - _TOP_KEYS
     _require(not unknown, f"unknown top-level keys in {path}: {sorted(unknown)}")
+    return document
+
+
+def _merge_settings(document: dict, settings: dict) -> None:
+    """Overlay the four writable keys onto the raw YAML document, in place."""
+    from .settings import validate_settings  # lazy: settings.py imports ConfigError from this module
+
+    validate_settings(settings)
+    if "notifiers" in settings:
+        # A full replacement is how a notifier is added, edited or disabled from the overlay. ``headers`` is
+        # the one field the overlay may not store (a mapping can carry a credential), so it stays in the YAML
+        # and is carried over by id: editing enablement must not silently drop authentication headers.
+        headers_by_id = {
+            entry.get("id"): entry["headers"]
+            for entry in (document.get("notifiers") or [])
+            if isinstance(entry, dict) and "headers" in entry
+        }
+        merged = []
+        for entry in settings["notifiers"]:
+            entry = dict(entry) if isinstance(entry, dict) else entry
+            if isinstance(entry, dict) and "headers" not in entry and entry.get("id") in headers_by_id:
+                entry["headers"] = headers_by_id[entry["id"]]
+            merged.append(entry)
+        document["notifiers"] = merged
+    if "sources" in settings:
+        document["sources"] = _merge_sources(document.get("sources"), settings["sources"])
+    if "poll_interval" in settings:
+        document["poll_interval"] = settings["poll_interval"]
+    if "hidden_source_hosts" in settings:
+        document["hidden_source_hosts"] = settings["hidden_source_hosts"]
+
+
+def _merge_sources(raw: object, overlay: dict) -> object:
+    """Apply the per-id ``enabled``/``tag`` edits to the YAML source list; an unknown id is refused."""
+    if raw is None:
+        raw = []  # an omitted list is the same empty list the validator treats it as
+    if not isinstance(raw, list):
+        return raw  # the validator refuses the YAML shape, which an overlay cannot repair
+    merged = [dict(entry) if isinstance(entry, dict) else entry for entry in raw]
+    by_id = {entry.get("id"): entry for entry in merged if isinstance(entry, dict)}
+    for identifier, changes in overlay.items():
+        entry = by_id.get(identifier)
+        if entry is None:
+            raise ConfigError(f"settings: no source with id {identifier!r} is defined in the YAML config")
+        entry.update(changes)
+    return merged
+
+
+def load_config(
+    path: Path,
+    env: dict[str, str] | None = None,
+    *,
+    lenient: bool = False,
+    settings: dict | None = None,
+) -> Config:
+    """Load and validate one YAML file, with an overlay merged before validation when given."""
+    return config_from_document(load_document(path, settings=settings), path, env, lenient=lenient)
+
+
+def config_from_document(
+    document: dict, path: Path, env: dict[str, str] | None = None, *, lenient: bool = False
+) -> Config:
+    """The one validator: a raw document becomes a frozen ``Config``.
+
+    The input is copied first: a caller that keeps the merged document (the web UI renders its forms
+    from it) must not receive the expanded, enabled-only version this function builds.
+    """
+    env = os.environ if env is None else env
+    document = copy.deepcopy(document)
     # Structure is validated on the *unexpanded* document: an entry whose id is missing must not put an
     # expanded password into the error message, and the secret names must be read before expansion
     # replaces them with their values.
@@ -218,6 +299,10 @@ def load_config(path: Path, env: dict[str, str] | None = None, *, lenient: bool 
     _require(
         state_path.name != "kev.json",
         "state_path must not be named kev.json: that is the KEV cache's filename beside the state file",
+    )
+    _require(
+        state_path.name != "settings.json",
+        "state_path must not be named settings.json: that is the settings overlay's filename beside the state file",
     )
     watchlist = document.get("watchlist")
     _require(

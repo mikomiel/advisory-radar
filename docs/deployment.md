@@ -71,8 +71,9 @@ exceeding a few poll intervals.
 ## Configuration
 
 One YAML file (`/config/config.yml`, see `examples/config.yml`). Secrets are
-`${VAR}` placeholders resolved from the environment at startup; `${VAR}_FILE`
-reads the value from a file (Docker secrets / Podman secrets pattern). The
+`${VAR}` placeholders resolved from the environment at startup; `${VAR_FILE}`
+reads the value from the file named by the `VAR_FILE` environment variable (Docker
+secrets / Podman secrets pattern). The
 container needs:
 
 | Env var | Purpose |
@@ -100,6 +101,40 @@ session cookie, a per-session form token on every state-changing POST, and a
 throttle on failed logins (five per five minutes per peer address). Put it behind
 a TLS-terminating reverse proxy; the session cookie is only sent over HTTPS unless
 `ADVISORY_RADAR_INSECURE_COOKIES=1`.
+
+### The settings overlay
+
+`/config` writes `settings.json` beside the state file on `/data` (`/data/settings.json`
+in the container, `~/.local/share/advisory-radar/settings.json` for the rootless
+quadlet). It is created with mode `0600`, owned by the container user, and replaced
+atomically (a temporary file in the same directory, `fsync`, `os.replace`), so a
+half-written file cannot brick a start. `/config` stays read-only: the overlay holds
+only four keys — `notifiers`, per-source `enabled`/`tag`, `poll_interval` and
+`hidden_source_hosts` — and the YAML owns everything else. While the overlay holds a
+`notifiers` list it replaces the YAML's membership and ordinary fields, so a notifier
+added to the YAML later is not used until that section is removed from the overlay; a
+notifier's `headers` are the exception, staying in the YAML and carried over by id.
+
+The overlay is optional; without it the YAML is the whole configuration. An invalid one
+is refused: a save shows the configuration error and writes nothing, the *Reload
+configuration* button shows the refusal, `kill -HUP <pid>` logs its reason, and either
+way the running configuration stays. A pass holds the state lock for its whole transaction, so a reload waits
+for it (`SIGHUP`) or answers `409` (the UI), and a pass that already started finishes
+with the configuration it started with; the wait between passes follows the live interval,
+so a shortened `poll_interval` does not sleep out the old one. Each settings form carries a
+fingerprint of the
+configuration it was rendered from, so a save from a page that has not seen a newer
+configuration — another save, a YAML edit, or an overlay deleted and recreated — is
+refused (`409`) rather than overwriting it. The notifier form rewrites the whole list, so
+every existing notifier must already use `${NAME}`/`${NAME_FILE}` references for `url`,
+`key`, `password` and `token`; a literal secret in the YAML is refused with an error
+naming that notifier, and has to be moved to the environment first. Pending and parked messages are not touched by a
+reload. A reload re-reads the YAML and the overlay, so an edit to `config.yml` is picked
+up too; `web.host`, `web.port` and `state_path` are refused rather than reported as
+applied, because they are bound when the process starts, and environment variables are
+read at start, so changing one still needs a restart. Deleting `settings.json` and
+reloading returns to the YAML (the empty overlay is applied as revision 0). The overlay itself is capped at 64 KiB: a value that would make the file larger
+is refused instead of written.
 
 Two upstreams reward configuration rather than credentials:
 

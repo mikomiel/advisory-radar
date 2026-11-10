@@ -18,6 +18,24 @@ operator action, and the release workflow then builds and pushes the image to
   nothing, write no state).
 - A `/sources` page rendered from the catalogue, and a README source table kept
   equal to it by `tests/test_catalogue.py`.
+- A settings overlay (`settings.json` beside the state file) merged over the YAML before
+  validation: `notifiers` (the overlay replaces the list's membership and ordinary fields,
+  so a channel can be added, edited or disabled; a notifier's `headers` stay in the YAML
+  and are carried over by id), per-source `enabled`/`tag`, `poll_interval` and
+  `hidden_source_hosts`. A shared configuration value fails with the `ConfigError` the YAML
+  gives, and the overlay adds its own restrictions — a secret-bearing key must be a
+  `${NAME}`/`${NAME_FILE}` reference, a source edit is `enabled`/`tag` only, and `headers`
+  may not be written — so no credential reaches the file.
+- Hot reload: a saved overlay, `POST /reload` and `SIGHUP` rebuild the plugins off to the
+  side and swap them under the state lock; the scheduler reads the configuration per pass,
+  and the wait between passes restarts on a reload so a shorter `poll_interval` takes
+  effect without sleeping out the old one. A refused overlay keeps the running
+  configuration, and pending and parked messages are untouched.
+- `/config` edits those settings with plain forms (poll interval, hidden hosts, sources,
+  notifiers) and shows which saved overlay revision is live. Each form carries a fingerprint
+  of the configuration it was rendered from, so a stale tab — after another save, a YAML
+  edit, or an overlay deleted and recreated — is refused instead of overwriting it, and a
+  notifier's `headers` stay in the YAML while the overlay edits its enablement.
 
 ### Fixed
 - An automerge left its head branch behind: the repository's *automatically delete head branches*

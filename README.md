@@ -23,8 +23,8 @@ Then open http://localhost:8080 (sign in with `ADVISORY_RADAR_AUTH_TOKEN`) for t
 dashboard, alert history, parked queue, run log and config overview. `/healthz`
 and `/metrics` (Prometheus text) are unauthenticated for probes and scrapers.
 Configuration lives in `config/` on the mounted volume (see `examples/config.yml`);
-secrets come from environment variables or `<NAME>_FILE` files, never from
-committed files.
+secrets come from environment variables or a `${NAME_FILE}` reference to a file, never
+from committed files.
 
 ```yaml
 # examples/config.yml (abridged)
@@ -54,6 +54,43 @@ ones you do not run. Package patterns filter Debian DSA titles.
 }
 ```
 
+### Settings without a restart
+
+The `/config` page changes four things without editing the YAML or restarting the
+container: `notifiers`, each source's `enabled` flag and `tag`, `poll_interval`, and
+`hidden_source_hosts`. The notifier form manages the whole list — that is how a channel
+is added, edited or disabled — and while the overlay holds a notifier list, that list
+replaces the YAML's membership and ordinary fields; only a notifier's `headers` stay in
+the YAML and are carried over by id, because the overlay may not store a mapping that can
+carry a credential. A notifier added to the YAML while the overlay holds a list is not
+used until that section is removed from the overlay. A save writes `settings.json` next to the state file (on the `/data`
+volume) and applies immediately when the state lock is free; if a pass holds the lock, the
+page says the revision is not live yet, and Reload applies it when the pass finishes. Each
+form carries a fingerprint of the configuration it was rendered from, so a second tab —
+after another save, a YAML edit, or the overlay being deleted and recreated — is refused
+with `409` instead of overwriting rows it never saw.
+`SIGHUP` re-reads `config.yml` and the overlay, for a configuration edited by hand. Every
+other setting stays in `config/config.yml`; editing most of it needs a reload (the button
+or `SIGHUP`), not a restart — `web.host`, `web.port` and `state_path` are bound when the
+process starts, and a change to one of them needs a restart.
+
+Secrets stay in the environment. The overlay stores a notifier's `url`, `key`,
+`password` or `token` only as a `${NAME}` or `${NAME_FILE}` reference, refuses a literal
+value, and does not accept `headers` at all. Changing an environment variable still
+needs a restart, because the process reads the environment when it starts.
+
+A reload builds the new configuration and its plugins before it swaps them in under the
+state lock. A shared configuration value goes through the same validator the YAML does,
+and the overlay adds its own restrictions (a secret must be a reference, a source edit is
+`enabled`/`tag` only, `headers` may not be written), so a refused overlay is reported with
+the validator's message; the running configuration stays; a pass that already started finishes with the
+configuration it started with, and the next pass uses the reloaded one. The wait between
+passes follows the live interval, so shortening `poll_interval` takes effect without sleeping
+out the old one. A reload re-reads both files; it refuses `web.host`, `web.port` and `state_path` rather than report them
+applied, because they are bound when the process starts. Environment variables are read at
+start too, so changing one still needs a restart. Deleting `settings.json` and reloading
+returns to the YAML: the empty overlay is applied as revision 0.
+
 ### Gap detection
 
 A source that knows its own page size (a FreshRSS export) reports a truncated
@@ -78,7 +115,7 @@ turns critical, and never re-sends what you already received.
 - Severity decision per CVE with re-evaluation window and one escalation per level
 - Web UI + REST API, in-process scheduler (default every 15 min), atomic JSON state on a volume
 - Docker and Podman deployment (compose file + quadlet/kube YAML), `/healthz` and `/metrics`
-- Secrets via environment / `_FILE` only; redaction filter on logs; fail-closed source errors
+- Secrets via environment / `${NAME_FILE}` references only; redaction filter on logs; fail-closed source errors
 
 ## Screenshots
 

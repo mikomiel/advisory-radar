@@ -79,10 +79,26 @@ class RedactFilter(logging.Filter):
 
     def __init__(self, secrets) -> None:
         super().__init__()
-        # A token that reaches a URL is percent-encoded there, so the encoded form must be redacted too.
-        values = [secret for secret in secrets if secret]
-        encoded = {urllib.parse.quote(secret, safe="") for secret in values}
-        self.secrets = sorted({*values, *encoded}, key=len, reverse=True)
+        self._raw: set[str] = set()
+        self.secrets: list[str] = []
+        self.add(secrets)
+
+    @property
+    def raw(self) -> list[str]:
+        """The secret values themselves, without the encoded variants."""
+        return list(self._raw)
+
+    def add(self, secrets) -> None:
+        """Merge more secrets into this filter, longest first.
+
+        A reload keeps the values an older configuration referenced (a pass may still be using it), and one
+        cumulative filter must know all of them: chained filters would let a short old value replace its part
+        of a longer new secret before the new filter could match it. Longest first is what makes that order
+        safe, including for the percent-encoded form a token takes inside a URL.
+        """
+        self._raw.update(secret for secret in secrets if secret)
+        encoded = {urllib.parse.quote(secret, safe="") for secret in self._raw}
+        self.secrets = sorted({*self._raw, *encoded}, key=len, reverse=True)
 
     def filter(self, record: logging.LogRecord) -> bool:
         text = record.getMessage()
