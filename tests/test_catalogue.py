@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient
 from advisory_radar import cli, config
 from advisory_radar.catalogue import SOURCE_SPECS
 from advisory_radar.config import load_config
-from advisory_radar.sources import SOURCE_BUILDERS, build_source
+from advisory_radar.sources import SOURCE_BUILDERS, _url_digest, build_source
 from advisory_radar.state import state_lock
 from advisory_radar.web import create_app
 
@@ -184,7 +184,14 @@ def test_sources_test_leaves_an_existing_state_document_untouched(tmp_path):
                 "parked": [],
                 "watch": {},
                 "cache": {},
-                "feeds": {"vendor": {"url_digest": "digest", "etag": 'W/"old"'}},
+                # The digest is the configured URL's, so a regression that passed this state to the fetch
+                # would send If-None-Match: a made-up digest would hide exactly what this test checks.
+                "feeds": {
+                    "vendor": {
+                        "url_digest": _url_digest("https://feeds.example.net/security.xml"),
+                        "etag": 'W/"old"',
+                    }
+                },
             }
         ),
         encoding="utf-8",
