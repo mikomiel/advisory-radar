@@ -174,8 +174,21 @@ def _merge_settings(document: dict, settings: dict) -> None:
 
     validate_settings(settings)
     if "notifiers" in settings:
-        # A full replacement is how a notifier is added, edited or disabled from the overlay.
-        document["notifiers"] = [dict(entry) if isinstance(entry, dict) else entry for entry in settings["notifiers"]]
+        # A full replacement is how a notifier is added, edited or disabled from the overlay. ``headers`` is
+        # the one field the overlay may not store (a mapping can carry a credential), so it stays in the YAML
+        # and is carried over by id: editing enablement must not silently drop authentication headers.
+        headers_by_id = {
+            entry.get("id"): entry["headers"]
+            for entry in (document.get("notifiers") or [])
+            if isinstance(entry, dict) and "headers" in entry
+        }
+        merged = []
+        for entry in settings["notifiers"]:
+            entry = dict(entry) if isinstance(entry, dict) else entry
+            if isinstance(entry, dict) and "headers" not in entry and entry.get("id") in headers_by_id:
+                entry["headers"] = headers_by_id[entry["id"]]
+            merged.append(entry)
+        document["notifiers"] = merged
     if "sources" in settings:
         document["sources"] = _merge_sources(document.get("sources"), settings["sources"])
     if "poll_interval" in settings:

@@ -490,6 +490,31 @@ def test_an_expanded_state_path_finds_its_overlay(tmp_path):
     assert Runtime.build(path, environment).cfg.poll_interval_seconds == 30
 
 
+def test_headers_stay_in_the_yaml_when_the_overlay_edits_a_notifier(tmp_path):
+    # headers is the one field the overlay may not store; an enablement edit must not drop the authentication
+    # headers the YAML holds.
+    path = write_config(
+        tmp_path,
+        {
+            "notifiers": [
+                {
+                    "id": "hook",
+                    "type": "webhook",
+                    "url": "${HOOK}",
+                    "headers": {"Authorization": "Bearer ${TOKEN}"},
+                }
+            ]
+        },
+    )
+    environment = {"HOOK": "https://hooks.example.net/x", "TOKEN": "t"}
+    overlay = {"notifiers": [{"id": "hook", "type": "webhook", "url": "${HOOK}"}]}
+    cfg = load_config(path, environment, settings=overlay)
+    assert cfg.notifiers[0]["headers"] == {"Authorization": "Bearer t"}, "the YAML headers reach the builder"
+    disabled = {"notifiers": [{"id": "hook", "type": "webhook", "url": "${HOOK}", "enabled": False}]}
+    merged = config.load_document(path, settings=disabled)
+    assert merged["notifiers"][0]["headers"] == {"Authorization": "Bearer ${TOKEN}"}
+
+
 def test_an_overlay_can_reference_a_file_secret(tmp_path):
     secret_file = tmp_path / "hook"
     secret_file.write_text(SECRET)
@@ -551,6 +576,7 @@ def test_a_refused_sighup_reload_keeps_the_running_configuration(tmp_path, caplo
             cli._reload_blocking(runtime)
         assert runtime.cfg.poll_interval_seconds == 900
         assert "keeping the running configuration" in caplog.text
+        assert "is not JSON" in caplog.text, "the refusal must say why, not only that it happened"
     finally:
         runtime.detach_redaction()
 

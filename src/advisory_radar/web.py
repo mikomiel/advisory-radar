@@ -580,14 +580,36 @@ def create_app(
     def first(form: dict[str, list[str]], name: str) -> str:
         return (form.get(name) or [""])[0]
 
-    def overlay_on_disk() -> dict:
-        """The overlay as saved (not necessarily live), so editing one section keeps the other three."""
+    def saved_overlay() -> tuple[dict, int]:
+        """The overlay as saved and its revision.
+
+        An unreadable file counts as revision 0: the save that follows replaces it, and the page shows the
+        error. The revision is what makes a stale form detectable, so both come from one read.
+        """
         if runtime.overlay_path is None:
-            return {}
+            return {}, 0
         try:
-            return dict(load_settings_document(runtime.overlay_path)["settings"])
+            stored = load_settings_document(runtime.overlay_path)
+            return dict(stored["settings"]), int(stored["revision"])
         except ConfigError:
-            return dict(runtime.overlay["settings"])
+            return dict(runtime.overlay["settings"]), 0
+
+    def stale_form(form: dict, current: int):
+        """Refuse a form rendered against another revision.
+
+        A second tab that did not see a saved revision would rewrite the whole section from its own rows: the
+        revision it carries is the only way to tell "this is what I saw" from "this is what is there now".
+        """
+        submitted = first(form, "revision")
+        if submitted == str(current):
+            return None
+        return page(
+            "Not saved",
+            f"<p>The overlay changed since this page was loaded (it is at revision {current}, this form was "
+            f"built for revision {esc(submitted or 'none')}). Reload <a href='/config'>the configuration page</a> "
+            "and make the change again.</p>",
+            status_code=409,
+        )
 
     def form_document(overlay: dict) -> tuple[dict, str]:
         """The document the forms edit: the saved overlay merged over the YAML.
@@ -706,7 +728,10 @@ def create_app(
             return RedirectResponse("/login", status_code=303)
         form = form_body(request)
         with SETTINGS_LOCK:
-            overlay = overlay_on_disk()
+            overlay, revision = saved_overlay()
+            stale = stale_form(form, revision)
+            if stale is not None:
+                return stale
             poll = first(form, "poll_interval").strip()
             if poll:
                 overlay["poll_interval"] = poll
@@ -723,7 +748,10 @@ def create_app(
             return RedirectResponse("/login", status_code=303)
         form = form_body(request)
         with SETTINGS_LOCK:
-            overlay = overlay_on_disk()
+            overlay, revision = saved_overlay()
+            stale = stale_form(form, revision)
+            if stale is not None:
+                return stale
             base, _ = form_document(overlay)
             changes = {}
             for entry in base.get("sources") or []:
@@ -743,7 +771,10 @@ def create_app(
             return RedirectResponse("/login", status_code=303)
         form = form_body(request)
         with SETTINGS_LOCK:
-            overlay = overlay_on_disk()
+            overlay, revision = saved_overlay()
+            stale = stale_form(form, revision)
+            if stale is not None:
+                return stale
             base, _ = form_document(overlay)
             return _save_notifiers(overlay, base, form)
 
@@ -754,6 +785,9 @@ def create_app(
                 continue
             identifier = entry["id"]
             updated = dict(entry)
+            # headers stay in the YAML (the overlay may not store a mapping that can carry a credential) and
+            # are carried over by id when the overlay is merged.
+            updated.pop("headers", None)
             updated["enabled"] = f"enabled:{identifier}" in form
             for key in NOTIFIER_FORM_KEYS:
                 if key not in entry:
@@ -885,24 +919,25 @@ def create_app(
             f"<label>{key} <input type='text' name='new:{key}'></label>" for key in NOTIFIER_FORM_KEYS
         )
         csrf = csrf_field(request)
+        revision_field = f"<input type='hidden' name='revision' value='{saved_revision}'>"
         body = (
             f"<p>Live poll interval <b>{cfg.poll_interval_seconds}s</b> · state {esc(cfg.state_path)} · "
             f"watchlist {esc(cfg.watchlist_path or 'built-in default')}</p>"
             f"<p class='muted'>Settings overlay: {status}</p>{banner}"
             f'<form method="post" action="/reload">{csrf}<button>Reload configuration</button></form>'
             "<h2>Settings</h2>"
-            f'<form method="post" action="/config/settings">{csrf}'
+            f'<form method="post" action="/config/settings">{csrf}{revision_field}'
             f"<p><label>Poll interval <input type='text' name='poll_interval' value='{esc(poll_text)}'></label> "
             "(15m, 30s or 12h)</p>"
             "<p><label>Hidden source hosts (one per line)<br>"
             f"<textarea name='hidden_source_hosts' rows='4' cols='40'>{esc(hidden_text)}</textarea></label></p>"
             "<button>Save settings</button></form>"
             "<h2>Sources</h2>"
-            f'<form method="post" action="/config/sources">{csrf}'
+            f'<form method="post" action="/config/sources">{csrf}{revision_field}'
             "<table><tr><th>Source</th><th>Enabled</th><th>Tag</th></tr>"
             f"{source_form_entries(sources)}</table><button>Save sources</button></form>"
             "<h2>Notifiers</h2>"
-            f'<form method="post" action="/config/notifiers">{csrf}'
+            f'<form method="post" action="/config/notifiers">{csrf}{revision_field}'
             "<table><tr><th>Notifier</th><th>Enabled</th><th>Non-secret fields</th><th>Secrets</th></tr>"
             f"{notifier_form_entries(notifiers)}</table>"
             "<h3>New notifier</h3>"

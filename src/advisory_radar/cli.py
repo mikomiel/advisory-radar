@@ -132,8 +132,11 @@ def _reload_blocking(runtime: Runtime) -> None:
     """
     try:
         runtime.reload(blocking=True)
-    except Exception:  # a reload must be able to fail without taking the process down
-        LOG.exception("reload refused; keeping the running configuration")
+    except Exception as exc:  # a reload must be able to fail without taking the process down
+        # The redaction filter removes exc_info from a record, so the reason is put into the message itself:
+        # a refusal the operator cannot diagnose is barely better than a crash.
+        reason = pipeline.redact(f"{type(exc).__name__}: {exc}", secret_values(runtime.cfg))
+        LOG.error("reload refused; keeping the running configuration: %s", reason)
     else:
         LOG.info("reload applied: overlay revision %s", runtime.overlay["revision"])
 
