@@ -24,14 +24,20 @@ from .state import load_state_document, save_state, state_lock
 LOG = logging.getLogger("advisory_radar")
 
 
-def _state_path(document: dict) -> Path:
+def _state_path(document: dict, environment: Mapping[str, str]) -> Path:
     """Where the overlay lives is read from the YAML before the overlay can exist.
 
-    Only the location is taken here; the validator owns the value itself, so a spelling it would
-    refuse falls back to the documented default and the validator reports the real error.
+    ``state_path`` goes through the same ``${NAME}`` expansion the validator applies, or a
+    ``state_path: ${DATA_DIR}/state.json`` would have the overlay read beside a literal
+    ``${DATA_DIR}/settings.json`` and written beside the expanded one. Only the location is taken here;
+    the validator owns the value itself, so a spelling it would refuse falls back to the documented
+    default and the validator reports the real error.
     """
     raw = document.get("state_path", core.DEFAULT_STATE)
-    return Path(raw) if isinstance(raw, str) else core.DEFAULT_STATE
+    if not isinstance(raw, str):
+        return core.DEFAULT_STATE
+    expanded = config._expand(raw, dict(environment))
+    return Path(expanded) if isinstance(expanded, str) else core.DEFAULT_STATE
 
 
 def read_config(
@@ -46,7 +52,7 @@ def read_config(
     with the overlay, whose values only the validator judges.
     """
     base = load_document(config_path)
-    overlay = settings.load_settings_document(settings.settings_path(_state_path(base)))
+    overlay = settings.load_settings_document(settings.settings_path(_state_path(base, environment)))
     document = load_document(config_path, settings=overlay["settings"])
     cfg = config.config_from_document(document, config_path, environment, lenient=lenient)
     return cfg, document, overlay
@@ -160,10 +166,10 @@ class Runtime:
         """Rebuild off to the side and install under the state lock.
 
         A candidate that cannot be built raises before the lock is taken and leaves every live object
-        untouched. ``blocking=False`` raises ``LockBusy`` when a pass holds the lock. The state
-        document is read before the swap, so an unreadable state is a refusal rather than a
-        configuration installed without its applied marker; the write itself leaves pending and
-        parked exactly as they were.
+        untouched. ``blocking=False`` raises ``LockBusy`` when a pass holds the lock. The state document is
+        read and the applied marker written before the candidate is published, so an unreadable or
+        unwritable state is a refusal rather than a live revision its state does not record; the write
+        itself leaves pending and parked exactly as they were.
         """
         if self.config_path is None or self.overlay_path is None:
             raise ConfigError("this runtime has no configuration file; reload is unavailable")
@@ -179,6 +185,14 @@ class Runtime:
                 state = load_state_document(self.cfg.state_path, core.STATE_SCHEMA, "advisory state")
                 if state is None:
                     state = core.new_state()
+                # Persist the applied marker *before* publishing the candidate: if the write fails the
+                # running configuration is still the old one, and a reader never sees a live revision its
+                # state does not record. Everything after the write is an in-memory assignment.
+                state["settings"] = {"revision": int(candidate.overlay["revision"]), "applied_at": int(self.clock())}
+                try:
+                    save_state(self.cfg.state_path, state)
+                except OSError as exc:
+                    raise ConfigError(f"the overlay was not applied: cannot record it in the state: {exc}") from exc
                 self._live = candidate.snapshot()
                 self.overlay = candidate.overlay
                 self.document = candidate.document
@@ -189,8 +203,6 @@ class Runtime:
                 candidate._redactor = None
                 if previous is not None:
                     LOG.removeFilter(previous)
-                state["settings"] = {"revision": int(self.overlay["revision"]), "applied_at": int(self.clock())}
-                save_state(self.cfg.state_path, state)
         finally:
             candidate.detach_redaction()
 
