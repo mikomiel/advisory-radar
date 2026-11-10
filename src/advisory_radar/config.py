@@ -285,6 +285,10 @@ def config_from_document(
         state_path.name != "kev.json",
         "state_path must not be named kev.json: that is the KEV cache's filename beside the state file",
     )
+    _require(
+        state_path.name != "settings.json",
+        "state_path must not be named settings.json: that is the settings overlay's filename beside the state file",
+    )
     watchlist = document.get("watchlist")
     _require(
         watchlist is None or isinstance(watchlist, str),
