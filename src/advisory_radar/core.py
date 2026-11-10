@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import datetime
 import fnmatch
+import hashlib
+import hmac
+import json
 import logging
 import math
 import re
@@ -2306,7 +2309,7 @@ def manage_parked(state_path: Path, release: bool, now: int) -> int:
         state["pending"] = [*map(_released, parked), *state["pending"]]
     else:
         for entry in parked:
-            _delivered(state, entry, now, outcome="dropped")
+            _delivered(state, entry, now, outcome="dropped", delivered_to=entry.get("sent_to") or ())
     state["parked"] = []
     save_state(state_path, state)
     LOG.info(
@@ -2318,13 +2321,24 @@ def manage_parked(state_path: Path, release: bool, now: int) -> int:
     return 0
 
 
-def manage_parked_entry(state_path: Path, index: int, release: bool, now: int) -> bool:
+def parked_token(entry: Mapping) -> str:
+    """A stable identity for one parked message, so an old row button cannot act on a different one.
+
+    The position alone is not enough: a page offers "Drop" for the row it rendered, and a release or a second
+    tap can move another message into that position before the form is submitted. The token covers the parts
+    of the entry an operator saw (its time, identifiers, title and link) and moves with it.
+    """
+    material = [entry.get("parked_at"), entry.get("ids"), entry.get("title"), entry.get("link")]
+    return hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+
+def manage_parked_entry(state_path: Path, index: int, release: bool, now: int, *, expected: str | None = None) -> bool:
     """The operator's decision on one parked message, by its position in ``state["parked"]``.
 
-    The same effect as :func:`manage_parked` for one entry. False when the state cannot be read or that
-    position no longer exists: the page that offered the button may be older than the queue, and a stale
-    index must refuse rather than act on whatever message moved into it. The caller holds the state lock,
-    exactly as for the bulk action.
+    The same effect as :func:`manage_parked` for one entry. False when the state cannot be read, that
+    position no longer exists, or ``expected`` names a different message: the page that offered the button
+    may be older than the queue, and a stale row must refuse rather than act on whatever message moved into
+    it. The caller holds the state lock, exactly as for the bulk action.
     """
     try:
         state = load_state_document(state_path, STATE_SCHEMA, "advisory state")
@@ -2338,11 +2352,19 @@ def manage_parked_entry(state_path: Path, index: int, release: bool, now: int) -
     if not isinstance(parked, list) or not 0 <= index < len(parked):
         LOG.warning("no parked message at position %d; the queue changed since the page was rendered", index)
         return False
-    entry = parked.pop(index)
+    entry = parked[index]
+    if expected is not None and not hmac.compare_digest(parked_token(entry), expected):
+        LOG.warning(
+            "the message at parked position %d is not the one the page offered; the queue was not changed", index
+        )
+        return False
+    parked.pop(index)
     if release:
         state["pending"] = [_released(entry), *state["pending"]]
     else:
-        _delivered(state, entry, now, outcome="dropped")
+        # A partial delivery may already have been accepted by one notifier: the record keeps that fact even
+        # though no escalation state may advance for a dropped message.
+        _delivered(state, entry, now, outcome="dropped", delivered_to=entry.get("sent_to") or ())
     save_state(state_path, state)
     LOG.info(
         "%s parked message at position %d: %s",

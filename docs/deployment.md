@@ -167,7 +167,8 @@ example.
 `/alerts` keeps its filters in the URL (`tag`, `source`, `outcome`, `q`, `since` and
 `until`, the dates as inclusive UTC days) and pages by keyset cursor rather than an offset,
 so a reload, a bookmark or a shared link shows the same rows and adding an advisory cannot
-shift a page. Each row links to `/advisories/<id>`, which shows the stored classification
+shift a page. Each row links to the advisory's page (the identifier is encoded in the path, so
+one containing slashes still opens), which shows the stored classification
 and delivery record — tag, source, title, identifiers and CVEs, KEV-only CVEs, matched
 products, per-CVE level and CVSS, and the notifiers that accepted the message — and says the details were not recorded for a seen record written by
 an older version, instead of inventing them. The message body is not retained and is not

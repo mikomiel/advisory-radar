@@ -10,6 +10,7 @@ frontend build step.
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import html
@@ -88,7 +89,10 @@ class Auth:
 
 def _public_url(url: str) -> str:
     """The origin only: a source URL can carry a token in its userinfo, query *or path*."""
-    parts = urllib.parse.urlsplit(url)
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return ""
     if not parts.scheme or not parts.hostname:
         return ""
     return f"{parts.scheme}://{parts.hostname}"
@@ -147,6 +151,24 @@ ALERT_PAGE_SIZE = 50
 ALERT_FILTERS = ("tag", "source", "outcome", "q", "since", "until")
 #: The outcomes a seen record can carry. A filter value outside this list matches nothing.
 SEEN_OUTCOMES = ("delivered", "dropped", "suppressed", "backlog", "alias", "not-security")
+
+
+def _advisory_token(identifier: str) -> str:
+    """A slash-free path segment for an identifier, which may itself be (or contain) a URL."""
+    return base64.urlsafe_b64encode(identifier.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _advisory_identifier(token: str) -> str:
+    """The identifier an advisory link names; a 400 page when the segment was not produced by the list."""
+    try:
+        identifier = base64.b64decode(token + "=" * (-len(token) % 4), altchars=b"-_", validate=True).decode("utf-8")
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=400, detail="malformed advisory link; open /alerts and follow a row") from None
+    if not identifier:
+        raise HTTPException(status_code=400, detail="malformed advisory link; open /alerts and follow a row")
+    return identifier
+
+
 #: The severity tags a message can carry; the alert filter and the route form offer these.
 TAGS = ("critical", "warning")
 #: Fixed route rows on /config. More rules already configured are rendered too, so a save cannot drop them.
@@ -174,8 +196,10 @@ def _cursor_decode(value: str) -> tuple[int, str]:
     """
     malformed = HTTPException(status_code=400, detail="malformed page cursor; open /alerts again")
     try:
-        raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)).decode("utf-8")
-    except ValueError:
+        # ``validate`` is the point: the default decoder silently drops characters outside the alphabet, so
+        # ``...!`` would decode instead of being refused. URL-safe characters only, no padding requirement.
+        raw = base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True).decode("utf-8")
+    except (binascii.Error, ValueError):
         raise malformed from None
     at, separator, identifier = raw.partition(":")
     if not separator or not identifier:
@@ -277,7 +301,11 @@ def _external_link(url: object, text: object = None) -> str:
     label = esc(text if text not in (None, "") else (url if url is not None else ""))
     if not isinstance(url, str) or not url.startswith("https://"):
         return label
-    parts = urllib.parse.urlsplit(url)
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        # A stored link can be malformed (``https://[broken``); it renders as text, never raises.
+        return label
     if not parts.hostname or "@" in parts.netloc:
         return label
     return f"<a href='{esc(url)}' rel='noreferrer'>{label}</a>"
@@ -335,7 +363,7 @@ def _seen_advisory(record: Mapping) -> str:
     if isinstance(accepted, list) and accepted:
         delivered = ", ".join(esc(value) for value in accepted)
     elif record.get("outcome") == "dropped":
-        delivered = "<span class='muted'>none: the message was dropped, not delivered</span>"
+        delivered = "<span class='muted'>none: dropped before any channel accepted it</span>"
     else:
         delivered = "<span class='muted'>not recorded</span>"
     facts += [
@@ -375,6 +403,7 @@ def _queued_advisory(state_label: str, entry: Mapping) -> str:
         ("Identifiers", _identifier_list(entry.get("ids"))),
         ("CVEs in this message", _identifier_list(entry.get("cves"))),
         ("KEV-only (not scored here)", _identifier_list(entry.get("kev_only"))),
+        ("Matched products", _identifier_list(entry.get("products"))),
         ("Accepted by", _identifier_list(accepted)),
         ("Delivery attempts", attempts_text),
         ("First attempt (UTC)", esc(first) or "<span class='muted'>not attempted yet</span>"),
@@ -813,7 +842,7 @@ def create_app(
         )
         table_rows = []
         for (_, identifier), record in window:
-            path = urllib.parse.quote(identifier, safe="")
+            path = _advisory_token(identifier)
             tag = record.get("tag")
             table_rows.append(
                 f"<tr><td><a href='/advisories/{esc(path)}'>{esc(identifier)}</a></td>"
@@ -841,11 +870,12 @@ def create_app(
             body += f"<p class='muted'>No records on this page. <a href='{esc(link())}'>Newest alerts</a>.</p>"
         return page("Alerts", body, nav_extra=sign_out_form(request))
 
-    @app.get("/advisories/{identifier}", response_class=HTMLResponse)
-    def advisory_page(identifier: str, request: Request):
+    @app.get("/advisories/{token}", response_class=HTMLResponse)
+    def advisory_page(token: str, request: Request):
         """One advisory, from the seen record first, then a pending message, then a parked one."""
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
+        identifier = _advisory_identifier(token)
         state = load_state()
         seen = state.get("seen")
         if isinstance(seen, dict) and isinstance(seen.get(identifier), dict):
@@ -867,15 +897,23 @@ def create_app(
         parked = parked if isinstance(parked, list) else []
         csrf = csrf_field(request)
         rows = []
+        from . import core
+
         for index, entry in enumerate(parked):
             if not isinstance(entry, dict):
                 continue
+            token = core.parked_token(entry)
+            identities = entry.get("ids")
+            shown = ""
+            if isinstance(identities, list):
+                shown = ", ".join(value for value in identities if isinstance(value, str))
             rows.append(
                 f"<tr><td class='tag-{esc(entry.get('tag', ''))}'>{esc(entry.get('tag', ''))}</td>"
-                f"<td>{esc(entry.get('title', ''))}</td><td>{esc(', '.join(entry.get('ids', []))[:80])}</td>"
+                f"<td>{esc(entry.get('title', ''))}</td><td>{esc(shown[:80])}</td>"
                 f"<td><form method='post' action='/parked/{index}/release'>{csrf}"
-                "<button>Release</button></form> "
-                f"<form method='post' action='/parked/{index}/drop'>{csrf}<button>Drop</button></form></td></tr>"
+                f"<input type='hidden' name='token' value='{esc(token)}'><button>Release</button></form> "
+                f"<form method='post' action='/parked/{index}/drop'>{csrf}"
+                f"<input type='hidden' name='token' value='{esc(token)}'><button>Drop</button></form></td></tr>"
             )
         body = (
             "<table><tr><th>Tag</th><th>Title</th><th>IDs</th><th>Actions</th></tr>" + "".join(rows) + "</table>"
@@ -884,11 +922,12 @@ def create_app(
         )
         return page("Parked messages", body, nav_extra=sign_out_form(request))
 
-    def parked_decision(index: int, release: bool):
-        """Release or drop one parked message under the state lock; a stale position is a 404.
+    def parked_decision(index: int, release: bool, request: Request):
+        """Release or drop one parked message under the state lock; a stale row is a 404.
 
         The bulk routes block on the lock, as they always have. A per-row action answers 409 instead: an
-        operator who clicked one row should not be left waiting for a whole pass to finish.
+        operator who clicked one row should not be left waiting for a whole pass to finish. The hidden token
+        the row carried is checked under the lock, so a message that moved into that position is not touched.
         """
         from . import core
         from .state import state_lock
@@ -896,7 +935,8 @@ def create_app(
         state_path = runtime.cfg.state_path
         try:
             with state_lock(state_path, blocking=False):
-                changed = core.manage_parked_entry(state_path, index, release, now=int(time.time()))
+                expected = first(form_body(request), "token") or None
+                changed = core.manage_parked_entry(state_path, index, release, now=int(time.time()), expected=expected)
         except LockBusy:
             return page(
                 "Busy",
@@ -914,13 +954,13 @@ def create_app(
     def parked_release_one(index: int, request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
-        return parked_decision(index, release=True)
+        return parked_decision(index, release=True, request=request)
 
     @app.post("/parked/{index}/drop", dependencies=[Depends(require_csrf)])
     def parked_drop_one(index: int, request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
-        return parked_decision(index, release=False)
+        return parked_decision(index, release=False, request=request)
 
     @app.post("/parked/release", dependencies=[Depends(require_csrf)])
     def parked_release(request: Request):
@@ -1088,9 +1128,12 @@ def create_app(
             selected = route.get("notifiers")
             selected = {value for value in selected if isinstance(value, str)} if isinstance(selected, list) else set()
             tag = match.get("tag") if isinstance(match.get("tag"), str) else ""
+            # The document is unexpanded here: a ${...} reference is a valid configured value, and dropping it
+            # from the select would silently broaden the rule the moment the form is saved.
+            tag_values = ("", *TAGS, *((tag,) if tag and tag not in TAGS else ()))
             tag_options = "".join(
                 f"<option value='{esc(value)}'{' selected' if value == tag else ''}>{esc(value or 'any tag')}</option>"
-                for value in ("", *TAGS)
+                for value in tag_values
             )
             options = "".join(
                 f"<option value='{esc(identifier)}'{' selected' if identifier in selected else ''}>"

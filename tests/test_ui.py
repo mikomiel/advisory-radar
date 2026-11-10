@@ -110,6 +110,13 @@ def config_form(client: TestClient, token: str = TOKEN) -> tuple[str, str]:
     return csrf, match.group(1)
 
 
+def advisory_token(identifier: str) -> str:
+    """The path segment the pages use for an identifier, which may contain slashes itself."""
+    import base64
+
+    return base64.urlsafe_b64encode(identifier.encode("utf-8")).decode("ascii").rstrip("=")
+
+
 def page_ids(text: str) -> list[str]:
     """The identifiers in the order the alert table renders them."""
     return ADVISORY_LINK_RE.findall(text)
@@ -230,7 +237,7 @@ def test_each_alert_filter_narrows_the_list_and_survives_a_reload(tmp_path):
     # one filter narrows another out entirely
     assert page_ids(client.get("/alerts", params={"tag": "warning", "q": "execution"}).text) == []
     # every row links to its advisory page
-    assert "href='/advisories/CVE-2026-1000'" in client.get("/alerts").text
+    assert f"href='/advisories/{advisory_token('CVE-2026-1000')}'" in client.get("/alerts").text
 
 
 def test_a_legacy_record_is_excluded_by_snapshot_filters_but_found_by_identifier(tmp_path):
@@ -327,7 +334,7 @@ def test_the_alert_list_pages_by_keyset_with_no_overlap_and_no_gap(tmp_path):
 def test_a_malformed_cursor_is_a_400_page_not_a_crash(tmp_path):
     client, token, _ = make_client(tmp_path, state=pagination_state())
     sign_in(client, token)
-    for cursor in ("not-base64!", "eA", "MTIzNDU2Nzg5MA"):  # not base64, no colon, no colon either
+    for cursor in ("not-base64!", "eA", "MTIzNDU2Nzg5MA", "MTIzOmlk!"):  # not base64 / no colon / stray char
         response = client.get("/alerts", params={"cursor": cursor}, headers={"accept": "text/html"})
         assert response.status_code == 400, cursor
         assert "malformed page cursor" in response.text
@@ -423,6 +430,106 @@ def test_a_dropped_message_is_recorded_with_no_accepted_notifier(tmp_path):
     assert record["tag"] == "critical"
 
 
+def test_an_identifier_with_slashes_round_trips_through_the_alert_link(tmp_path):
+    identifier = "src:https://vendor.example.net/advisory/42"
+    state = core.new_state()
+    state["seen"][identifier] = seen(NOW, tag="critical", title="A vendor advisory")
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get("/alerts").text
+    links = re.findall(r"href='(/advisories/[^']+)'", page)
+    assert len(links) == 1, "the row must link to the advisory page"
+    detail = client.get(html.unescape(links[0]))
+    assert detail.status_code == 200
+    assert identifier in detail.text
+    # A segment the list never produced is a 400 page, not a crash.
+    assert client.get("/advisories/!!!!").status_code == 400
+    assert client.get("/advisories/").status_code == 404
+
+
+def test_a_malformed_stored_link_renders_as_text_not_a_crash(tmp_path):
+    state = core.new_state()
+    entry = pending_entry("CVE-2026-7000")
+    entry["link"] = "https://[broken"
+    state["pending"].append(entry)
+    state["seen"]["CVE-2026-7001"] = seen(NOW, tag="critical", title="Seen", link="https://[broken")
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    for identifier in ("CVE-2026-7000", "CVE-2026-7001"):
+        page = client.get(f"/advisories/{advisory_token(identifier)}")
+        assert page.status_code == 200
+        assert "href='https://[broken'" not in page.text, "a broken URL is not offered as a link"
+
+
+def test_the_pending_page_shows_the_matched_products(tmp_path):
+    entry = pending_entry("CVE-2026-6000", products=["magento", "php"])
+    state = core.new_state()
+    state["pending"].append(entry)
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get(f"/advisories/{advisory_token('CVE-2026-6000')}").text
+    assert "Matched products" in page
+    assert "magento" in page and "php" in page
+
+
+def test_a_dropped_message_keeps_the_channel_that_already_accepted_it(tmp_path):
+    entry = parked_entry("CVE-2026-9000")
+    entry["sent_to"] = ["ops"]
+    state = core.new_state()
+    state["parked"] = [entry]
+    state_path = tmp_path / "state.json"
+    save_state(state_path, state)
+    assert core.manage_parked_entry(state_path, 0, release=False, now=NOW) is True
+    stored = load_state_document(state_path, core.STATE_SCHEMA, "advisory state")
+    record = stored["seen"]["CVE-2026-9000"]
+    assert record["outcome"] == "dropped"
+    assert record["delivered_to"] == ["ops"], "a channel that accepted the message did accept it"
+    client, token, _ = make_client(tmp_path, state=stored)
+    sign_in(client, token)
+    page = client.get(f"/advisories/{advisory_token('CVE-2026-9000')}").text
+    assert "ops" in page and "dropped before any channel accepted it" not in page
+
+
+def test_a_stale_parked_row_does_not_act_on_the_message_that_moved_into_its_place(tmp_path):
+    state = core.new_state()
+    state["parked"] = [parked_entry("CVE-2026-1"), parked_entry("CVE-2026-2"), parked_entry("CVE-2026-3")]
+    client, token, runtime = make_client(tmp_path, state=state)
+    csrf = sign_in(client, token)
+    page = client.get("/parked").text
+    tokens = re.findall(r"name='token' value='([0-9a-f]{16})'", page)
+    assert len(tokens) == 6, "each row offers a release and a drop, both carrying the row token"
+    released = client.post("/parked/0/release", data={"csrf": csrf, "token": tokens[0]}, follow_redirects=False)
+    assert released.status_code == 303
+    # The page's second row now sits at position 1 but is not the message the old form named.
+    stale = client.post("/parked/1/release", data={"csrf": csrf, "token": tokens[2]}, follow_redirects=False)
+    assert stale.status_code == 404
+    stored = load_state_document(runtime.cfg.state_path, core.STATE_SCHEMA, "advisory state")
+    assert [entry["ids"][0] for entry in stored["parked"]] == ["CVE-2026-2", "CVE-2026-3"]
+
+
+def test_a_route_reference_round_trips_through_the_form(tmp_path):
+    body = ROUTES_CONFIG.replace("match: {tag: critical}", 'match: {source: nodejs, tag: "${ROUTE_TAG}"}')
+    client, token, runtime = make_client(tmp_path, body=body, environment={**CHANNEL_ENV, "ROUTE_TAG": "critical"})
+    csrf, fingerprint = config_form(client, token)
+    page = client.get("/config").text
+    assert "value='${ROUTE_TAG}'" in page, "the configured reference must be offered, not silently dropped"
+    saved = client.post(
+        "/config/routes",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "route:1:source": "nodejs",
+            "route:1:tag": "${ROUTE_TAG}",
+            "route:1:notifiers": ["phone"],
+            "default": ["ops"],
+        },
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303
+    overlay = load_settings(settings_path(runtime.cfg.state_path))
+    assert overlay["routes"] == [{"match": {"source": "nodejs", "tag": "${ROUTE_TAG}"}, "notifiers": ["phone"]}]
+
+
 # --- /advisories/{identifier} ------------------------------------------------------------------
 
 
@@ -456,7 +563,7 @@ def advisory_state() -> dict:
 def test_the_advisory_page_shows_the_delivery_snapshot(tmp_path):
     client, token, _ = make_client(tmp_path, state=advisory_state())
     sign_in(client, token)
-    page = client.get("/advisories/CVE-2026-1000")
+    page = client.get(f"/advisories/{advisory_token('CVE-2026-1000')}")
     assert page.status_code == 200
     assert "CRITICAL: CVE-2026-1000 in widget" in page.text
     assert "Vendor Feed" in page.text and "critical" in page.text
@@ -471,14 +578,14 @@ def test_the_advisory_page_shows_the_delivery_snapshot(tmp_path):
 def test_the_advisory_page_finds_a_pending_and_a_parked_message(tmp_path):
     client, token, _ = make_client(tmp_path, state=advisory_state())
     sign_in(client, token)
-    pending = client.get("/advisories/CVE-2026-3000")
+    pending = client.get(f"/advisories/{advisory_token('CVE-2026-3000')}")
     assert pending.status_code == 200
     assert "pending" in pending.text
     assert "2 (last HTTP 500)" in pending.text
     assert "ops" in pending.text, "a pending message shows the notifiers that already accepted it"
     assert "KEV-only" in pending.text and "CVE-2026-3001" in pending.text
     assert "PARKED-DUPLICATE" not in pending.text, "a pending message is found before a parked one"
-    parked = client.get("/advisories/CVE-2026-4000")
+    parked = client.get(f"/advisories/{advisory_token('CVE-2026-4000')}")
     assert parked.status_code == 200
     assert "parked" in parked.text
     assert "Parked (UTC)" in parked.text
@@ -488,7 +595,7 @@ def test_the_advisory_page_finds_a_pending_and_a_parked_message(tmp_path):
 def test_an_unknown_identifier_is_a_404_page(tmp_path):
     client, token, _ = make_client(tmp_path, state=advisory_state())
     sign_in(client, token)
-    response = client.get("/advisories/CVE-2026-NOPE", headers={"accept": "text/html"})
+    response = client.get(f"/advisories/{advisory_token('CVE-2026-NOPE')}", headers={"accept": "text/html"})
     assert response.status_code == 404
     assert "no advisory" in response.text
 
@@ -496,7 +603,7 @@ def test_an_unknown_identifier_is_a_404_page(tmp_path):
 def test_a_legacy_record_says_the_details_were_not_recorded(tmp_path):
     client, token, _ = make_client(tmp_path, state=advisory_state())
     sign_in(client, token)
-    page = client.get("/advisories/CVE-2026-LEGACY")
+    page = client.get(f"/advisories/{advisory_token('CVE-2026-LEGACY')}")
     assert page.status_code == 200
     assert "not recorded" in page.text
     assert "older version" in page.text
@@ -508,10 +615,10 @@ def test_a_legacy_record_says_the_details_were_not_recorded(tmp_path):
 def test_the_seen_record_wins_and_no_message_body_is_rendered(tmp_path):
     client, token, _ = make_client(tmp_path, state=advisory_state())
     sign_in(client, token)
-    duplicate = client.get("/advisories/CVE-2026-DUP")
+    duplicate = client.get(f"/advisories/{advisory_token('CVE-2026-DUP')}")
     assert "Seen title" in duplicate.text and "Pending title" not in duplicate.text
     for identifier in ("CVE-2026-3000", "CVE-2026-4000"):
-        assert "BODY-MARKER" not in client.get(f"/advisories/{identifier}").text
+        assert "BODY-MARKER" not in client.get(f"/advisories/{advisory_token(identifier)}").text
     assert "BODY-MARKER" not in client.get("/alerts").text
 
 
