@@ -33,7 +33,7 @@ from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from . import adobe
+from . import adobe, routing
 from .feeds import FeedExport
 from .feeds import parse_feed as parse_greader
 from .http import MESSAGE_LIMIT, Http, inert, parse_json
@@ -333,6 +333,17 @@ def _matches_product(text: str, host: str, product) -> bool:
     return False
 
 
+def matched_products(item: Item, policy: Policy) -> tuple[str, ...]:
+    """The ids of the configured watchlist products this item matches, sorted.
+
+    The one implementation of a product match: ``passes_filter`` uses it for scope, and ``classify_new``
+    records the result on the queued message so routing can match on it later.
+    """
+    host = _host(item.link)
+    text = f"{item.title} {item.summary} {item.source_title}"
+    return tuple(sorted(product.id for product in policy.products if _matches_product(text, host, product)))
+
+
 def passes_filter(item: Item, policy: Policy) -> bool:
     """Debian publishes every package; nginx.org mixes news with security notes.
 
@@ -348,8 +359,7 @@ def passes_filter(item: Item, policy: Policy) -> bool:
             product = Product(excluded, (), (), False)
         if _matches_product(text, host, product):
             return False
-    matched = {product_id for product_id, product in by_id.items() if _matches_product(text, host, product)}
-    if policy.products and not matched:
+    if policy.products and not matched_products(item, policy):
         return False
     if host == "lists.debian.org" or item.title.startswith("DSA-"):
         match = DSA_RE.match(item.title)
@@ -1378,11 +1388,17 @@ def classify_new(
     *,
     share: int | None = None,
     trusted: Collection[str] = (),
+    source_id: str = "",
 ) -> list[Item]:
     """Queue the items nobody has seen, oldest first, until the delivery cap or the lookup budget is reached.
 
     ``share`` bounds how much of the pending room one source may take, so a busy first source cannot fill the
     queue and leave later sources unclassified pass after pass.
+
+    ``source_id`` is the configured ``source.id`` the items came from, and each queued message records it with
+    the watchlist products the item matched. Routing reads both; a message queued elsewhere (an escalation, an
+    Adobe bulletin) has neither, so it falls through ``source``/``product`` rules to ``tag``, ``ids`` or the
+    default.
 
     Returns the candidates left unclassified. The caller must carry them to the next pass: the feed window
     advances past them, so without that they can rotate out of the export unrecorded.
@@ -1605,6 +1621,8 @@ def classify_new(
                     "scores": scores,
                     "source": heading,
                     "link": item.link,
+                    "source_id": source_id,
+                    "products": list(matched_products(item, policy)),
                 }
             )
         claimed.update(ids)
@@ -1741,6 +1759,8 @@ def reevaluate(state: dict, intel: Intel, kev: frozenset[str], kev_known: bool, 
             feed_host,
             action=ESCALATION_ACTION,
         )
+        # No source_id and no products: an escalation is not a feed item, so routing falls through a
+        # source/product rule to tag, ids or the default.
         state["pending"].append(
             {
                 "kind": "escalation",
@@ -1848,6 +1868,8 @@ def _adobe_new_message(bulletin: adobe.Bulletin, detail: adobe.Detail | None, ex
         lines.append(("Hotfix", _md(detail.hotfix_note)))
     tag = "critical" if decision else "warning"
     title, body = render_adobe(tag, bulletin.apsb, head, lines, decision, bulletin.url)
+    # No source_id and no products: a bulletin is not a feed item, so routing falls through a source/product
+    # rule to tag, ids or the default.
     return {
         "kind": "adobe",
         "tag": tag,
@@ -1872,6 +1894,7 @@ def _adobe_kev_message(bulletin: adobe.Bulletin, listed: Sequence[str]) -> dict:
         ("CVEs in KEV", shown),
     ]
     title, body = render_adobe("critical", bulletin.apsb, head, [], True, bulletin.url)
+    # Same as a new bulletin: no source_id or products, so tag, ids or the default decide.
     return {
         "kind": "adobe-kev",
         "tag": "critical",
@@ -2100,17 +2123,23 @@ def deliver(
     now: int,
     *,
     persist: Callable[[], None] | None = None,
+    routes: Sequence[dict] = (),
+    default: Sequence[str] = (),
 ) -> bool:
-    """POST up to DELIVERY_CAP pending messages to every notifier; False when a failure stopped the pass.
+    """POST up to DELIVERY_CAP pending messages to the notifiers routing selects; False on a failed pass.
 
-    A failed message stays at the head and stops the pass, so order is kept. Its
-    MAX_DELIVERY_ATTEMPTS-th failed attempt, or a first attempt older than PARK_AFTER, parks it instead
-    (see ``_park``) and the pass goes on with the next message, unless the parked list is full: then it stays
-    at the head and stops the pass. A message that already failed MAX_DELIVERY_ATTEMPTS times is never posted
-    again, so a full parked list cannot turn into a duplicate post on every pass.
+    ``routes`` and ``default`` narrow the channels per message (see :func:`routing.select`); both empty keeps
+    the pre-routing behaviour of every enabled notifier. A failed message stays at the head and stops the pass,
+    so order is kept. Its MAX_DELIVERY_ATTEMPTS-th failed attempt, or a first attempt older than PARK_AFTER,
+    parks it instead (see ``_park``) and the pass goes on with the next message, unless the parked list is full:
+    then it stays at the head and stops the pass. A message that already failed MAX_DELIVERY_ATTEMPTS times is
+    never posted again, so a full parked list cannot turn into a duplicate post on every pass. A selection that
+    names no built notifier is a configuration fault: it logs an error, fails the pass and leaves the message
+    queued, never marked delivered.
     """
     if not notifiers:  # an empty notifier list must never mark a message delivered
         return not state["pending"]
+    enabled_ids = [notifier.id for notifier in notifiers]
     for entry in list(state["pending"][:DELIVERY_CAP]):
         entry.setdefault("first_attempt_at", now)
         if entry.get("attempts", 0) >= MAX_DELIVERY_ATTEMPTS:  # only a full parked list leaves one here
@@ -2118,8 +2147,21 @@ def deliver(
                 continue
             return False
         already = set(entry.get("sent_to") or ())
+        selected, label = routing.select(entry, routes, default, enabled_ids)
+        targets = [notifier for notifier in notifiers if notifier.id in set(selected)]
+        # One line per decision, before any POST: the notifiers this message is routed to and the rule that
+        # chose them. No body and no credential ever reaches it.
+        LOG.debug("routing: %s -> %s (%s)", _audit_ids(entry), ",".join(selected) or "none", label)
+        if not targets:
+            LOG.error(
+                "routing: %s selects no enabled notifier (%s, ids %s); the message stays pending",
+                _audit_ids(entry),
+                label,
+                ",".join(selected) or "none",
+            )
+            return False
         statuses = []
-        for notifier in notifiers:
+        for notifier in targets:
             if notifier.id in already:  # a retry only re-sends to the channels that have not had it
                 statuses.append(200)
                 continue

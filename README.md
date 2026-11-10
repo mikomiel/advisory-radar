@@ -54,6 +54,38 @@ ones you do not run. Package patterns filter Debian DSA titles.
 }
 ```
 
+### Routing
+
+By default every message goes to every enabled notifier. A `routes` list in `config.yml`
+narrows that per message: rules are checked in the order written and the **first match
+wins**, so the most specific rule goes first. A rule matches on one or more of:
+
+| Match key | Matches when |
+|---|---|
+| `source` | the message came from the source with that id; an escalation or an Adobe bulletin has no source, so it never matches a source rule |
+| `tag` | the message's severity is exactly that value (`critical` or `warning`) |
+| `product` | the item matched that watchlist product id; a message without a product match never matches a product rule |
+| `ids` | any id in the message matches the pattern, case-insensitively (`CVE-2026-*`, `GHSA-*`) |
+
+Every key present in one rule must match. `notifiers` names the enabled channels the
+message goes to, and `default` is used when no rule matches. Every id must name an
+**enabled** notifier, or the configuration is refused when it loads.
+
+```yaml
+routes:
+  - match: {source: php-releases}
+    notifiers: [matrix-php]
+  - match: {tag: critical}
+    notifiers: [discord-security, phone]
+default: [discord-security]
+```
+
+With no `routes` block at all — or an empty list — nothing changes: every message goes to
+every enabled notifier. So does a message that matches no rule when no `default` is set
+(`default` applies while at least one route is configured). A route that leaves a message
+with no notifier is a **failed pass**, not silence: delivery logs the error and the message
+stays queued until the configuration is fixed.
+
 ### Settings without a restart
 
 The `/config` page changes four things without editing the YAML or restarting the

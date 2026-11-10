@@ -145,6 +145,16 @@ Two upstreams reward configuration rather than credentials:
 - **Conditional GET.** RSS/Atom sources keep the publisher's `ETag`/`Last-Modified` in the state, so an
   unchanged feed answers `304` and costs one round trip instead of the whole document.
 
+### Routing
+
+Notification routing lives in `config.yml`, not in the settings overlay: an ordered `routes` list plus an
+optional `default`, each naming notifier ids. Every id must name an enabled notifier in the same file, or the
+configuration is refused when it loads, and with no `routes` block every message still goes to every enabled
+notifier. Delivery records on the message which channels already accepted it, so when one routed channel fails
+a retry re-sends the message only to the channels that have not had it — the failed channel is retried, the
+others are not repeated. The README's [Routing](../README.md#routing) section lists the match keys and an
+example.
+
 ## Multi-arch images
 
 Releases publish `linux/amd64` and `linux/arm64`, so the same tag runs on a
