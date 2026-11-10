@@ -381,6 +381,31 @@ def test_reload_under_the_lock_records_the_applied_revision_and_keeps_the_queues
         runtime.detach_redaction()
 
 
+def test_a_reload_never_publishes_an_older_revision(tmp_path, monkeypatch):
+    # A candidate is built before the lock. If a newer revision was applied while it waited, publishing the
+    # older one would roll the configuration back while the file on disk stays newer.
+    path = write_config(tmp_path, {})
+    runtime = Runtime.build(path, {})
+    stale = Runtime.build(path, {})  # built at revision 0, before the save below
+    save_overlay(tmp_path, {"poll_interval": "30s"})
+    runtime.reload(blocking=False)
+    assert runtime.cfg.poll_interval_seconds == 30
+    monkeypatch.setattr("advisory_radar.runtime.Runtime.build", classmethod(lambda cls, *a, **k: stale))
+    with pytest.raises(ConfigError) as caught:
+        runtime.reload(blocking=False)
+    assert "older than the live revision" in str(caught.value)
+    assert runtime.cfg.poll_interval_seconds == 30
+
+
+def test_a_state_file_named_settings_json_is_refused(tmp_path):
+    # The overlay is the file beside the state file with that name; a state file there would be read as an
+    # overlay and a pass would write a state document there that every later overlay read refuses.
+    path = write_config(tmp_path, {"state_path": str(tmp_path / "settings.json")})
+    with pytest.raises(ConfigError) as caught:
+        load_config(path, {})
+    assert "settings.json" in str(caught.value)
+
+
 def test_a_reload_with_an_unreadable_state_is_refused(tmp_path):
     path = write_config(tmp_path, {})
     runtime = Runtime.build(path, {})

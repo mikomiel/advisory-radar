@@ -185,10 +185,20 @@ class Runtime:
                 state = load_state_document(self.cfg.state_path, core.STATE_SCHEMA, "advisory state")
                 if state is None:
                     state = core.new_state()
+                # A candidate is built before the lock, so another reload can publish a newer revision in
+                # between. Publishing this one then would silently roll the configuration back; refuse and
+                # tell the operator, who can reload again to pick up what is on disk now.
+                live_revision = int(self.overlay.get("revision", 0))
+                candidate_revision = int(candidate.overlay["revision"])
+                if candidate_revision < live_revision:
+                    raise ConfigError(
+                        f"the saved overlay is revision {candidate_revision}, older than the live revision "
+                        f"{live_revision}; not reloading over it"
+                    )
                 # Persist the applied marker *before* publishing the candidate: if the write fails the
                 # running configuration is still the old one, and a reader never sees a live revision its
                 # state does not record. Everything after the write is an in-memory assignment.
-                state["settings"] = {"revision": int(candidate.overlay["revision"]), "applied_at": int(self.clock())}
+                state["settings"] = {"revision": candidate_revision, "applied_at": int(self.clock())}
                 try:
                     save_state(self.cfg.state_path, state)
                 except OSError as exc:
