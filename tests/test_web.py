@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from advisory_radar import core
 from advisory_radar.config import load_config
 from advisory_radar.state import load_state_document, save_state
-from advisory_radar.web import LoginThrottle, create_app, readiness
+from advisory_radar.web import LoginThrottle, _when, create_app, readiness
 
 
 def make_client(tmp_path: Path, token: str = "secret-token", clock: float | None = None):
@@ -75,6 +75,39 @@ def test_login_and_dashboard(tmp_path):
     other, _ = make_client(tmp_path, token="other")
     bad = other.post("/login", data={"token": "nope"})
     assert "Wrong token" in bad.text
+
+
+def test_pages_render_timestamps_as_utc_dates(tmp_path):
+    client, token = make_client(tmp_path)
+    signed_in(client, token)
+    for path in ("/", "/alerts", "/runs"):
+        page = client.get(path).text
+        assert "2026-10-21 16:26" in page, path
+        assert "1792600000" not in page, f"{path} still prints the raw epoch"
+    assert "First seen (UTC)" in client.get("/alerts").text
+    assert "At (UTC)" in client.get("/runs").text
+
+
+def test_the_time_helper_survives_a_value_it_cannot_render():
+    assert _when(1792600000) == "2026-10-21 16:26"
+    # A hand-edited or older state can hold any of these; a page must render rather than take the UI down.
+    for unusable in (None, "never", "", float("nan"), float("inf"), 10**20, -1, True):
+        assert _when(unusable) == "", repr(unusable)
+
+
+def test_a_page_with_an_unusable_stored_timestamp_still_renders(tmp_path):
+    client, token = make_client(tmp_path)
+    state = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    assert state is not None
+    state["seen"]["CVE-2026-3"] = {"at": "yesterday", "outcome": "delivered"}
+    state["runs"][-1]["at"] = None
+    save_state(tmp_path / "state.json", state)
+    signed_in(client, token)
+    alerts = client.get("/alerts")
+    assert alerts.status_code == 200 and "yesterday" not in alerts.text
+    runs = client.get("/runs")
+    assert runs.status_code == 200 and "None" not in runs.text
+    assert "Last pass: never" in client.get("/").text
 
 
 CSRF_RE = re.compile(r'name="csrf" value="([0-9a-f]{64})"')
