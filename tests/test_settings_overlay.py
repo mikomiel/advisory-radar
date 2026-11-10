@@ -570,6 +570,24 @@ def test_a_refused_sighup_reload_keeps_the_secret_out_of_its_reason(tmp_path, ca
         runtime.detach_redaction()
 
 
+def test_a_pass_queued_before_a_reload_keeps_its_redaction(tmp_path, caplog):
+    # A pass can hold a snapshot of the old configuration while it waits for the state lock, and run after the
+    # reload published. Its secrets are only filtered if the filter it was built under is still installed.
+    old_only = "OLD-ONLY-SECRET-VALUE"
+    path = write_config(
+        tmp_path,
+        {"sources": [{"id": "${SOURCE_ID}", "type": "rss", "url": "https://feeds.example.net/x"}]},
+    )
+    runtime = Runtime.build(path, {"SOURCE_ID": old_only})
+    write_config(tmp_path, {})  # the reloaded configuration no longer references the value
+    save_overlay(tmp_path, {"poll_interval": "30s"})
+    runtime.reload(blocking=False)
+    assert runtime.cfg.sources == ()
+    with caplog.at_level(logging.ERROR, logger="advisory_radar"):
+        LOG.error("source %s failed", old_only)  # the queued pass has not run yet
+    assert old_only not in caplog.text, "the old snapshot's secrets are still filtered after the swap"
+
+
 def test_sighup_reloads_the_running_process(tmp_path, monkeypatch):
     path = write_config(tmp_path, {})
     runtime = Runtime.build(path, {})

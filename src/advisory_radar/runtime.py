@@ -236,12 +236,13 @@ class Runtime:
             self.overlay = candidate.overlay
             self.document = candidate.document
             self.overlay_path = candidate.overlay_path
-            # The candidate's filter was installed before its plugins were built; adopting it before
-            # removing the live one leaves no log line unfiltered during the swap.
-            previous, self._redactor = self._redactor, candidate._redactor
+            # The candidate's filter was installed before its plugins were built. The previous filter is
+            # deliberately *kept*: a pass can hold a snapshot of the old configuration while it waits for the
+            # state lock, and it would run after this swap — removing the old filter would let its log lines
+            # emit secrets the candidate's configuration no longer references. One small filter is retained per
+            # applied overlay for the process lifetime, which is the price of not opening that window.
+            self._redactor = candidate._redactor
             candidate._redactor = None
-            if previous is not None:
-                LOG.removeFilter(previous)
 
 
 __all__ = ["Runtime", "read_config"]
