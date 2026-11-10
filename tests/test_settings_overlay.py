@@ -1,0 +1,512 @@
+"""The settings overlay: merge precedence, secret references, atomic storage and hot reload.
+
+Every behaviour here is the contract of ``settings.json``: it wins over the YAML for exactly four
+keys, it is validated by the one configuration validator, no credential is stored in it, and a
+reload either installs a wholly built candidate under the state lock or changes nothing.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import signal
+import stat
+
+import pytest
+import yaml
+
+from advisory_radar import cli, config, core, pipeline
+from advisory_radar.config import ConfigError, load_config
+from advisory_radar.http import RedactFilter
+from advisory_radar.runtime import Runtime
+from advisory_radar.settings import (
+    MAX_SETTINGS_BYTES,
+    SETTINGS_SCHEMA,
+    load_settings,
+    load_settings_document,
+    save_settings,
+    settings_path,
+)
+from advisory_radar.state import LockBusy, SourceError, load_state_document, save_state, state_lock
+
+NOW = 1792600000
+SECRET = "https://hooks.example.com/SUPERSECRET"
+LOG = logging.getLogger("advisory_radar")
+
+
+@pytest.fixture(autouse=True)
+def _detach_log_redaction():
+    """A runtime installs a log filter; one test's secrets must not redact the next test's output."""
+    yield
+    for installed in list(LOG.filters):
+        if isinstance(installed, RedactFilter):
+            LOG.removeFilter(installed)
+
+
+def write_config(tmp_path, document: dict, *, name: str = "config.yml"):
+    body = {
+        "sources": [],
+        "notifiers": [],
+        "poll_interval": "15m",
+        "state_path": str(tmp_path / "state.json"),
+        **document,
+    }
+    path = tmp_path / name
+    path.write_text(yaml.safe_dump(body, sort_keys=False))
+    return path
+
+
+def save_overlay(tmp_path, overlay: dict, *, now: int = NOW):
+    return save_settings(settings_path(tmp_path / "state.json"), overlay, now=now)
+
+
+class Stopper:
+    """The scheduler's stop signal, recording each wait and running one action during the first."""
+
+    def __init__(self, passes: int, action=None):
+        self.remaining = passes
+        self.waits: list[int] = []
+        self._action = action
+
+    def is_set(self) -> bool:
+        return self.remaining <= 0
+
+    def wait(self, seconds: int) -> None:
+        self.waits.append(seconds)
+        self.remaining -= 1
+        if self._action is not None:
+            action, self._action = self._action, None
+            action()
+
+
+# --- precedence and validation ---------------------------------------------------------------
+
+
+def test_the_overlay_wins_for_each_writable_key_and_the_yaml_still_supplies_the_rest(tmp_path):
+    document = {
+        "sources": [
+            {"id": "keep", "type": "rss", "url": "https://feeds.example.com/keep.xml", "tag": "news"},
+            {"id": "edit", "type": "rss", "url": "https://feeds.example.com/edit.xml"},
+        ],
+        "notifiers": [{"id": "yaml_notifier", "type": "ntfy", "url": "${YAML_HOOK}", "topic": "yaml"}],
+        "poll_interval": "15m",
+        "hidden_source_hosts": ["yaml.example.com"],
+        "watchlist": str(tmp_path / "watchlist.json"),
+    }
+    path = write_config(tmp_path, document)
+    overlay = {
+        "notifiers": [{"id": "overlay_notifier", "type": "ntfy", "url": "${OVERLAY_HOOK}", "topic": "ops"}],
+        "sources": {"edit": {"enabled": False, "tag": "security"}},
+        "poll_interval": "30s",
+        "hidden_source_hosts": ["overlay.example.com"],
+    }
+    # No YAML_HOOK: the replaced notifier must not need it any more.
+    cfg = load_config(path, {"OVERLAY_HOOK": "https://ntfy.example.com/overlay"}, settings=overlay)
+
+    assert cfg.poll_interval_seconds == 30
+    assert cfg.hidden_source_hosts == frozenset({"overlay.example.com"})
+    assert [source["id"] for source in cfg.sources] == ["keep"]
+    assert cfg.sources[0]["tag"] == "news", "a source the overlay does not name keeps its YAML value"
+    assert [notifier["id"] for notifier in cfg.notifiers] == ["overlay_notifier"]
+    assert cfg.notifiers[0]["url"] == "https://ntfy.example.com/overlay"
+    # Everything outside the four keys still comes from the YAML.
+    assert cfg.watchlist_path == tmp_path / "watchlist.json"
+    assert cfg.state_path == tmp_path / "state.json"
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("poll_interval", "banana"),
+        ("hidden_source_hosts", "not-a-list"),
+        ("notifiers", {"not": "a list"}),
+    ],
+)
+def test_a_bad_overlay_value_fails_with_the_message_the_yaml_gives(tmp_path, key, value):
+    yaml_path = write_config(tmp_path, {key: value}, name="bad.yml")
+    with pytest.raises(ConfigError) as from_yaml:
+        load_config(yaml_path, {})
+    overlay_path = write_config(tmp_path, {})
+    with pytest.raises(ConfigError) as from_overlay:
+        load_config(overlay_path, {}, settings={key: value})
+    assert str(from_overlay.value) == str(from_yaml.value)
+
+
+def test_a_bad_notifier_key_fails_with_the_message_the_yaml_gives(tmp_path):
+    entry = {"id": "n", "type": "webhook", "url": "${HOOK}", "bogus": 1}
+    yaml_path = write_config(tmp_path, {"notifiers": [entry]}, name="bad.yml")
+    with pytest.raises(ConfigError) as from_yaml:
+        load_config(yaml_path, {"HOOK": SECRET})
+    overlay_path = write_config(tmp_path, {})
+    with pytest.raises(ConfigError) as from_overlay:
+        load_config(overlay_path, {"HOOK": SECRET}, settings={"notifiers": [entry]})
+    assert str(from_overlay.value) == str(from_yaml.value)
+
+
+def test_an_overlay_key_outside_the_four_is_refused(tmp_path):
+    path = write_config(tmp_path, {})
+    with pytest.raises(ConfigError) as caught:
+        load_config(path, {}, settings={"watchlist": "other.json"})
+    assert "unknown overlay keys" in str(caught.value)
+    assert "watchlist" in str(caught.value)
+
+
+def test_a_null_overlay_section_is_refused_instead_of_crashing(tmp_path):
+    path = write_config(tmp_path, {})
+    for key in ("notifiers", "sources"):
+        with pytest.raises(ConfigError):
+            load_config(path, {}, settings={key: None})
+
+
+def test_an_unknown_source_id_is_refused(tmp_path):
+    path = write_config(tmp_path, {"sources": [{"id": "known", "type": "webhook"}]})
+    with pytest.raises(ConfigError) as caught:
+        load_config(path, {}, settings={"sources": {"missing": {"enabled": False}}})
+    assert "missing" in str(caught.value)
+
+
+def test_a_source_id_is_refused_when_the_yaml_defines_no_sources(tmp_path):
+    path = tmp_path / "config.yml"
+    path.write_text(f"notifiers: []\nstate_path: {tmp_path}/state.json\n")
+    with pytest.raises(ConfigError) as caught:
+        load_config(path, {}, settings={"sources": {"missing": {"enabled": False}}})
+    assert "missing" in str(caught.value)
+
+
+def test_a_literal_notifier_secret_is_refused_and_never_stored(tmp_path):
+    path = write_config(tmp_path, {})
+    overlay = {"notifiers": [{"id": "hook", "type": "discord_webhook", "url": SECRET}]}
+    with pytest.raises(ConfigError) as caught:
+        load_config(path, {}, settings=overlay)
+    assert SECRET not in str(caught.value)
+    assert "reference" in str(caught.value)
+    overlay_path = settings_path(tmp_path / "state.json")
+    with pytest.raises(ConfigError):
+        save_settings(overlay_path, overlay, now=1)
+    assert not overlay_path.exists(), "a refused overlay is never written"
+    # a reference buried inside a URL still stores the rest of a credential-bearing URL
+    with pytest.raises(ConfigError):
+        save_settings(
+            overlay_path,
+            {"notifiers": [{"id": "hook", "type": "webhook", "url": "https://hooks.example.com/${HOOK}"}]},
+            now=1,
+        )
+    assert not overlay_path.exists()
+
+
+def test_headers_cannot_be_written_by_the_overlay(tmp_path):
+    overlay_path = settings_path(tmp_path / "state.json")
+    overlay = {
+        "notifiers": [
+            {"id": "hook", "type": "webhook", "url": "${HOOK}", "headers": {"Authorization": "Bearer ${TOKEN}"}}
+        ]
+    }
+    with pytest.raises(ConfigError) as caught:
+        save_settings(overlay_path, overlay, now=1)
+    assert "headers" in str(caught.value)
+    assert not overlay_path.exists()
+
+
+def test_a_reference_in_the_overlay_is_expanded_and_redacted_like_a_yaml_one(tmp_path, caplog):
+    yaml_value = "https://hooks.example.com/YAML-SECRET"
+    path = write_config(tmp_path, {"notifiers": [{"id": "yaml", "type": "webhook", "url": "${YAML_HOOK}"}]})
+    environment = {"YAML_HOOK": yaml_value, "OVERLAY_HOOK": SECRET}
+    by_yaml = load_config(path, environment)
+    by_overlay = load_config(
+        path,
+        environment,
+        settings={"notifiers": [{"id": "overlay", "type": "webhook", "url": "${OVERLAY_HOOK}"}]},
+    )
+
+    assert [notifier["url"] for notifier in by_overlay.notifiers] == [SECRET]
+    assert "OVERLAY_HOOK" in by_overlay.secret_names
+    assert "YAML_HOOK" not in by_overlay.secret_names, "the replaced YAML notifier is no longer referenced"
+    assert SECRET in by_overlay.secret_values
+    assert yaml_value in by_yaml.secret_values
+
+    def redacted(cfg, value: str) -> str:
+        caplog.clear()
+        redactor = pipeline.attach_redaction(config.secret_values(cfg))
+        try:
+            with caplog.at_level(logging.INFO, logger="advisory_radar"):
+                LOG.info("hook %s", value)
+        finally:
+            LOG.removeFilter(redactor)
+        return caplog.text
+
+    assert "hook [redacted]" in redacted(by_yaml, yaml_value)
+    assert "hook [redacted]" in redacted(by_overlay, SECRET)
+
+
+# --- storage ---------------------------------------------------------------------------------
+
+
+def test_load_settings_is_empty_until_a_document_exists_and_refuses_a_corrupt_one(tmp_path):
+    path = settings_path(tmp_path / "state.json")
+    assert load_settings(path) == {}
+    path.write_text("{not json")
+    with pytest.raises(ConfigError) as caught:
+        load_settings(path)
+    assert str(path) in str(caught.value)
+    path.write_text(json.dumps({"schema": "advisory-radar-settings.v0", "revision": 1, "settings": {}}))
+    with pytest.raises(ConfigError) as caught:
+        load_settings(path)
+    assert str(path) in str(caught.value)
+    path.write_bytes(b"{}" + b" " * MAX_SETTINGS_BYTES)
+    with pytest.raises(ConfigError) as caught:
+        load_settings(path)
+    assert str(path) in str(caught.value)
+
+
+def test_save_settings_writes_0600_and_moves_the_revision_forward(tmp_path):
+    path = settings_path(tmp_path / "state.json")
+    first = save_settings(path, {"poll_interval": "30s"}, now=100)
+    assert first == {
+        "schema": SETTINGS_SCHEMA,
+        "revision": 1,
+        "updated_at": 100,
+        "settings": {"poll_interval": "30s"},
+    }
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert load_settings(path) == {"poll_interval": "30s"}
+    second = save_settings(path, {"poll_interval": "12h"}, now=200)
+    assert second["revision"] == 2
+    assert load_settings(path) == {"poll_interval": "12h"}
+    assert load_settings_document(path)["updated_at"] == 200
+
+
+def test_a_failed_replace_leaves_the_previous_overlay(tmp_path, monkeypatch):
+    path = settings_path(tmp_path / "state.json")
+    save_settings(path, {"poll_interval": "30s"}, now=1)
+    before = path.read_bytes()
+
+    def refuse(source, destination):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("advisory_radar.state.os.replace", refuse)
+    with pytest.raises(OSError):
+        save_settings(path, {"poll_interval": "12h"}, now=2)
+    assert path.read_bytes() == before
+    assert load_settings(path) == {"poll_interval": "30s"}
+    assert list(path.parent.glob(".settings-*")) == [], "a failed write leaves no temporary file"
+
+
+# --- the runtime and reload ------------------------------------------------------------------
+
+
+def test_a_failed_build_leaves_the_live_runtime_and_the_overlay_untouched(tmp_path):
+    path = write_config(tmp_path, {"notifiers": [{"id": "base", "type": "webhook", "url": "${BASE_HOOK}"}]})
+    environment = {"BASE_HOOK": SECRET, "OVERLAY_HOOK": "https://hooks.example.com/overlay"}
+    runtime = Runtime.build(path, environment)
+    overlay = settings_path(runtime.cfg.state_path)
+    # A valid shape: the ntfy builder is what needs a `topic` the overlay does not carry.
+    save_settings(overlay, {"notifiers": [{"id": "broken", "type": "ntfy", "url": "${OVERLAY_HOOK}"}]}, now=1)
+    before = overlay.read_bytes()
+    try:
+        with pytest.raises(ConfigError):
+            runtime.reload(blocking=False)
+        assert [notifier.id for notifier in runtime.notifiers] == ["base"]
+        assert runtime.overlay["revision"] == 0
+        assert overlay.read_bytes() == before
+        assert not (tmp_path / "state.json").exists(), "a refused reload writes no state"
+    finally:
+        runtime.detach_redaction()
+
+
+def test_reload_under_the_lock_records_the_applied_revision_and_keeps_the_queues(tmp_path):
+    path = write_config(tmp_path, {"notifiers": [{"id": "base", "type": "webhook", "url": "${BASE_HOOK}"}]})
+    environment = {"BASE_HOOK": SECRET, "EXTRA_HOOK": "https://hooks.example.com/extra"}
+    runtime = Runtime.build(path, environment, clock=lambda: NOW)
+    state = core.new_state()
+    state["seen"] = {"CVE-2026-9": {"at": NOW, "outcome": "delivered"}}
+    state["pending"] = [
+        {
+            "kind": "new",
+            "tag": "warning",
+            "title": "Pending",
+            "body": "b",
+            "ids": ["CVE-2026-10"],
+            "cves": [],
+            "levels": {},
+            "source": "s",
+            "link": "",
+        }
+    ]
+    state["parked"] = [
+        {
+            "kind": "new",
+            "tag": "critical",
+            "title": "Parked",
+            "body": "b",
+            "ids": ["CVE-2026-11"],
+            "cves": [],
+            "levels": {},
+            "source": "s",
+            "link": "",
+            "attempts": 3,
+            "first_attempt_at": NOW - 3600,
+            "parked_at": NOW - 60,
+        }
+    ]
+    save_state(runtime.cfg.state_path, state)
+    pending_before = json.dumps(state["pending"], sort_keys=True)
+    parked_before = json.dumps(state["parked"], sort_keys=True)
+    overlay = settings_path(runtime.cfg.state_path)
+    stored = save_settings(
+        overlay,
+        {
+            "notifiers": [
+                {"id": "base", "type": "webhook", "url": "${BASE_HOOK}"},
+                {"id": "extra", "type": "webhook", "url": "${EXTRA_HOOK}"},
+            ]
+        },
+        now=1,
+    )
+    try:
+        with state_lock(runtime.cfg.state_path):
+            with pytest.raises(LockBusy):
+                runtime.reload(blocking=False)
+            assert [notifier.id for notifier in runtime.notifiers] == ["base"]
+            assert runtime.overlay["revision"] == 0
+        runtime.reload(blocking=False)
+        assert [notifier.id for notifier in runtime.notifiers] == ["base", "extra"]
+        after = load_state_document(runtime.cfg.state_path, core.STATE_SCHEMA, "advisory state")
+        assert after["settings"] == {"revision": stored["revision"], "applied_at": NOW}
+        assert json.dumps(after["pending"], sort_keys=True) == pending_before
+        assert json.dumps(after["parked"], sort_keys=True) == parked_before
+        assert after["seen"] == state["seen"]
+    finally:
+        runtime.detach_redaction()
+
+
+def test_a_reload_with_an_unreadable_state_is_refused(tmp_path):
+    path = write_config(tmp_path, {})
+    runtime = Runtime.build(path, {})
+    (tmp_path / "state.json").write_text("{not json")
+    try:
+        with pytest.raises(SourceError):
+            runtime.reload(blocking=False)
+        assert runtime.cfg.poll_interval_seconds == 900, "a refused reload leaves the live configuration"
+    finally:
+        runtime.detach_redaction()
+
+
+def test_sighup_reloads_the_running_process(tmp_path, monkeypatch):
+    path = write_config(tmp_path, {})
+    runtime = Runtime.build(path, {})
+    save_overlay(tmp_path, {"poll_interval": "30s"})
+    registered = []
+    monkeypatch.setattr(cli.signal, "signal", lambda signum, handler: registered.append((signum, handler)))
+    try:
+        assert cli.install_sighup(runtime) is True
+        assert registered and registered[0][0] == signal.SIGHUP
+        worker = registered[0][1](signal.SIGHUP, None)
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert runtime.cfg.poll_interval_seconds == 30
+    finally:
+        runtime.detach_redaction()
+
+
+def test_a_refused_sighup_reload_keeps_the_running_configuration(tmp_path, caplog):
+    path = write_config(tmp_path, {})
+    runtime = Runtime.build(path, {})
+    settings_path(runtime.cfg.state_path).write_text("{not json")
+    try:
+        with caplog.at_level(logging.ERROR, logger="advisory_radar"):
+            cli._reload_blocking(runtime)
+        assert runtime.cfg.poll_interval_seconds == 900
+        assert "keeping the running configuration" in caplog.text
+    finally:
+        runtime.detach_redaction()
+
+
+# --- the scheduler ---------------------------------------------------------------------------
+
+
+def test_the_scheduler_reads_the_reloaded_interval_on_the_next_pass(tmp_path, monkeypatch):
+    path = write_config(tmp_path, {})
+    runtime = Runtime.build(path, {})
+    overlay = settings_path(runtime.cfg.state_path)
+
+    def reload_interval():
+        save_settings(overlay, {"poll_interval": "30s"}, now=1)
+        runtime.reload(blocking=False)
+
+    passes: list[int] = []
+
+    def fake_pass(cfg, sources, notifiers, **kwargs):
+        passes.append(cfg.poll_interval_seconds)
+        return 0
+
+    monkeypatch.setattr(cli.pipeline, "run_pass", fake_pass)
+    stopper = Stopper(passes=2, action=reload_interval)
+    try:
+        cli.run_scheduler(runtime, stopper)
+        assert passes == [900, 30]
+        assert stopper.waits == [900, 30], "the wait after each pass is the interval that pass ran under"
+    finally:
+        runtime.detach_redaction()
+
+
+def test_a_pass_that_started_keeps_the_plugins_it_started_with(tmp_path, monkeypatch):
+    path = write_config(tmp_path, {"notifiers": [{"id": "base", "type": "webhook", "url": "${BASE_HOOK}"}]})
+    runtime = Runtime.build(path, {"BASE_HOOK": SECRET})
+    overlay = settings_path(runtime.cfg.state_path)
+    old_sources, old_notifiers = runtime.sources, runtime.notifiers
+    seen = {}
+
+    def fake_pass(cfg, sources, notifiers, **kwargs):
+        seen["sources"], seen["notifiers"] = sources, notifiers
+        # a reload completes while this pass is "running": its argument list must not change
+        save_settings(overlay, {"poll_interval": "30s"}, now=1)
+        runtime.reload(blocking=False)
+        return 0
+
+    monkeypatch.setattr(cli.pipeline, "run_pass", fake_pass)
+    try:
+        cli.run_scheduler(runtime, Stopper(passes=1))
+        assert seen["sources"] is old_sources and seen["notifiers"] is old_notifiers
+        assert runtime.sources is not old_sources, "the next pass reads the reloaded plugins"
+    finally:
+        runtime.detach_redaction()
+
+
+# --- the one-shot commands keep working ------------------------------------------------------
+
+
+def test_the_sources_commands_still_work_with_an_overlay(tmp_path, capsys):
+    path = write_config(
+        tmp_path,
+        {"sources": [{"id": "vendor", "type": "rss", "url": "https://feeds.example.net/security.xml"}]},
+    )
+    save_overlay(tmp_path, {"poll_interval": "30s"})
+    assert cli.main(["sources", "list"], env={}) == 0
+    assert "rss:" in capsys.readouterr().out
+
+    body = (
+        b'<?xml version="1.0"?><rss version="2.0"><channel><title>V</title>'
+        b"<link>https://feeds.example.net/</link><item><title>CVE-2026-1 fixed</title>"
+        b"<link>https://feeds.example.net/a</link><guid>a1</guid></item></channel></rss>"
+    )
+
+    def http(method, url, headers, payload):
+        return 200, {}, body
+
+    assert cli.main(["--config", str(path), "sources", "test", "vendor"], env={}, http=http) == 0
+    printed = capsys.readouterr().out
+    assert "a1\tCVE-2026-1 fixed\thttps://feeds.example.net/a" in printed
+    assert not (tmp_path / "state.json").exists(), "sources test still writes no state"
+
+
+def test_test_notify_sends_through_a_notifier_the_overlay_added(tmp_path):
+    path = write_config(tmp_path, {})
+    save_overlay(tmp_path, {"notifiers": [{"id": "ops", "type": "webhook", "url": "${OPS_HOOK}"}]})
+    calls: list[str] = []
+
+    def http(method, url, headers, payload):
+        calls.append(url)
+        return 204, {}, b""
+
+    assert cli.main(["--config", str(path), "test-notify"], env={"OPS_HOOK": SECRET}, http=http) == 0
+    assert calls == [SECRET]

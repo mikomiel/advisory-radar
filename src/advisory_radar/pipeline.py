@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from . import core
@@ -361,3 +361,15 @@ def attach_redaction(secrets: list[str]) -> RedactFilter:
     redactor = RedactFilter(secrets)
     LOG.addFilter(redactor)
     return redactor
+
+
+def redact(text: str, secrets: Sequence[str]) -> str:
+    """The log filter's replacement applied to text that is about to be rendered or logged.
+
+    ``RedactFilter`` owns the replacement, including the percent-encoded form of a token in a URL;
+    routing a rendered error through it keeps a page and the log from disagreeing about what is a
+    secret.
+    """
+    record = logging.LogRecord(LOG.name, logging.INFO, __file__, 0, text, None, None)
+    RedactFilter(secrets).filter(record)
+    return record.getMessage()

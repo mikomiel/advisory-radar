@@ -3,13 +3,28 @@
 from __future__ import annotations
 
 import json
+import logging
 
+import pytest
 from fastapi.testclient import TestClient
 
-from advisory_radar.config import load_config
+from advisory_radar.http import RedactFilter
 from advisory_radar.notifiers import GotifyNotifier, MatrixWebhookNotifier, NtfyNotifier
+from advisory_radar.runtime import Runtime
 from advisory_radar.sources import ChangedetectionSource, WebhookSource, webhook_item_from_payload
 from advisory_radar.web import create_app
+
+LOG = logging.getLogger("advisory_radar")
+
+
+@pytest.fixture(autouse=True)
+def _detach_log_redaction():
+    """A runtime installs a log filter; one test's secrets must not redact the next test's output."""
+    yield
+    for installed in list(LOG.filters):
+        if isinstance(installed, RedactFilter):
+            LOG.removeFilter(installed)
+
 
 WATCHES_V1 = {
     "uuid-1": {
@@ -75,12 +90,8 @@ def test_webhook_payload_mapping():
 def test_webhook_intake_and_source_roundtrip(tmp_path):
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
-    cfg = load_config(cfg_path, {})
-    app = create_app(
-        cfg,
-        {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_WEBHOOK_SECRET": "s3cret"},
-        sources=[WebhookSource("wh")],
-    )
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_WEBHOOK_SECRET": "s3cret"}
+    app = create_app(Runtime.build(cfg_path, environment), environment)
     client = TestClient(app)
     # an unconfigured source id is refused outright, before any authentication is considered
     assert client.post("/webhooks/other", json={"title": "x"}).status_code == 404
@@ -266,18 +277,15 @@ def test_a_full_webhook_inbox_refuses_rather_than_discards(tmp_path):
 
     from fastapi.testclient import TestClient
 
-    from advisory_radar.config import load_config
+    from advisory_radar import core
     from advisory_radar.state import load_state_document
     from advisory_radar.web import create_app
 
     path = tmp_path / "c.yml"
     path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
-    cfg = load_config(path, {})
-    app = create_app(
-        cfg,
-        {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_WEBHOOK_SECRET": "s"},
-        sources=[WebhookSource("wh")],
-    )
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_WEBHOOK_SECRET": "s"}
+    runtime = Runtime.build(path, environment)
+    app = create_app(runtime, environment)
     client = TestClient(app)
     headers = {"Authorization": "Bearer s"}
     for index in range(500):
@@ -285,9 +293,7 @@ def test_a_full_webhook_inbox_refuses_rather_than_discards(tmp_path):
         assert response.status_code == 200
     refused = client.post("/webhooks/wh", json={"title": "one too many"}, headers=headers)
     assert refused.status_code == 429, "a full inbox refuses the new entry"
-    state = load_state_document(
-        cfg.state_path, __import__("advisory_radar.core", fromlist=["STATE_SCHEMA"]).STATE_SCHEMA, "state"
-    )
+    state = load_state_document(runtime.cfg.state_path, core.STATE_SCHEMA, "state")
     inbox = state["webhook_inbox"]["wh"]
     assert len(inbox) == 500
     assert inbox[0]["title"] == "advisory 0", "the first accepted entry is still there"
@@ -296,13 +302,13 @@ def test_a_full_webhook_inbox_refuses_rather_than_discards(tmp_path):
 def test_an_oversized_login_body_is_refused_before_buffering(tmp_path):
     from fastapi.testclient import TestClient
 
-    from advisory_radar.config import load_config
+    from advisory_radar.runtime import Runtime
     from advisory_radar.web import LOGIN_BODY_LIMIT, create_app
 
     path = tmp_path / "c.yml"
     path.write_text(f"sources: []\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
-    cfg = load_config(path, {})
-    client = TestClient(create_app(cfg, {"ADVISORY_RADAR_AUTH_TOKEN": "t"}))
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t"}
+    client = TestClient(create_app(Runtime.build(path, environment), environment))
     big = b"token=" + b"x" * (LOGIN_BODY_LIMIT + 1)
     assert client.post("/login", content=big).status_code == 413
 

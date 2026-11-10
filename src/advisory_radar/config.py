@@ -8,6 +8,7 @@ fails at startup instead of silently doing nothing.
 
 from __future__ import annotations
 
+import copy
 import os
 import re
 from dataclasses import dataclass, field
@@ -145,16 +146,80 @@ def _require(condition: bool, message: str) -> None:
         raise ConfigError(message)
 
 
-def load_config(path: Path, env: dict[str, str] | None = None, *, lenient: bool = False) -> Config:
-    env = os.environ if env is None else env
+def load_document(path: Path, *, settings: dict | None = None) -> dict:
+    """The YAML document with the overlay merged in, before expansion and filtering.
+
+    The overlay is merged here, before any structural check, and validated by the same validator
+    :func:`load_config` runs: an overlay value fails with the message the YAML would give.
+    ``settings`` is the overlay mapping already loaded by the caller (``settings.load_settings``);
+    ``None`` means no overlay.
+    """
     try:
         document = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
         raise ConfigError(f"cannot read {path}: {exc}") from exc
     if not isinstance(document, dict):
         raise ConfigError(f"{path} is not a mapping")
+    if settings is not None:
+        _merge_settings(document, settings)
     unknown = set(document) - _TOP_KEYS
     _require(not unknown, f"unknown top-level keys in {path}: {sorted(unknown)}")
+    return document
+
+
+def _merge_settings(document: dict, settings: dict) -> None:
+    """Overlay the four writable keys onto the raw YAML document, in place."""
+    from .settings import validate_settings  # lazy: settings.py imports ConfigError from this module
+
+    validate_settings(settings)
+    if "notifiers" in settings:
+        # A full replacement is how a notifier is added, edited or disabled from the overlay.
+        document["notifiers"] = [dict(entry) if isinstance(entry, dict) else entry for entry in settings["notifiers"]]
+    if "sources" in settings:
+        document["sources"] = _merge_sources(document.get("sources"), settings["sources"])
+    if "poll_interval" in settings:
+        document["poll_interval"] = settings["poll_interval"]
+    if "hidden_source_hosts" in settings:
+        document["hidden_source_hosts"] = settings["hidden_source_hosts"]
+
+
+def _merge_sources(raw: object, overlay: dict) -> object:
+    """Apply the per-id ``enabled``/``tag`` edits to the YAML source list; an unknown id is refused."""
+    if raw is None:
+        raw = []  # an omitted list is the same empty list the validator treats it as
+    if not isinstance(raw, list):
+        return raw  # the validator refuses the YAML shape, which an overlay cannot repair
+    merged = [dict(entry) if isinstance(entry, dict) else entry for entry in raw]
+    by_id = {entry.get("id"): entry for entry in merged if isinstance(entry, dict)}
+    for identifier, changes in overlay.items():
+        entry = by_id.get(identifier)
+        if entry is None:
+            raise ConfigError(f"settings: no source with id {identifier!r} is defined in the YAML config")
+        entry.update(changes)
+    return merged
+
+
+def load_config(
+    path: Path,
+    env: dict[str, str] | None = None,
+    *,
+    lenient: bool = False,
+    settings: dict | None = None,
+) -> Config:
+    """Load and validate one YAML file, with an overlay merged before validation when given."""
+    return config_from_document(load_document(path, settings=settings), path, env, lenient=lenient)
+
+
+def config_from_document(
+    document: dict, path: Path, env: dict[str, str] | None = None, *, lenient: bool = False
+) -> Config:
+    """The one validator: a raw document becomes a frozen ``Config``.
+
+    The input is copied first: a caller that keeps the merged document (the web UI renders its forms
+    from it) must not receive the expanded, enabled-only version this function builds.
+    """
+    env = os.environ if env is None else env
+    document = copy.deepcopy(document)
     # Structure is validated on the *unexpanded* document: an entry whose id is missing must not put an
     # expanded password into the error message, and the secret names must be read before expansion
     # replaces them with their values.

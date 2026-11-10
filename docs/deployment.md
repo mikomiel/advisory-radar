@@ -101,6 +101,25 @@ throttle on failed logins (five per five minutes per peer address). Put it behin
 a TLS-terminating reverse proxy; the session cookie is only sent over HTTPS unless
 `ADVISORY_RADAR_INSECURE_COOKIES=1`.
 
+### The settings overlay
+
+`/config` writes `settings.json` beside the state file on `/data` (`/data/settings.json`
+in the container, `~/.local/share/advisory-radar/settings.json` for the rootless
+quadlet). It is created with mode `0600`, owned by the container user, and replaced
+atomically (a temporary file in the same directory, `fsync`, `os.replace`), so a
+half-written file cannot brick a start. `/config` stays read-only: the overlay holds
+only four keys — `notifiers`, per-source `enabled`/`tag`, `poll_interval` and
+`hidden_source_hosts` — and the YAML owns everything else.
+
+The overlay is optional; without it the YAML is the whole configuration. An invalid one
+is refused: a save shows the configuration error and writes nothing, and a reload — the
+*Reload configuration* button or `kill -HUP <pid>` — logs the error and keeps the running
+configuration. A pass holds the state lock for its whole transaction, so a reload waits
+for it (`SIGHUP`) or answers `409` (the UI), and a pass that already started finishes
+with the configuration it started with. Pending and parked messages are not touched by a
+reload. Changing an environment variable that a `${NAME}` reference reads still needs a
+restart.
+
 Two upstreams reward configuration rather than credentials:
 
 - **NVD key.** `nvd_api_key: ${NVD_API_KEY}` in the config raises NVD's anonymous limit from 5 requests per

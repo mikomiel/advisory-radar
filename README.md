@@ -54,6 +54,26 @@ ones you do not run. Package patterns filter Debian DSA titles.
 }
 ```
 
+### Settings without a restart
+
+The `/config` page changes four things without editing the YAML or restarting the
+container: `notifiers` (the whole list, which is how a channel is added, edited or
+disabled), each source's `enabled` flag and `tag`, `poll_interval`, and
+`hidden_source_hosts`. A save writes `settings.json` next to the state file (on the
+`/data` volume) and applies it as soon as the state lock is free; the page shows which
+saved revision is live. `SIGHUP` reloads the same overlay for a configuration edited by
+hand. Every other setting stays in `config/config.yml` and still needs a restart.
+
+Secrets stay in the environment. The overlay stores a notifier's `url`, `key`,
+`password` or `token` only as a `${NAME}` or `${NAME}_FILE` reference, refuses a literal
+value, and does not accept `headers` at all. Changing an environment variable still
+needs a restart, because the process reads the environment when it starts.
+
+A reload builds the new configuration and its plugins before it swaps them in under the
+state lock. An invalid overlay is refused with the same error the YAML would give, and
+the running configuration stays; a pass that already started finishes with the
+configuration it started with, and the next pass uses the reloaded one.
+
 ### Gap detection
 
 A source that knows its own page size (a FreshRSS export) reports a truncated
