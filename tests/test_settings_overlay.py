@@ -11,6 +11,8 @@ import json
 import logging
 import signal
 import stat
+import threading
+import time
 
 import pytest
 import yaml
@@ -402,6 +404,78 @@ def test_a_reload_cannot_move_the_state_file(tmp_path):
     assert "state_path" in str(caught.value)
     assert runtime.cfg.state_path == tmp_path / "state.json"
     assert not (tmp_path / "moved.json").exists()
+
+
+def test_an_overlay_over_the_reader_limit_is_never_written(tmp_path):
+    # JSON escaping can push an accepted value past the limit the reader enforces; writing that file would
+    # brick the next start, so the size is checked against the exact text that is about to be written.
+    overlay_path = settings_path(tmp_path / "state.json")
+    with pytest.raises(ConfigError) as caught:
+        save_overlay(tmp_path, {"hidden_source_hosts": ["x" * MAX_SETTINGS_BYTES]})
+    assert str(MAX_SETTINGS_BYTES) in str(caught.value)
+    assert not overlay_path.exists(), "a refused overlay is never written"
+
+
+def test_a_reload_whose_state_write_fails_keeps_the_old_configuration(tmp_path, monkeypatch):
+    path = write_config(tmp_path, {})
+    runtime = Runtime.build(path, {})
+    save_overlay(tmp_path, {"poll_interval": "30s"})
+
+    def fails(*args, **kwargs):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr("advisory_radar.runtime.save_state", fails)
+    with pytest.raises(ConfigError) as caught:
+        runtime.reload(blocking=False)
+    assert "not applied" in str(caught.value)
+    assert runtime.cfg.poll_interval_seconds == 900, "a failed marker write must not publish the candidate"
+    assert runtime.overlay["settings"] == {}
+
+
+def test_an_expanded_state_path_finds_its_overlay(tmp_path):
+    # A state_path that uses ${...} must have its overlay read beside the expanded file, not beside a
+    # literal "${DATA_DIR}/settings.json"; otherwise the UI saves where the next start does not look.
+    path = write_config(tmp_path, {"state_path": "${DATA_DIR}/state.json"})
+    environment = {"DATA_DIR": str(tmp_path)}
+    runtime = Runtime.build(path, environment)
+    assert runtime.overlay_path == tmp_path / "settings.json"
+    save_settings(tmp_path / "settings.json", {"poll_interval": "30s"}, now=NOW)
+    assert Runtime.build(path, environment).cfg.poll_interval_seconds == 30
+
+
+def test_an_overlay_can_reference_a_file_secret(tmp_path):
+    secret_file = tmp_path / "hook"
+    secret_file.write_text(SECRET)
+    path = write_config(tmp_path, {})
+    overlay = {"notifiers": [{"id": "hook", "type": "discord_webhook", "url": "${HOOK_FILE}"}]}
+    cfg = load_config(path, {"HOOK_FILE": str(secret_file)}, settings=overlay)
+    assert cfg.notifiers[0]["url"] == SECRET, "the documented ${NAME_FILE} form must resolve from a file"
+
+
+def test_concurrent_saves_never_reuse_a_revision(tmp_path, monkeypatch):
+    original = load_settings_document
+
+    def slow(path):
+        time.sleep(0.01)  # widen the window a missing writer lock would lose a revision in
+        return original(path)
+
+    monkeypatch.setattr("advisory_radar.settings.load_settings_document", slow)
+    overlay_path = settings_path(tmp_path / "state.json")
+    failures: list[Exception] = []
+
+    def save(index: int) -> None:
+        try:
+            save_settings(overlay_path, {"poll_interval": f"{index + 1}m"}, now=NOW + index)
+        except Exception as exc:  # a failure is the test result
+            failures.append(exc)
+
+    workers = [threading.Thread(target=save, args=(index,)) for index in range(4)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    assert failures == []
+    assert load_settings_document(overlay_path)["revision"] == 4, "every save must advance the revision once"
 
 
 def test_sighup_reloads_the_running_process(tmp_path, monkeypatch):

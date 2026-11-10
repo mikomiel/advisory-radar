@@ -7,7 +7,7 @@ YAML would refuse is refused with the same message.
 
 Storage and the overlay-specific shape rules live here; the merge and the configuration
 validator own everything else. A secret-bearing notifier key may only be a ``${NAME}`` or
-``${NAME}_FILE`` reference, and ``headers`` cannot be written at all: no credential ever
+``${NAME_FILE}`` reference, and ``headers`` cannot be written at all: no credential ever
 reaches this file.
 """
 
@@ -15,12 +15,17 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from pathlib import Path
 
 from .config import ConfigError
-from .state import save_json
+from .state import save_json, serialize_json
 
 #: The schema tag the stored document declares.
+#: One overlay transaction at a time in this process. Each save reads the revision, validates and replaces
+#: the file; two concurrent form posts would otherwise read the same revision and one section would be lost.
+#: It is deliberately independent of the state lock, so a save still lands while a pass is running.
+SETTINGS_LOCK = threading.RLock()
 SETTINGS_SCHEMA = "advisory-radar-settings.v1"
 #: The filename beside the state file; see :func:`settings_path`.
 SETTINGS_NAME = "settings.json"
@@ -30,7 +35,7 @@ MAX_SETTINGS_BYTES = 64 * 1024
 OVERLAY_KEYS = frozenset({"notifiers", "sources", "poll_interval", "hidden_source_hosts"})
 #: Notifier keys that carry a credential: only a whole-value environment reference is accepted.
 SECRET_KEYS = ("url", "key", "password", "token")
-#: Exactly one ``${NAME}`` (optionally ``${NAME}_FILE``), with no surrounding text: a value with
+#: Exactly one ``${NAME}`` (optionally ``${NAME_FILE}``), with no surrounding text: a value with
 #: ``https://host/${TOKEN}`` in it would still put the rest of a credential-bearing URL in the file.
 SECRET_REFERENCE = re.compile(r"\$\{[A-Z_][A-Z0-9_]*(?:_FILE)?\}")
 
@@ -68,7 +73,7 @@ def validate_settings(settings: object) -> dict:
             for key in SECRET_KEYS:
                 if key in entry and not is_reference(entry[key]):
                     raise ConfigError(
-                        f"settings: notifier {entry.get('id')!r}: {key} must be a ${{NAME}} or ${{NAME}}_FILE "
+                        f"settings: notifier {entry.get('id')!r}: {key} must be a ${{NAME}} or ${{NAME_FILE}} "
                         "reference; a literal secret is never stored"
                     )
     if "sources" in settings:
@@ -139,15 +144,24 @@ def save_settings(path: Path, settings: dict, *, now: int) -> dict:
     unreadable previous document refuses the write instead of silently resetting the counter.
     """
     validate_settings(settings)
-    previous = load_settings_document(path)
-    document = {
-        "schema": SETTINGS_SCHEMA,
-        "revision": previous["revision"] + 1,
-        "updated_at": int(now),
-        "settings": settings,
-    }
-    save_json(path, document)
-    return document
+    with SETTINGS_LOCK:
+        previous = load_settings_document(path)
+        document = {
+            "schema": SETTINGS_SCHEMA,
+            "revision": previous["revision"] + 1,
+            "updated_at": int(now),
+            "settings": settings,
+        }
+        # The reader refuses a file over the limit, so writing one would brick the next start. Check the
+        # exact text that is about to be written, not the form body: JSON escaping can double a value.
+        payload = serialize_json(document)
+        if len(payload.encode("utf-8")) > MAX_SETTINGS_BYTES:
+            raise ConfigError(
+                f"the overlay would be {len(payload.encode('utf-8'))} bytes, more than the {MAX_SETTINGS_BYTES} "
+                "the reader accepts; shorten a value"
+            )
+        save_json(path, document)
+        return document
 
 
 def settings_path(state_path: Path) -> Path:
