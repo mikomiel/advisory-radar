@@ -111,6 +111,8 @@ def test_pages_tolerate_records_that_are_not_objects_or_not_times(tmp_path):
         "CVE-2026-3": "not-an-object",
         # A timestamp outside the representable range is blank on the page, so it must not be counted as recent.
         "CVE-2026-4": {"at": 10**20, "outcome": "delivered"},
+        # A string timestamp inside an object reaches the same sort key as the integers: mixed types must not raise.
+        "CVE-2026-6": {"at": "yesterday", "outcome": "delivered"},
         "CVE-2026-5": {"at": int(time.time()), "outcome": "delivered"},
     }
     save_state(tmp_path / "state.json", state)
@@ -124,7 +126,8 @@ def test_pages_tolerate_records_that_are_not_objects_or_not_times(tmp_path):
     alerts = client.get("/alerts")
     assert alerts.status_code == 200
     assert "not-an-object" not in alerts.text
-    assert "CVE-2026-5" in alerts.text
+    assert "yesterday" not in alerts.text  # unreadable time renders blank, it is not copied into the table
+    assert "CVE-2026-5" in alerts.text and "CVE-2026-6" in alerts.text
 
     runs = client.get("/runs")
     assert runs.status_code == 200 and "At (UTC)" in runs.text
