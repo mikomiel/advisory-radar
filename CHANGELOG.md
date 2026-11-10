@@ -26,6 +26,14 @@ operator action, and the release workflow then builds and pushes the image to
   policy paragraph and in the setup example, and the guard test now checks that
   every guarded pattern is documented in that paragraph.
 
+### Security
+- Every workflow action is pinned to a full commit SHA, with its version in a
+  trailing comment so Dependabot keeps it current, and every job runs on
+  `ubuntu-24.04` instead of the moving `ubuntu-latest`.
+- The release publishes build provenance and an SBOM: BuildKit attestations in
+  the image manifest, plus a GitHub attestation bound to the pushed digest and
+  verifiable with `gh attestation verify oci://ghcr.io/mikomiel/advisory-radar:<tag>`.
+
 ## [0.1.0] - 2026-11-06
 
 The first public release: the extracted security-advisory notifier, packaged as a

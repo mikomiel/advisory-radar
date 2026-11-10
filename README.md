@@ -225,9 +225,14 @@ vulnerabilities.
 ## Status
 
 `0.1.0` — the first public release. The pipeline, plugin seams, web UI, container
-and integrations are complete and tested (178 tests), and CI runs them on free
-GitHub-hosted runners. Version numbers follow SemVer; every `vX.Y.Z` tag on `main`
-publishes a multi-arch image to `ghcr.io/mikomiel/advisory-radar`.
+and integrations are complete and covered by the test suite that CI runs on every pull
+request on free GitHub-hosted runners. Version numbers follow SemVer; every `vX.Y.Z` tag
+on `main` publishes a multi-arch image to `ghcr.io/mikomiel/advisory-radar`, with build
+provenance and an SBOM attestation bound to the pushed digest:
+
+```
+gh attestation verify oci://ghcr.io/mikomiel/advisory-radar:<tag> --repo mikomiel/advisory-radar
+```
 
 What is deliberately not here yet: a per-host agent, alert deduplication across
 sources beyond the watch window, and any hosted service. Issues and pull requests
