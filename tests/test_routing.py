@@ -205,6 +205,12 @@ def test_a_valid_block_loads_into_the_config(tmp_path):
     assert cfg.default_notifiers == ("discord",)
 
 
+def test_an_empty_default_is_no_default(tmp_path):
+    # The overlay clears a YAML default by storing []; that must load as "no fallback", not as an error.
+    cfg = load_config(write_config(tmp_path, "default: []\n"), {})
+    assert cfg.default_notifiers == ()
+
+
 def test_an_absent_or_empty_block_changes_nothing(tmp_path):
     for extra in ("", "routes: []\n"):
         cfg = load_config(write_config(tmp_path, extra), {})
@@ -225,7 +231,6 @@ def test_an_absent_or_empty_block_changes_nothing(tmp_path):
         "routes:\n  - match: {tag: ''}\n    notifiers: [discord]\n",  # empty matcher value
         "routes:\n  - match: {tag: critical}\n    notifiers: [discord]\n    extra: 1\n",  # unknown route key
         "routes: {}\n",  # not a list
-        "default: []\n",  # empty default
         "default: [disabled-channel]\n",  # disabled default
     ],
 )

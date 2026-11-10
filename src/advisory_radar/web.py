@@ -17,6 +17,7 @@ import html
 import json
 import logging
 import os
+import re
 import time
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
@@ -932,10 +933,14 @@ def create_app(
         from . import core
         from .state import state_lock
 
+        expected = first(form_body(request), "token")
+        if not re.fullmatch(r"[0-9a-f]{16}", expected):
+            # Fail closed: a form without the row token is not a row this page offered, so there is no
+            # message it could be asking about.
+            raise HTTPException(status_code=400, detail="missing or malformed row token; reload the parked queue")
         state_path = runtime.cfg.state_path
         try:
             with state_lock(state_path, blocking=False):
-                expected = first(form_body(request), "token") or None
                 changed = core.manage_parked_entry(state_path, index, release, now=int(time.time()), expected=expected)
         except LockBusy:
             return page(
@@ -1135,11 +1140,15 @@ def create_app(
                 f"<option value='{esc(value)}'{' selected' if value == tag else ''}>{esc(value or 'any tag')}</option>"
                 for value in tag_values
             )
+            known = {identifier for identifier, _ in choices}
+            # A selection may be a ${...} reference (expanded when the configuration loads): offer it as its
+            # own selected option, or the browser would submit only the literal ids and silently drop it.
+            extra = sorted(value for value in selected if value not in known)
             options = "".join(
                 f"<option value='{esc(identifier)}'{' selected' if identifier in selected else ''}>"
                 f"{esc(identifier)}{'' if enabled else ' (disabled)'}</option>"
                 for identifier, enabled in choices
-            )
+            ) + "".join(f"<option value='{esc(value)}' selected>{esc(value)} (reference)</option>" for value in extra)
             rows.append(
                 f"<tr><td><input type='text' name='route:{index}:source' "
                 f"value='{esc(match.get('source', ''))}' placeholder='source id'></td>"
@@ -1151,10 +1160,14 @@ def create_app(
                 f"<td><select name='route:{index}:notifiers' multiple size='2'>{options}</select></td></tr>"
             )
         default_ids = {value for value in defaults if isinstance(value, str)}
+        known = {identifier for identifier, _ in choices}
+        extra_defaults = sorted(value for value in default_ids if value not in known)
         default_options = "".join(
             f"<option value='{esc(identifier)}'{' selected' if identifier in default_ids else ''}>"
             f"{esc(identifier)}{'' if enabled else ' (disabled)'}</option>"
             for identifier, enabled in choices
+        ) + "".join(
+            f"<option value='{esc(value)}' selected>{esc(value)} (reference)</option>" for value in extra_defaults
         )
         return (
             "<table><tr><th>Source id</th><th>Tag</th><th>Product id</th><th>IDs pattern</th>"
@@ -1348,11 +1361,12 @@ def create_app(
         default = [value for value in form.get("default", []) if value]
         if routes:
             overlay["routes"] = routes
-        else:
-            overlay.pop("routes", None)
-        if default:
+            # Always stored with the rules: an empty default is a decision ("no fallback, so an unmatched
+            # message goes to every enabled notifier"), and removing the key would restore the YAML default
+            # the operator just cleared. An entirely empty form still removes both keys and keeps the YAML.
             overlay["default"] = default
         else:
+            overlay.pop("routes", None)
             overlay.pop("default", None)
         return commit_overlay(overlay)
 

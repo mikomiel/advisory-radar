@@ -507,6 +507,52 @@ def test_a_stale_parked_row_does_not_act_on_the_message_that_moved_into_its_plac
     assert [entry["ids"][0] for entry in stored["parked"]] == ["CVE-2026-2", "CVE-2026-3"]
 
 
+def test_a_notifier_reference_in_a_rule_round_trips_through_the_form(tmp_path):
+    body = ROUTES_CONFIG.replace("notifiers: [phone]", 'notifiers: [phone, "${SECOND_CHANNEL}"]').replace(
+        "default: [ops]", 'default: [ops, "${SECOND_CHANNEL}"]'
+    )
+    client, token, runtime = make_client(tmp_path, body=body, environment={**CHANNEL_ENV, "SECOND_CHANNEL": "phone"})
+    csrf, fingerprint = config_form(client, token)
+    page = client.get("/config").text
+    assert page.count("value='${SECOND_CHANNEL}' selected") == 2, "both selects must offer the reference"
+    saved = client.post(
+        "/config/routes",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "route:1:tag": "critical",
+            "route:1:notifiers": ["phone", "${SECOND_CHANNEL}"],
+            "default": ["ops", "${SECOND_CHANNEL}"],
+        },
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303
+    overlay = load_settings(settings_path(runtime.cfg.state_path))
+    assert overlay["routes"] == [{"match": {"tag": "critical"}, "notifiers": ["phone", "${SECOND_CHANNEL}"]}]
+    assert overlay["default"] == ["ops", "${SECOND_CHANNEL}"], "a configured reference must survive a save"
+
+
+def test_clearing_the_default_with_rules_kept_means_no_fallback(tmp_path):
+    client, token, runtime = make_client(tmp_path, body=ROUTES_CONFIG, environment=CHANNEL_ENV)
+    assert runtime.cfg.default_notifiers == ("ops",)
+    csrf, fingerprint = config_form(client, token)
+    saved = client.post(
+        "/config/routes",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "route:1:tag": "critical",
+            "route:1:notifiers": ["phone"],
+        },
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303
+    overlay = load_settings(settings_path(runtime.cfg.state_path))
+    assert overlay["routes"] == [{"match": {"tag": "critical"}, "notifiers": ["phone"]}]
+    assert overlay["default"] == [], "an explicit empty default must be stored, not removed"
+    assert runtime.cfg.default_notifiers == (), "removing the key would have restored the YAML default"
+
+
 def test_a_route_reference_round_trips_through_the_form(tmp_path):
     body = ROUTES_CONFIG.replace("match: {tag: critical}", 'match: {source: nodejs, tag: "${ROUTE_TAG}"}')
     client, token, runtime = make_client(tmp_path, body=body, environment={**CHANNEL_ENV, "ROUTE_TAG": "critical"})
@@ -664,17 +710,22 @@ def test_the_parked_page_offers_one_action_per_row(tmp_path):
 
 
 def test_a_per_entry_release_or_drop_changes_exactly_one_message(tmp_path):
+    first, second = parked_entry("CVE-2026-1"), parked_entry("CVE-2026-2", "warning")
     state = core.new_state()
-    state["parked"] = [parked_entry("CVE-2026-1"), parked_entry("CVE-2026-2", "warning")]
+    state["parked"] = [first, second]
     client, token, _ = make_client(tmp_path, state=state)
     csrf = sign_in(client, token)
-    released = client.post("/parked/0/release", data={"csrf": csrf}, follow_redirects=False)
+    released = client.post(
+        "/parked/0/release", data={"csrf": csrf, "token": core.parked_token(first)}, follow_redirects=False
+    )
     assert released.status_code == 303
     stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
     assert [entry["ids"][0] for entry in stored["pending"]] == ["CVE-2026-1"]
     assert [entry["ids"][0] for entry in stored["parked"]] == ["CVE-2026-2"]
 
-    dropped = client.post("/parked/0/drop", data={"csrf": csrf}, follow_redirects=False)
+    dropped = client.post(
+        "/parked/0/drop", data={"csrf": csrf, "token": core.parked_token(second)}, follow_redirects=False
+    )
     assert dropped.status_code == 303
     stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
     assert stored["parked"] == []
@@ -689,9 +740,27 @@ def test_a_stale_parked_index_is_a_404(tmp_path):
     client, token, _ = make_client(tmp_path, state=state)
     csrf = sign_in(client, token)
     before = (tmp_path / "state.json").read_bytes()
-    response = client.post("/parked/7/release", data={"csrf": csrf}, headers={"accept": "text/html"})
+    response = client.post("/parked/7/release", data={"csrf": csrf, "token": "0" * 16}, headers={"accept": "text/html"})
     assert response.status_code == 404
     assert "no parked message at position 7" in response.text
+    assert (tmp_path / "state.json").read_bytes() == before
+
+
+def test_a_per_entry_parked_post_without_the_row_token_is_refused(tmp_path):
+    state = core.new_state()
+    state["parked"] = [parked_entry("CVE-2026-1")]
+    client, token, _ = make_client(tmp_path, state=state)
+    csrf = sign_in(client, token)
+    before = (tmp_path / "state.json").read_bytes()
+    for data in (
+        {"csrf": csrf},
+        {"csrf": csrf, "token": ""},
+        {"csrf": csrf, "token": "not-a-token"},
+        {"csrf": csrf, "token": "é" * 16},
+    ):
+        response = client.post("/parked/0/release", data=data, headers={"accept": "text/html"})
+        assert response.status_code == 400, data
+        assert "row token" in response.text
     assert (tmp_path / "state.json").read_bytes() == before
 
 
@@ -712,7 +781,11 @@ def test_a_per_entry_parked_post_answers_409_while_a_pass_holds_the_lock(tmp_pat
     client, token, runtime = make_client(tmp_path, state=state)
     csrf = sign_in(client, token)
     with state_lock(runtime.cfg.state_path):
-        response = client.post("/parked/0/release", data={"csrf": csrf}, headers={"accept": "text/html"})
+        response = client.post(
+            "/parked/0/release",
+            data={"csrf": csrf, "token": core.parked_token(state["parked"][0])},
+            headers={"accept": "text/html"},
+        )
     assert response.status_code == 409
     assert "holds the state lock" in response.text
     stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")

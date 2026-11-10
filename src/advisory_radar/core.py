@@ -2353,9 +2353,14 @@ def manage_parked_entry(state_path: Path, index: int, release: bool, now: int, *
         LOG.warning("no parked message at position %d; the queue changed since the page was rendered", index)
         return False
     entry = parked[index]
-    if expected is not None and not hmac.compare_digest(parked_token(entry), expected):
+    # The shape is checked before the compare: ``compare_digest`` raises on non-ASCII input, and a token this
+    # page never produced cannot name the row.
+    if expected is not None and (
+        not re.fullmatch(r"[0-9a-f]{16}", expected) or not hmac.compare_digest(parked_token(entry), expected)
+    ):
         LOG.warning(
-            "the message at parked position %d is not the one the page offered; the queue was not changed", index
+            "the message at parked position %d is not the one the page offered; the queue was not changed",
+            index,
         )
         return False
     parked.pop(index)

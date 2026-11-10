@@ -296,7 +296,13 @@ def _routing(document: dict, notifiers: list[dict], *, strict: bool = True) -> t
             }
         )
     raw_default = document.get("default")
-    default = () if raw_default is None else _notifier_selection(raw_default, "default", enabled_ids, strict=strict)
+    # An empty list says "no default" (the fallback is every enabled notifier), which an overlay uses to clear
+    # a default it inherited from the YAML; only a non-empty selection needs ids checked.
+    default = (
+        ()
+        if raw_default is None or raw_default == []
+        else _notifier_selection(raw_default, "default", enabled_ids, strict=strict)
+    )
     return tuple(routes), default
 
 

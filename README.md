@@ -108,8 +108,9 @@ so a stored GUID or URL containing slashes still opens). `/advisories/<id>` show
 classification — tag, source, title, the identifiers and CVEs, whether any was KEV-only,
 the watchlist products the item matched, the per-CVE levels and CVSS, and the notifiers
 that accepted the message — for a delivered message, a pending one or a parked one. It never
-shows the message body, which is not retained, and a record written by an older version
-says its details were not recorded instead of inventing them. `/parked` releases or drops a
+renders the message body: a delivered record does not retain it, and a pending or parked
+queue entry still carries its own body only until it leaves the queue. A record written by
+an older version says its details were not recorded instead of inventing them. `/parked` releases or drops a
 single message per row while keeping the bulk actions, and `/runs` filters by exit code and
 day; the writer keeps only the last 200 passes, so that page states the cap rather than
 paging.

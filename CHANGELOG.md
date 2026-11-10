@@ -50,15 +50,20 @@ operator action, and the release workflow then builds and pushes the image to
   the last 200 passes, and the page says so.
 - A delivery record on a seen advisory: a delivered `new` message also stores its tag,
   source heading, title, link, kind, per-CVE levels and CVSS scores, and the notifier ids
-  that accepted it (never the message body). The first record for an identifier is kept.
+  that accepted it, the identifiers and CVEs, KEV-only CVEs and the matched watchlist
+  products (never the message body). The first record for an identifier is kept.
 - `/advisories/<identifier>` shows what the state holds for one advisory, looked up in the
   seen record, then a pending message, then a parked one: tag, source, title, per-CVE levels
   and scores, KEV-only CVEs, accepted or already-sent notifiers, attempt count and timestamps.
   Records written by an older version say their details were not recorded; unknown
-  identifiers are a 404 page. The message body is not retained and is not shown.
+  identifiers are a 404 page. The page never renders the message body: a delivered record
+  does not retain it, while a pending or parked entry still carries its body in the queue
+  until it leaves.
 - Per-entry release and drop on `/parked` (`POST /parked/<index>/release` and
-  `/parked/<index>/drop`), CSRF-protected and refused with `404` when the index no longer
-  exists and `409` while a pass holds the state lock. The bulk actions stay.
+  `/parked/<index>/drop`), CSRF-protected, with each form carrying a row token: a stale row
+  is refused with `404`, a missing or malformed token with `400`, and a pass holding the
+  state lock with `409`. The bulk actions stay, and dropping a partially delivered message
+  keeps the channel that had already accepted it.
 - The routing `routes`/`default` block is editable on `/config`, with three fixed rule rows
   plus a default selection, the same fingerprint/stale-form refusal and validate-and-build
   path as the other forms. An empty form keeps the YAML's rules; a partly filled row is saved
