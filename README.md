@@ -106,8 +106,8 @@ the review itself, published as a status:
 - **A review is acted on at once, not at the next sweep.** `pull_request_review` cannot run the
   gate itself: like `pull_request`, it would execute the head's copy of the workflow that declares
   it. So a no-op workflow, `review-signal`, listens for `submitted` and `dismissed` — no checkout,
-  no secret, `permissions: {}`, one line of output — and its completion is the signal the default
-  branch acts on. `review-signal` starts `review-gate`, which republishes the status, and
+  no secret, `permissions: {}` as committed, one line of output — and its completion is the signal
+  the default branch acts on. `review-signal` starts `review-gate`, which republishes the status, and
   `review-gate`'s completion starts `automerge`, so an approval turns the status and merges the
   pull request within minutes. The `*/5` and `*/30` schedules remain only as a backstop: GitHub
   runs fixed crons late, and an approval that arrives after `ci` has finished would otherwise wait
@@ -168,13 +168,14 @@ approved them".
 
 `.github/workflows/automerge.yml` does the merging itself: an approved pull request whose
 checks are green is squash-merged (with `--match-head-commit`, so a head that moved is
-refused) when `ci` finishes or on a 30-minute sweep. Branch deletion follows the
-repository's *automatically delete head branches* setting.
+refused) when `ci` finishes, when `review-gate` finishes, or on a 30-minute sweep. Branch
+deletion follows the repository's *automatically delete head branches* setting.
 
 The workflow only runs from the default branch — `workflow_run` and `schedule`,
 never `pull_request*` and not `workflow_dispatch` (a dispatcher can pick another
-ref, and that ref's copy of the file is what runs). The trade-off is latency: a merge lands
-within ~30 minutes of the approval, not at the instant of the review. Nothing
+ref, and that ref's copy of the file is what runs). Expected latency for an otherwise
+eligible pull request is therefore minutes, because a review starts the relay above; the
+schedules are the backstop, not the mechanism, and GitHub runs fixed crons late. Nothing
 merges without an approval from the configured reviewer at the exact head — or, for an
 exempt dependency update, without one being required — and any check that is not
 terminal-success stops it.
