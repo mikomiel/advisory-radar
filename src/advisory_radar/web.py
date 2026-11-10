@@ -151,7 +151,7 @@ ALERT_PAGE_SIZE = 50
 #: The filters /alerts keeps in the URL. One tuple, so the form and the pagination links cannot disagree.
 ALERT_FILTERS = ("tag", "source", "outcome", "q", "since", "until")
 #: The outcomes a seen record can carry. A filter value outside this list matches nothing.
-SEEN_OUTCOMES = ("delivered", "dropped", "suppressed", "backlog", "alias", "not-security")
+SEEN_OUTCOMES = ("delivered", "dropped", "filtered", "suppressed", "backlog", "alias", "not-security")
 
 
 def _advisory_token(identifier: str) -> str:
@@ -347,12 +347,13 @@ def _identifier_list(values: object) -> str:
     return ", ".join(esc(value) for value in values)
 
 
-def _seen_advisory(record: Mapping) -> str:
+def _seen_advisory(record: Mapping, delivery: Mapping | None = None) -> str:
     """The detail page for an identifier the state has seen: the snapshot, or only what an older record held."""
     facts: list[tuple[str, str]] = [
         ("Outcome", esc(record.get("outcome", ""))),
         ("Recorded (UTC)", esc(_when(record.get("at"))) or "<span class='muted'>not recorded</span>"),
     ]
+    record = delivery if isinstance(delivery, Mapping) else record
     if not any(key in record for key in ("tag", "source", "title", "levels", "scores", "delivered_to")):
         return (
             "<p>The state holds this identifier, but only its outcome and when it was recorded.</p>"
@@ -880,7 +881,10 @@ def create_app(
         state = load_state()
         seen = state.get("seen")
         if isinstance(seen, dict) and isinstance(seen.get(identifier), dict):
-            body = _seen_advisory(seen[identifier])
+            record = seen[identifier]
+            deliveries = state.get("deliveries")
+            snapshot = deliveries.get(record.get("delivery")) if isinstance(deliveries, dict) else None
+            body = _seen_advisory(record, snapshot if isinstance(snapshot, dict) else None)
             return page(f"Advisory {identifier}", body, nav_extra=sign_out_form(request))
         for label, queue in (("pending", state.get("pending")), ("parked", state.get("parked"))):
             for entry in queue if isinstance(queue, list) else ():
@@ -1359,6 +1363,14 @@ def create_app(
                 continue  # an entirely empty row is not a rule
             routes.append({"match": match, "notifiers": selected})
         default = [value for value in form.get("default", []) if value]
+        if default and not routes:
+            return page(
+                "Not saved",
+                "<p>A default selection needs at least one rule: with no rules every enabled notifier "
+                "receives every message.</p><p>Add a rule, or leave the default empty to keep the YAML "
+                "routing.</p>",
+                status_code=400,
+            )
         if routes:
             overlay["routes"] = routes
             # Always stored with the rules: an empty default is a decision ("no fallback, so an unmatched

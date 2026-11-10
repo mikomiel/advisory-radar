@@ -362,6 +362,12 @@ def runs_state() -> dict:
     return state
 
 
+def test_the_outcome_filter_offers_the_filtered_outcome(tmp_path):
+    client, token, _ = make_client(tmp_path, state=pagination_state())
+    sign_in(client, token)
+    assert "value='filtered'" in client.get("/alerts").text
+
+
 def test_the_runs_page_filters_by_exit_code_and_day_and_states_the_cap(tmp_path):
     client, token, _ = make_client(tmp_path, state=runs_state())
     sign_in(client, token)
@@ -393,9 +399,10 @@ def test_a_delivered_message_records_the_snapshot_and_keeps_the_first_record():
     ops, phone = RecordingNotifier("ops"), RecordingNotifier("phone")
     assert core.deliver(state, [ops, phone], no_http, NOW) is True
     record = state["seen"]["CVE-2026-1"]
-    assert record == {
-        "at": NOW,
-        "outcome": "delivered",
+    assert set(record) == {"at", "outcome", "delivery"}, "a seen record points at its snapshot, not a copy"
+    assert record["at"] == NOW and record["outcome"] == "delivered"
+    delivery = state["deliveries"][record["delivery"]]
+    assert delivery == {
         "tag": "critical",
         "source": "Vendor Feed",
         "title": "CRITICAL: CVE-2026-1 in widget",
@@ -409,14 +416,30 @@ def test_a_delivered_message_records_the_snapshot_and_keeps_the_first_record():
         "scores": {"CVE-2026-1": 7.5},
         "delivered_to": ["ops", "phone"],
     }
-    assert "body" not in record, "the rendered message body is not stored"
+    assert "body" not in delivery, "the rendered message body is not stored"
 
     # A later message about the same identifier is delivered too, but the first record is what the page keeps.
     again = pending_entry("CVE-2026-1", tag="warning", title="WARNING: CVE-2026-1 elsewhere")
     state["pending"].append(again)
     assert core.deliver(state, [ops], no_http, NOW) is True
-    assert state["seen"]["CVE-2026-1"]["title"] == "CRITICAL: CVE-2026-1 in widget"
-    assert state["seen"]["CVE-2026-1"]["delivered_to"] == ["ops", "phone"]
+    assert state["seen"]["CVE-2026-1"] == record
+    assert state["deliveries"][record["delivery"]]["delivered_to"] == ["ops", "phone"]
+
+
+def test_a_message_naming_thousands_of_identifiers_does_not_multiply_its_snapshot():
+    state = core.new_state()
+    entry = pending_entry("CVE-2026-1")
+    identifiers = [f"CVE-2026-{number}" for number in range(2000)]
+    entry["ids"] = identifiers
+    entry["cves"] = identifiers
+    state["pending"].append(entry)
+    assert core.deliver(state, [RecordingNotifier("ops")], no_http, NOW) is True
+    assert len(state["seen"]) == 2000
+    assert len(state["deliveries"]) == 1, "one snapshot for one message"
+    assert all(set(record) == {"at", "outcome", "delivery"} for record in state["seen"].values())
+    serialized = json.dumps(state)
+    # The identifiers appear once (the snapshot) plus their keys; a per-identifier copy would be ~2000x larger.
+    assert len(serialized) < 400_000, f"state grew to {len(serialized)} bytes"
 
 
 def test_a_dropped_message_is_recorded_with_no_accepted_notifier(tmp_path):
@@ -424,10 +447,12 @@ def test_a_dropped_message_is_recorded_with_no_accepted_notifier(tmp_path):
     state["parked"] = [parked_entry("CVE-2026-7777")]
     save_state(tmp_path / "state.json", state)
     assert core.manage_parked_entry(tmp_path / "state.json", 0, release=False, now=NOW) is True
-    record = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")["seen"]["CVE-2026-7777"]
+    stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    record = stored["seen"]["CVE-2026-7777"]
     assert record["outcome"] == "dropped"
-    assert record["delivered_to"] == []
-    assert record["tag"] == "critical"
+    delivery = stored["deliveries"][record["delivery"]]
+    assert delivery["delivered_to"] == []
+    assert delivery["tag"] == "critical"
 
 
 def test_an_identifier_with_slashes_round_trips_through_the_alert_link(tmp_path):
@@ -483,7 +508,7 @@ def test_a_dropped_message_keeps_the_channel_that_already_accepted_it(tmp_path):
     stored = load_state_document(state_path, core.STATE_SCHEMA, "advisory state")
     record = stored["seen"]["CVE-2026-9000"]
     assert record["outcome"] == "dropped"
-    assert record["delivered_to"] == ["ops"], "a channel that accepted the message did accept it"
+    assert stored["deliveries"][record["delivery"]]["delivered_to"] == ["ops"], "the channel that accepted it"
     client, token, _ = make_client(tmp_path, state=stored)
     sign_in(client, token)
     page = client.get(f"/advisories/{advisory_token('CVE-2026-9000')}").text
@@ -530,6 +555,18 @@ def test_a_notifier_reference_in_a_rule_round_trips_through_the_form(tmp_path):
     overlay = load_settings(settings_path(runtime.cfg.state_path))
     assert overlay["routes"] == [{"match": {"tag": "critical"}, "notifiers": ["phone", "${SECOND_CHANNEL}"]}]
     assert overlay["default"] == ["ops", "${SECOND_CHANNEL}"], "a configured reference must survive a save"
+
+
+def test_a_default_without_a_rule_is_refused_not_silently_discarded(tmp_path):
+    client, token, _ = make_client(tmp_path, body="sources: []\nnotifiers: []\n")
+    csrf, fingerprint = config_form(client, token)
+    response = client.post(
+        "/config/routes",
+        data={"csrf": csrf, "fingerprint": fingerprint, "default": ["ops"]},
+        headers={"accept": "text/html"},
+    )
+    assert response.status_code == 400
+    assert "needs at least one rule" in response.text
 
 
 def test_clearing_the_default_with_rules_kept_means_no_fallback(tmp_path):

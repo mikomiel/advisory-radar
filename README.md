@@ -84,8 +84,9 @@ routes:
 default: [discord-security]
 ```
 
-With no `routes` block at all — or an empty list — nothing changes: every message goes to
-every enabled notifier. So does a message that matches no rule when no `default` is set
+The form refuses a default selection with no rule at all (with no rules every enabled
+notifier receives every message). With no `routes` block at all — or an empty list —
+nothing changes: every message goes to every enabled notifier. So does a message that matches no rule when no `default` is set
 (`default` applies while at least one route is configured). A route that leaves a message
 with no notifier is a **failed pass**, not silence: delivery logs the error and the message
 stays queued until the configuration is fixed.
@@ -109,8 +110,10 @@ classification — tag, source, title, the identifiers and CVEs, whether any was
 the watchlist products the item matched, the per-CVE levels and CVSS, and the notifiers
 that accepted the message — for a delivered message, a pending one or a parked one. It never
 renders the message body: a delivered record does not retain it, and a pending or parked
-queue entry still carries its own body only until it leaves the queue. A record written by
-an older version says its details were not recorded instead of inventing them. `/parked` releases or drops a
+queue entry still carries its own body only until it leaves the queue. The record is stored
+once per delivered message and each identifier points at it, so an advisory that names
+thousands of identifiers does not multiply it. A record written by an older version says its
+details were not recorded instead of inventing them. `/parked` releases or drops a
 single message per row while keeping the bulk actions, and `/runs` filters by exit code and
 day; the writer keeps only the last 200 passes, so that page states the cap rather than
 paging.

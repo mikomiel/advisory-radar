@@ -1365,6 +1365,12 @@ def _delivery_snapshot(entry: dict, delivered_to: Sequence[str]) -> dict:
     }
 
 
+def _snapshot_id(snapshot: dict) -> str:
+    """A stable id for one delivery snapshot, so its collections are stored once rather than per identifier."""
+    material = json.dumps(snapshot, sort_keys=True, default=str)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
 def _delivered(
     state: dict, entry: dict, now: int, outcome: str = "delivered", delivered_to: Sequence[str] = ()
 ) -> None:
@@ -1372,13 +1378,22 @@ def _delivered(
 
     ``delivered_to`` names the notifiers that accepted the message; ``deliver`` clears ``sent_to`` from the
     entry before calling this, so the accepted ids are passed in rather than read back off it.
+
+    The snapshot is stored once under ``state["deliveries"]`` and each seen identifier points at it. Copying it
+    into every identifier's record would be quadratic: one accepted message can name thousands of identifiers,
+    each of which would then carry a copy of the full list.
     """
     if entry["kind"] == "new":
         snapshot = _delivery_snapshot(entry, delivered_to)
-        for identifier in entry["ids"]:
-            # The first record wins: an identifier keeps what was sent for it first, even when a later message
-            # about the same advisory is dropped or delivered again from another source.
-            state["seen"].setdefault(identifier, {"at": now, "outcome": outcome, **snapshot})
+        fresh = [identifier for identifier in entry["ids"] if identifier not in state["seen"]]
+        if fresh:
+            deliveries = state.setdefault("deliveries", {})
+            snapshot_id = _snapshot_id(snapshot)
+            deliveries[snapshot_id] = snapshot
+            for identifier in fresh:
+                # The first record wins: an identifier keeps what was sent for it first, even when a later
+                # message about the same advisory is dropped or delivered again from another source.
+                state["seen"][identifier] = {"at": now, "outcome": outcome, "delivery": snapshot_id}
         kev_only = set(entry.get("kev_only") or ())
         for cve, level in entry["levels"].items() if outcome == "delivered" else ():
             # A message the operator dropped was never sent, so no later escalation may refer to it as sent.

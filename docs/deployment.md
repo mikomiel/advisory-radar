@@ -173,7 +173,8 @@ and delivery record — tag, source, title, identifiers and CVEs, KEV-only CVEs,
 products, per-CVE level and CVSS, and the notifiers that accepted the message — and says the details were not recorded for a seen record written by
 an older version, instead of inventing them. The page never renders the message body: a
 delivered record does not retain it, while a pending or parked entry still carries its body
-in the queue until it leaves. `/parked` releases or drops one message per row as well as the whole queue, and
+in the queue until it leaves. The record is stored once per message and each identifier
+points at it, so a message naming thousands of identifiers does not multiply it. `/parked` releases or drops one message per row as well as the whole queue, and
 `/runs` filters by exit code and day; the state keeps only the last 200 passes, so the page
 states that cap instead of paging.
 

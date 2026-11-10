@@ -52,6 +52,9 @@ operator action, and the release workflow then builds and pushes the image to
   source heading, title, link, kind, per-CVE levels and CVSS scores, and the notifier ids
   that accepted it, the identifiers and CVEs, KEV-only CVEs and the matched watchlist
   products (never the message body). The first record for an identifier is kept.
+  The snapshot is stored once per message under `deliveries` and each identifier's
+  record points at it, so a message naming thousands of identifiers does not store
+  thousands of copies of its own lists. The first record for an identifier is kept.
 - `/advisories/<identifier>` shows what the state holds for one advisory, looked up in the
   seen record, then a pending message, then a parked one: tag, source, title, per-CVE levels
   and scores, KEV-only CVEs, accepted or already-sent notifiers, attempt count and timestamps.
