@@ -30,7 +30,7 @@ from .catalogue import SOURCE_SPECS
 from .config import Config, ConfigError, config_from_document, load_document, secret_values
 from .notifiers import NOTIFIER_BUILDERS
 from .runtime import Runtime
-from .settings import SECRET_KEYS, is_reference, load_settings_document, save_settings
+from .settings import SECRET_KEYS, SETTINGS_LOCK, is_reference, load_settings_document, save_settings
 from .state import LockBusy, SourceError
 
 LOG = logging.getLogger("advisory_radar")
@@ -589,6 +589,20 @@ def create_app(
         except ConfigError:
             return dict(runtime.overlay["settings"])
 
+    def form_document(overlay: dict) -> tuple[dict, str]:
+        """The document the forms edit: the saved overlay merged over the YAML.
+
+        Not ``runtime.document``: a revision saved while a pass held the lock has not been applied yet, and
+        editing another section from the live snapshot would silently drop it. Falls back to the live
+        document, with the reason, when the saved overlay cannot be merged.
+        """
+        if runtime.config_path is None:
+            return runtime.document, ""
+        try:
+            return load_document(runtime.config_path, settings=overlay), ""
+        except ConfigError as exc:
+            return runtime.document, esc(str(exc))
+
     def applied_settings() -> dict:
         try:
             value = load_state().get("settings")
@@ -691,43 +705,51 @@ def create_app(
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         form = form_body(request)
-        overlay = overlay_on_disk()
-        poll = first(form, "poll_interval").strip()
-        if poll:
-            overlay["poll_interval"] = poll
-        else:
-            overlay.pop("poll_interval", None)  # an empty field means "use the YAML value"
-        overlay["hidden_source_hosts"] = [
-            line.strip() for line in first(form, "hidden_source_hosts").splitlines() if line.strip()
-        ]
-        return commit_overlay(overlay)
+        with SETTINGS_LOCK:
+            overlay = overlay_on_disk()
+            poll = first(form, "poll_interval").strip()
+            if poll:
+                overlay["poll_interval"] = poll
+            else:
+                overlay.pop("poll_interval", None)  # an empty field means "use the YAML value"
+            overlay["hidden_source_hosts"] = [
+                line.strip() for line in first(form, "hidden_source_hosts").splitlines() if line.strip()
+            ]
+            return commit_overlay(overlay)
 
     @app.post("/config/sources", dependencies=[Depends(require_csrf)])
     def save_sources_form(request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         form = form_body(request)
-        overlay = overlay_on_disk()
-        changes = {}
-        for entry in runtime.document.get("sources") or []:
-            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
-                continue
-            identifier = entry["id"]
-            changes[identifier] = {
-                "enabled": f"enabled:{identifier}" in form,
-                "tag": first(form, f"tag:{identifier}").strip(),
-            }
-        overlay["sources"] = changes
-        return commit_overlay(overlay)
+        with SETTINGS_LOCK:
+            overlay = overlay_on_disk()
+            base, _ = form_document(overlay)
+            changes = {}
+            for entry in base.get("sources") or []:
+                if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                    continue
+                identifier = entry["id"]
+                changes[identifier] = {
+                    "enabled": f"enabled:{identifier}" in form,
+                    "tag": first(form, f"tag:{identifier}").strip(),
+                }
+            overlay["sources"] = changes
+            return commit_overlay(overlay)
 
     @app.post("/config/notifiers", dependencies=[Depends(require_csrf)])
     def save_notifiers_form(request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         form = form_body(request)
-        overlay = overlay_on_disk()
+        with SETTINGS_LOCK:
+            overlay = overlay_on_disk()
+            base, _ = form_document(overlay)
+            return _save_notifiers(overlay, base, form)
+
+    def _save_notifiers(overlay: dict, base: dict, form: dict):
         entries = []
-        for entry in runtime.document.get("notifiers") or []:
+        for entry in base.get("notifiers") or []:
             if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
                 continue
             identifier = entry["id"]
@@ -759,7 +781,7 @@ def create_app(
                 if not reference:
                     return page(
                         "Not saved",
-                        f"<p>A {esc(kind)} needs a reference here: enter ${{NAME}} or ${{NAME}}_FILE. "
+                        f"<p>A {esc(kind)} needs a reference here: enter ${{NAME}} or ${{NAME_FILE}}. "
                         "The secret itself stays in the environment.</p>",
                         status_code=400,
                     )
@@ -801,11 +823,6 @@ def create_app(
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         cfg = runtime.cfg
-        document = runtime.document
-        sources = document.get("sources")
-        sources = sources if isinstance(sources, list) else []
-        notifiers = document.get("notifiers")
-        notifiers = notifiers if isinstance(notifiers, list) else []
         try:
             saved_document = (
                 load_settings_document(runtime.overlay_path)
@@ -823,13 +840,29 @@ def create_app(
         applied = applied_settings()
         applied_at = _when(applied.get("applied_at"))
         if saved_revision == 0 and not saved_document["settings"]:
-            status = "no overlay saved; the YAML is the whole configuration"
+            if live_revision:
+                status = (
+                    f"no overlay file; the live configuration still has revision <b>{live_revision}</b> — "
+                    "press Reload to return to the YAML"
+                )
+            else:
+                status = "no overlay saved; the YAML is the whole configuration"
         else:
             status = f"saved revision <b>{saved_revision}</b> · " + (
                 "<b>live</b>" if live_now else f"NOT live (live revision <b>{live_revision}</b>)"
             )
             if applied_at:
                 status += f" · last applied {esc(applied_at)}"
+        # The forms edit the saved overlay, not the live snapshot: a revision saved while a pass held the lock
+        # must stay visible and editable, and saving another section must not drop it.
+        with SETTINGS_LOCK:
+            document, form_error = form_document(dict(saved_document["settings"]))
+        if form_error and not overlay_error:
+            overlay_error = form_error
+        sources = document.get("sources")
+        sources = sources if isinstance(sources, list) else []
+        notifiers = document.get("notifiers")
+        notifiers = notifiers if isinstance(notifiers, list) else []
         banner = ""
         if saved is not None:
             if live_now and saved == live_revision:
@@ -873,7 +906,7 @@ def create_app(
             "<table><tr><th>Notifier</th><th>Enabled</th><th>Non-secret fields</th><th>Secrets</th></tr>"
             f"{notifier_form_entries(notifiers)}</table>"
             "<h3>New notifier</h3>"
-            "<p class='muted'>Secrets stay in the environment: the reference field takes ${NAME} or ${NAME}_FILE "
+            "<p class='muted'>Secrets stay in the environment: the reference field takes ${NAME} or ${NAME_FILE} "
             "and is stored instead of the value. A type that needs two references, or a header, is added by "
             "editing the YAML.</p>"
             "<p><label>id <input type='text' name='new:id'></label> "
