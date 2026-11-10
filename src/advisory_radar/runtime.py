@@ -12,6 +12,7 @@ Nothing is read at import time: the module only defines the runtime.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -19,9 +20,14 @@ from pathlib import Path
 from . import config, core, pipeline, settings
 from .config import Config, ConfigError, load_document
 from .http import RedactFilter
-from .state import load_state_document, save_state, state_lock
+from .state import LockBusy, load_state_document, save_state, state_lock
 
 LOG = logging.getLogger("advisory_radar")
+
+#: One reload at a time. A candidate is built before the state lock is taken, so without this two reloads could
+#: publish out of order and put an older configuration live under a newer file. It is process-wide: every
+#: runtime in this process serves the same volume.
+_RELOAD_LOCK = threading.Lock()
 
 
 def _state_path(document: dict, environment: Mapping[str, str]) -> Path:
@@ -173,48 +179,69 @@ class Runtime:
         """
         if self.config_path is None or self.overlay_path is None:
             raise ConfigError("this runtime has no configuration file; reload is unavailable")
-        candidate = type(self).build(self.config_path, self.environment, clock=self.clock)
+        if blocking:
+            _RELOAD_LOCK.acquire()
+        elif not _RELOAD_LOCK.acquire(blocking=False):
+            # A SIGHUP reload may be waiting for the pass lock; the UI answers at once instead of waiting
+            # behind it, exactly as it does when the pass lock itself is held.
+            raise LockBusy("a reload is already in progress")
         try:
-            if candidate.cfg.state_path != self.cfg.state_path:
-                # The overlay cannot move the state file, but the YAML can, and a reload would then take one
-                # file's lock, read that file and write the document to the other path. That is a restart's job.
-                raise ConfigError(
-                    "state_path is file-only and a reload cannot move it; restart to use a new state file"
-                )
-            with state_lock(self.cfg.state_path, blocking=blocking):
-                state = load_state_document(self.cfg.state_path, core.STATE_SCHEMA, "advisory state")
-                if state is None:
-                    state = core.new_state()
-                # A candidate is built before the lock, so another reload can publish a newer revision in
-                # between. Publishing this one then would silently roll the configuration back; refuse and
-                # tell the operator, who can reload again to pick up what is on disk now.
-                live_revision = int(self.overlay.get("revision", 0))
-                candidate_revision = int(candidate.overlay["revision"])
-                if candidate_revision < live_revision:
-                    raise ConfigError(
-                        f"the saved overlay is revision {candidate_revision}, older than the live revision "
-                        f"{live_revision}; not reloading over it"
-                    )
-                # Persist the applied marker *before* publishing the candidate: if the write fails the
-                # running configuration is still the old one, and a reader never sees a live revision its
-                # state does not record. Everything after the write is an in-memory assignment.
-                state["settings"] = {"revision": candidate_revision, "applied_at": int(self.clock())}
-                try:
-                    save_state(self.cfg.state_path, state)
-                except OSError as exc:
-                    raise ConfigError(f"the overlay was not applied: cannot record it in the state: {exc}") from exc
-                self._live = candidate.snapshot()
-                self.overlay = candidate.overlay
-                self.document = candidate.document
-                self.overlay_path = candidate.overlay_path
-                # The candidate's filter was installed before its plugins were built; adopting it before
-                # removing the live one leaves no log line unfiltered during the swap.
-                previous, self._redactor = self._redactor, candidate._redactor
-                candidate._redactor = None
-                if previous is not None:
-                    LOG.removeFilter(previous)
+            candidate = type(self).build(self.config_path, self.environment, clock=self.clock)
+            try:
+                self._publish(candidate, blocking=blocking)
+            finally:
+                candidate.detach_redaction()
         finally:
-            candidate.detach_redaction()
+            _RELOAD_LOCK.release()
+
+    def _publish(self, candidate: Runtime, *, blocking: bool) -> None:
+        """Install a built candidate, refusing the changes only a restart can make."""
+        if candidate.cfg.state_path != self.cfg.state_path:
+            # The overlay cannot move the state file, but the YAML can, and a reload would then take one
+            # file's lock, read that file and write the document to the other path. That is a restart's job.
+            raise ConfigError("state_path is file-only and a reload cannot move it; restart to use a new state file")
+        if (candidate.cfg.web_host, candidate.cfg.web_port) != (self.cfg.web_host, self.cfg.web_port):
+            # uvicorn binds the socket once, when the process starts; recording a new address as applied while
+            # the server keeps its old one would make the UI report a configuration that is not in force.
+            raise ConfigError(
+                "web.host and web.port are bound when the process starts and a reload cannot change them; restart"
+            )
+        with state_lock(self.cfg.state_path, blocking=blocking):
+            state = load_state_document(self.cfg.state_path, core.STATE_SCHEMA, "advisory state")
+            if state is None:
+                state = core.new_state()
+            # A candidate is built before the lock, so another reload can publish a newer revision in
+            # between. Publishing this one then would silently roll the configuration back; refuse and
+            # tell the operator, who can reload again to pick up what is on disk now.
+            live_revision = int(self.overlay.get("revision", 0))
+            candidate_revision = int(candidate.overlay["revision"])
+            # A deleted overlay is revision 0 with no settings, and applying it is the documented way back
+            # to the YAML; any other lower revision is a stale candidate and must not roll the live
+            # configuration back under a newer file.
+            reset = candidate_revision == 0 and not candidate.overlay["settings"]
+            if candidate_revision < live_revision and not reset:
+                raise ConfigError(
+                    f"the saved overlay is revision {candidate_revision}, older than the live revision "
+                    f"{live_revision}; not reloading over it"
+                )
+            # Persist the applied marker *before* publishing the candidate: if the write fails the
+            # running configuration is still the old one, and a reader never sees a live revision its
+            # state does not record. Everything after the write is an in-memory assignment.
+            state["settings"] = {"revision": candidate_revision, "applied_at": int(self.clock())}
+            try:
+                save_state(self.cfg.state_path, state)
+            except OSError as exc:
+                raise ConfigError(f"the overlay was not applied: cannot record it in the state: {exc}") from exc
+            self._live = candidate.snapshot()
+            self.overlay = candidate.overlay
+            self.document = candidate.document
+            self.overlay_path = candidate.overlay_path
+            # The candidate's filter was installed before its plugins were built; adopting it before
+            # removing the live one leaves no log line unfiltered during the swap.
+            previous, self._redactor = self._redactor, candidate._redactor
+            candidate._redactor = None
+            if previous is not None:
+                LOG.removeFilter(previous)
 
 
 __all__ = ["Runtime", "read_config"]

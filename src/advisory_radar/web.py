@@ -805,7 +805,7 @@ def create_app(
         except LockBusy:
             return page(
                 "Reload refused",
-                "<p>A pass is running, so the configuration was not reloaded; try again when it finishes.</p>"
+                "<p>A pass or another reload is running, so the configuration was not reloaded; try again shortly.</p>"
                 '<p><a href="/config">Back to configuration</a></p>',
                 status_code=409,
             )

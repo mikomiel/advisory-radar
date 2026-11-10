@@ -386,15 +386,37 @@ def test_a_reload_never_publishes_an_older_revision(tmp_path, monkeypatch):
     # older one would roll the configuration back while the file on disk stays newer.
     path = write_config(tmp_path, {})
     runtime = Runtime.build(path, {})
-    stale = Runtime.build(path, {})  # built at revision 0, before the save below
     save_overlay(tmp_path, {"poll_interval": "30s"})
+    stale = Runtime.build(path, {})  # a candidate built at revision 1
+    save_overlay(tmp_path, {"poll_interval": "12h"})
     runtime.reload(blocking=False)
-    assert runtime.cfg.poll_interval_seconds == 30
+    assert runtime.cfg.poll_interval_seconds == 12 * 3600
     monkeypatch.setattr("advisory_radar.runtime.Runtime.build", classmethod(lambda cls, *a, **k: stale))
     with pytest.raises(ConfigError) as caught:
         runtime.reload(blocking=False)
     assert "older than the live revision" in str(caught.value)
-    assert runtime.cfg.poll_interval_seconds == 30
+    assert runtime.cfg.poll_interval_seconds == 12 * 3600, "the stale candidate must not be published"
+
+
+def test_a_second_nonblocking_reload_answers_instead_of_waiting(tmp_path):
+    # A SIGHUP reload holds the reload lock while it waits for a pass; the UI's reload must answer at once,
+    # not queue behind it.
+    from advisory_radar.runtime import _RELOAD_LOCK
+
+    path = write_config(tmp_path, {})
+    runtime = Runtime.build(path, {})
+    with _RELOAD_LOCK, pytest.raises(LockBusy):
+        runtime.reload(blocking=False)
+
+
+def test_a_reload_that_would_change_the_web_binding_is_refused(tmp_path):
+    path = write_config(tmp_path, {})
+    runtime = Runtime.build(path, {})
+    write_config(tmp_path, {"web": {"port": 9090}})
+    with pytest.raises(ConfigError) as caught:
+        runtime.reload(blocking=False)
+    assert "restart" in str(caught.value)
+    assert (runtime.cfg.web_host, runtime.cfg.web_port) == ("0.0.0.0", 8080)
 
 
 def test_a_state_file_named_settings_json_is_refused(tmp_path):

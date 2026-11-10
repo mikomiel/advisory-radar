@@ -531,6 +531,11 @@ def test_deleting_the_overlay_file_is_reported_as_not_live(tmp_path):
     settings_path(runtime.cfg.state_path).unlink()
     page = client.get("/config").text
     assert "no overlay file" in page and "Reload to return to the YAML" in page
+    # The page advertises that Reload returns to the YAML; the advertised action has to work, so a missing
+    # overlay is applied as revision 0 rather than refused as an older revision.
+    reloaded = client.post("/reload", data={"csrf": csrf}, follow_redirects=False)
+    assert reloaded.status_code == 303
+    assert runtime.cfg.poll_interval_seconds == 900, "the reload must fall back to the YAML configuration"
 
 
 def test_the_config_page_and_its_posts_require_auth(tmp_path):
@@ -613,7 +618,7 @@ def test_reload_refuses_with_409_while_a_pass_holds_the_lock(tmp_path):
     with state_lock(runtime.cfg.state_path):
         response = client.post("/reload", data={"csrf": csrf})
     assert response.status_code == 409
-    assert "A pass is running" in response.text
+    assert "A pass or another reload is running" in response.text
 
 
 def test_reload_applies_a_saved_overlay(tmp_path):

@@ -65,8 +65,9 @@ the overlay. A save writes `settings.json` next to the state file (on the `/data
 volume) and applies immediately when the state lock is free; if a pass holds the lock, the
 page says the revision is not live yet, and Reload applies it when the pass finishes.
 `SIGHUP` re-reads `config.yml` and the overlay, for a configuration edited by hand. Every
-other setting stays in `config/config.yml`; editing it needs a reload (the button or
-`SIGHUP`), not a restart.
+other setting stays in `config/config.yml`; editing most of it needs a reload (the button
+or `SIGHUP`), not a restart — `web.host`, `web.port` and `state_path` are bound when the
+process starts, and a change to one of them needs a restart.
 
 Secrets stay in the environment. The overlay stores a notifier's `url`, `key`,
 `password` or `token` only as a `${NAME}` or `${NAME_FILE}` reference, refuses a literal
@@ -77,9 +78,10 @@ A reload builds the new configuration and its plugins before it swaps them in un
 state lock. An invalid overlay is refused with the same error the YAML would give, and
 the running configuration stays; a pass that already started finishes with the
 configuration it started with, and the next pass uses the reloaded one. A reload re-reads
-both files; `state_path` is the one key it refuses to move (it would lock one file and
-write the other), and environment variables are read at start, so changing one still
-needs a restart.
+both files; it refuses `web.host`, `web.port` and `state_path` rather than report them
+applied, because they are bound when the process starts. Environment variables are read at
+start too, so changing one still needs a restart. Deleting `settings.json` and reloading
+returns to the YAML: the empty overlay is applied as revision 0.
 
 ### Gap detection
 

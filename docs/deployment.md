@@ -121,9 +121,10 @@ configuration. A pass holds the state lock for its whole transaction, so a reloa
 for it (`SIGHUP`) or answers `409` (the UI), and a pass that already started finishes
 with the configuration it started with. Pending and parked messages are not touched by a
 reload. A reload re-reads the YAML and the overlay, so an edit to `config.yml` is picked
-up too; `state_path` is the one key it refuses to move (it would lock one file and write
-the other), and environment variables are read at start, so changing one still needs a
-restart. The overlay itself is capped at 64 KiB: a value that would make the file larger
+up too; `web.host`, `web.port` and `state_path` are refused rather than reported as
+applied, because they are bound when the process starts, and environment variables are
+read at start, so changing one still needs a restart. Deleting `settings.json` and
+reloading returns to the YAML (the empty overlay is applied as revision 0). The overlay itself is capped at 64 KiB: a value that would make the file larger
 is refused instead of written.
 
 Two upstreams reward configuration rather than credentials:
