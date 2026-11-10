@@ -354,7 +354,9 @@ def test_reload_under_the_lock_records_the_applied_revision_and_keeps_the_queues
         runtime.reload(blocking=False)
         assert [notifier.id for notifier in runtime.notifiers] == ["base", "extra"]
         after = load_state_document(runtime.cfg.state_path, core.STATE_SCHEMA, "advisory state")
-        assert after["settings"] == {"revision": stored["revision"], "applied_at": NOW}
+        assert after["settings"]["revision"] == stored["revision"]
+        assert after["settings"]["applied_at"] == NOW
+        assert len(after["settings"]["fingerprint"]) == 64
         assert json.dumps(after["pending"], sort_keys=True) == pending_before
         assert json.dumps(after["parked"], sort_keys=True) == parked_before
         assert after["seen"] == state["seen"]

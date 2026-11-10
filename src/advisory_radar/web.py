@@ -30,7 +30,16 @@ from .catalogue import SOURCE_SPECS
 from .config import Config, ConfigError, config_from_document, load_document, secret_values
 from .notifiers import NOTIFIER_BUILDERS
 from .runtime import Runtime
-from .settings import SECRET_KEYS, SETTINGS_LOCK, is_reference, load_settings_document, save_settings
+from .settings import (
+    SECRET_KEYS,
+    SETTINGS_LOCK,
+    is_reference,
+    load_settings_document,
+    save_settings,
+)
+from .settings import (
+    fingerprint as settings_fingerprint,
+)
 from .state import LockBusy, SourceError
 
 LOG = logging.getLogger("advisory_radar")
@@ -658,11 +667,12 @@ def create_app(
                 continue
             identifier = entry["id"]
             checked = " checked" if entry.get("enabled", True) is not False else ""
+            # Every optional field is rendered, not only those the entry already carries: a defaulted value
+            # must be settable, and a value cleared in one save must be settable again in the next.
             fields = " ".join(
                 f"<label>{key} <input type='text' name='field:{esc(identifier)}:{key}' "
-                f"value='{esc(entry[key])}'></label>"
+                f"value='{esc(entry.get(key, ''))}'></label>"
                 for key in NOTIFIER_FORM_KEYS
-                if key in entry
             )
             rows.append(
                 f"<tr><td><b>{esc(identifier)}</b><br><span class='muted'>{esc(entry.get('type', ''))}</span></td>"
@@ -798,8 +808,6 @@ def create_app(
             updated.pop("headers", None)
             updated["enabled"] = f"enabled:{identifier}" in form
             for key in NOTIFIER_FORM_KEYS:
-                if key not in entry:
-                    continue
                 value = first(form, f"field:{identifier}:{key}").strip()
                 if value:
                     updated[key] = value
@@ -880,9 +888,11 @@ def create_app(
         # hand-edit that kept the revision number is therefore not reported as applied.
         live_now = saved_revision == live_revision and saved_document["settings"] == runtime.overlay["settings"]
         applied = applied_settings()
-        # The state marker can be older than the file (a save while a pass held the lock, then a restart): an
-        # application timestamp is only reported for the revision it belongs to.
-        applied_at = _when(applied.get("applied_at")) if applied.get("revision") == saved_revision else ""
+        # The state marker can be older than the file (a save while a pass held the lock, then a restart), and a
+        # revision number can be reused after the overlay is deleted and recreated: the timestamp is only
+        # reported for the settings fingerprint the marker recorded.
+        applied_now = applied.get("fingerprint") == settings_fingerprint(saved_document["settings"])
+        applied_at = _when(applied.get("applied_at")) if applied_now else ""
         if saved_revision == 0 and not saved_document["settings"]:
             if live_revision:
                 status = (

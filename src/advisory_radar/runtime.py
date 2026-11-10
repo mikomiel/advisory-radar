@@ -230,7 +230,11 @@ class Runtime:
             # Persist the applied marker *before* publishing the candidate: if the write fails the
             # running configuration is still the old one, and a reader never sees a live revision its
             # state does not record. Everything after the write is an in-memory assignment.
-            state["settings"] = {"revision": candidate_revision, "applied_at": int(self.clock())}
+            state["settings"] = {
+                "revision": candidate_revision,
+                "applied_at": int(self.clock()),
+                "fingerprint": settings.fingerprint(candidate.overlay["settings"]),
+            }
             try:
                 save_state(self.cfg.state_path, state)
             except OSError as exc:

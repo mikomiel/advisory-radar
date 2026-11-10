@@ -588,6 +588,103 @@ def test_a_yaml_notifier_with_headers_can_still_be_edited_from_the_form(tmp_path
     )
 
 
+def test_a_failing_reference_does_not_echo_the_environment_value(tmp_path, caplog):
+    # A *_FILE variable can wrongly hold the credential itself; the expansion error names the variable, and
+    # must not print what it held, on the page or in a SIGHUP log.
+    from advisory_radar import cli
+
+    secret = "https://hooks.example.net/SUPERSECRET-FROM-ENV"
+    client, token, runtime = make_app_client(tmp_path, environment={"HOOK_FILE": secret})
+    csrf, fingerprint = config_form(client, token)
+    response = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "new:id": "hook",
+            "new:type": "webhook",
+            "new:reference": "${HOOK_FILE}",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 400
+    assert "no readable file" in response.text
+    assert "SUPERSECRET-FROM-ENV" not in response.text
+    save_settings(
+        settings_path(runtime.cfg.state_path),
+        {"notifiers": [{"id": "hook", "type": "webhook", "url": "${HOOK_FILE}"}]},
+        now=1,
+    )
+    try:
+        with caplog.at_level(logging.ERROR, logger="advisory_radar"):
+            cli._reload_blocking(runtime)
+        assert "no readable file" in caplog.text
+        assert "SUPERSECRET-FROM-ENV" not in caplog.text
+    finally:
+        runtime.detach_redaction()
+
+
+def test_an_omitted_optional_notifier_field_can_be_set_cleared_and_restored(tmp_path):
+    client, token, runtime = make_app_client(tmp_path, environment={"HOOK": "https://ntfy.example.net/x"})
+    csrf, fingerprint = config_form(client, token)
+    added = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "new:id": "phone",
+            "new:type": "ntfy",
+            "new:reference": "${HOOK}",
+            "new:topic": "advisories",
+        },
+        follow_redirects=False,
+    )
+    assert added.status_code == 303
+    page = client.get("/config").text
+    assert "name='field:phone:priority'" in page, "a defaulted field must still be offered"
+    csrf, fingerprint = config_form(client, token)
+    set_priority = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "enabled:phone": "1",
+            "field:phone:topic": "advisories",
+            "field:phone:priority": "4",
+        },
+        follow_redirects=False,
+    )
+    assert set_priority.status_code == 303
+    assert runtime.notifiers[0].priority == 4
+    csrf, fingerprint = config_form(client, token)
+    cleared = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "enabled:phone": "1",
+            "field:phone:topic": "advisories",
+        },
+        follow_redirects=False,
+    )
+    assert cleared.status_code == 303
+    assert "name='field:phone:priority'" in client.get("/config").text, "a cleared field must stay editable"
+    csrf, fingerprint = config_form(client, token)
+    restored = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "enabled:phone": "1",
+            "field:phone:topic": "advisories",
+            "field:phone:priority": "2",
+        },
+        follow_redirects=False,
+    )
+    assert restored.status_code == 303
+    assert runtime.notifiers[0].priority == 2
+
+
 def test_a_stale_notifier_form_is_refused(tmp_path):
     # Two tabs opened before either save: the second one would rewrite the whole list from rows that do not
     # know about the first save, disabling it and dropping its fields. The revision it carries is the check.
@@ -761,7 +858,9 @@ def test_a_saved_setting_is_live_after_the_post(tmp_path):
     assert runtime.cfg.hidden_source_hosts == frozenset({"internal.example.com", "echo.example.net"})
     assert load_settings_document(settings_path(runtime.cfg.state_path))["revision"] == 1
     state = load_state_document(runtime.cfg.state_path, core.STATE_SCHEMA, "advisory state")
-    assert state["settings"] == {"revision": 1, "applied_at": 1792600000}
+    assert state["settings"]["revision"] == 1
+    assert state["settings"]["applied_at"] == 1792600000
+    assert len(state["settings"]["fingerprint"]) == 64
     # the next pass reads this snapshot, which already carries the saved value
     cfg, _, _ = runtime.snapshot()
     assert cfg.poll_interval_seconds == 30
@@ -808,7 +907,9 @@ def test_reload_applies_a_saved_overlay(tmp_path):
     assert response.status_code == 303
     assert runtime.cfg.poll_interval_seconds == 12 * 3600
     state = load_state_document(runtime.cfg.state_path, core.STATE_SCHEMA, "advisory state")
-    assert state["settings"] == {"revision": 1, "applied_at": 1792600000}
+    assert state["settings"]["revision"] == 1
+    assert state["settings"]["applied_at"] == 1792600000
+    assert len(state["settings"]["fingerprint"]) == 64
 
 
 def test_a_refused_reload_keeps_the_running_configuration(tmp_path):

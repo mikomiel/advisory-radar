@@ -41,7 +41,9 @@ def _expand(value: object, env: dict[str, str], resolved: list[str] | None = Non
                     return contents
                 if lenient:
                     return match.group(0)  # a state-only command never builds the plugin that reads it
-                raise ConfigError(f"${{{name}_FILE}}: no readable file (env {name}_FILE={path!r})")
+                # The variable's value is not in the message: an operator can point a *_FILE variable at the
+                # secret itself by mistake, and this error is printed before any redaction exists.
+                raise ConfigError(f"${{{name}_FILE}}: no readable file")
             if name not in env:
                 if lenient:
                     return match.group(0)  # state-only commands never build the plugin that would use it

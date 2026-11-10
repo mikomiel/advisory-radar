@@ -13,6 +13,7 @@ reaches this file.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import threading
@@ -89,6 +90,12 @@ def validate_settings(settings: object) -> dict:
             if "tag" in changes and not isinstance(changes["tag"], str):
                 raise ConfigError(f"settings: source {identifier!r}: tag must be a string")
     return settings
+
+
+def fingerprint(settings: dict) -> str:
+    """A stable hash of an overlay's settings, so an applied marker can name what it applied."""
+    canonical = json.dumps(settings, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def load_settings_document(path: Path) -> dict:
