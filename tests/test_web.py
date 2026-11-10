@@ -105,10 +105,14 @@ def test_pages_tolerate_records_that_are_not_objects_or_not_times(tmp_path):
     # A malformed entry before a valid latest one must not hide the valid one, and the record that is not an
     # object must be skipped by the alerts sort rather than raising from the comparison.
     state["runs"] = [None, "nope", valid_run]
-    state["seen"]["CVE-2026-3"] = "not-an-object"
-    # A timestamp outside the representable range is blank on the page, so it must not be counted as recent.
-    state["seen"]["CVE-2026-4"] = {"at": 10**20, "outcome": "delivered"}
-    state["seen"]["CVE-2026-5"] = {"at": int(time.time()), "outcome": "delivered"}
+    # Replace the fixture's seen map rather than adding to it: the expected count must not depend on when the
+    # suite happens to run, and the fixture's 2026-10-21 timestamp is inside 24h on an earlier wall clock.
+    state["seen"] = {
+        "CVE-2026-3": "not-an-object",
+        # A timestamp outside the representable range is blank on the page, so it must not be counted as recent.
+        "CVE-2026-4": {"at": 10**20, "outcome": "delivered"},
+        "CVE-2026-5": {"at": int(time.time()), "outcome": "delivered"},
+    }
     save_state(tmp_path / "state.json", state)
     signed_in(client, token)
 
@@ -124,6 +128,7 @@ def test_pages_tolerate_records_that_are_not_objects_or_not_times(tmp_path):
 
     runs = client.get("/runs")
     assert runs.status_code == 200 and "At (UTC)" in runs.text
+    assert "2026-10-21 16:26" in runs.text
     assert "None" not in runs.text and "nope" not in runs.text
 
 
