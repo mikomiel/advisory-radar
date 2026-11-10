@@ -550,6 +550,26 @@ def test_concurrent_saves_never_reuse_a_revision(tmp_path, monkeypatch):
     assert load_settings_document(overlay_path)["revision"] == 4, "every save must advance the revision once"
 
 
+def test_a_refused_sighup_reload_keeps_the_secret_out_of_its_reason(tmp_path, caplog):
+    secret = "https://hooks.example.net/SUPERSECRET-BUILDER-VALUE"
+    path = write_config(tmp_path, {})
+    runtime = Runtime.build(path, {"HOOK": secret})
+    save_settings(
+        settings_path(runtime.cfg.state_path),
+        {"notifiers": [{"id": "x", "type": "ntfy", "url": "${HOOK}", "topic": "advisories", "priority": "${HOOK}"}]},
+        now=NOW,
+    )
+    try:
+        with caplog.at_level(logging.ERROR, logger="advisory_radar"):
+            cli._reload_blocking(runtime)
+        assert "keeping the running configuration" in caplog.text
+        assert "int() argument" in caplog.text or "invalid literal" in caplog.text, "the reason is logged"
+        assert "SUPERSECRET-BUILDER-VALUE" not in caplog.text, "the expanded secret never reaches the log"
+        assert runtime.cfg.poll_interval_seconds == 900
+    finally:
+        runtime.detach_redaction()
+
+
 def test_sighup_reloads_the_running_process(tmp_path, monkeypatch):
     path = write_config(tmp_path, {})
     runtime = Runtime.build(path, {})

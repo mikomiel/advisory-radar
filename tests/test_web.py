@@ -578,6 +578,8 @@ def test_a_yaml_notifier_with_headers_can_still_be_edited_from_the_form(tmp_path
     assert response.status_code == 303, "the YAML headers must not make every notifier save fail"
     saved = load_settings(settings_path(runtime.cfg.state_path))
     assert "headers" not in saved["notifiers"][0], "the overlay never stores a header mapping"
+    assert saved["notifiers"][0].get("enabled") is False, "the form did not submit the enable checkbox"
+    assert runtime.notifiers == [], "the disabled notifier is gone from the live runtime"
     from advisory_radar.config import load_document
 
     merged = load_document(cfg_path, settings=saved)
