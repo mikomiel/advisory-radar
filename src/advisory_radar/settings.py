@@ -1,7 +1,7 @@
 """The settings overlay: a small JSON document applied over the YAML configuration.
 
 ``settings.json`` lives beside the state file (the writable volume), not beside the YAML
-(``/config`` is mounted read-only), and holds only the four keys the UI may change. The
+(``/config`` is mounted read-only), and holds only the six keys the UI may change. The
 overlay is merged into the YAML *before* ``config.load_config`` validates, so a value the
 YAML would refuse is refused with the same message.
 
@@ -33,7 +33,7 @@ SETTINGS_NAME = "settings.json"
 #: A file larger than this is refused before it is parsed.
 MAX_SETTINGS_BYTES = 64 * 1024
 #: The only keys the overlay may carry. Everything else stays in the YAML.
-OVERLAY_KEYS = frozenset({"notifiers", "sources", "poll_interval", "hidden_source_hosts"})
+OVERLAY_KEYS = frozenset({"notifiers", "sources", "poll_interval", "hidden_source_hosts", "routes", "default"})
 #: Notifier keys that carry a credential: only a whole-value environment reference is accepted.
 SECRET_KEYS = ("url", "key", "password", "token")
 #: Exactly one ``${NAME}`` (optionally ``${NAME_FILE}``), with no surrounding text: a value with
@@ -49,16 +49,23 @@ def is_reference(value: object) -> bool:
 def validate_settings(settings: object) -> dict:
     """Refuse an overlay the runtime could not apply, without repeating the config validator.
 
-    Only rules specific to the overlay live here: the four-key allowlist, the reference-only secret
+    Only rules specific to the overlay live here: the six-key allowlist, the reference-only secret
     rule, and the two-key source edit. Values the YAML validator checks -- a poll interval, a
-    hidden-host list, a notifier's keys and its ``enabled`` boolean -- are merged and left to it, so
-    both sources of truth fail with one message.
+    hidden-host list, a notifier's keys and its ``enabled`` boolean, a route's match keys and whether
+    a selected notifier is enabled -- are merged and left to it, so both sources of truth fail with
+    one message.
     """
     if not isinstance(settings, dict):
         raise ConfigError("settings: the overlay must be a mapping")
     unknown = set(settings) - OVERLAY_KEYS
     if unknown:
         raise ConfigError(f"settings: unknown overlay keys {sorted(unknown)}")
+    # ``routes`` and ``default`` are only type-checked here: their shape and the notifier membership are
+    # judged by ``config._routing`` after the merge, where an overlay-added notifier is finally known.
+    if "routes" in settings and not isinstance(settings["routes"], list):
+        raise ConfigError("settings: routes must be a list of {match, notifiers} rules")
+    if "default" in settings and not isinstance(settings["default"], list):
+        raise ConfigError("settings: default must be a list of notifier ids")
     if "notifiers" in settings:
         entries = settings["notifiers"]
         if not isinstance(entries, list):

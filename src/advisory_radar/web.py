@@ -9,6 +9,7 @@ frontend build step.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import html
@@ -17,7 +18,7 @@ import logging
 import os
 import time
 import urllib.parse
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 
 import yaml
@@ -138,6 +139,251 @@ def _when(value: object) -> str:
     if stamp is None:
         return ""
     return datetime.fromtimestamp(stamp, tz=UTC).strftime("%Y-%m-%d %H:%M")
+
+
+#: One page of /alerts: a screenful of rows, and small enough to stay fast on a phone.
+ALERT_PAGE_SIZE = 50
+#: The filters /alerts keeps in the URL. One tuple, so the form and the pagination links cannot disagree.
+ALERT_FILTERS = ("tag", "source", "outcome", "q", "since", "until")
+#: The outcomes a seen record can carry. A filter value outside this list matches nothing.
+SEEN_OUTCOMES = ("delivered", "dropped", "suppressed", "backlog", "alias", "not-security")
+#: The severity tags a message can carry; the alert filter and the route form offer these.
+TAGS = ("critical", "warning")
+#: Fixed route rows on /config. More rules already configured are rendered too, so a save cannot drop them.
+ROUTE_FORM_ROWS = 3
+
+
+def _day_start(value: str, where: str) -> int:
+    """A ``YYYY-MM-DD`` filter as the UTC epoch of that day's midnight; a 400 page when it is not a date."""
+    try:
+        return int(datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=UTC).timestamp())
+    except (ValueError, OverflowError):
+        raise HTTPException(status_code=400, detail=f"{where} must be a date like 2026-10-21") from None
+
+
+def _cursor_encode(at: int, identifier: str) -> str:
+    """A page position as URL-safe base64 of ``at:identifier``, without padding."""
+    return base64.urlsafe_b64encode(f"{at}:{identifier}".encode()).decode("ascii").rstrip("=")
+
+
+def _cursor_decode(value: str) -> tuple[int, str]:
+    """The position a ``cursor``/``before`` parameter names; a 400 page when it is not one.
+
+    ``identifier`` is split off at the first colon, because a stored identifier may contain one
+    (``src:<guid>``). Nothing else about the value is trusted: it comes from the URL.
+    """
+    malformed = HTTPException(status_code=400, detail="malformed page cursor; open /alerts again")
+    try:
+        raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)).decode("utf-8")
+    except ValueError:
+        raise malformed from None
+    at, separator, identifier = raw.partition(":")
+    if not separator or not identifier:
+        raise malformed
+    try:
+        return int(at), identifier
+    except ValueError:
+        raise malformed from None
+
+
+def _position(identifier: str, record: Mapping) -> tuple[int, str]:
+    """A seen record's sort position: its recorded time, then the identifier ascending.
+
+    A record without a usable time sorts as epoch zero rather than raising: one hand-edited field must
+    not take the alert history down, and the page already renders such a time as blank.
+    """
+    return _number(record.get("at"), 0), identifier
+
+
+def _matches_seen(
+    identifier: str,
+    record: Mapping,
+    filters: Mapping[str, str],
+    since: int | None,
+    until: int | None,
+) -> bool:
+    """Whether one seen record passes every filter.
+
+    A record that predates the delivery snapshot carries only ``at``/``outcome``, so a tag, source or
+    title filter excludes it -- matching on an empty value would be a lie. The date range and the text
+    filter still apply, so it stays findable by its identifier.
+    """
+    if filters.get("tag") and record.get("tag") != filters["tag"]:
+        return False
+    if filters.get("source") and record.get("source") != filters["source"]:
+        return False
+    if filters.get("outcome") and record.get("outcome") != filters["outcome"]:
+        return False
+    text = filters.get("q")
+    if text:
+        needle = text.casefold()
+        title = record.get("title")
+        if needle not in identifier.casefold() and not (isinstance(title, str) and needle in title.casefold()):
+            return False
+    at = _number(record.get("at"), 0)
+    if since is not None and at < since:
+        return False
+    return until is None or at < until
+
+
+def _alert_page(
+    rows: Sequence[tuple[tuple[int, str], Mapping]],
+    cursor: tuple[int, str] | None,
+    before: tuple[int, str] | None,
+) -> tuple[list[tuple[tuple[int, str], Mapping]], tuple[int, str] | None, tuple[int, str] | None]:
+    """One page of seen records, and the positions its previous/next links point at.
+
+    Keyset, not an offset: both directions slice the same ordered list, so a record arriving between two
+    requests cannot shift a page and make a row repeat or go missing. ``cursor`` continues towards older
+    records (the next link); ``before`` towards newer ones (the previous link). Newest first by
+    ``(at desc, identifier asc)``.
+    """
+    ordered = sorted(rows, key=lambda item: (-item[0][0], item[0][1]))
+    keys = [(-position[0], position[1]) for position, _ in ordered]
+    if cursor is not None:
+        start = (-cursor[0], cursor[1])
+        window = [item for item, key in zip(ordered, keys, strict=True) if key > start][:ALERT_PAGE_SIZE]
+    elif before is not None:
+        limit = (-before[0], before[1])
+        newer = [item for item, key in zip(ordered, keys, strict=True) if key < limit]
+        window = newer[-ALERT_PAGE_SIZE:]
+    else:
+        window = ordered[:ALERT_PAGE_SIZE]
+    if not window:
+        return [], None, None
+    first, last = window[0][0], window[-1][0]
+    first_key, last_key = (-first[0], first[1]), (-last[0], last[1])
+    # One row past either edge is enough to know that direction has a page, without counting pages.
+    previous = first if keys and keys[0] < first_key else None
+    following = last if keys and keys[-1] > last_key else None
+    return list(window), previous, following
+
+
+def _short(value: object, limit: int = 70) -> str:
+    """A stored string cut to ``limit`` characters for a table cell, and escaped after the cut.
+
+    Cutting the escaped text would split an entity such as ``&amp;`` and render the fragment literally.
+    """
+    text = "" if value is None else str(value)
+    return esc(text if len(text) <= limit else f"{text[:limit]}…")
+
+
+def _external_link(url: object, text: object = None) -> str:
+    """A stored URL as an anchor when it is a public https URL, and as escaped text otherwise.
+
+    The link comes from state, which is a file a person can edit: rendering it as an ``href`` without a
+    check would make every page offer whatever scheme it named.
+    """
+    label = esc(text if text not in (None, "") else (url if url is not None else ""))
+    if not isinstance(url, str) or not url.startswith("https://"):
+        return label
+    parts = urllib.parse.urlsplit(url)
+    if not parts.hostname or "@" in parts.netloc:
+        return label
+    return f"<a href='{esc(url)}' rel='noreferrer'>{label}</a>"
+
+
+def _levels_table(levels: object, scores: object) -> str:
+    """One row per recorded CVE, with the level and CVSS the message was classified with."""
+    if not isinstance(levels, Mapping) or not levels:
+        return "<p class='muted'>No per-CVE level was recorded for this message.</p>"
+    recorded = scores if isinstance(scores, Mapping) else {}
+    rows = []
+    for cve in sorted(levels, key=str):
+        score = recorded.get(cve)
+        if cve not in recorded:
+            shown = "<span class='muted'>not recorded</span>"
+        elif isinstance(score, (int, float)) and not isinstance(score, bool):
+            shown = esc(f"{score:g}")
+        elif score is None:
+            shown = "<span class='muted'>unscored</span>"
+        else:
+            shown = esc(score)
+        rows.append(
+            f"<tr><td>{esc(cve)}</td><td class='tag-{esc(levels[cve])}'>{esc(levels[cve])}</td><td>{shown}</td></tr>"
+        )
+    return "<table><tr><th>CVE</th><th>Level</th><th>CVSS</th></tr>" + "".join(rows) + "</table>"
+
+
+def _facts(facts: Sequence[tuple[str, str]]) -> str:
+    """A two-column table of already-escaped/rendered values."""
+    rows = "".join(f"<tr><th>{esc(name)}</th><td>{value}</td></tr>" for name, value in facts)
+    return f"<table>{rows}</table>"
+
+
+def _identifier_list(values: object) -> str:
+    """A stored list of identifier strings; anything else is shown as the absence it is."""
+    if not isinstance(values, (list, tuple)) or not values:
+        return "<span class='muted'>(none recorded)</span>"
+    return ", ".join(esc(value) for value in values)
+
+
+def _seen_advisory(record: Mapping) -> str:
+    """The detail page for an identifier the state has seen: the snapshot, or only what an older record held."""
+    facts: list[tuple[str, str]] = [
+        ("Outcome", esc(record.get("outcome", ""))),
+        ("Recorded (UTC)", esc(_when(record.get("at"))) or "<span class='muted'>not recorded</span>"),
+    ]
+    if not any(key in record for key in ("tag", "source", "title", "levels", "scores", "delivered_to")):
+        return (
+            "<p>The state holds this identifier, but only its outcome and when it was recorded.</p>"
+            "<p class='muted'>The delivered message's details were not recorded: this record was written by an "
+            "older version of advisory-radar, or no message was delivered for this identifier. Nothing is "
+            "reconstructed here, and the message body is not retained.</p>" + _facts(facts)
+        )
+    accepted = record.get("delivered_to")
+    if isinstance(accepted, list) and accepted:
+        delivered = ", ".join(esc(value) for value in accepted)
+    elif record.get("outcome") == "dropped":
+        delivered = "<span class='muted'>none: the message was dropped, not delivered</span>"
+    else:
+        delivered = "<span class='muted'>not recorded</span>"
+    facts += [
+        ("Tag", esc(record.get("tag", "")) or "<span class='muted'>not recorded</span>"),
+        ("Source", esc(record.get("source", "")) or "<span class='muted'>not recorded</span>"),
+        ("Message kind", esc(record.get("kind", "")) or "<span class='muted'>not recorded</span>"),
+        ("Accepted by", delivered),
+        ("Advisory", _external_link(record.get("link")) or "<span class='muted'>not recorded</span>"),
+    ]
+    return (
+        (f"<p><b>{esc(record.get('title'))}</b></p>" if record.get("title") else "")
+        + _facts(facts)
+        + "<h2>CVEs and levels</h2>"
+        + _levels_table(record.get("levels"), record.get("scores"))
+    )
+
+
+def _queued_advisory(state_label: str, entry: Mapping) -> str:
+    """The detail page for a pending or parked message: everything the queued entry itself holds."""
+    attempts = _number(entry.get("attempts"), 0)
+    first = _when(entry.get("first_attempt_at"))
+    parked_at = _when(entry.get("parked_at"))
+    status = entry.get("last_status")
+    attempts_text = f"{attempts}" + (f" (last HTTP {esc(status)})" if status is not None else "")
+    if not attempts:
+        attempts_text = "0 (never attempted)"
+    accepted = entry.get("sent_to")
+    facts = [
+        ("State", esc(state_label)),
+        ("Tag", esc(entry.get("tag", "")) or "<span class='muted'>not recorded</span>"),
+        ("Source", esc(entry.get("source", "")) or "<span class='muted'>not recorded</span>"),
+        ("Message kind", esc(entry.get("kind", "")) or "<span class='muted'>not recorded</span>"),
+        ("Identifiers", _identifier_list(entry.get("ids"))),
+        ("CVEs in this message", _identifier_list(entry.get("cves"))),
+        ("KEV-only (not scored here)", _identifier_list(entry.get("kev_only"))),
+        ("Accepted by", _identifier_list(accepted)),
+        ("Delivery attempts", attempts_text),
+        ("First attempt (UTC)", esc(first) or "<span class='muted'>not attempted yet</span>"),
+        ("Advisory", _external_link(entry.get("link")) or "<span class='muted'>not recorded</span>"),
+    ]
+    if parked_at:
+        facts.append(("Parked (UTC)", esc(parked_at)))
+    return (
+        (f"<p><b>{esc(entry.get('title'))}</b></p>" if entry.get("title") else "")
+        + _facts(facts)
+        + "<h2>CVEs and levels</h2>"
+        + _levels_table(entry.get("levels"), entry.get("scores"))
+    )
 
 
 def last_pass_code(state: dict) -> int:
@@ -516,44 +762,161 @@ def create_app(
 
     @app.get("/alerts", response_class=HTMLResponse)
     def alerts(request: Request):
+        """The seen identifiers, filtered and paged from the URL alone, so a reload or a shared link keeps them."""
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         state = load_state()
         seen = state.get("seen")
         seen = seen if isinstance(seen, dict) else {}
-        rows = []
-        # A record that is not an object, or whose timestamp is not a number, is skipped by the sort key rather
-        # than raising: one hand-edited field must not hide every advisory behind a 500.
-        ordered = sorted(
-            ((identifier, record) for identifier, record in seen.items() if isinstance(record, dict)),
-            key=lambda kv: (-_number(kv[1].get("at"), 0), kv[0]),
+        filters = {key: (request.query_params.get(key) or "").strip() for key in ALERT_FILTERS}
+        since = _day_start(filters["since"], "since") if filters["since"] else None
+        until = _day_start(filters["until"], "until") + 86400 if filters["until"] else None
+        # ``cursor`` wins when both are present: the links never produce both, and a hand-written URL that
+        # does still gets a page rather than an error.
+        cursor = _cursor_decode(request.query_params["cursor"]) if request.query_params.get("cursor") else None
+        before = _cursor_decode(request.query_params["before"]) if request.query_params.get("before") else None
+        rows = [
+            (_position(identifier, record), record)
+            for identifier, record in seen.items()
+            if isinstance(record, dict) and _matches_seen(identifier, record, filters, since, until)
+        ]
+        window, previous, following = _alert_page(rows, cursor, before)
+
+        def link(**overrides: str) -> str:
+            """This page's filters plus one pagination position; empties never reach the URL."""
+            params = {key: value for key, value in filters.items() if value}
+            params.update({key: value for key, value in overrides.items() if value})
+            return "/alerts" + (f"?{urllib.parse.urlencode(sorted(params.items()))}" if params else "")
+
+        def option(value: str, current: str) -> str:
+            selected = " selected" if value == current else ""
+            return f"<option value='{esc(value)}'{selected}>{esc(value or 'any')}</option>"
+
+        outcome_values = SEEN_OUTCOMES
+        if filters["outcome"] and filters["outcome"] not in SEEN_OUTCOMES:
+            outcome_values = (*SEEN_OUTCOMES, filters["outcome"])
+        filter_form = (
+            "<form method='get' action='/alerts'><p>"
+            f"<label>Tag <select name='tag'>{''.join(option(value, filters['tag']) for value in ('', *TAGS))}"
+            "</select></label> "
+            f"<label>Source <input type='text' name='source' value='{esc(filters['source'])}'></label> "
+            f"<label>Outcome <select name='outcome'>"
+            f"{''.join(option(value, filters['outcome']) for value in ('', *outcome_values))}</select></label> "
+            f"<label>Text <input type='text' name='q' value='{esc(filters['q'])}'></label> "
+            f"<label>Since <input type='date' name='since' value='{esc(filters['since'])}'></label> "
+            f"<label>Until <input type='date' name='until' value='{esc(filters['until'])}'></label> "
+            "<button>Filter</button></p></form>"
         )
-        for identifier, record in ordered[:200]:
-            rows.append(
-                f"<tr><td>{esc(identifier)}</td><td>{esc(record.get('outcome', ''))}</td>"
+        table_rows = []
+        for (_, identifier), record in window:
+            path = urllib.parse.quote(identifier, safe="")
+            tag = record.get("tag")
+            table_rows.append(
+                f"<tr><td><a href='/advisories/{esc(path)}'>{esc(identifier)}</a></td>"
+                f"<td class='tag-{esc(tag or '')}'>{esc(tag) if tag else '—'}</td>"
+                f"<td>{esc(record.get('source')) if record.get('source') else '—'}</td>"
+                f"<td>{_short(record.get('title')) if record.get('title') else '—'}</td>"
+                f"<td>{esc(record.get('outcome', ''))}</td>"
                 f"<td class='muted'>{esc(_when(record.get('at')))}</td></tr>"
             )
-        body = "<table><tr><th>ID</th><th>Outcome</th><th>First seen (UTC)</th></tr>" + "".join(rows) + "</table>"
+        pager = []
+        if previous is not None:
+            pager.append(f"<a href='{esc(link(before=_cursor_encode(*previous)))}'>← Newer</a>")
+        if following is not None:
+            pager.append(f"<a href='{esc(link(cursor=_cursor_encode(*following)))}'>Older →</a>")
+        body = (
+            filter_form
+            + f"<p class='muted'>{len(rows)} matching record(s). A dash means the record predates the delivery "
+            "snapshot, so it carries no tag, source or title.</p>"
+            "<table><tr><th>ID</th><th>Tag</th><th>Source</th><th>Title</th><th>Outcome</th>"
+            "<th>First seen (UTC)</th></tr>" + "".join(table_rows) + "</table>"
+        )
+        if pager:
+            body += "<p>" + " · ".join(pager) + "</p>"
+        elif cursor is not None or before is not None:
+            body += f"<p class='muted'>No records on this page. <a href='{esc(link())}'>Newest alerts</a>.</p>"
         return page("Alerts", body, nav_extra=sign_out_form(request))
+
+    @app.get("/advisories/{identifier}", response_class=HTMLResponse)
+    def advisory_page(identifier: str, request: Request):
+        """One advisory, from the seen record first, then a pending message, then a parked one."""
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        state = load_state()
+        seen = state.get("seen")
+        if isinstance(seen, dict) and isinstance(seen.get(identifier), dict):
+            body = _seen_advisory(seen[identifier])
+            return page(f"Advisory {identifier}", body, nav_extra=sign_out_form(request))
+        for label, queue in (("pending", state.get("pending")), ("parked", state.get("parked"))):
+            for entry in queue if isinstance(queue, list) else ():
+                if isinstance(entry, dict) and identifier in (entry.get("ids") or ()):
+                    body = _queued_advisory(label, entry)
+                    return page(f"Advisory {identifier}", body, nav_extra=sign_out_form(request))
+        raise HTTPException(status_code=404, detail=f"no advisory {identifier} is recorded")
 
     @app.get("/parked", response_class=HTMLResponse)
     def parked_page(request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         state = load_state()
+        parked = state.get("parked")
+        parked = parked if isinstance(parked, list) else []
+        csrf = csrf_field(request)
         rows = []
-        for entry in state.get("parked", []):
+        for index, entry in enumerate(parked):
+            if not isinstance(entry, dict):
+                continue
             rows.append(
                 f"<tr><td class='tag-{esc(entry.get('tag', ''))}'>{esc(entry.get('tag', ''))}</td>"
-                f"<td>{esc(entry.get('title', ''))}</td><td>{esc(', '.join(entry.get('ids', []))[:80])}</td></tr>"
+                f"<td>{esc(entry.get('title', ''))}</td><td>{esc(', '.join(entry.get('ids', []))[:80])}</td>"
+                f"<td><form method='post' action='/parked/{index}/release'>{csrf}"
+                "<button>Release</button></form> "
+                f"<form method='post' action='/parked/{index}/drop'>{csrf}<button>Drop</button></form></td></tr>"
             )
         body = (
-            "<table><tr><th>Tag</th><th>Title</th><th>IDs</th></tr>" + "".join(rows) + "</table>"
-            f'<form method="post" action="/parked/release">{csrf_field(request)}'
-            "<button>Release all</button></form> "
-            f'<form method="post" action="/parked/drop">{csrf_field(request)}<button>Drop all</button></form>'
+            "<table><tr><th>Tag</th><th>Title</th><th>IDs</th><th>Actions</th></tr>" + "".join(rows) + "</table>"
+            f'<form method="post" action="/parked/release">{csrf}<button>Release all</button></form> '
+            f'<form method="post" action="/parked/drop">{csrf}<button>Drop all</button></form>'
         )
         return page("Parked messages", body, nav_extra=sign_out_form(request))
+
+    def parked_decision(index: int, release: bool):
+        """Release or drop one parked message under the state lock; a stale position is a 404.
+
+        The bulk routes block on the lock, as they always have. A per-row action answers 409 instead: an
+        operator who clicked one row should not be left waiting for a whole pass to finish.
+        """
+        from . import core
+        from .state import state_lock
+
+        state_path = runtime.cfg.state_path
+        try:
+            with state_lock(state_path, blocking=False):
+                changed = core.manage_parked_entry(state_path, index, release, now=int(time.time()))
+        except LockBusy:
+            return page(
+                "Busy",
+                "<p>A pass holds the state lock, so the queue was not changed. Try again shortly.</p>"
+                "<p><a href='/parked'>Back to the parked queue</a></p>",
+                status_code=409,
+            )
+        if not changed:
+            raise HTTPException(
+                status_code=404, detail=f"no parked message at position {index}; reload the parked queue"
+            )
+        return RedirectResponse("/parked", status_code=303)
+
+    @app.post("/parked/{index}/release", dependencies=[Depends(require_csrf)])
+    def parked_release_one(index: int, request: Request):
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        return parked_decision(index, release=True)
+
+    @app.post("/parked/{index}/drop", dependencies=[Depends(require_csrf)])
+    def parked_drop_one(index: int, request: Request):
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        return parked_decision(index, release=False)
 
     @app.post("/parked/release", dependencies=[Depends(require_csrf)])
     def parked_release(request: Request):
@@ -698,6 +1061,63 @@ def create_app(
                 f"<td><input type='text' name='tag:{esc(identifier)}' value='{esc(entry.get('tag', ''))}'></td></tr>"
             )
         return "".join(rows)
+
+    def notifier_choices(entries) -> list[tuple[str, bool]]:
+        """Every configured notifier id with its enabled flag; a route may only select an enabled one."""
+        choices = []
+        for entry in entries:
+            if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+                choices.append((entry["id"], entry.get("enabled", True) is not False))
+        return choices
+
+    def route_form_entries(routes: list, defaults: list, choices: list[tuple[str, bool]]) -> str:
+        """Fixed route rows (at least three) and the default selection, prefilled from the merged config.
+
+        More than three configured rules are rendered too: the form replaces the whole block, so a row it
+        did not render would be lost on save.
+        """
+        rows = []
+        for index in range(1, max(ROUTE_FORM_ROWS, len(routes)) + 1):
+            route = routes[index - 1] if index <= len(routes) and isinstance(routes[index - 1], dict) else {}
+            match = route.get("match")
+            match = match if isinstance(match, dict) else {}
+            selected = route.get("notifiers")
+            selected = {value for value in selected if isinstance(value, str)} if isinstance(selected, list) else set()
+            tag = match.get("tag") if isinstance(match.get("tag"), str) else ""
+            tag_options = "".join(
+                f"<option value='{esc(value)}'{' selected' if value == tag else ''}>{esc(value or 'any tag')}</option>"
+                for value in ("", *TAGS)
+            )
+            options = "".join(
+                f"<option value='{esc(identifier)}'{' selected' if identifier in selected else ''}>"
+                f"{esc(identifier)}{'' if enabled else ' (disabled)'}</option>"
+                for identifier, enabled in choices
+            )
+            rows.append(
+                f"<tr><td><input type='text' name='route:{index}:source' "
+                f"value='{esc(match.get('source', ''))}' placeholder='source id'></td>"
+                f"<td><select name='route:{index}:tag'>{tag_options}</select></td>"
+                f"<td><input type='text' name='route:{index}:product' "
+                f"value='{esc(match.get('product', ''))}' placeholder='product id'></td>"
+                f"<td><input type='text' name='route:{index}:ids' "
+                f"value='{esc(match.get('ids', ''))}' placeholder='CVE-2026-*'></td>"
+                f"<td><select name='route:{index}:notifiers' multiple size='2'>{options}</select></td></tr>"
+            )
+        default_ids = {value for value in defaults if isinstance(value, str)}
+        default_options = "".join(
+            f"<option value='{esc(identifier)}'{' selected' if identifier in default_ids else ''}>"
+            f"{esc(identifier)}{'' if enabled else ' (disabled)'}</option>"
+            for identifier, enabled in choices
+        )
+        return (
+            "<table><tr><th>Source id</th><th>Tag</th><th>Product id</th><th>IDs pattern</th>"
+            f"<th>Notifiers</th></tr>{''.join(rows)}</table>"
+            f"<p><label>Default notifiers (when no rule matches)<br>"
+            f"<select name='default' multiple size='3'>{default_options}</select></label></p>"
+            "<p class='muted'>Rules are checked in order and the first match wins. An entirely empty row is "
+            "ignored; a partly filled one is saved as written and the validator reports what is wrong. Only "
+            "enabled notifiers may be selected.</p>"
+        )
 
     def commit_overlay(overlay: dict):
         """Validate, build, save and apply one overlay; nothing is written when any step refuses.
@@ -844,6 +1264,51 @@ def create_app(
         overlay["notifiers"] = entries
         return commit_overlay(overlay)
 
+    @app.post("/config/routes", dependencies=[Depends(require_csrf)])
+    def save_routes_form(request: Request):
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        form = form_body(request)
+        with SETTINGS_LOCK:
+            overlay, revision = saved_overlay()
+            base, _ = form_document(overlay)
+            stale = stale_form(form, base)
+            if stale is not None:
+                return stale
+            return _save_routes(overlay, base, form)
+
+    def _save_routes(overlay: dict, base: dict, form: dict):
+        """Replace the overlay's ``routes``/``default`` with the form's rows, or remove them when empty.
+
+        An empty form means "use the YAML": the overlay keeps no routes block, so the rules written by hand
+        stay in force. Everything else is written as given and judged by the one configuration validator --
+        the only place where an overlay-added notifier's membership is known.
+        """
+        configured = base.get("routes")
+        rows = max(ROUTE_FORM_ROWS, len(configured)) if isinstance(configured, list) else ROUTE_FORM_ROWS
+        routes = []
+        for index in range(1, rows + 1):
+            prefix = f"route:{index}"
+            match = {}
+            for key in ("source", "tag", "product", "ids"):
+                value = first(form, f"{prefix}:{key}").strip()
+                if value:
+                    match[key] = value
+            selected = [value for value in form.get(f"{prefix}:notifiers", []) if value]
+            if not match and not selected:
+                continue  # an entirely empty row is not a rule
+            routes.append({"match": match, "notifiers": selected})
+        default = [value for value in form.get("default", []) if value]
+        if routes:
+            overlay["routes"] = routes
+        else:
+            overlay.pop("routes", None)
+        if default:
+            overlay["default"] = default
+        else:
+            overlay.pop("default", None)
+        return commit_overlay(overlay)
+
     @app.post("/reload", dependencies=[Depends(require_csrf)])
     def reload_configuration(request: Request):
         if not require_auth(request):
@@ -917,6 +1382,10 @@ def create_app(
         sources = sources if isinstance(sources, list) else []
         notifiers = document.get("notifiers")
         notifiers = notifiers if isinstance(notifiers, list) else []
+        routes = document.get("routes")
+        routes = routes if isinstance(routes, list) else []
+        defaults = document.get("default")
+        defaults = defaults if isinstance(defaults, list) else []
         banner = ""
         if saved is not None:
             if live_now and saved == live_revision:
@@ -969,6 +1438,10 @@ def create_app(
             f"<label>type <select name='new:type'>{type_options}</select></label> "
             "<label>reference <input type='text' name='new:reference' placeholder='${NAME}'></label></p>"
             f"<p>{new_fields}</p><button>Save notifiers</button></form>"
+            "<h2>Routes</h2>"
+            f'<form method="post" action="/config/routes">{csrf}{fingerprint_field}'
+            f"{route_form_entries(routes, defaults, notifier_choices(notifiers))}"
+            "<button>Save routes</button></form>"
             "<p class='muted'>The YAML file stays the source of every other setting; environment changes still "
             "need a restart.</p>"
         )
@@ -1003,23 +1476,51 @@ def create_app(
 
     @app.get("/runs", response_class=HTMLResponse)
     def runs_page(request: Request):
+        """The pass history, filtered by exit code and day range. No pager: the writer keeps only 200 runs."""
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         runs = load_state().get("runs")
         runs = runs if isinstance(runs, list) else []
+        filters = {key: (request.query_params.get(key) or "").strip() for key in ("code", "since", "until")}
+        since = _day_start(filters["since"], "since") if filters["since"] else None
+        until = _day_start(filters["until"], "until") + 86400 if filters["until"] else None
+        code = None
+        if filters["code"]:
+            try:
+                code = int(filters["code"])
+            except ValueError:
+                raise HTTPException(status_code=400, detail="code must be an integer exit code") from None
+        shown = []
+        for run in reversed(runs):
+            if not isinstance(run, dict):
+                continue
+            if code is not None and _number(run.get("code"), -1) != code:
+                continue
+            at = _number(run.get("at"), 0)
+            if since is not None and at < since:
+                continue
+            if until is not None and at >= until:
+                continue
+            shown.append(run)
         rows = "".join(
-            f"<tr><td>{esc(_when(r.get('at')))}</td><td>{r.get('sent', 0)}</td><td>{r.get('parked', 0)}</td>"
-            f"<td>{r.get('pending', 0)}</td><td>{r.get('code', '')}</td></tr>"
-            for r in reversed(runs)
-            if isinstance(r, dict)
+            f"<tr><td>{esc(_when(run.get('at')))}</td><td>{esc(run.get('sent', 0))}</td>"
+            f"<td>{esc(run.get('parked', 0))}</td><td>{esc(run.get('pending', 0))}</td>"
+            f"<td>{esc(run.get('code', ''))}</td></tr>"
+            for run in shown
         )
-        return page(
-            "Runs",
-            nav_extra=sign_out_form(request),
-            body="<table><tr><th>At (UTC)</th><th>Sent</th><th>Parked</th><th>Pending</th><th>Exit</th></tr>"
+        body = (
+            "<form method='get' action='/runs'><p>"
+            f"<label>Exit code <input type='text' name='code' size='3' value='{esc(filters['code'])}'></label> "
+            f"<label>Since <input type='date' name='since' value='{esc(filters['since'])}'></label> "
+            f"<label>Until <input type='date' name='until' value='{esc(filters['until'])}'></label> "
+            "<button>Filter</button></p></form>"
+            "<p class='muted'>The writer keeps only the last 200 passes in the state, so this page has no "
+            "pagination: older rows are not stored.</p>"
+            "<table><tr><th>At (UTC)</th><th>Sent</th><th>Parked</th><th>Pending</th><th>Exit</th></tr>"
             + rows
-            + "</table>",
+            + "</table>"
         )
+        return page("Runs", nav_extra=sign_out_form(request), body=body)
 
     @app.get("/healthz", response_class=PlainTextResponse)
     def healthz():

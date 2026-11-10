@@ -181,7 +181,7 @@ def load_document(path: Path, *, settings: dict | None = None) -> dict:
 
 
 def _merge_settings(document: dict, settings: dict) -> None:
-    """Overlay the four writable keys onto the raw YAML document, in place."""
+    """Overlay the six writable keys onto the raw YAML document, in place."""
     from .settings import validate_settings  # lazy: settings.py imports ConfigError from this module
 
     validate_settings(settings)
@@ -207,6 +207,12 @@ def _merge_settings(document: dict, settings: dict) -> None:
         document["poll_interval"] = settings["poll_interval"]
     if "hidden_source_hosts" in settings:
         document["hidden_source_hosts"] = settings["hidden_source_hosts"]
+    if "routes" in settings:
+        # A full replacement, like the notifier list: the rules are edited as one ordered block, and the
+        # merged validator then judges their shape and whether every id names an enabled notifier.
+        document["routes"] = settings["routes"]
+    if "default" in settings:
+        document["default"] = settings["default"]
 
 
 def _merge_sources(raw: object, overlay: dict) -> object:
