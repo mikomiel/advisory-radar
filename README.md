@@ -66,8 +66,9 @@ carry a credential. A notifier added to the YAML while the overlay holds a list 
 used until that section is removed from the overlay. A save writes `settings.json` next to the state file (on the `/data`
 volume) and applies immediately when the state lock is free; if a pass holds the lock, the
 page says the revision is not live yet, and Reload applies it when the pass finishes. Each
-form carries the revision it was rendered from, so a second tab that has not seen a newer
-save is refused instead of overwriting it.
+form carries a fingerprint of the configuration it was rendered from, so a second tab —
+after another save, a YAML edit, or the overlay being deleted and recreated — is refused
+with `409` instead of overwriting rows it never saw.
 `SIGHUP` re-reads `config.yml` and the overlay, for a configuration edited by hand. Every
 other setting stays in `config/config.yml`; editing most of it needs a reload (the button
 or `SIGHUP`), not a restart — `web.host`, `web.port` and `state_path` are bound when the

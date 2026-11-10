@@ -594,20 +594,27 @@ def create_app(
         except ConfigError:
             return dict(runtime.overlay["settings"]), 0
 
-    def stale_form(form: dict, current: int):
-        """Refuse a form rendered against another revision.
+    def form_fingerprint(document: dict) -> str:
+        """A stable hash of the configuration a form was rendered from.
 
-        A second tab that did not see a saved revision would rewrite the whole section from its own rows: the
-        revision it carries is the only way to tell "this is what I saw" from "this is what is there now".
+        The saved revision alone is not enough: deleting the overlay resets the counter, and a YAML edit does
+        not move it, so a form issued before either would pass a revision check and rewrite rows it never saw.
         """
-        submitted = first(form, "revision")
-        if submitted == str(current):
+        canonical = json.dumps(document, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def stale_form(form: dict, document: dict):
+        """Refuse a form rendered against a different configuration.
+
+        A second tab would rewrite the whole section from its own rows: the fingerprint it carries covers both
+        the saved overlay and the YAML the rows came from, so any change is a refusal rather than a silent loss.
+        """
+        if first(form, "fingerprint") == form_fingerprint(document):
             return None
         return page(
             "Not saved",
-            f"<p>The overlay changed since this page was loaded (it is at revision {current}, this form was "
-            f"built for revision {esc(submitted or 'none')}). Reload <a href='/config'>the configuration page</a> "
-            "and make the change again.</p>",
+            "<p>The configuration changed since this page was loaded. Reload "
+            "<a href='/config'>the configuration page</a> and make the change again.</p>",
             status_code=409,
         )
 
@@ -729,7 +736,8 @@ def create_app(
         form = form_body(request)
         with SETTINGS_LOCK:
             overlay, revision = saved_overlay()
-            stale = stale_form(form, revision)
+            base, _ = form_document(overlay)
+            stale = stale_form(form, base)
             if stale is not None:
                 return stale
             poll = first(form, "poll_interval").strip()
@@ -749,10 +757,10 @@ def create_app(
         form = form_body(request)
         with SETTINGS_LOCK:
             overlay, revision = saved_overlay()
-            stale = stale_form(form, revision)
+            base, _ = form_document(overlay)
+            stale = stale_form(form, base)
             if stale is not None:
                 return stale
-            base, _ = form_document(overlay)
             changes = {}
             for entry in base.get("sources") or []:
                 if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
@@ -772,10 +780,10 @@ def create_app(
         form = form_body(request)
         with SETTINGS_LOCK:
             overlay, revision = saved_overlay()
-            stale = stale_form(form, revision)
+            base, _ = form_document(overlay)
+            stale = stale_form(form, base)
             if stale is not None:
                 return stale
-            base, _ = form_document(overlay)
             return _save_notifiers(overlay, base, form)
 
     def _save_notifiers(overlay: dict, base: dict, form: dict):
@@ -919,25 +927,26 @@ def create_app(
             f"<label>{key} <input type='text' name='new:{key}'></label>" for key in NOTIFIER_FORM_KEYS
         )
         csrf = csrf_field(request)
-        revision_field = f"<input type='hidden' name='revision' value='{saved_revision}'>"
+        fingerprint = form_fingerprint(document)
+        fingerprint_field = f"<input type='hidden' name='fingerprint' value='{fingerprint}'>"
         body = (
             f"<p>Live poll interval <b>{cfg.poll_interval_seconds}s</b> · state {esc(cfg.state_path)} · "
             f"watchlist {esc(cfg.watchlist_path or 'built-in default')}</p>"
             f"<p class='muted'>Settings overlay: {status}</p>{banner}"
             f'<form method="post" action="/reload">{csrf}<button>Reload configuration</button></form>'
             "<h2>Settings</h2>"
-            f'<form method="post" action="/config/settings">{csrf}{revision_field}'
+            f'<form method="post" action="/config/settings">{csrf}{fingerprint_field}'
             f"<p><label>Poll interval <input type='text' name='poll_interval' value='{esc(poll_text)}'></label> "
             "(15m, 30s or 12h)</p>"
             "<p><label>Hidden source hosts (one per line)<br>"
             f"<textarea name='hidden_source_hosts' rows='4' cols='40'>{esc(hidden_text)}</textarea></label></p>"
             "<button>Save settings</button></form>"
             "<h2>Sources</h2>"
-            f'<form method="post" action="/config/sources">{csrf}{revision_field}'
+            f'<form method="post" action="/config/sources">{csrf}{fingerprint_field}'
             "<table><tr><th>Source</th><th>Enabled</th><th>Tag</th></tr>"
             f"{source_form_entries(sources)}</table><button>Save sources</button></form>"
             "<h2>Notifiers</h2>"
-            f'<form method="post" action="/config/notifiers">{csrf}{revision_field}'
+            f'<form method="post" action="/config/notifiers">{csrf}{fingerprint_field}'
             "<table><tr><th>Notifier</th><th>Enabled</th><th>Non-secret fields</th><th>Secrets</th></tr>"
             f"{notifier_form_entries(notifiers)}</table>"
             "<h3>New notifier</h3>"

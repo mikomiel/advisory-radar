@@ -120,9 +120,13 @@ is refused: a save shows the configuration error and writes nothing, the *Reload
 configuration* button shows the refusal, `kill -HUP <pid>` logs its reason, and either
 way the running configuration stays. A pass holds the state lock for its whole transaction, so a reload waits
 for it (`SIGHUP`) or answers `409` (the UI), and a pass that already started finishes
-with the configuration it started with. Each settings form carries the revision it was
-rendered from, so a save from a page that has not seen a newer one is refused (`409`)
-rather than overwriting it. Pending and parked messages are not touched by a
+with the configuration it started with. Each settings form carries a fingerprint of the
+configuration it was rendered from, so a save from a page that has not seen a newer
+configuration — another save, a YAML edit, or an overlay deleted and recreated — is
+refused (`409`) rather than overwriting it. The notifier form rewrites the whole list, so
+every existing notifier must already use `${NAME}`/`${NAME_FILE}` references for `url`,
+`key`, `password` and `token`; a literal secret in the YAML is refused with an error
+naming that notifier, and has to be moved to the environment first. Pending and parked messages are not touched by a
 reload. A reload re-reads the YAML and the overlay, so an edit to `config.yml` is picked
 up too; `web.host`, `web.port` and `state_path` are refused rather than reported as
 applied, because they are bound when the process starts, and environment variables are
