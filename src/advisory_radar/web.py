@@ -349,8 +349,9 @@ def _identifier_list(values: object) -> str:
 
 def _seen_advisory(record: Mapping, delivery: Mapping | None = None) -> str:
     """The detail page for an identifier the state has seen: the snapshot, or only what an older record held."""
+    outcome = record.get("outcome", "")
     facts: list[tuple[str, str]] = [
-        ("Outcome", esc(record.get("outcome", ""))),
+        ("Outcome", esc(outcome)),
         ("Recorded (UTC)", esc(_when(record.get("at"))) or "<span class='muted'>not recorded</span>"),
     ]
     record = delivery if isinstance(delivery, Mapping) else record
@@ -364,7 +365,7 @@ def _seen_advisory(record: Mapping, delivery: Mapping | None = None) -> str:
     accepted = record.get("delivered_to")
     if isinstance(accepted, list) and accepted:
         delivered = ", ".join(esc(value) for value in accepted)
-    elif record.get("outcome") == "dropped":
+    elif outcome == "dropped":
         delivered = "<span class='muted'>none: dropped before any channel accepted it</span>"
     else:
         delivered = "<span class='muted'>not recorded</span>"
@@ -810,11 +811,26 @@ def create_app(
         # does still gets a page rather than an error.
         cursor = _cursor_decode(request.query_params["cursor"]) if request.query_params.get("cursor") else None
         before = _cursor_decode(request.query_params["before"]) if request.query_params.get("before") else None
-        rows = [
-            (_position(identifier, record), record)
-            for identifier, record in seen.items()
-            if isinstance(record, dict) and _matches_seen(identifier, record, filters, since, until)
-        ]
+        deliveries = state.get("deliveries")
+        deliveries = deliveries if isinstance(deliveries, dict) else {}
+
+        def resolved(record: dict) -> dict:
+            """The snapshot a seen record points at; the record's own time and outcome stay authoritative.
+
+            A record written before the delivery table has no ``delivery`` key and is rendered as it is.
+            """
+            snapshot = deliveries.get(record.get("delivery"))
+            if not isinstance(snapshot, dict):
+                return record
+            return {**snapshot, "at": record.get("at"), "outcome": record.get("outcome")}
+
+        rows = []
+        for identifier, record in seen.items():
+            if not isinstance(record, dict):
+                continue
+            view = resolved(record)
+            if _matches_seen(identifier, view, filters, since, until):
+                rows.append((_position(identifier, view), view))
         window, previous, following = _alert_page(rows, cursor, before)
 
         def link(**overrides: str) -> str:

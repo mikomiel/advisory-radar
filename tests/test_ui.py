@@ -25,7 +25,7 @@ from advisory_radar.config import ConfigError, load_config
 from advisory_radar.http import RedactFilter
 from advisory_radar.runtime import Runtime
 from advisory_radar.settings import load_settings, settings_path
-from advisory_radar.state import load_state_document, save_state, state_lock
+from advisory_radar.state import load_state_document, save_state, serialize_json, state_lock
 from advisory_radar.web import create_app
 
 LOG = logging.getLogger("advisory_radar")
@@ -426,6 +426,45 @@ def test_a_delivered_message_records_the_snapshot_and_keeps_the_first_record():
     assert state["deliveries"][record["delivery"]]["delivered_to"] == ["ops", "phone"]
 
 
+def test_a_message_delivered_by_this_version_appears_and_filters_in_the_list(tmp_path):
+    state = core.new_state()
+    entry = pending_entry("CVE-2026-1234")
+    entry.update({"tag": "critical", "title": "CRITICAL: CVE-2026-1234 in widget", "source": "Vendor Feed"})
+    state["pending"].append(entry)
+    assert core.deliver(state, [RecordingNotifier("ops")], no_http, NOW) is True
+    save_state(tmp_path / "state.json", state)
+    stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    client, token, _ = make_client(tmp_path, state=stored)
+    sign_in(client, token)
+    page = client.get("/alerts").text
+    assert "CVE-2026-1234" in page and "CRITICAL: CVE-2026-1234 in widget" in page
+    assert "Vendor Feed" in page and "critical" in page
+    assert client.get("/alerts", params={"tag": "critical"}).text.count("/advisories/") >= 1
+    assert "/advisories/" not in client.get("/alerts", params={"tag": "warning"}).text
+    assert client.get("/alerts", params={"source": "Vendor Feed"}).text.count("/advisories/") >= 1
+    assert client.get("/alerts", params={"q": "widget"}).text.count("/advisories/") >= 1
+    # The detail page resolves the same snapshot.
+    detail = client.get(f"/advisories/{advisory_token('CVE-2026-1234')}").text
+    assert "CRITICAL: CVE-2026-1234 in widget" in detail and "7.5" in detail
+    # A record whose snapshot is gone degrades to what the record itself holds, not a crash.
+    stored["deliveries"].clear()
+    save_state(tmp_path / "state.json", stored)
+    degraded = client.get("/alerts").text
+    assert "CVE-2026-1234" in degraded
+
+
+def test_a_dropped_message_with_no_acceptor_says_so_on_the_page(tmp_path):
+    state = core.new_state()
+    state["parked"] = [parked_entry("CVE-2026-8888")]
+    save_state(tmp_path / "state.json", state)
+    assert core.manage_parked_entry(tmp_path / "state.json", 0, release=False, now=NOW) is True
+    stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    client, token, _ = make_client(tmp_path, state=stored)
+    sign_in(client, token)
+    page = client.get(f"/advisories/{advisory_token('CVE-2026-8888')}").text
+    assert "dropped before any channel accepted it" in page
+
+
 def test_a_message_naming_thousands_of_identifiers_does_not_multiply_its_snapshot():
     state = core.new_state()
     entry = pending_entry("CVE-2026-1")
@@ -437,9 +476,9 @@ def test_a_message_naming_thousands_of_identifiers_does_not_multiply_its_snapsho
     assert len(state["seen"]) == 2000
     assert len(state["deliveries"]) == 1, "one snapshot for one message"
     assert all(set(record) == {"at", "outcome", "delivery"} for record in state["seen"].values())
-    serialized = json.dumps(state)
-    # The identifiers appear once (the snapshot) plus their keys; a per-identifier copy would be ~2000x larger.
-    assert len(serialized) < 400_000, f"state grew to {len(serialized)} bytes"
+    serialized = serialize_json(state)
+    # The identifiers appear once (the snapshot) plus their keys; a per-identifier copy would be far larger.
+    assert len(serialized) < 700_000, f"the persisted state grew to {len(serialized)} bytes"
 
 
 def test_a_dropped_message_is_recorded_with_no_accepted_notifier(tmp_path):

@@ -128,20 +128,23 @@ def demo_config(state_path: Path) -> str:
     return DEMO_CONFIG.replace("{state_path}", str(state_path))
 
 
-def _seen(at: int, tag: str, source: str, title: str, cve: str, level: str, score: float, delivered: list[str]):
-    """One delivered record with the snapshot the advisory page reads."""
-    return {
-        "at": at,
-        "outcome": "delivered",
+def _seen(cve: str, tag: str, source: str, title: str, level: str, score: float, delivered: list[str]):
+    """The delivery snapshot the advisory page reads, and the id its seen record points at."""
+    snapshot = {
         "tag": tag,
         "source": source,
         "title": title,
         "link": f"https://vendor.example.net/advisories/{cve}",
         "kind": "new",
+        "ids": [cve],
+        "cves": [cve],
+        "kev_only": [],
+        "products": [],
         "levels": {cve: level},
         "scores": {cve: score},
         "delivered_to": delivered,
     }
+    return snapshot, f"demo-{cve.lower().replace(':', '-')}"
 
 
 def _queued(title: str, tag: str, cves: list[str], levels: dict, scores: dict, *, parked_at: int | None = None):
@@ -200,11 +203,14 @@ def demo_state(now: int | None = None) -> dict:
         "GHSA-7h2p-4m6c-9r3x": 6.8,
         "DSA-6098-1: curl": 6.5,
     }
+    deliveries: dict[str, dict] = {}
     for hours, tag, source, identifier, title in rows:
         delivered = ["discord-security", "ntfy-phone"] if tag == "critical" else ["discord-security"]
-        state["seen"][identifier] = _seen(
-            now - hours * hour, tag, source, title, identifier, tag, scores[identifier], delivered
-        )
+        snapshot, delivery_id = _seen(identifier, tag, source, title, tag, scores[identifier], delivered)
+        deliveries[delivery_id] = snapshot
+        state["seen"][identifier] = {"at": now - hours * hour, "outcome": "delivered", "delivery": delivery_id}
+    if deliveries:
+        state["deliveries"] = deliveries
     # A record from before the delivery snapshot: the UI says its details were not recorded instead of guessing.
     state["seen"][DEMO_LEGACY] = {"at": now - 44 * hour, "outcome": "suppressed"}
 
