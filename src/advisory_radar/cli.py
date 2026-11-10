@@ -57,6 +57,31 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _terminal(value: object) -> str:
+    """One source-controlled field made safe for a tab-separated terminal line.
+
+    A feed's ``guid``, title and link are remote input: an embedded ``ESC`` sequence would drive the
+    operator's terminal, and a tab or newline would forge another field or another record. Control
+    characters are shown as their escapes rather than dropped, so a surprising source stays visible in
+    the output instead of silently changing it.
+    """
+    out: list[str] = []
+    for char in str(value):
+        if char == "\t":
+            out.append("\\t")
+        elif char == "\n":
+            out.append("\\n")
+        elif char == "\r":
+            out.append("\\r")
+        elif char.isprintable():
+            out.append(char)
+        elif ord(char) <= 0xFF:
+            out.append(f"\\x{ord(char):02x}")
+        else:
+            out.append(f"\\u{ord(char):04x}")
+    return "".join(out)
+
+
 def _list_sources() -> int:
     """The catalogue without a config file or any secret, so it is dispatched before ``load_config``."""
     for kind, spec in SOURCE_SPECS.items():
@@ -91,7 +116,7 @@ def _test_source(cfg: Config, args: argparse.Namespace, http: Http, environment:
         LOG.error("sources test: %s: %s: %s", args.id, type(exc).__name__, exc)
         return 1
     for item in window.items[: args.limit]:
-        print(f"{item.guid}\t{item.title}\t{item.link}")
+        print(f"{_terminal(item.guid)}\t{_terminal(item.title)}\t{_terminal(item.link)}")
     print(f"{args.id}: {len(window.items)} item(s); truncated: {'yes' if window.truncated else 'no'}")
     return 1 if window.truncated else 0
 

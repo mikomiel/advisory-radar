@@ -116,6 +116,38 @@ def test_sources_test_prints_items_and_saves_nothing(tmp_path, capsys):
     assert "2 item(s); truncated: no" in limited
 
 
+def test_source_controlled_text_cannot_drive_the_terminal(tmp_path, capsys):
+    path = config_file(
+        tmp_path, [{"id": "cd", "type": "changedetection", "url": "https://cd.example.net", "api_key": "${CD_KEY}"}]
+    )
+    hostile = "watch-\u001b]0;pwned\u0007"
+    watches = {
+        # The watch key becomes the guid, the title carries a newline and a tab that would forge a second
+        # record, and the link carries an OSC 8 terminal hyperlink.
+        hostile: {
+            "uuid": hostile,
+            "url": "https://vendor.example.net/item",
+            "link": "https://vendor.example.net/item\u001b]8;;https://evil.example.net\u001b\\",
+            "title": "first\nsecond\tthird",
+            "paused": False,
+            "notification_muted": False,
+            "last_changed": 1700000000,
+        }
+    }
+    code = cli.main(
+        ["--config", str(path), "sources", "test", "cd"],
+        env={"CD_KEY": "dummy-key"},
+        http=lambda method, url, headers, body: (200, {}, json.dumps(watches).encode()),
+    )
+    assert code == 0
+    printed = capsys.readouterr().out
+    assert "\x1b" not in printed and "\x07" not in printed, "an escape sequence must not reach the terminal"
+    assert "cd:watch-\\x1b]0;pwned\\x07:1700000000" in printed, "the guid is shown as one escaped field"
+    assert "first\\nsecond\\tthird" in printed, "a newline or tab inside a title cannot forge a field or a record"
+    assert "\\x1b]8;;https://evil.example.net" in printed, "the link is escaped, not passed through"
+    assert printed.count("\n") == 2, "one record line and one summary line, whatever the title contains"
+
+
 def test_a_truncated_window_exits_one(tmp_path, capsys):
     path = config_file(
         tmp_path,
