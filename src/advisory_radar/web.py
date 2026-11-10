@@ -342,6 +342,10 @@ def _seen_advisory(record: Mapping) -> str:
         ("Tag", esc(record.get("tag", "")) or "<span class='muted'>not recorded</span>"),
         ("Source", esc(record.get("source", "")) or "<span class='muted'>not recorded</span>"),
         ("Message kind", esc(record.get("kind", "")) or "<span class='muted'>not recorded</span>"),
+        ("Identifiers", _identifier_list(record.get("ids"))),
+        ("CVEs in this message", _identifier_list(record.get("cves"))),
+        ("KEV-only (not scored here)", _identifier_list(record.get("kev_only"))),
+        ("Matched products", _identifier_list(record.get("products"))),
         ("Accepted by", delivered),
         ("Advisory", _external_link(record.get("link")) or "<span class='muted'>not recorded</span>"),
     ]

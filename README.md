@@ -104,8 +104,9 @@ case-insensitive text search (identifier and title) and an inclusive UTC day ran
 filter lives in the URL query string, so a reload or a shared link keeps it. The list is
 paged with a keyset cursor (50 rows, newest first by time then identifier) instead of a
 fixed cap, and each row links to `/advisories/<id>`. `/advisories/<id>` shows the stored
-classification — tag, source, title, the per-CVE levels and CVSS, the notifiers that
-accepted the message — for a delivered message, a pending one or a parked one. It never
+classification — tag, source, title, the identifiers and CVEs, whether any was KEV-only,
+the watchlist products the item matched, the per-CVE levels and CVSS, and the notifiers
+that accepted the message — for a delivered message, a pending one or a parked one. It never
 shows the message body, which is not retained, and a record written by an older version
 says its details were not recorded instead of inventing them. `/parked` releases or drops a
 single message per row while keeping the bulk actions, and `/runs` filters by exit code and

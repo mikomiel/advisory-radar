@@ -1327,11 +1327,23 @@ def _prune(state: dict, now: int) -> None:
     state["cache"] = {key: entry for key, entry in state["cache"].items() if now - entry["at"] < CACHE_TTL}
 
 
+def _stored_list(value: object) -> list[str]:
+    """A list of identifier strings off a queue entry; anything else is stored as the empty list.
+
+    The entry came through the state document, where a hand edit can turn a list into a string; splitting that
+    into characters would put nonsense on the advisory page.
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
 def _delivery_snapshot(entry: dict, delivered_to: Sequence[str]) -> dict:
     """The compact record of one delivered message, copied off the queue entry so a later edit cannot reach it.
 
     ``tag``/``source``/``levels``/``scores`` are the classification the message was sent with, which the seen
-    record previously dropped. The body is deliberately absent: it is the rendered text, not a stored fact.
+    record previously dropped, and the identifiers, KEV-only CVEs and matched products answer the rest of the
+    advisory page from the record alone. The body is deliberately absent: it is the rendered text, not a fact.
     """
     return {
         "tag": entry.get("tag", ""),
@@ -1340,6 +1352,10 @@ def _delivery_snapshot(entry: dict, delivered_to: Sequence[str]) -> dict:
         "link": entry.get("link", ""),
         # Stored too, because the snapshot's meaning depends on which kind of message produced it.
         "kind": entry.get("kind", ""),
+        "ids": _stored_list(entry.get("ids")),
+        "cves": _stored_list(entry.get("cves")),
+        "kev_only": _stored_list(entry.get("kev_only")),
+        "products": _stored_list(entry.get("products")),
         "levels": dict(entry.get("levels") or {}),
         "scores": dict(entry.get("scores") or {}),
         "delivered_to": list(delivered_to),
