@@ -1,10 +1,8 @@
-"""The automerge deletes the branch it merged, and only that branch.
+"""The automerge calls the tested cleanup, and its failure cannot fail the merge.
 
-``delete_branch_on_merge`` is a repository setting, and a merge made through the API does not honour it: the
-branch of an automerged pull request survived with the setting on. The workflow therefore deletes the head ref
-itself. That step is a shell script which only runs on the default branch, so this test is structural: it pins
-the properties a reviewer cannot observe in a diff of a live run -- the merge still requires the exact head,
-the delete targets the ref that was merged, and a fork's head is never touched.
+The deletion itself is tested in ``tests/test_delete_merged_branch.py``, against a real local git remote. This
+file pins the two declarations the workflow must hold: the merge still refuses a head that moved, and the
+cleanup is a guarded call whose non-zero exit is a warning -- the merge it follows has already happened.
 """
 
 from __future__ import annotations
@@ -30,13 +28,13 @@ def test_the_merge_still_pins_the_head_the_reviewer_approved():
     assert "--delete-branch" not in run
 
 
-def test_the_delete_targets_the_merged_ref_of_this_repository_only():
+def test_the_cleanup_is_the_tested_script_and_its_failure_is_a_warning():
     run = merge_step()
-    delete = run.index("git/refs/heads/$branch")
-    assert run.index("headRefName") < delete, "the delete must use the branch name the merge just used"
-    assert run.index("isCrossRepository") < delete, "a fork's head may name an unrelated branch of this repository"
-    assert "^[A-Za-z0-9][A-Za-z0-9._/-]*$" in run, "the ref name is checked before it reaches the API"
-    # An elif condition can fail without aborting the `set -e` loop, so a 404 or a permissions failure reports
-    # itself instead of failing the run that already merged.
-    assert "elif gh api -X DELETE" in run
+    call = next(line for line in run.splitlines() if "scripts/delete_merged_branch.py" in line)
+    assert call.strip().startswith("if python3 scripts/delete_merged_branch.py"), (
+        "the call is a condition, so a refusal or a failed delete cannot abort the run after the merge"
+    )
+    assert '--branch "$branch"' in call and '--head "$head"' in call
+    assert run.index("headRefName") < run.index("scripts/delete_merged_branch.py")
+    assert run.index("isCrossRepository") < run.index("scripts/delete_merged_branch.py")
     assert "::warning::" in run

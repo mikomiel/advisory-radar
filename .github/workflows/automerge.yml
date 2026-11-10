@@ -179,21 +179,17 @@ jobs:
             # instead of merging a commit the reviewer never saw.
             if gh pr merge "$pr" --repo "$REPO" --squash --match-head-commit "$head"; then
               echo "merged #$pr at $head (approval by $REVIEWER_LOGIN)"
-              # The repository setting delete_branch_on_merge does not cover a merge made through this API: the
-              # branch of an automerged pull request survived with the setting on, so the head ref is deleted
-              # here. A pull request from a fork keeps its branch in another repository, and its headRefName may
-              # name an unrelated branch of this one, so only a same-repository head is touched, and only after
-              # the name passes a conservative check. The delete is best-effort: the merge already happened, and
-              # a branch that stays is reported rather than failing the run that merged.
+              # The branch is deleted by a tested script, not from this line: the repository setting did not
+              # cover a merge made through the API, and the script's delete is a lease on this exact head, so a
+              # push that landed after the merge is never removed. The call is a condition, so a refusal or a
+              # failed delete warns instead of failing the run whose merge already happened.
               branch=$(jq -r '.headRefName' <<<"$meta")
-              if [ "$(jq -r '.isCrossRepository' <<<"$meta")" != "false" ]; then
-                echo "merged #$pr from another repository; its head branch is not ours to delete"
-              elif ! [[ "$branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || [[ "$branch" == *..* ]] || [[ "$branch" == *//* ]]; then
-                echo "::warning::merged #$pr; refusing to delete the head branch name it reports"
-              elif gh api -X DELETE "repos/$REPO/git/refs/heads/$branch" >/dev/null; then
+              cross=$(jq -r '.isCrossRepository' <<<"$meta")
+              if python3 scripts/delete_merged_branch.py --repo "$REPO" --branch "$branch" --head "$head" \
+                   --cross-repository "$cross"; then
                 echo "deleted head branch $branch"
               else
-                echo "::warning::merged #$pr but the head branch $branch could not be deleted"
+                echo "::warning::merged #$pr; its head branch was left in place (the reason is above)"
               fi
               gh pr comment "$pr" --repo "$REPO" \
                 --body "Merged by automerge: $REQUIRED_CHECK green and approved at \`$head\` by $REVIEWER_LOGIN." || true
