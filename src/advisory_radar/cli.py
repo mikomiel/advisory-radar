@@ -191,7 +191,22 @@ def run_scheduler(
                 LOG.warning("pass exited %d; continuing on schedule", code)
         except Exception:  # the schedule must survive any single bad pass
             LOG.exception("pass raised; continuing on schedule")
-        stopping.wait(cfg.poll_interval_seconds)
+        _wait_for_next_pass(runtime, stopping)
+
+
+def _wait_for_next_pass(runtime: Runtime, stopping: threading.Event) -> None:
+    """Wait for the next pass, restarting the wait when a reload lands.
+
+    The wait follows the *live* interval, not the one the finished pass ran under: shortening the interval
+    and then sleeping out the old one would leave the scheduler idle while /readyz judges by the new
+    interval and reports a healthy instance unready. The wake event is also what shutdown sets, so a stop is
+    seen without waiting for the interval to expire.
+    """
+    while not stopping.is_set():
+        if runtime.wake.wait(runtime.cfg.poll_interval_seconds):
+            runtime.wake.clear()
+            continue
+        return
 
 
 def main(
@@ -289,8 +304,10 @@ def main(
             try:
                 uvicorn.run(app, host=runtime.cfg.web_host, port=runtime.cfg.web_port, log_level="warning")
             finally:
-                # Shutdown is not a reason to fetch and notify again: stop the schedule and leave.
+                # Shutdown is not a reason to fetch and notify again: stop the schedule and leave. The wake
+                # event ends the wait between passes so the thread is not joined while asleep.
                 stopping.set()
+                runtime.wake.set()
                 thread.join(timeout=5)
             return 0
         return pipeline.run_pass(

@@ -62,25 +62,6 @@ def save_overlay(tmp_path, overlay: dict, *, now: int = NOW):
     return save_settings(settings_path(tmp_path / "state.json"), overlay, now=now)
 
 
-class Stopper:
-    """The scheduler's stop signal, recording each wait and running one action during the first."""
-
-    def __init__(self, passes: int, action=None):
-        self.remaining = passes
-        self.waits: list[int] = []
-        self._action = action
-
-    def is_set(self) -> bool:
-        return self.remaining <= 0
-
-    def wait(self, seconds: int) -> None:
-        self.waits.append(seconds)
-        self.remaining -= 1
-        if self._action is not None:
-            action, self._action = self._action, None
-            action()
-
-
 # --- precedence and validation ---------------------------------------------------------------
 
 
@@ -644,27 +625,77 @@ def test_a_refused_sighup_reload_keeps_the_running_configuration(tmp_path, caplo
 # --- the scheduler ---------------------------------------------------------------------------
 
 
+class Wake:
+    """A wake event whose wait records the timeout; the default answers "the interval elapsed"."""
+
+    def __init__(self) -> None:
+        self.waits: list[int] = []
+        self.answer = False
+
+    def wait(self, timeout: int) -> bool:
+        self.waits.append(timeout)
+        return self.answer
+
+    def clear(self) -> None:
+        self.answer = False
+
+    def set(self) -> None:
+        self.answer = True
+
+
 def test_the_scheduler_reads_the_reloaded_interval_on_the_next_pass(tmp_path, monkeypatch):
     path = write_config(tmp_path, {})
     runtime = Runtime.build(path, {})
     overlay = settings_path(runtime.cfg.state_path)
-
-    def reload_interval():
-        save_settings(overlay, {"poll_interval": "30s"}, now=1)
-        runtime.reload(blocking=False)
-
+    wake = Wake()
+    runtime.wake = wake
+    stopping = threading.Event()
     passes: list[int] = []
 
     def fake_pass(cfg, sources, notifiers, **kwargs):
         passes.append(cfg.poll_interval_seconds)
+        if len(passes) == 1:
+            save_settings(overlay, {"poll_interval": "30s"}, now=1)
+            runtime.reload(blocking=False)
+        else:
+            stopping.set()
         return 0
 
     monkeypatch.setattr(cli.pipeline, "run_pass", fake_pass)
-    stopper = Stopper(passes=2, action=reload_interval)
     try:
-        cli.run_scheduler(runtime, stopper)
+        cli.run_scheduler(runtime, stopping)
         assert passes == [900, 30]
-        assert stopper.waits == [900, 30], "the wait after each pass is the interval that pass ran under"
+        # each pass runs under its own snapshot (900, then 30) and each wait follows the live interval at
+        # the time it waits: the reload during the first pass is already in force for the first wait
+        assert wake.waits == [30, 30]
+    finally:
+        runtime.detach_redaction()
+
+
+def test_a_reload_restarts_the_wait_with_the_new_interval(tmp_path):
+    path = write_config(tmp_path, {})
+    runtime = Runtime.build(path, {})
+    wake = Wake()
+    runtime.wake = wake
+    waits = wake.waits
+
+    def wait_then_reload(timeout: int) -> bool:
+        waits.append(timeout)
+        if len(waits) == 1:
+            save_overlay(tmp_path, {"poll_interval": "30s"})
+            runtime.reload(blocking=False)  # sets the real event; this fake ignores the setter
+            return True
+        return False
+
+    wake.wait = wait_then_reload  # type: ignore[method-assign]
+    try:
+        cli._wait_for_next_pass(runtime, threading.Event())
+        assert waits == [900, 30], "the outstanding wait is recalculated with the reloaded interval"
+        stopping = threading.Event()
+        stopping.set()
+        waits.clear()
+        cli._wait_for_next_pass(runtime, stopping)
+        assert waits == [], "a stop is seen before another wait starts"
     finally:
         runtime.detach_redaction()
 
@@ -674,6 +705,8 @@ def test_a_pass_that_started_keeps_the_plugins_it_started_with(tmp_path, monkeyp
     runtime = Runtime.build(path, {"BASE_HOOK": SECRET})
     overlay = settings_path(runtime.cfg.state_path)
     old_sources, old_notifiers = runtime.sources, runtime.notifiers
+    runtime.wake = Wake()
+    stopping = threading.Event()
     seen = {}
 
     def fake_pass(cfg, sources, notifiers, **kwargs):
@@ -681,11 +714,12 @@ def test_a_pass_that_started_keeps_the_plugins_it_started_with(tmp_path, monkeyp
         # a reload completes while this pass is "running": its argument list must not change
         save_settings(overlay, {"poll_interval": "30s"}, now=1)
         runtime.reload(blocking=False)
+        stopping.set()
         return 0
 
     monkeypatch.setattr(cli.pipeline, "run_pass", fake_pass)
     try:
-        cli.run_scheduler(runtime, Stopper(passes=1))
+        cli.run_scheduler(runtime, stopping)
         assert seen["sources"] is old_sources and seen["notifiers"] is old_notifiers
         assert runtime.sources is not old_sources, "the next pass reads the reloaded plugins"
     finally:

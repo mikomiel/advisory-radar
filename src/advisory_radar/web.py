@@ -880,7 +880,9 @@ def create_app(
         # hand-edit that kept the revision number is therefore not reported as applied.
         live_now = saved_revision == live_revision and saved_document["settings"] == runtime.overlay["settings"]
         applied = applied_settings()
-        applied_at = _when(applied.get("applied_at"))
+        # The state marker can be older than the file (a save while a pass held the lock, then a restart): an
+        # application timestamp is only reported for the revision it belongs to.
+        applied_at = _when(applied.get("applied_at")) if applied.get("revision") == saved_revision else ""
         if saved_revision == 0 and not saved_document["settings"]:
             if live_revision:
                 status = (

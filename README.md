@@ -84,8 +84,9 @@ state lock. A shared configuration value goes through the same validator the YAM
 and the overlay adds its own restrictions (a secret must be a reference, a source edit is
 `enabled`/`tag` only, `headers` may not be written), so a refused overlay is reported with
 the validator's message; the running configuration stays; a pass that already started finishes with the
-configuration it started with, and the next pass uses the reloaded one. A reload re-reads
-both files; it refuses `web.host`, `web.port` and `state_path` rather than report them
+configuration it started with, and the next pass uses the reloaded one. The wait between
+passes follows the live interval, so shortening `poll_interval` takes effect without sleeping
+out the old one. A reload re-reads both files; it refuses `web.host`, `web.port` and `state_path` rather than report them
 applied, because they are bound when the process starts. Environment variables are read at
 start too, so changing one still needs a restart. Deleting `settings.json` and reloading
 returns to the YAML: the empty overlay is applied as revision 0.

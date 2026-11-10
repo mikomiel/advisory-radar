@@ -90,6 +90,9 @@ class Runtime:
         #: between two of them. ``cfg``/``sources``/``notifiers`` read through to it.
         self._live: tuple[Config, list, list] = (cfg, sources, notifiers)
         self.clock = clock
+        #: Set by a successful reload and by shutdown: the scheduler waits on it so a changed interval takes
+        #: effect without waiting out the old one, and a stop is seen promptly.
+        self.wake = threading.Event()
         self._redactor = redactor
 
     @property
@@ -247,6 +250,7 @@ class Runtime:
                     self._redactor.add(candidate._redactor.raw)
                     LOG.removeFilter(candidate._redactor)
             candidate._redactor = None
+            self.wake.set()  # the scheduler waits on this, so a changed interval applies now
 
 
 __all__ = ["Runtime", "read_config"]
