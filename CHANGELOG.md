@@ -29,7 +29,9 @@ operator action, and the release workflow then builds and pushes the image to
   pass. A refused overlay keeps the running configuration, and pending and parked
   messages are untouched.
 - `/config` edits those settings with plain forms (poll interval, hidden hosts, sources,
-  notifiers) and shows which saved overlay revision is live.
+  notifiers) and shows which saved overlay revision is live. Each form carries the revision
+  it was rendered from, so a stale tab is refused instead of overwriting a newer save, and a
+  notifier's `headers` stay in the YAML while the overlay edits its enablement.
 
 ### Fixed
 - An automerge left its head branch behind: the repository's *automatically delete head branches*

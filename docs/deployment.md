@@ -119,7 +119,9 @@ is refused: a save shows the configuration error and writes nothing, and a reloa
 *Reload configuration* button or `kill -HUP <pid>` — logs the error and keeps the running
 configuration. A pass holds the state lock for its whole transaction, so a reload waits
 for it (`SIGHUP`) or answers `409` (the UI), and a pass that already started finishes
-with the configuration it started with. Pending and parked messages are not touched by a
+with the configuration it started with. Each settings form carries the revision it was
+rendered from, so a save from a page that has not seen a newer one is refused (`409`)
+rather than overwriting it. Pending and parked messages are not touched by a
 reload. A reload re-reads the YAML and the overlay, so an edit to `config.yml` is picked
 up too; `web.host`, `web.port` and `state_path` are refused rather than reported as
 applied, because they are bound when the process starts, and environment variables are

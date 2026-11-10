@@ -63,7 +63,9 @@ is added, edited or disabled — and while the overlay holds a notifier list, th
 the notifier list: the YAML's `notifiers` is not used until that section is removed from
 the overlay. A save writes `settings.json` next to the state file (on the `/data`
 volume) and applies immediately when the state lock is free; if a pass holds the lock, the
-page says the revision is not live yet, and Reload applies it when the pass finishes.
+page says the revision is not live yet, and Reload applies it when the pass finishes. Each
+form carries the revision it was rendered from, so a second tab that has not seen a newer
+save is refused instead of overwriting it.
 `SIGHUP` re-reads `config.yml` and the overlay, for a configuration edited by hand. Every
 other setting stays in `config/config.yml`; editing most of it needs a reload (the button
 or `SIGHUP`), not a restart — `web.host`, `web.port` and `state_path` are bound when the
