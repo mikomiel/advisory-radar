@@ -94,6 +94,7 @@ local run with demo data, so the advisories in them are not real findings.
 | Parked messages | Runs |
 |---|---|
 | ![Parked queue: severity, title and advisory ids, with bulk release and drop actions](docs/screenshots/parked.png) | ![Run history: sent, parked, pending and exit code per pass](docs/screenshots/runs.png) |
+
 ## Sources
 
 Four source types are built in, and the table below is the whole catalogue: a
