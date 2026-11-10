@@ -91,7 +91,9 @@ and optional keys and needs no config file. `advisory-radar sources test <id>
 source or notifier is a configuration error, exactly as it is for a pass — then
 fetches that one source and prints its items and truncation flag. It sends no
 notification, commits no state and writes no state file, so it is safe to run
-against a live data volume.
+against a live data volume. A `webhook` source is read from an empty inbox, so
+the command prints no items for it and exits 0: it checks the configuration, not
+the intake.
 
 The UI is protected by the login token, a `SameSite=Lax` + `Secure` + `HttpOnly`
 session cookie, a per-session form token on every state-changing POST, and a

@@ -105,7 +105,8 @@ catalogue is on the `/sources` page of the web UI and in
 `advisory-radar sources test <id>` fetches one *configured* source, prints its
 items and whether its window was truncated, and exits non-zero when it was or
 when the fetch failed. It sends no notification and writes no state, so it is
-safe to run while the service is polling.
+safe to run while the service is polling. A `webhook` source is read from an
+empty inbox, so it prints no items: the command checks configuration, not intake.
 
 | Kind | Summary | Required keys | Optional keys |
 |---|---|---|---|

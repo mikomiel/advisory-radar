@@ -11,6 +11,7 @@ import html
 import json
 import logging
 import re
+import threading
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -21,6 +22,7 @@ from advisory_radar import cli, config
 from advisory_radar.catalogue import SOURCE_SPECS
 from advisory_radar.config import load_config
 from advisory_radar.sources import SOURCE_BUILDERS, build_source
+from advisory_radar.state import state_lock
 from advisory_radar.web import create_app
 
 README = Path(__file__).parent.parent / "README.md"
@@ -168,24 +170,107 @@ def test_sources_test_rejects_an_unknown_id(tmp_path):
     assert code == 1
 
 
+def test_sources_test_leaves_an_existing_state_document_untouched(tmp_path):
+    path = config_file(tmp_path, [{"id": "vendor", "type": "rss", "url": "https://feeds.example.net/security.xml"}])
+    # A stored ETag would answer 304 if the command read the state; it passes an empty state instead, and the
+    # document it did not read must still be byte-identical afterwards.
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema": "advisory-radar-state.v1",
+                "seen": {"CVE-2026-1": {"at": 1792600000, "outcome": "delivered"}},
+                "pending": [],
+                "parked": [],
+                "watch": {},
+                "cache": {},
+                "feeds": {"vendor": {"url_digest": "digest", "etag": 'W/"old"'}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = state_path.read_bytes()
+    headers: list[dict[str, str]] = []
+
+    def http(method, url, request_headers, body):
+        headers.append(dict(request_headers))
+        return 200, {}, RSS
+
+    code = cli.main(["--config", str(path), "sources", "test", "vendor"], env={}, http=http)
+    assert code == 0
+    assert headers and "If-None-Match" not in headers[0]
+    assert state_path.read_bytes() == before, "sources test must not rewrite the state it was pointed at"
+
+
+def test_sources_test_does_not_wait_for_the_state_lock(tmp_path):
+    path = config_file(tmp_path, [{"id": "vendor", "type": "rss", "url": "https://feeds.example.net/security.xml"}])
+    state_path = tmp_path / "state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    result: list[int] = []
+    with state_lock(state_path):
+        worker = threading.Thread(
+            target=lambda: result.append(
+                cli.main(["--config", str(path), "sources", "test", "vendor"], env={}, http=lambda *a: (200, {}, RSS))
+            ),
+            daemon=True,
+        )
+        worker.start()
+        worker.join(10)
+        assert not worker.is_alive(), "sources test must not take the state lock a pass already holds"
+    assert result == [0]
+
+
+def test_sources_test_loads_a_notifier_secret_strictly(tmp_path, caplog):
+    path = tmp_path / "config.yml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "sources": [{"id": "vendor", "type": "rss", "url": "https://feeds.example.net/security.xml"}],
+                "notifiers": [
+                    {
+                        "id": "phone",
+                        "type": "ntfy",
+                        "url": "https://ntfy.example.net",
+                        "topic": "advisories",
+                        "token": "${NTFY_TOKEN}",
+                    }
+                ],
+                "state_path": str(tmp_path / "state.json"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.ERROR):
+        code = cli.main(["--config", str(path), "sources", "test", "vendor"], env={}, http=lambda *a: (200, {}, RSS))
+    assert code == 1, "the documented 'any enabled plugin' rule includes the notifiers a pass would build"
+    assert "NTFY_TOKEN" in caplog.text
+
+
 def _keys(cell: str) -> tuple[str, ...]:
     if cell.strip().strip("`") in {"", "-", "—", "none", "(none)"}:
         return ()
     return tuple(part.strip().strip("`") for part in cell.split(","))
 
 
-def _readme_rows() -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+def _readme_rows() -> dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]]:
+    """Parse the catalogue table into kind -> (summary, required, optional).
+
+    A duplicate kind is a failure, not a silently overwritten row: the table is the only place a user reads a
+    summary, and two rows for one kind would make one of them invisible to this check.
+    """
     text = README.read_text(encoding="utf-8")
     assert "\n## Sources\n" in text, "README must document the sources in its own section"
     section = text.split("\n## Sources\n", 1)[1].split("\n## ", 1)[0]
-    rows = {}
+    rows: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {}
     for line in section.splitlines():
         if not line.startswith("|"):
             continue
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
         if not cells or cells[0].lower() == "kind" or set(cells[0]) <= {"-", ":", " "}:
             continue
-        rows[cells[0].strip("`")] = (_keys(cells[2]), _keys(cells[3]))
+        kind = cells[0].strip("`")
+        assert kind not in rows, f"README has two rows for {kind}"
+        rows[kind] = (cells[1], _keys(cells[2]), _keys(cells[3]))
     return rows
 
 
@@ -193,7 +278,11 @@ def test_the_readme_table_matches_the_registry():
     rows = _readme_rows()
     assert set(rows) == set(SOURCE_SPECS)
     for kind, spec in SOURCE_SPECS.items():
-        required, optional = rows[kind]
+        summary, required, optional = rows[kind]
+        # The summary is user-facing prose, not a key list: it has to be the same sentence the catalogue and the
+        # /sources page carry, or the README describes a kind differently from the page next to it.
+        # The table renders the endpoint path as code, so compare the prose with the markdown removed.
+        assert summary.replace("`", "") == spec.summary, f"README summary drifted for {kind}"
         assert required == spec.required, f"README required keys drifted for {kind}"
         assert optional == spec.optional, f"README optional keys drifted for {kind}"
 
