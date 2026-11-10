@@ -499,6 +499,40 @@ def test_a_malformed_collection_does_not_break_the_scrape(tmp_path):
 # --- the settings overlay: /config, its POSTs and /reload -------------------------------------
 
 
+def test_two_saved_notifiers_survive_while_the_application_is_blocked(tmp_path):
+    client, token, runtime = make_app_client(tmp_path, environment={"HOOK": "https://hooks.example.net/x"})
+    csrf = signed_in(client, token)
+    with state_lock(runtime.cfg.state_path):  # a pass holds the lock, so neither save can be applied
+        for identifier in ("first", "second"):
+            response = client.post(
+                "/config/notifiers",
+                data={
+                    "csrf": csrf,
+                    "new:id": identifier,
+                    "new:type": "ntfy",
+                    "new:reference": "${HOOK}",
+                    "new:topic": "advisories",
+                },
+                follow_redirects=False,
+            )
+            assert response.status_code == 303
+    overlay = load_settings(settings_path(runtime.cfg.state_path))
+    assert [entry["id"] for entry in overlay["notifiers"]] == ["first", "second"], (
+        "the second save must edit the saved overlay, not the old live snapshot"
+    )
+
+
+def test_deleting_the_overlay_file_is_reported_as_not_live(tmp_path):
+    client, token, runtime = make_app_client(tmp_path)
+    csrf = signed_in(client, token)
+    saved = client.post("/config/settings", data={"csrf": csrf, "poll_interval": "30s"}, follow_redirects=False)
+    assert saved.status_code == 303
+    assert runtime.cfg.poll_interval_seconds == 30, "with the lock free the save is live at once"
+    settings_path(runtime.cfg.state_path).unlink()
+    page = client.get("/config").text
+    assert "no overlay file" in page and "Reload to return to the YAML" in page
+
+
 def test_the_config_page_and_its_posts_require_auth(tmp_path):
     client, _ = make_client(tmp_path)
     response = client.get("/config", follow_redirects=False)
