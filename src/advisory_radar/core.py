@@ -1439,9 +1439,10 @@ def _delivered(
         # The rules that judged this message travel with it: a queue entry written before thresholds were
         # configurable carries none, and then the defaults are what judged it.
         judged_by = Thresholds.from_snapshot(entry.get("thresholds")).snapshot()
+        source_id = entry.get("source_id")
         for cve, level in entry["levels"].items() if outcome == "delivered" else ():
             # A message the operator dropped was never sent, so no later escalation may refer to it as sent.
-            state["watch"][cve] = {
+            record = {
                 "since": now,
                 "last_eval": now,
                 "level": level,
@@ -1451,8 +1452,13 @@ def _delivered(
                 "thresholds": judged_by,
                 "judged": level,
             }
+            if isinstance(source_id, str) and source_id:
+                # The source that queued the entry, so a later evaluation applies its own numbers rather than
+                # the global block. An entry recorded before this key existed keeps judging by the global one.
+                record["source_id"] = source_id
             if "scores" in entry:  # A message queued before the key existed has no score on record: legacy.
-                state["watch"][cve]["cvss"] = entry["scores"].get(cve)
+                record["cvss"] = entry["scores"].get(cve)
+            state["watch"][cve] = record
     elif entry["kind"] == "escalation":
         watch = state["watch"].get(entry["cves"][0])
         if watch is not None:
@@ -1470,12 +1476,13 @@ def _suppressed(
     scores: Mapping[str, float | None],
     now: int,
     thresholds: Thresholds,
+    source_id: str = "",
 ) -> None:
     for identifier in ids:
         # An identifier that was already notified keeps its history: this message is about the new CVEs.
         state["seen"].setdefault(identifier, {"at": now, "outcome": "suppressed"})
     for cve, level in verdict.levels:
-        state["watch"][cve] = {
+        watch = {
             "since": now,
             "last_eval": now,
             "level": level,
@@ -1485,6 +1492,12 @@ def _suppressed(
             "cvss": scores.get(cve),
             "thresholds": thresholds.snapshot(),
         }
+        if source_id:
+            # A suppressed advisory is watched too, and the source that recorded it is which numbers may judge
+            # it later: without this, a re-evaluation would fall back to the global block and re-baseline a
+            # CVE whose source never changed its rules.
+            watch["source_id"] = source_id
+        state["watch"][cve] = watch
 
 
 def _claimed(state: dict) -> set[str]:
@@ -1706,8 +1719,13 @@ def classify_new(
             verdict = replace(verdict, note=ENRICH_FAILED_NOTE)
         # The CVSS each watched CVE had when its message was queued: a later escalation by the remote rule needs it.
         scores = {cve: facts[cve].cvss for cve, _ in verdict.levels}
+        # What a route predicate may read, and only that: the EPSS each judged CVE was measured at, and whether
+        # any of them is in the KEV catalog. An unreadable catalog measured no membership, so it is recorded
+        # as ``None`` rather than as "not in KEV", which would let ``kev: false`` claim a fact nobody observed.
+        epss = {cve: facts[cve].epss for cve, _ in verdict.levels}
+        kev_membership = None if not kev_known else any(cve in kev for cve, _ in verdict.levels)
         if verdict.tag == "suppressed":
-            _suppressed(state, ids, verdict, item, scores, now, thresholds)
+            _suppressed(state, ids, verdict, item, scores, now, thresholds, source_id=source_id)
         else:
             shown_ids = [i for i in ids if i not in claimed and not i.startswith("src:")]
             heading, excerpt = headline(item.title, item.summary)
@@ -1739,6 +1757,8 @@ def classify_new(
                     "levels": dict(verdict.levels),
                     "kev_only": list(verdict.skipped),
                     "scores": scores,
+                    "epss": epss,
+                    "kev": kev_membership,
                     "thresholds": thresholds.snapshot(),
                     "source": heading,
                     "link": item.link,
@@ -1803,6 +1823,19 @@ def _score_is_new(entry: dict, thresholds: Thresholds) -> bool:
     return "cvss" in entry and (entry["cvss"] is None or entry["cvss"] < thresholds.critical_cvss)
 
 
+def _entry_thresholds(entry: dict, default: Thresholds, overrides: Mapping[str, Thresholds] | None) -> Thresholds:
+    """The numbers that judge one watch entry: those of the source that queued it, or the global block.
+
+    A watch entry written before the source was recorded, a hand-edited ``source_id`` and a source the
+    configuration no longer defines all fall back to the global block -- which is what judged them when they
+    were written, and the state file is JSON a person can damage without warning.
+    """
+    source_id = entry.get("source_id")
+    if isinstance(source_id, str) and source_id:
+        return (overrides or {}).get(source_id, default)
+    return default
+
+
 def reevaluate(
     state: dict,
     intel: Intel,
@@ -1812,14 +1845,17 @@ def reevaluate(
     feed_host: str,
     *,
     thresholds: Thresholds,
+    source_thresholds: Mapping[str, Thresholds] | None = None,
 ) -> None:
     """Re-score due CVEs once a day; queue one escalation per level a CVE newly reaches.
 
     The remote-and-unauthenticated rule alone escalates only a CVE whose score was new (``_score_is_new``): a rule
     that changed since the first message is not a change in the world. KEV, SSVC and EPSS escalate as before.
 
-    A *threshold* change is the same kind of rule change, so an entry judged under other numbers is re-baselined
-    once (``entry["thresholds"]``) instead of being escalated: otherwise lowering the floor would send the whole
+    Each entry is judged by the numbers of the source that queued it (``source_thresholds``, from
+    ``Config.thresholds_for``), so a per-source override behaves exactly like the global block: a *threshold*
+    change is the same kind of rule change, so an entry judged under other numbers is re-baselined once
+    (``entry["thresholds"]``) instead of being escalated: otherwise lowering the floor would send the whole
     watch list out at once. Observed exploitation is the exception -- a KEV hit or CISA's active flag that a
     reader was never told about is a miss, whatever the thresholds say.
     """
@@ -1845,8 +1881,9 @@ def reevaluate(
     for cve in due:
         current = facts[cve]
         entry = watch[cve]
+        entry_thresholds = _entry_thresholds(entry, thresholds, source_thresholds)
         # Membership is positive evidence on its own; kev_known only gates the *absence*-based suppression.
-        deciding = critical_reason(current, cve in kev, thresholds=thresholds)
+        deciding = critical_reason(current, cve in kev, thresholds=entry_thresholds)
         if cve in deferred and not deciding:
             # No request was made and nothing independently decisive is known: try again next pass rather
             # than waiting a whole day. KEV or SSVC evidence still escalates now.
@@ -1860,26 +1897,28 @@ def reevaluate(
             entry["last_eval"] = now
             continue
         entry["last_eval"] = now
-        level, reason = level_of(current, cve in kev, kev_known, thresholds=thresholds)
+        level, reason = level_of(current, cve in kev, kev_known, thresholds=entry_thresholds)
         # Two levels, deliberately kept apart: ``level`` is what the reader was last told, and ``judged`` is what
         # the numbers in force now make of the CVE, whether or not anything was sent. A re-baseline raises only
         # the second, so it stays silent -- while later evidence (KEV, SSVC) can still escalate against the first.
         told = _rank(entry.get("level"))
         judged_by = Thresholds.from_snapshot(entry.get("thresholds"))
-        entry["thresholds"] = thresholds.snapshot()
+        entry["thresholds"] = entry_thresholds.snapshot()
         evidence = reason in ("kev", "ssvc") and _rank(level) > told
-        if judged_by != thresholds:
+        if judged_by != entry_thresholds:
             entry["judged"] = level
             if not evidence:
                 # A settings edit is not a change in the world, so it must not look like one.
                 LOG.info("reevaluate: %s recorded as %s under changed thresholds; nothing sent", cve, level)
                 continue
-        held = reason == "remote" and not _score_is_new(entry, thresholds)
+        held = reason == "remote" and not _score_is_new(entry, entry_thresholds)
         if held:  # Judge again without the remote rule, so EPSS can still escalate.
             level, reason = level_of(
-                replace(current, remote_unauth=False), cve in kev, kev_known, thresholds=thresholds
+                replace(current, remote_unauth=False), cve in kev, kev_known, thresholds=entry_thresholds
             )
-        if level == "warning" and not (current.cvss is not None and current.cvss >= thresholds.suppress_below_cvss):
+        if level == "warning" and not (
+            current.cvss is not None and current.cvss >= entry_thresholds.suppress_below_cvss
+        ):
             continue  # Still unscored or LOW: not an escalation.
         if _rank(level) <= max(told, _rank(entry.get("judged"))) and not evidence:
             if held and entry["level"] != "critical":
@@ -1896,7 +1935,7 @@ def reevaluate(
             continue
         before = "recorded as LOW and not sent" if entry["level"] == "suppressed" else "sent as a warning"
         line = metrics_line(current.cvss, current.epss, current.percentile, current.ssvc, cve in kev)
-        note = change_note(reason, thresholds)
+        note = change_note(reason, entry_thresholds)
         title, body = render(
             level,
             f"{cve} now {LEVEL_LABEL[level]}",
@@ -1910,7 +1949,8 @@ def reevaluate(
             action=ESCALATION_ACTION,
         )
         # No source_id and no products: an escalation is not a feed item, so routing falls through a
-        # source/product rule to tag, ids or the default.
+        # source/product rule to tag, ids or the default. Its measured score travels with it so a numeric
+        # predicate judges what the escalation message reports, and its KEV membership is the fact that decided it.
         state["pending"].append(
             {
                 "kind": "escalation",
@@ -1920,9 +1960,12 @@ def reevaluate(
                 "ids": [cve],
                 "cves": [cve],
                 "levels": {},
+                "scores": {cve: current.cvss},
+                "epss": {cve: current.epss},
+                "kev": None if not kev_known else cve in kev,
                 "source": entry["title"],
                 "link": entry["link"],
-                "thresholds": thresholds.snapshot(),
+                "thresholds": entry_thresholds.snapshot(),
             }
         )
 

@@ -8,9 +8,9 @@ from pathlib import Path
 import pytest
 
 from advisory_radar import core, pipeline, routing
-from advisory_radar.config import DEFAULT_THRESHOLDS, ConfigError, load_config
+from advisory_radar.config import DEFAULT_THRESHOLDS, ConfigError, Thresholds, load_config
 from advisory_radar.sources import RssSource
-from advisory_radar.watchlist import load_policy
+from advisory_radar.watchlist import Policy, load_policy
 
 NOW = 1792600000
 FEED_URL = "https://feeds.example.com/a"
@@ -106,6 +106,80 @@ class TestSelect:
         assert routing.select({"tag": "critical"}, [], (), ENABLED) == (ENABLED, "all")
         # A default alone does not change that: without a route the feature is off, exactly as before.
         assert routing.select({"tag": "critical"}, [], ["discord"], ENABLED) == (ENABLED, "all")
+
+    def test_min_cvss_reads_the_highest_reported_score(self):
+        routes = [{"match": {"min_cvss": 9.0}, "notifiers": ["phone"]}]
+        entry = {"tag": "critical", "scores": {"CVE-2026-1": 7.0, "CVE-2026-2": 9.8}}
+        assert routing.select(entry, routes, (), ENABLED) == (["phone"], "route 1")
+        assert routing.select({"scores": {"CVE-2026-1": 8.9, "CVE-2026-2": None}}, routes, (), ENABLED) == (
+            ENABLED,
+            "all",
+        )
+
+    def test_epss_gte_reads_the_highest_reported_probability(self):
+        routes = [{"match": {"epss_gte": 0.3}, "notifiers": ["phone"]}]
+        entry = {"epss": {"CVE-2026-1": 0.2, "CVE-2026-2": 0.35}}
+        assert routing.select(entry, routes, (), ENABLED) == (["phone"], "route 1")
+        assert routing.select({"epss": {"CVE-2026-1": 0.2}}, routes, (), ENABLED) == (ENABLED, "all")
+
+    def test_a_message_without_a_measured_score_never_matches_a_numeric_predicate(self):
+        routes = [
+            {"match": {"min_cvss": 0.1}, "notifiers": ["phone"]},
+            {"match": {"epss_gte": 0.1}, "notifiers": ["phone"]},
+        ]
+        for entry in (
+            {},
+            {"scores": None},
+            {"scores": []},
+            {"scores": {}},
+            {"scores": {"CVE-1": None}},
+            {"epss": "0.9"},
+        ):
+            assert routing.select(entry, routes, (), ENABLED) == (ENABLED, "all"), entry
+        # A measured zero is a measurement: it is compared rather than ignored, and the bar is above it.
+        zeros = [{"scores": {"CVE-1": 0.0}}, {"epss": {"CVE-1": 0.0}}]
+        for entry in zeros:
+            assert routing.select(entry, routes, (), ENABLED) == (ENABLED, "all"), entry
+
+    def test_kev_matches_the_messages_measured_membership(self):
+        routes = [
+            {"match": {"kev": True}, "notifiers": ["phone"]},
+            {"match": {"kev": False}, "notifiers": ["matrix"]},
+        ]
+        assert routing.select({"kev": True}, routes, (), ENABLED) == (["phone"], "route 1")
+        assert routing.select({"kev": False}, routes, (), ENABLED) == (["matrix"], "route 2")
+        # An unmeasured membership -- an unreadable catalogue, or an entry written before the key existed --
+        # satisfies neither predicate: the rule describes a fact the message does not have.
+        for entry in ({"kev": None}, {}):
+            assert routing.select(entry, routes, (), ENABLED) == (ENABLED, "all"), entry
+
+    def test_a_predicate_combines_with_the_string_keys(self):
+        entry = {"tag": "critical", "scores": {"CVE-2026-1": 9.8}, "epss": {"CVE-2026-1": 0.4}, "kev": True}
+        route = [{"match": {"tag": "critical", "min_cvss": 9.5, "epss_gte": 0.3, "kev": True}, "notifiers": ["phone"]}]
+        assert routing.select(entry, route, ("discord",), ENABLED) == (["phone"], "route 1")
+        for key, changes in (
+            ("tag", {"tag": "warning"}),
+            ("min_cvss", {"scores": {"CVE-2026-1": 9.0}}),
+            ("epss_gte", {"epss": {"CVE-2026-1": 0.2}}),
+            ("kev", {"kev": False}),
+        ):
+            changed = {**entry, **changes}
+            assert routing.select(changed, route, ("discord",), ENABLED) == (["discord"], "default"), key
+
+    def test_a_malformed_predicate_never_matches(self):
+        """A hand-built route is not the validator's output: it must not raise, and it must not match."""
+        entry = {"scores": {"CVE-2026-1": 9.8}, "epss": {"CVE-2026-1": 0.5}}
+        matches = (
+            {"min_cvss": "9.0"},
+            {"min_cvss": True},
+            {"min_cvss": float("nan")},
+            {"epss_gte": None},
+            {"kev": "yes"},
+        )
+        for match in matches:
+            assert routing.select(entry, [{"match": match, "notifiers": ["phone"]}], (), ENABLED) == (ENABLED, "all"), (
+                match
+            )
 
     def test_a_malformed_entry_does_not_raise(self):
         routes = [
@@ -221,6 +295,60 @@ def test_an_absent_or_empty_block_changes_nothing(tmp_path):
         cfg = load_config(write_config(tmp_path, extra), {})
         assert cfg.routes == () and cfg.default_notifiers == ()
         assert cfg.notifiers and all(notifier["id"] != "disabled-channel" for notifier in cfg.notifiers)
+
+
+def test_a_predicate_block_loads_with_typed_values(tmp_path):
+    cfg = load_config(
+        write_config(
+            tmp_path, "routes:\n  - match: {min_cvss: 9, epss_gte: 0.5, kev: false}\n    notifiers: [discord]\n"
+        ),
+        {},
+    )
+    assert cfg.routes[0]["match"] == {"min_cvss": 9.0, "epss_gte": 0.5, "kev": False}
+    assert isinstance(cfg.routes[0]["match"]["min_cvss"], float), "a whole number is stored as the number it is"
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (
+            "routes:\n  - match: {min_cvss: high}\n    notifiers: [discord]\n",
+            "routes[1]: match.min_cvss must be a number",
+        ),
+        (
+            "routes:\n  - match: {min_cvss: true}\n    notifiers: [discord]\n",
+            "routes[1]: match.min_cvss must be a number",
+        ),
+        (
+            "routes:\n  - match: {min_cvss: 0}\n    notifiers: [discord]\n",
+            "routes[1]: match.min_cvss must be above 0 and at most 10",
+        ),
+        (
+            "routes:\n  - match: {min_cvss: 10.5}\n    notifiers: [discord]\n",
+            "routes[1]: match.min_cvss must be above 0 and at most 10",
+        ),
+        (
+            "routes:\n  - match: {epss_gte: 0}\n    notifiers: [discord]\n",
+            "routes[1]: match.epss_gte must be above 0 and at most 1",
+        ),
+        (
+            "routes:\n  - match: {epss_gte: 1.5}\n    notifiers: [discord]\n",
+            "routes[1]: match.epss_gte must be above 0 and at most 1",
+        ),
+        (
+            "routes:\n  - match: {kev: 'yes'}\n    notifiers: [discord]\n",
+            "routes[1]: match.kev must be true or false",
+        ),
+        (
+            "routes:\n  - match: {kev: 1}\n    notifiers: [discord]\n",
+            "routes[1]: match.kev must be true or false",
+        ),
+    ],
+)
+def test_a_bad_predicate_is_refused_by_its_key(tmp_path, extra, message):
+    with pytest.raises(ConfigError) as caught:
+        load_config(write_config(tmp_path, extra), {})
+    assert str(caught.value) == message
 
 
 @pytest.mark.parametrize(
@@ -385,3 +513,162 @@ def test_the_pipeline_delivers_through_the_configured_routes(tmp_path):
     assert len(routed.sent) == 1, "the route selects the source's channel"
     assert accepted.sent == [], "a channel the route does not select receives nothing"
     assert json.loads(cfg.state_path.read_text())["pending"] == []
+
+
+# --- what a predicate reads on a real queue entry -----------------------------------------------
+
+
+class Facts:
+    """A deterministic Intel for ``classify_new``: one answer per CVE, no cache, no network."""
+
+    def __init__(self, **answers: core.CveFacts) -> None:
+        self.answers = {key.replace("_", "-"): value for key, value in answers.items()}
+
+    def cves(self, cves, **ignored):
+        # ``**ignored``: ``classify_new`` passes its own lookup limit, which this stub has no use for.
+        return {cve: self.answers.get(cve, core.CveFacts(None, None, None, None, False)) for cve in cves}
+
+
+def classified(kev: frozenset[str] = frozenset(), *, kev_known: bool = True) -> dict:
+    """One item naming a remote CVE, classified by a stub that measures CVSS 9.8 and EPSS 0.4."""
+    state = core.new_state()
+    item = core.Item(
+        "g1", "CVE-2026-7777 remote bug", "https://vendor.example.net/a", "notes", NOW - 60, ("CVE-2026-7777",)
+    )
+    intel = Facts(CVE_2026_7777=core.CveFacts(9.8, None, 0.4, None, True, remote_unauth=True))
+    core.classify_new(
+        state,
+        [item],
+        intel,
+        kev,
+        kev_known,
+        NOW,
+        "vendor.example.net",
+        Policy((), (), ()),
+        source_id="php-releases",
+        thresholds=DEFAULT_THRESHOLDS,
+    )
+    return state
+
+
+class GhsaOnlyFacts(Facts):
+    """An Intel whose one advisory has no CVE alias, so the level comes from the advisory's own label."""
+
+    def ghsa(self, identifier):
+        return core.OsvFacts((), 9.8, True)
+
+
+def test_a_message_with_no_cve_carries_no_measured_score():
+    """The preview mirrors this: a numeric or KEV predicate is satisfied only through a CVE the message names."""
+    state = core.new_state()
+    item = core.Item(
+        "g1",
+        "GHSA-aaaa-bbbb-cccc advisory",
+        "https://vendor.example.net/a",
+        "notes",
+        NOW - 60,
+        ("GHSA-aaaa-bbbb-cccc",),
+    )
+    core.classify_new(
+        state,
+        [item],
+        GhsaOnlyFacts(),
+        frozenset(),
+        True,
+        NOW,
+        "vendor.example.net",
+        Policy((), (), ()),
+        source_id="php-releases",
+        thresholds=DEFAULT_THRESHOLDS,
+    )
+    queued = state["pending"][0]
+    assert queued["tag"] == "critical", "the advisory's own OSV severity still decides the level"
+    assert queued["cves"] == []
+    assert queued["scores"] == {} and queued["epss"] == {}, "an advisory-level score is not a CVE measurement"
+    assert queued["kev"] is False, "a message naming no CVE names none in the catalog"
+
+
+def test_a_queued_message_carries_the_facts_a_predicate_reads():
+    """Only what the classification measured is recorded: no score is ever invented for a predicate."""
+    queued = classified(frozenset({"CVE-2026-7777"}))["pending"][0]
+    assert queued["scores"] == {"CVE-2026-7777": 9.8}
+    assert queued["epss"] == {"CVE-2026-7777": 0.4}
+    assert queued["kev"] is True
+    # A catalogue that was read, and names no CVE of this message, is a measured "false".
+    assert classified()["pending"][0]["kev"] is False
+    # An unreadable catalogue measured no membership, so neither predicate may claim it.
+    assert classified(kev_known=False)["pending"][0]["kev"] is None
+
+
+def test_delivery_routes_on_a_measured_score():
+    routes = [{"match": {"min_cvss": 9.5, "epss_gte": 0.3, "kev": True}, "notifiers": ("matrix",)}]
+    state = core.new_state()
+    state["pending"].append(
+        {
+            "kind": "new",
+            "tag": "critical",
+            "title": "T",
+            "body": "b",
+            "ids": ["CVE-2026-1"],
+            "cves": ["CVE-2026-1"],
+            "levels": {"CVE-2026-1": "critical"},
+            "scores": {"CVE-2026-1": 9.8},
+            "epss": {"CVE-2026-1": 0.5},
+            "kev": True,
+            "source": "adv",
+            "link": "",
+            "source_id": "php-releases",
+            "products": [],
+        }
+    )
+    accepted, routed = RecordingNotifier("fake"), RecordingNotifier("matrix")
+    assert core.deliver(state, [accepted, routed], None, NOW, routes=routes)
+    assert len(routed.sent) == 1 and accepted.sent == [], "the route selects the predicate's channel"
+
+    # The same rule does not take a message that measured less: it falls to every enabled notifier.
+    state["pending"].append(
+        {**routed.sent[0], "scores": {"CVE-2026-1": 9.0}, "ids": ["CVE-2026-2"], "cves": ["CVE-2026-2"]}
+    )
+    assert core.deliver(state, [accepted, routed], None, NOW, routes=routes)
+    assert len(routed.sent) == 2 and len(accepted.sent) == 1
+
+
+def test_the_pass_judges_each_source_with_its_own_thresholds(tmp_path, monkeypatch):
+    """``pipeline`` hands each source the block resolved for it, never the global one by default."""
+    path = tmp_path / "config.yml"
+    later = "https://feeds.example.com/later"
+    path.write_text(
+        "sources:\n"
+        f"  - id: php-releases\n    type: rss\n    url: {FEED_URL}\n    thresholds: {{critical_cvss: 7.0}}\n"
+        f"  - id: later\n    type: rss\n    url: {later}\n"
+        "notifiers:\n"
+        "  - id: fake\n    type: webhook\n    url: https://hooks.example.com/x\n"
+        f"state_path: {tmp_path}/state.json\n"
+    )
+    cfg = load_config(path, {})
+    seen: dict[str, Thresholds] = {}
+
+    def spy(state, items, intel, kev, kev_known, now, feed_host, policy, *, source_id="", thresholds=None, **kwargs):
+        seen[source_id] = thresholds
+        return []
+
+    monkeypatch.setattr(core, "classify_new", spy)
+
+    def http(method, url, headers, body):
+        if url in (FEED_URL, later):
+            return 200, {}, feed("g1", "Magento security note", "https://vendor.example.com/a1")
+        if "cisa.gov" in url:
+            return 200, {}, json.dumps({"vulnerabilities": []}).encode()
+        return 404, {}, b""
+
+    code = pipeline.run_pass(
+        cfg,
+        [RssSource("php-releases", FEED_URL), RssSource("later", later)],
+        [RecordingNotifier("fake")],
+        http=http,
+        clock=lambda: float(NOW),
+        sleep=lambda seconds: None,
+    )
+
+    assert code == 0
+    assert seen == {"php-releases": Thresholds(critical_cvss=7.0), "later": DEFAULT_THRESHOLDS}

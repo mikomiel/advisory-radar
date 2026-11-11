@@ -132,23 +132,30 @@ def _threshold_number(raw: object, where: str) -> float:
     return float(raw)
 
 
-def _thresholds(raw: object) -> Thresholds:
-    """The validated ``thresholds`` block; an absent one is the defaults, never an error."""
+def _thresholds(raw: object, *, base: Thresholds = DEFAULT_THRESHOLDS, context: str = "") -> Thresholds:
+    """The validated ``thresholds`` block; an absent one is ``base``, never an error.
+
+    ``base`` is what a partial block is completed from: the defaults for the global block, and the global
+    block for a source's own, so a source states only the numbers it wants to differ. ``context`` prefixes
+    each message with the entry that carries the block -- while the wording stays exactly the one the
+    global block gives -- because two blocks share these three keys and a refusal must say whose it is.
+    """
+    where = f"{context}thresholds"
     if raw is None:
-        return DEFAULT_THRESHOLDS
-    _require(isinstance(raw, dict), "thresholds must be a mapping")
+        return base
+    _require(isinstance(raw, dict), f"{where} must be a mapping")
     unknown = set(raw) - set(THRESHOLD_KEYS)
-    _require(not unknown, f"thresholds: unknown keys {sorted(unknown)}")
-    values = {key: getattr(DEFAULT_THRESHOLDS, key) for key in THRESHOLD_KEYS}
+    _require(not unknown, f"{where}: unknown keys {sorted(unknown)}")
+    values = {key: getattr(base, key) for key in THRESHOLD_KEYS}
     for key in THRESHOLD_KEYS:
         if key in raw:
-            values[key] = _threshold_number(raw[key], f"thresholds.{key}")
+            values[key] = _threshold_number(raw[key], f"{where}.{key}")
     thresholds = Thresholds(**values)
-    _require(0 < thresholds.critical_cvss <= 10, "thresholds.critical_cvss must be above 0 and at most 10")
-    _require(0 < thresholds.critical_epss <= 1, "thresholds.critical_epss must be above 0 and at most 1")
+    _require(0 < thresholds.critical_cvss <= 10, f"{where}.critical_cvss must be above 0 and at most 10")
+    _require(0 < thresholds.critical_epss <= 1, f"{where}.critical_epss must be above 0 and at most 1")
     _require(
         0 <= thresholds.suppress_below_cvss <= thresholds.critical_cvss,
-        "thresholds.suppress_below_cvss must be between 0 and thresholds.critical_cvss",
+        f"{where}.suppress_below_cvss must be between 0 and thresholds.critical_cvss",
     )
     return thresholds
 
@@ -172,6 +179,9 @@ class Config:
     #: The severity thresholds in force; see :class:`Thresholds`. Never read from a module constant in ``core``,
     #: or a saved overlay could not change the next pass.
     thresholds: Thresholds = DEFAULT_THRESHOLDS
+    #: Per-source blocks resolved at load time, keyed by source id. Empty for a configuration that states no
+    #: override, so the global block judges every message exactly as before this key existed.
+    source_thresholds: Mapping[str, Thresholds] = field(default_factory=dict)
     #: Ordered routing rules, first match wins. Empty means every message goes to every enabled notifier,
     #: exactly as it did before routing existed.
     routes: tuple[dict, ...] = ()
@@ -185,13 +195,22 @@ class Config:
     #: The values those references expanded to, including the contents of a ``${NAME_FILE}``.
     secret_values: tuple[str, ...] = ()
 
+    def thresholds_for(self, source_id: str | None = None) -> Thresholds:
+        """The numbers a source's items are judged by: its own block, or the global one.
+
+        A source with no block, a source no longer configured and a message that came from no source at all
+        all resolve to the global block -- which is what judged every message before overrides existed.
+        """
+        return self.source_thresholds.get(source_id or "", self.thresholds)
+
 
 #: The keys a source entry may carry: the structural ones plus every key the catalogue documents for a
 #: built-in. A key a builder needs but this set rejects is an integration nobody can configure, so the
 #: allowlist is derived rather than repeated; ``tests/test_catalogue.py`` pins it to the registry and
 #: ``tests/test_integrations.py`` loads one complete YAML per built-in through ``load_config`` and
-#: ``build_plugins``.
-_SOURCE_KEYS = {"id", "type", "enabled"} | {
+#: ``build_plugins``. ``thresholds`` is structural rather than a builder key: it never reaches a source's
+#: constructor, it changes the rules the source's items are judged by.
+_SOURCE_KEYS = {"id", "type", "enabled", "thresholds"} | {
     key for spec in SOURCE_SPECS.values() for key in (*spec.required, *spec.optional)
 }
 #: The notifier keys whose value is a credential: the overlay accepts only a reference for them, and an id may
@@ -234,6 +253,9 @@ _TOP_KEYS = {
 }
 #: The keys a routing rule itself may carry; the match keys and the tag set are ``routing.py``'s.
 _ROUTE_KEYS = frozenset({"match", "notifiers"})
+#: The numeric match predicates and the highest value each can accept, which is the range the measured
+#: score itself occupies: a rule outside it could never match, so it is a configuration error.
+_MATCH_NUMBERS = {"min_cvss": 10.0, "epss_gte": 1.0}
 
 
 #: Spellings accepted for a boolean option that came from the environment (expansion yields strings).
@@ -412,7 +434,7 @@ def _merge_settings(document: dict, settings: dict) -> None:
 
 
 def _merge_sources(raw: object, overlay: dict) -> object:
-    """Apply the per-id ``enabled``/``tag`` edits to the YAML source list; an unknown id is refused."""
+    """Apply the per-id ``enabled``/``tag``/``thresholds`` edits to the YAML source list; an unknown id is refused."""
     if raw is None:
         raw = []  # an omitted list is the same empty list the validator treats it as
     if not isinstance(raw, list):
@@ -423,6 +445,13 @@ def _merge_sources(raw: object, overlay: dict) -> object:
         entry = by_id.get(identifier)
         if entry is None:
             raise ConfigError(f"settings: no source with id {identifier!r} is defined in the YAML config")
+        if isinstance(changes, dict):
+            # ``thresholds`` merges key by key, exactly like the global block: a number saved here must not
+            # silently drop the YAML's other keys for this source, and clearing one field in the form has to
+            # fall back to the YAML value rather than delete the whole override.
+            saved = changes.get("thresholds")
+            if isinstance(saved, dict) and isinstance(entry.get("thresholds"), dict):
+                changes = {**changes, "thresholds": {**entry["thresholds"], **saved}}
         entry.update(changes)
     return merged
 
@@ -507,15 +536,30 @@ def _routing(document: dict, notifiers: list[dict], *, strict: bool = True) -> t
         _require(isinstance(match, dict) and bool(match), f"{where}: match must be a non-empty mapping")
         unknown_match = set(match) - MATCH_KEYS
         _require(not unknown_match, f"{where}: unknown match keys {sorted(unknown_match)}")
+        # A match value is validated by its key: the four string keys are names and patterns, the two numeric
+        # predicates are numbers in the range the score itself occupies, and ``kev`` is the boolean it reads.
+        # Accepting "a non-empty string" for all of them would let ``min_cvss: "9.5"`` load and never fire.
+        validated: dict = {}
         for key, value in match.items():
-            _require(isinstance(value, str) and bool(value), f"{where}: match.{key} must be a non-empty string")
-            if key == "tag":
-                # A message's tag is its severity word, so any other value is a rule that can never fire. Refuse
-                # it here: a route that silently delivers nothing is worse than a configuration error.
-                _require(value in SEVERITY_TAGS, f"{where}: match.tag must be one of {sorted(SEVERITY_TAGS)}")
+            position = f"{where}: match.{key}"
+            if key in _MATCH_NUMBERS:
+                high = _MATCH_NUMBERS[key]
+                number = _threshold_number(value, position)
+                _require(0 < number <= high, f"{position} must be above 0 and at most {high:g}")
+                validated[key] = number
+            elif key == "kev":
+                _require(isinstance(value, bool), f"{position} must be true or false")
+                validated[key] = value
+            else:
+                _require(isinstance(value, str) and bool(value), f"{position} must be a non-empty string")
+                if key == "tag":
+                    # A message's tag is its severity word, so any other value is a rule that can never fire.
+                    # Refuse it here: a route that silently delivers nothing is worse than a configuration error.
+                    _require(value in SEVERITY_TAGS, f"{position} must be one of {sorted(SEVERITY_TAGS)}")
+                validated[key] = value
         routes.append(
             {
-                "match": dict(match),
+                "match": validated,
                 "notifiers": _notifier_selection(
                     route.get("notifiers"), f"{where}: notifiers", enabled_ids, strict=strict
                 ),
@@ -606,6 +650,14 @@ def config_from_document(
     routes, default_notifiers = _routing(document, notifiers, strict=not lenient)
     # After expansion: a block can carry a reference, which arrives as a string and is refused as "not a number".
     thresholds = _thresholds(document.get("thresholds"))
+    # A source's own block completes itself from the global one, key by key, and is judged by the same rules.
+    # Resolved here so ``core`` looks the numbers up instead of re-reading the document, and only for the
+    # sources that run: a disabled plugin's block is not resolved, exactly as its references are not.
+    source_thresholds: dict[str, Thresholds] = {
+        entry["id"]: _thresholds(entry["thresholds"], base=thresholds, context=f"{entry['id']}: ")
+        for entry in sources
+        if entry.get("thresholds") is not None
+    }
 
     poll = document.get("poll_interval", "15m")
     match = re.fullmatch(r"(\d+)([smh])", str(poll))
@@ -659,6 +711,7 @@ def config_from_document(
         allow_private_sources=_bool_option(document.get("allow_private_sources", False), "allow_private_sources"),
         nvd_api_key=raw_nvd_key.strip(),
         thresholds=thresholds,
+        source_thresholds=source_thresholds,
         routes=routes,
         default_notifiers=default_notifiers,
         web_host=web_host,

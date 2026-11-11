@@ -50,7 +50,9 @@ def test_every_builder_has_exactly_one_spec():
 
 def test_config_allows_the_registry_keys():
     documented = {key for spec in SOURCE_SPECS.values() for key in (*spec.required, *spec.optional)}
-    assert {"id", "type", "enabled"} | documented == config._SOURCE_KEYS
+    # ``thresholds`` is structural like ``enabled``: it never reaches a builder, and the catalogue owns only
+    # the keys a kind reads.
+    assert {"id", "type", "enabled", "thresholds"} | documented == config._SOURCE_KEYS
 
 
 def test_every_example_validates_and_builds(tmp_path):

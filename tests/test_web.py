@@ -178,6 +178,39 @@ CSRF_RE = re.compile(r'name="csrf" value="([0-9a-f]{64})"')
 
 
 FINGERPRINT_RE = re.compile(r"name='fingerprint' value='([0-9a-f]{64})'")
+NOW = 1792600000
+PREDICATE_CONFIG = """\
+sources:
+  - id: nodejs
+    type: rss
+    url: https://feeds.example.net/nodejs.xml
+    thresholds: {critical_cvss: 7.0}
+notifiers:
+  - id: ops
+    type: ntfy
+    url: ${OPS_HOOK}
+    topic: advisories
+  - id: phone
+    type: ntfy
+    url: ${PHONE_HOOK}
+    topic: alerts
+routes:
+  - match: {min_cvss: 9.5, epss_gte: 0.3, kev: true}
+    notifiers: [phone]
+default: [ops]
+"""
+PREDICATE_ENV = {"OPS_HOOK": "https://ntfy.example.net/OPS", "PHONE_HOOK": "https://ntfy.example.net/PHONE"}
+
+
+def predicate_client(tmp_path: Path, token: str = "secret-token"):
+    """A signed-out client over a configuration with a source block and a predicate route."""
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(f"{PREDICATE_CONFIG}state_path: {tmp_path}/state.json\n")
+    env = {"ADVISORY_RADAR_AUTH_TOKEN": token, **PREDICATE_ENV}
+    runtime = Runtime.build(cfg_path, env, clock=lambda: float(NOW))
+    save_state(runtime.cfg.state_path, core.new_state())
+    app = create_app(runtime, env, clock=lambda: float(NOW))
+    return TestClient(app), token, runtime
 
 
 def config_form(client, token: str) -> tuple[str, str]:
@@ -1062,3 +1095,157 @@ def test_no_secret_value_reaches_the_config_page_or_a_log_line(tmp_path, caplog)
     assert refused.status_code == 400
     assert "SUPERSECRET-WEBHOOK" not in refused.text
     assert "SUPERSECRET-WEBHOOK" not in caplog.text
+
+
+# --- the route predicates on the form and in the preview ---------------------------------------
+
+
+def test_the_routes_form_renders_and_saves_the_three_predicates(tmp_path):
+    client, token, runtime = predicate_client(tmp_path)
+    csrf, fingerprint = config_form(client, token)
+    page = client.get("/config").text
+    assert "name='route:1:min_cvss' size='4' value='9.5'" in page
+    assert "name='route:1:epss_gte' size='4' value='0.3'" in page
+    assert "name='route:1:kev'" in page and "value='true' selected" in page, "the boolean is prefilled"
+
+    saved = client.post(
+        "/config/routes",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "route:1:min_cvss": "8.0",
+            "route:1:epss_gte": "0.2",
+            "route:1:kev": "false",
+            "route:1:notifiers": ["phone"],
+            "default": ["ops"],
+        },
+        follow_redirects=False,
+    )
+
+    assert saved.status_code == 303
+    assert runtime.cfg.routes == ({"match": {"min_cvss": 8.0, "epss_gte": 0.2, "kev": False}, "notifiers": ("phone",)},)
+    overlay = load_settings(settings_path(runtime.cfg.state_path))
+    assert overlay["routes"][0]["match"] == {"min_cvss": 8.0, "epss_gte": 0.2, "kev": False}, (
+        "the numbers are stored as numbers, so the next load judges them as the validator expects"
+    )
+
+
+def test_a_predicate_alone_is_a_rule(tmp_path):
+    client, token, runtime = predicate_client(tmp_path)
+    csrf, fingerprint = config_form(client, token)
+
+    saved = client.post(
+        "/config/routes",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "route:1:kev": "true",
+            "route:1:notifiers": ["phone"],
+            "default": ["ops"],
+        },
+        follow_redirects=False,
+    )
+
+    assert saved.status_code == 303
+    assert runtime.cfg.routes == ({"match": {"kev": True}, "notifiers": ("phone",)},)
+
+
+def test_a_refused_predicate_writes_nothing(tmp_path):
+    client, token, runtime = predicate_client(tmp_path)
+    csrf, fingerprint = config_form(client, token)
+
+    refused = client.post(
+        "/config/routes",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "route:1:min_cvss": "11",
+            "route:1:notifiers": ["phone"],
+        },
+        follow_redirects=False,
+    )
+
+    assert refused.status_code == 400
+    assert "match.min_cvss must be above 0 and at most 10" in refused.text
+    assert not (tmp_path / "settings.json").exists()
+    assert runtime.cfg.routes[0]["match"]["min_cvss"] == 9.5, "the running configuration is unchanged"
+
+
+def test_the_preview_predicts_a_numeric_and_kev_predicate(tmp_path):
+    client, token, _ = predicate_client(tmp_path)
+    signed_in(client, token)
+
+    matched = client.get(
+        "/thresholds",
+        params={"preview": "1", "cvss": "9.8", "epss": "0.4", "kev": "yes", "ids": "CVE-2026-1234"},
+    ).text
+    assert "Routing:" in matched and "route 1" in matched and "phone" in matched
+    assert "overrides the global block" not in matched, "no source was previewed, so the global block applies"
+
+    # Each predicate has to be satisfied by what the message measured, and one missing value is enough.
+    for query in (
+        {"cvss": "9.0", "epss": "0.4", "kev": "yes"},  # below min_cvss
+        {"cvss": "9.8", "kev": "yes"},  # no EPSS was typed
+        {"cvss": "9.8", "epss": "0.4", "kev": "unknown"},  # membership not measured
+        {"cvss": "9.8", "epss": "0.4"},  # not in KEV, so kev: true fails
+    ):
+        page = client.get("/thresholds", params={"preview": "1", "ids": "CVE-2026-1234", **query}).text
+        assert "Routing: <b>default</b>" in page or "cannot be predicted" in page, query
+
+
+def test_the_preview_attributes_a_measured_score_to_a_cve_only(tmp_path):
+    """The queue entry is scored per CVE, so a GHSA id stands for no measurement at all."""
+    client, token, _ = predicate_client(tmp_path)
+    signed_in(client, token)
+
+    # A lower-case id is the same CVE: the classifier's pattern is case-insensitive, and so is this one.
+    predicted = client.get(
+        "/thresholds",
+        params={"preview": "1", "cvss": "9.8", "epss": "0.4", "kev": "yes", "ids": "cve-2026-1234"},
+    ).text
+    assert "Routing:" in predicted and "route 1" in predicted and "phone" in predicted
+
+    for identifier in ("GHSA-aaaa-bbbb-cccc", "", "CVE-26-1"):
+        params = {"preview": "1", "cvss": "9.8", "epss": "0.4", "kev": "yes"}
+        if identifier:
+            params["ids"] = identifier
+        page = client.get("/thresholds", params=params).text
+        assert "Routing:" not in page, identifier
+        assert "cannot be predicted" in page and "CVE id" in page, identifier
+        assert "an advisory-level score is not a CVE measurement" in page, identifier
+
+
+def test_the_preview_will_not_predict_a_kev_rule_against_an_unknown_catalogue(tmp_path):
+    client, token, _ = predicate_client(tmp_path)
+    signed_in(client, token)
+
+    page = client.get(
+        "/thresholds",
+        params={"preview": "1", "cvss": "9.8", "epss": "0.4", "kev": "unknown", "ids": "CVE-2026-1234"},
+    ).text
+
+    assert "Routing:" not in page
+    assert "matches on KEV membership" in page and "cannot be predicted" in page
+
+
+def test_a_kev_value_that_is_not_a_boolean_is_refused(tmp_path):
+    """Dropping it would silently broaden the rule to every message; the validator must refuse it."""
+    client, token, runtime = predicate_client(tmp_path)
+    csrf, fingerprint = config_form(client, token)
+
+    refused = client.post(
+        "/config/routes",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "route:1:tag": "critical",
+            "route:1:kev": "yes",
+            "route:1:notifiers": ["phone"],
+        },
+        follow_redirects=False,
+    )
+
+    assert refused.status_code == 400
+    assert "match.kev must be true or false" in refused.text
+    assert not (tmp_path / "settings.json").exists()
+    assert runtime.cfg.routes[0]["match"]["kev"] is True, "the running rules are unchanged"

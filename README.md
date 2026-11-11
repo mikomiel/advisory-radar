@@ -75,20 +75,46 @@ thresholds:                 # these are the defaults
 - **warning** — everything else, an unmeasured severity included: an unknown is never
   suppressed.
 
+A single source may raise or lower the bar for its own items with its own `thresholds`
+block. It states only the numbers that differ; the rest are the global block's, key by key,
+and the same validation and ranges apply — a refusal names the source whose block it is
+(`nodejs: thresholds.critical_cvss must be a number`):
+
+```yaml
+sources:
+  - id: nodejs
+    type: rss
+    url: https://nodejs.org/en/feed/vulnerability.xml
+    thresholds:
+      critical_cvss: 7.0     # this feed's own bar; the other two follow the global block
+```
+
+The same block can be saved to the settings overlay from `/config`, key by key, so a feed
+you care about more than the rest can be watched more strictly without editing the file. A
+source with no block follows the global numbers, and a disabled source's block is not
+resolved until the source is enabled.
+
 A message's note names the bar that decided it (`CVSS >= 7.5, remote attack, ...`), so the
 text cannot claim a threshold the configuration no longer has. Changing a threshold is a
 change of rules, not of the world, so it does not send the backlog out: each watched CVE
-records the numbers it was judged under, and the first evaluation after a change records the
-new verdict without telling anyone. The entry keeps what you were actually told apart from
-what the numbers now say, so a KEV hit or a CISA active flag that arrives later still
-escalates — that is evidence, not a rule.
+records the numbers it was judged under — its source's block when it has one — and the first
+evaluation after a change records the new verdict without telling anyone. A change to a
+source's block re-baselines only the CVEs that source queued, and a change to the global block
+reaches a source only through the numbers that source does not state itself. The entry keeps
+what you were actually told
+apart from what the numbers now say, so a KEV hit or a CISA active flag that arrives later
+still escalates — that is evidence, not a rule.
 
 `/thresholds`, linked from `/config`, previews one advisory: give it a CVSS, an EPSS, its
 KEV and SSVC state, a source, a product and the advisory's identifiers, and it shows the
 level, the reason, the exact metrics line and note the message would carry, and which route
-and notifiers would receive it. It reads the live configuration and writes nothing, so the
-link can be shared. A route that matches on identifiers needs them: without one the page says
-the destination cannot be predicted rather than guessing.
+and notifiers would receive it. It judges the advisory with the previewed source's own block
+when it has one, says which numbers it used, and reads the live configuration without writing
+anything, so the link can be shared. A route that matches on identifiers needs them: without
+one the page says the destination cannot be predicted rather than guessing. A numeric or
+`kev` predicate needs the advisory's CVE id for the same reason: the classifier records a
+score per CVE it judged, so an advisory-level score is not a measurement a rule can read, and
+the page asks for the CVE id instead of inventing one.
 
 ### Routing
 
@@ -102,11 +128,25 @@ wins**, so the most specific rule goes first. A rule matches on one or more of:
 | `tag` | the message's severity is exactly that value (`critical` or `warning`) |
 | `product` | the item matched that watchlist product id; a message without a product match never matches a product rule |
 | `ids` | any id in the message matches the pattern, case-insensitively (`CVE-2026-*`, `GHSA-*`) |
+| `min_cvss` | the highest CVSS measured for a CVE the message names is at least this number (`0 < x <= 10`) |
+| `epss_gte` | the highest EPSS measured for a CVE the message names is at least this number (`0 < x <= 1`) |
+| `kev` | `true` when at least one CVE the message names is in the KEV catalog, `false` when none is |
+
+The three predicates read only what the classification measured, which the queued message
+carries: the CVSS and EPSS of every CVE it judged, and its KEV membership. A message with no
+measured score never satisfies a numeric predicate — an advisory with no CVE id has an
+advisory-level OSV label, not a CVE measurement — and an unmeasured KEV membership, because
+the catalog could not be read, satisfies neither `kev: true` nor `kev: false`: the rule
+describes evidence the message does not have, and a route chosen for a fact nobody observed
+is worse than no rule. An escalation carries the score and EPSS of the CVE it names, so the
+predicates apply to it; it still matches no `source` rule.
 
 A `match.tag` outside `critical` and `warning` is refused when the configuration loads: a
-message can carry no other tag, so such a rule could never fire. A rule naming a source id
-that no source defines still loads — a rule may be staged before its source — and `/config`
-reports it as inert until that source exists.
+message can carry no other tag, so such a rule could never fire. A `match.min_cvss` outside
+0..10, a `match.epss_gte` outside 0..1 and a `match.kev` that is not a boolean are refused the
+same way — a rule outside the range a score occupies could never fire either. A rule naming a
+source id that no source defines still loads — a rule may be staged before its source — and
+`/config` reports it as inert until that source exists.
 
 Every key present in one rule must match. `notifiers` names the enabled channels the
 message goes to, and `default` is used when no rule matches. Every id must name an
@@ -118,9 +158,11 @@ they need the state path, not a delivery target.
 ```yaml
 routes:
   - match: {source: php-releases}
-    notifiers: [matrix-php]
+    notifiers: [matrix-php]       # a source's channel, whatever the severity
+  - match: {min_cvss: 9.5, epss_gte: 0.3}
+    notifiers: [phone]            # only a score that measured this high reaches the phone
   - match: {tag: critical}
-    notifiers: [discord-security, phone]
+    notifiers: [discord-security]
 default: [discord-security]
 ```
 
@@ -132,7 +174,8 @@ with no notifier is a **failed pass**, not silence: delivery logs the error and 
 stays queued until the configuration is fixed.
 
 The same rules are editable on `/config`: three fixed rows (a source id, a severity tag, a
-product id, an ids pattern and the notifiers to send to) plus a default selection. Saving
+product id, an ids pattern, a minimum CVSS, a minimum EPSS, a KEV state and the notifiers to
+send to) plus a default selection. Saving
 replaces the whole block in the overlay, so a form with every row empty keeps the YAML's
 rules; a partly filled row is saved as written and the validator reports what is wrong. The
 notifier membership is judged once, after the merge, so a rule may select a notifier the
@@ -161,8 +204,8 @@ paging.
 ### Settings without a restart
 
 The `/config` page changes eight things without editing the YAML or restarting the
-container: `notifiers`, each source's `enabled` flag and watch `tag`, the sources the
-overlay itself adds, `poll_interval`, `hidden_source_hosts`, the routing
+container: `notifiers`, each source's `enabled` flag, watch `tag` and threshold block, the
+sources the overlay itself adds, `poll_interval`, `hidden_source_hosts`, the routing
 `routes`/`default` block, and the risk thresholds. The notifier form manages
 the whole list — that is how a channel
 is added, edited or disabled — and while the overlay holds a notifier list, that list
@@ -228,8 +271,8 @@ turns critical, and never re-sends what you already received.
 - Enrichment plugins: CVE.org, NVD, FIRST EPSS, CISA KEV, OSV, Debian security tracker
 - Notifier plugins: Discord webhook, Matrix (Hookshot), ntfy, Gotify, Apprise, generic webhook, SMTP
 - Severity decision per CVE with re-evaluation window and one escalation per level; the
-  thresholds are configurable on `/config`, and `/thresholds` previews what one advisory
-  would be judged as and where its message would go
+  thresholds are configurable on `/config` globally or per source, and `/thresholds` previews
+  what one advisory would be judged as and where its message would go
 - Filterable `/alerts` and `/runs` lists with their state in the URL, keyset pagination for
   the alert history, and a per-advisory page (`/advisories/<id>`) showing the stored
   classification and delivery record

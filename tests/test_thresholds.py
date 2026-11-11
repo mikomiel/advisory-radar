@@ -17,8 +17,9 @@ from fastapi.testclient import TestClient
 from advisory_radar import core
 from advisory_radar.config import DEFAULT_THRESHOLDS, ConfigError, Thresholds, load_config
 from advisory_radar.runtime import Runtime
-from advisory_radar.settings import load_settings, settings_path
+from advisory_radar.settings import load_settings, save_settings, settings_path
 from advisory_radar.state import save_state, state_lock
+from advisory_radar.watchlist import Policy
 from advisory_radar.web import create_app
 
 TOKEN = "secret-token"
@@ -77,9 +78,12 @@ def load(tmp_path: Path, body: str, *, settings: dict | None = None, env: dict[s
     return load_config(write_config(tmp_path, body), env or {}, settings=settings)
 
 
-def make_client(tmp_path: Path, *, body: str = BODY, state: dict | None = None):
+def make_client(tmp_path: Path, *, body: str = BODY, state: dict | None = None, overlay: dict | None = None):
     path = write_config(tmp_path, f"{body}\nstate_path: {tmp_path / 'state.json'}\n")
     env = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, **ENVIRONMENT}
+    if overlay is not None:
+        # Written before the runtime is built, so the overlay is part of the configuration the page renders.
+        save_settings(settings_path(tmp_path / "state.json"), overlay, now=NOW)
     runtime = Runtime.build(path, env, clock=lambda: float(NOW))
     save_state(runtime.cfg.state_path, state if state is not None else core.new_state())
     client = TestClient(create_app(runtime, env, clock=lambda: float(NOW)))
@@ -125,6 +129,26 @@ def save_thresholds(
     )
 
 
+def save_source_threshold(client: TestClient, csrf: str, fingerprint: str, **fields: str):
+    """Post the thresholds form with empty global fields and one field per ``<source id>:<key>`` pair."""
+    data = {
+        "csrf": csrf,
+        "fingerprint": fingerprint,
+        "threshold:critical_cvss": "",
+        "threshold:critical_epss": "",
+        "threshold:suppress_below_cvss": "",
+    }
+    data.update({f"source_threshold:{name}": value for name, value in fields.items()})
+    return client.post("/config/thresholds", data=data, follow_redirects=False)
+
+
+def source_threshold_value(page: str, identifier: str, key: str) -> str:
+    """The value one source's threshold input was rendered with, or a failure naming the field."""
+    match = re.search(rf"name='source_threshold:{re.escape(identifier)}:{key}'[^>]*value='([^']*)'", page)
+    assert match, f"the form must render source_threshold:{identifier}:{key}"
+    return match.group(1)
+
+
 def facts(cvss=None, epss=None, ssvc=None, *, remote=False, complete=True) -> core.CveFacts:
     return core.CveFacts(cvss, ssvc, epss, None, complete, remote_unauth=remote)
 
@@ -135,7 +159,8 @@ class Facts:
     def __init__(self, **answers: core.CveFacts) -> None:
         self.answers = {key.replace("_", "-"): value for key, value in answers.items()}
 
-    def cves(self, cves, force=False, deferred=None):
+    def cves(self, cves, force=False, deferred=None, **ignored):
+        # ``**ignored``: ``classify_new`` passes its own lookup limit, which this stub has no use for.
         return {cve: self.answers.get(cve, core.CveFacts(None, None, None, None, False)) for cve in cves}
 
 
@@ -586,3 +611,427 @@ def test_the_preview_and_the_form_require_auth(tmp_path):
     response = client.get("/thresholds", follow_redirects=False)
     assert response.status_code == 303 and response.headers["location"] == "/login"
     assert client.post("/config/thresholds", data={}, follow_redirects=False).status_code == 303
+
+
+# --- a source's own block ----------------------------------------------------------------------
+
+
+BODY_SOURCE_OVERRIDE = """\
+sources:
+  - id: nodejs
+    type: rss
+    url: https://feeds.example.net/nodejs.xml
+    thresholds: {critical_cvss: 7.0}
+  - id: legacy
+    type: rss
+    url: https://feeds.example.net/legacy.xml
+notifiers:
+  - id: ops
+    type: ntfy
+    url: ${OPS_HOOK}
+    topic: advisories
+  - id: phone
+    type: ntfy
+    url: ${PHONE_HOOK}
+    topic: alerts
+routes:
+  - match: {source: nodejs, tag: critical}
+    notifiers: [phone]
+default: [ops]
+"""
+
+
+def test_a_source_block_completes_itself_from_the_global_one(tmp_path):
+    """A source states only the numbers it changes; the rest are the global block's, not the defaults."""
+    config = load(
+        tmp_path,
+        """\
+        sources:
+          - id: nodejs
+            type: rss
+            url: https://feeds.example.net/nodejs.xml
+            thresholds:
+              critical_cvss: 7.5
+          - id: legacy
+            type: rss
+            url: https://feeds.example.net/legacy.xml
+        notifiers: []
+        thresholds:
+          critical_epss: 0.25
+          suppress_below_cvss: 3
+        """,
+    )
+    assert config.thresholds == Thresholds(9.0, 0.25, 3.0)
+    assert config.thresholds_for("nodejs") == Thresholds(7.5, 0.25, 3.0)
+    assert config.thresholds_for("legacy") == Thresholds(9.0, 0.25, 3.0), "no block means the global numbers"
+    assert config.thresholds_for("ghost") == config.thresholds, "an id the configuration no longer defines"
+    assert config.thresholds_for(None) == config.thresholds, "a message that came from no source at all"
+
+
+@pytest.mark.parametrize(
+    ("block", "message"),
+    [
+        ({"critical_cvss": "high"}, "nodejs: thresholds.critical_cvss must be a number"),
+        ({"critical_cvss": True}, "nodejs: thresholds.critical_cvss must be a number"),
+        ({"critical_cvss": 0}, "nodejs: thresholds.critical_cvss must be above 0 and at most 10"),
+        ({"critical_epss": 1.5}, "nodejs: thresholds.critical_epss must be above 0 and at most 1"),
+        (
+            {"suppress_below_cvss": 9.5},
+            "nodejs: thresholds.suppress_below_cvss must be between 0 and thresholds.critical_cvss",
+        ),
+        ({"nonsense": 1}, "nodejs: thresholds: unknown keys ['nonsense']"),
+        ("not-a-mapping", "nodejs: thresholds must be a mapping"),
+    ],
+)
+def test_a_source_block_is_refused_by_the_same_rules(tmp_path, block, message):
+    """The wording is the global block's, prefixed by the source so a refusal says whose block it is."""
+    body = (
+        "sources:\n"
+        "  - id: nodejs\n"
+        "    type: rss\n"
+        "    url: https://feeds.example.net/nodejs.xml\n"
+        f"    thresholds: {block!r}\n"
+        "notifiers: []\n"
+    )
+    with pytest.raises(ConfigError) as exc:
+        load(tmp_path, body)
+    assert str(exc.value) == message
+
+
+def test_a_source_override_from_the_overlay_merges_key_by_key(tmp_path):
+    """A saved number must not drop the YAML's other keys for that source, exactly as for the global block."""
+    merged = load(
+        tmp_path,
+        """\
+        sources:
+          - id: nodejs
+            type: rss
+            url: https://feeds.example.net/nodejs.xml
+            thresholds: {critical_cvss: 7.0, critical_epss: 0.2}
+        notifiers: []
+        """,
+        settings={"sources": {"nodejs": {"thresholds": {"critical_cvss": 8.0}}}},
+    )
+    assert merged.thresholds_for("nodejs") == Thresholds(8.0, 0.2, 4.0)
+    added = load(
+        tmp_path,
+        "sources:\n  - id: nodejs\n    type: rss\n    url: https://feeds.example.net/nodejs.xml\nnotifiers: []\n",
+        settings={"sources": {"nodejs": {"thresholds": {"critical_epss": 0.4}}}},
+    )
+    assert added.thresholds_for("nodejs") == Thresholds(9.0, 0.4, 4.0), "a source with no block may still gain one"
+
+
+def test_a_disabled_source_block_is_not_resolved(tmp_path):
+    """A disabled plugin is not built, so its block is not judged either; enabling one judges it then."""
+    config = load(
+        tmp_path,
+        """\
+        sources:
+          - id: paused
+            type: rss
+            url: https://feeds.example.net/off.xml
+            enabled: false
+            thresholds: {critical_cvss: high}
+        notifiers: []
+        """,
+    )
+    assert config.sources == ()
+    assert config.source_thresholds == {}
+
+
+# --- the decision per source -------------------------------------------------------------------
+
+
+def test_classify_new_judges_with_the_source_block(tmp_path):
+    config = load(tmp_path, BODY_SOURCE_OVERRIDE, env=ENVIRONMENT)
+    item = core.Item(
+        "g1", "CVE-2026-8000 remote bug", "https://vendor.example.net/a", "notes", NOW - 60, ("CVE-2026-8000",)
+    )
+    intel = Facts(**{"CVE-2026-8000": facts(7.5, 0.2, remote=True)})
+
+    def classify(source_id: str) -> dict:
+        classified = core.new_state()
+        core.classify_new(
+            classified,
+            [item],
+            intel,
+            frozenset(),
+            True,
+            NOW,
+            "vendor.example.net",
+            Policy((), (), ()),
+            source_id=source_id,
+            thresholds=config.thresholds_for(source_id),
+        )
+        return classified
+
+    loose = classify("nodejs")
+    strict = classify("legacy")
+    assert loose["pending"][0]["tag"] == "critical", "7.5 is critical under this source's own bar"
+    assert strict["pending"][0]["tag"] == "warning", "the global bar still decides for a source without a block"
+    assert loose["pending"][0]["thresholds"] == [7.0, 0.10, 4.0]
+
+
+def test_a_suppressed_advisory_records_the_source_that_queued_it(tmp_path):
+    """A suppressed CVE is watched too, so the source is what lets a later evaluation use its own numbers."""
+    config = load(tmp_path, BODY_SOURCE_OVERRIDE, env=ENVIRONMENT)
+    state = core.new_state()
+    item = core.Item("g1", "CVE-2026-8001 low", "https://vendor.example.net/a", "notes", NOW - 60, ("CVE-2026-8001",))
+    core.classify_new(
+        state,
+        [item],
+        Facts(**{"CVE-2026-8001": facts(2.0)}),
+        frozenset(),
+        True,
+        NOW,
+        "vendor.example.net",
+        Policy((), (), ()),
+        source_id="nodejs",
+        thresholds=config.thresholds_for("nodejs"),
+    )
+    assert state["pending"] == []
+    assert state["watch"]["CVE-2026-8001"]["source_id"] == "nodejs"
+    assert state["watch"]["CVE-2026-8001"]["thresholds"] == [7.0, 0.10, 4.0]
+
+
+def test_a_delivered_message_records_the_source_on_its_watch_entry():
+    state = core.new_state()
+    entry = {
+        "kind": "new",
+        "tag": "critical",
+        "title": "adv",
+        "body": "b",
+        "ids": ["CVE-2026-8002"],
+        "cves": ["CVE-2026-8002"],
+        "levels": {"CVE-2026-8002": "critical"},
+        "kev_only": [],
+        "scores": {"CVE-2026-8002": 9.8},
+        "epss": {"CVE-2026-8002": 0.5},
+        "kev": True,
+        "thresholds": [7.0, 0.1, 4.0],
+        "source": "adv",
+        "link": "",
+        "source_id": "nodejs",
+        "products": [],
+    }
+    core._delivered(state, entry, NOW, "delivered", ("ops",))
+    assert state["watch"]["CVE-2026-8002"]["source_id"] == "nodejs"
+    assert state["watch"]["CVE-2026-8002"]["thresholds"] == [7.0, 0.1, 4.0]
+
+    # A message queued before the key existed still records a watch entry, without inventing a source.
+    legacy = dict(entry, ids=["CVE-2026-8003"], cves=["CVE-2026-8003"], levels={"CVE-2026-8003": "critical"})
+    legacy.pop("source_id")
+    core._delivered(state, legacy, NOW, "delivered", ("ops",))
+    assert "source_id" not in state["watch"]["CVE-2026-8003"]
+
+
+def test_reevaluate_applies_the_source_block_not_the_global_one():
+    state = core.new_state()
+    cve = "CVE-2026-8004"
+    # Queued unscored by the nodejs source, under a block that has not changed since.
+    state["watch"][cve] = watch_entry(cve, cvss=None, source_id="nodejs", thresholds=[7.0, 0.10, 4.0])
+    intel = Facts(**{cve: facts(7.5, 0.2, remote=True)})
+
+    core.reevaluate(
+        state,
+        intel,
+        frozenset(),
+        True,
+        NOW,
+        "",
+        thresholds=DEFAULT_THRESHOLDS,
+        source_thresholds={"nodejs": Thresholds(critical_cvss=7.0)},
+    )
+
+    queued = [entry for entry in state["pending"] if entry["kind"] == "escalation"]
+    assert queued and queued[0]["tag"] == "critical", "the source's own bar is the one that applies"
+    assert queued[0]["thresholds"] == [7.0, 0.10, 4.0]
+    assert queued[0]["scores"] == {cve: 7.5} and queued[0]["epss"] == {cve: 0.2}
+    assert queued[0]["kev"] is False, "a catalogue was read and this CVE is not in it"
+
+
+def test_reevaluate_without_the_source_block_treats_it_as_a_rule_change():
+    """The same entry judged by the global block: the source's numbers differ, so this is a re-baseline."""
+    state = core.new_state()
+    cve = "CVE-2026-8005"
+    state["watch"][cve] = watch_entry(cve, cvss=None, source_id="nodejs", thresholds=[7.0, 0.10, 4.0])
+    intel = Facts(**{cve: facts(7.5, 0.2, remote=True)})
+
+    core.reevaluate(state, intel, frozenset(), True, NOW, "", thresholds=DEFAULT_THRESHOLDS)
+
+    assert state["pending"] == [], "a change of rules never sends the backlog out"
+    assert state["watch"][cve]["judged"] == "warning"
+    assert state["watch"][cve]["thresholds"] == DEFAULT_THRESHOLDS.snapshot()
+
+
+def test_a_global_change_does_not_replay_a_source_whose_own_block_is_unchanged():
+    state = core.new_state()
+    cve = "CVE-2026-8006"
+    state["watch"][cve] = watch_entry(
+        cve, level="critical", judged="critical", cvss=7.5, source_id="nodejs", thresholds=[7.0, 0.10, 4.0]
+    )
+    intel = Facts(**{cve: facts(7.5, 0.2, remote=True)})
+
+    # The global bar moved from 9.0 to 9.9; the source's block did not move at all.
+    core.reevaluate(
+        state,
+        intel,
+        frozenset(),
+        True,
+        NOW,
+        "",
+        thresholds=Thresholds(critical_cvss=9.9),
+        source_thresholds={"nodejs": Thresholds(critical_cvss=7.0)},
+    )
+
+    assert state["pending"] == []
+    assert state["watch"][cve]["judged"] == "critical", "the source's rules still say critical, so nothing changed"
+    assert state["watch"][cve]["level"] == "critical"
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        {"source_id": 7},
+        {"source_id": ["nodejs"]},
+        {"source_id": ""},
+        {"source_id": "nodejs", "thresholds": "not-a-snapshot"},
+        {"thresholds": [1, 2]},
+    ],
+)
+def test_a_damaged_watch_record_judges_without_raising(damage):
+    """The state file is hand-editable JSON: a record that cannot be read must fall back, never raise."""
+    state = core.new_state()
+    cve = "CVE-2026-8007"
+    entry = watch_entry(cve, cvss=None)
+    entry.update(damage)
+    state["watch"][cve] = entry
+
+    core.reevaluate(
+        state,
+        Facts(**{cve: facts(7.5, 0.2, remote=True)}),
+        frozenset(),
+        True,
+        NOW,
+        "",
+        thresholds=Thresholds(critical_cvss=7.0),
+        source_thresholds={"nodejs": Thresholds(critical_cvss=7.0)},
+    )
+
+    assert state["pending"] == [], "an unreadable record is re-baselined, not escalated and not raised on"
+    assert state["watch"][cve]["thresholds"] == [7.0, 0.10, 4.0]
+
+
+# --- the /config form per source ---------------------------------------------------------------
+
+
+def test_the_thresholds_form_saves_a_source_override(tmp_path):
+    client, _, runtime = make_client(tmp_path)
+    csrf, fingerprint = config_form(client)
+
+    saved = save_source_threshold(client, csrf, fingerprint, **{"nodejs:critical_cvss": "7.5"})
+
+    assert saved.status_code == 303
+    assert runtime.cfg.thresholds_for("nodejs") == Thresholds(7.5, 0.10, 4.0)
+    assert runtime.cfg.thresholds == DEFAULT_THRESHOLDS, "the global block is untouched"
+    stored = load_settings(settings_path(runtime.cfg.state_path))
+    assert stored["sources"]["nodejs"]["thresholds"] == {"critical_cvss": 7.5}
+    page = client.get("/config").text
+    assert source_threshold_value(page, "nodejs", "critical_cvss") == "7.5"
+    assert source_threshold_value(page, "nodejs", "critical_epss") == "", (
+        "an inherited number is not rendered as a value"
+    )
+
+
+def test_clearing_a_source_override_stops_overriding(tmp_path):
+    client, _, runtime = make_client(tmp_path)
+    csrf, fingerprint = config_form(client)
+    assert save_source_threshold(client, csrf, fingerprint, **{"nodejs:critical_cvss": "7.5"}).status_code == 303
+
+    csrf, fingerprint = config_form(client)
+    cleared = save_source_threshold(client, csrf, fingerprint, **{"nodejs:critical_cvss": ""})
+
+    assert cleared.status_code == 303
+    assert runtime.cfg.thresholds_for("nodejs") == DEFAULT_THRESHOLDS
+    assert "sources" not in load_settings(settings_path(runtime.cfg.state_path)), "an empty block keeps no entry"
+
+
+def test_a_source_override_saved_while_a_pass_holds_the_lock_renders_what_was_saved(tmp_path):
+    client, _, runtime = make_client(tmp_path)
+    with state_lock(runtime.cfg.state_path, blocking=False):
+        csrf, fingerprint = config_form(client)
+        assert save_source_threshold(client, csrf, fingerprint, **{"nodejs:critical_cvss": "7.5"}).status_code == 303
+    assert runtime.cfg.thresholds_for("nodejs") == DEFAULT_THRESHOLDS, "the reload was deferred"
+
+    page = client.get("/config").text
+    assert source_threshold_value(page, "nodejs", "critical_cvss") == "7.5", "the form shows the saved block"
+
+    # Resubmitting the form as rendered must leave the saved configuration where it is.
+    csrf, fingerprint = config_form(client)
+    saved = save_source_threshold(
+        client, csrf, fingerprint, **{"nodejs:critical_cvss": source_threshold_value(page, "nodejs", "critical_cvss")}
+    )
+    assert saved.status_code == 303
+    assert load_settings(settings_path(runtime.cfg.state_path))["sources"]["nodejs"]["thresholds"] == {
+        "critical_cvss": 7.5
+    }, "resubmitting the rendered form must not undo the save"
+
+
+def test_a_refused_source_threshold_writes_nothing(tmp_path):
+    client, _, runtime = make_client(tmp_path)
+    csrf, fingerprint = config_form(client)
+
+    refused = save_source_threshold(client, csrf, fingerprint, **{"nodejs:critical_cvss": "banana"})
+
+    assert refused.status_code == 400
+    assert "nodejs: thresholds.critical_cvss must be a number" in refused.text
+    assert runtime.cfg.thresholds_for("nodejs") == DEFAULT_THRESHOLDS
+    assert not (tmp_path / "settings.json").exists()
+
+
+def test_an_overlay_added_source_keeps_its_override_in_its_own_entry(tmp_path):
+    added = [{"id": "added", "type": "rss", "url": "https://feeds.example.net/added.xml"}]
+    client, _, runtime = make_client(tmp_path, overlay={"sources_added": added})
+    csrf, fingerprint = config_form(client)
+
+    saved = save_source_threshold(client, csrf, fingerprint, **{"added:critical_cvss": "6.5"})
+
+    assert saved.status_code == 303
+    stored = load_settings(settings_path(runtime.cfg.state_path))
+    assert stored["sources_added"][0]["thresholds"] == {"critical_cvss": 6.5}
+    assert "sources" not in stored, "an added source is stored whole, not as a YAML edit"
+    assert runtime.cfg.thresholds_for("added") == Thresholds(6.5, 0.10, 4.0)
+
+
+def test_a_threshold_form_that_rendered_no_source_rows_cannot_clear_an_override(tmp_path):
+    """A hand-built POST is not a browser's: it must not read an absent per-source field as a cleared one."""
+    client, _, runtime = make_client(tmp_path)
+    csrf, fingerprint = config_form(client)
+    assert save_source_threshold(client, csrf, fingerprint, **{"nodejs:critical_cvss": "7.5"}).status_code == 303
+
+    csrf, fingerprint = config_form(client)
+    saved = save_thresholds(client, csrf, fingerprint, critical_cvss="8.0")
+
+    assert saved.status_code == 303
+    assert runtime.cfg.thresholds == Thresholds(8.0, 0.10, 4.0)
+    assert runtime.cfg.thresholds_for("nodejs") == Thresholds(7.5, 0.10, 4.0), "the override survived"
+
+
+# --- the /thresholds preview per source --------------------------------------------------------
+
+
+def test_the_preview_uses_the_previewed_sources_block(tmp_path):
+    client, _, _ = make_client(tmp_path, body=BODY_SOURCE_OVERRIDE)
+    sign_in(client)
+
+    loose = preview(client, cvss="7.5", remote="1", source="nodejs")
+    assert "Critical" in loose, "7.5 is critical under this source's own bar"
+    assert "overrides the global block" in loose, "the page says which numbers it used"
+
+    strict = preview(client, cvss="7.5", remote="1", source="legacy")
+    assert "Warning" in strict, "a source without a block is judged by the global numbers"
+    assert "overrides the global block" not in strict
+
+    ghost = preview(client, cvss="7.5", remote="1", source="ghost")
+    assert "Warning" in ghost, "an id no source defines is judged by the global numbers too"
+    assert "overrides the global block" not in ghost
