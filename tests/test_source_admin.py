@@ -1373,3 +1373,59 @@ def test_a_notifier_id_may_not_borrow_a_credential_variable(tmp_path):
     path.write_text(yaml.safe_dump(document))
     with pytest.raises(ConfigError, match="may not be composed from a variable that supplies a credential"):
         load_config(path, {"HOOK": "https://hooks.example.net/secret"})
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        # the kind is itself a reference, so the collector must not depend on it
+        {
+            "sources": [
+                {
+                    "id": "feed-${CD_TOKEN}",
+                    "type": "${SOURCE_KIND}",
+                    "url": "https://changes.example.net",
+                    "api_key": "${CD_TOKEN}",
+                }
+            ]
+        },
+        # a top-level credential is a credential
+        {
+            "nvd_api_key": "${NVD_KEY}",
+            "sources": [{"id": "feed-${NVD_KEY}", "type": "rss", "url": "https://feeds.example.net/x.xml"}],
+        },
+        # a disabled entry can supply the value an enabled id borrows
+        {
+            "sources": [
+                {"id": "changes", "type": "changedetection", "url": "https://c.example.net", "api_key": "${CD_TOKEN}"}
+            ]
+        },
+    ],
+)
+def test_the_credential_inventory_does_not_depend_on_the_kind_or_the_enabled_flag(tmp_path, document):
+    path = tmp_path / "config.yml"
+    document = {**document, "notifiers": [], "state_path": str(tmp_path / "state.json")}
+    if document["sources"][-1].get("api_key") == "${CD_TOKEN}" and document["sources"][-1]["id"] == "changes":
+        document["sources"].append({"id": "feed-${CD_TOKEN}", "type": "rss", "url": "https://feeds.example.net/x.xml"})
+    path.write_text(yaml.safe_dump(document))
+    with pytest.raises(ConfigError, match="may not be composed from a variable that supplies a credential"):
+        load_config(
+            path,
+            {"CD_TOKEN": "AbCdEf123456", "SOURCE_KIND": "changedetection", "NVD_KEY": "AbCdEf123456"},
+        )
+
+
+def test_both_reference_spellings_are_the_same_variable(tmp_path):
+    path = write_config(
+        tmp_path,
+        sources=[
+            {
+                "id": "feed-${CD_TOKEN}",
+                "type": "changedetection",
+                "url": "https://changes.example.net",
+                "api_key": "${CD_TOKEN_FILE}",
+            }
+        ],
+    )
+    with pytest.raises(ConfigError, match="may not be composed from a variable that supplies a credential"):
+        load_config(path, {})

@@ -171,21 +171,26 @@ def _reference_names(value: object) -> set[str]:
     return {name.removesuffix("_FILE") for name in _ENV_RE.findall(value)}
 
 
+#: Every key any built-in source kind declares as a credential. The collector uses the union rather than the
+#: entry's own kind: ``type`` may itself be a reference, and a key that one kind ignores is still a credential
+#: position in the file.
+SOURCE_SECRET_KEYS = tuple(sorted({key for spec in SOURCE_SPECS.values() for key in spec.secret_keys}))
+
+
 def _credential_names(document: dict) -> set[str]:
     """Every environment variable that supplies a credential somewhere in this configuration.
 
     An id may not be composed from one of these: ``id: feed-${CD_TOKEN}`` beside ``api_key: ${CD_TOKEN}`` would
     publish the key on every page, log line and metric label that shows the id. A variable that only names
-    something -- ``id: tenant-${TENANT}`` -- stays usable in an id.
+    something -- ``id: tenant-${TENANT}`` -- stays usable in an id. The scan is deliberately blind to whether an
+    entry is enabled or which kind it is: both are configuration, and both can supply a value an enabled entry's
+    id borrows.
     """
     names: set[str] = set()
     for entry in document.get("sources") or []:
-        if not isinstance(entry, dict):
-            continue
-        kind = entry.get("type")
-        spec = SOURCE_SPECS.get(kind) if isinstance(kind, str) else None
-        for key in spec.secret_keys if spec is not None else ():
-            names |= _reference_names(entry.get(key))
+        if isinstance(entry, dict):
+            for key in SOURCE_SECRET_KEYS:
+                names |= _reference_names(entry.get(key))
     for entry in document.get("notifiers") or []:
         if not isinstance(entry, dict):
             continue
@@ -196,6 +201,7 @@ def _credential_names(document: dict) -> set[str]:
                     names |= _reference_names(item)
             else:
                 names |= _reference_names(value)
+    names |= _reference_names(document.get("nvd_api_key"))
     return names
 
 
