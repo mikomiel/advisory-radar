@@ -996,7 +996,7 @@ def remote_note(thresholds: Thresholds = DEFAULT_THRESHOLDS) -> str:
     A literal "CVSS >= 9.0" would be a lie the moment the threshold is saved as anything else, and the note is
     the only place a reader learns which rule decided.
     """
-    return f"CVSS >= {thresholds.critical_cvss:g}, remote attack, no privileges, no user interaction (CVSS vector)."
+    return f"CVSS >= {thresholds.critical_cvss}, remote attack, no privileges, no user interaction (CVSS vector)."
 
 
 def reason_note(reason: str | None, thresholds: Thresholds = DEFAULT_THRESHOLDS) -> str:
@@ -1019,10 +1019,10 @@ def change_note(reason: str | None, thresholds: Thresholds = DEFAULT_THRESHOLDS)
     if reason == "ssvc":
         return "Change: CISA recorded active exploitation (SSVC)."
     if reason == "epss":
-        return f"Change: exploitation likelihood (EPSS) at or above {thresholds.critical_epss:g}; unconfirmed."
+        return f"Change: exploitation likelihood (EPSS) at or above {thresholds.critical_epss}; unconfirmed."
     if reason == "remote":
         return (
-            f"Change: a CVSS >= {thresholds.critical_cvss:g} score appeared for a remote, unauthenticated, "
+            f"Change: a CVSS >= {thresholds.critical_cvss} score appeared for a remote, unauthenticated, "
             "no-interaction attack."
         )
     return ""

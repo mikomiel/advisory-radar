@@ -32,6 +32,7 @@ from itsdangerous import BadSignature, URLSafeSerializer
 from . import __version__, pipeline
 from .catalogue import SOURCE_SPECS
 from .config import (
+    DEFAULT_THRESHOLDS,
     THRESHOLD_KEYS,
     Config,
     ConfigError,
@@ -2475,7 +2476,9 @@ def create_app(
             banner += _notice(f"The overlay cannot be read: {overlay_error}", "critical")
         status_tone = "ok" if live_now and saved_revision else ("warning" if saved_revision else "neutral")
         poll_text = document.get("poll_interval")
-        poll_text = poll_text if isinstance(poll_text, str) else f"{cfg.poll_interval_seconds}s"
+        # What the *saved* document means, not what the process is running: a save that landed while a pass
+        # held the lock is not live yet, and rendering the live value would make the form resubmit it.
+        poll_text = poll_text if isinstance(poll_text, str) else "15m"
         raw_thresholds = document.get("thresholds")
         raw_thresholds = raw_thresholds if isinstance(raw_thresholds, dict) else {}
 
@@ -2483,9 +2486,11 @@ def create_app(
             """The block as written, round-trip safe: a ${NAME} reference stays one, a number keeps every digit.
 
             ``str`` of a float is what parses back to the same value -- a ``:g`` format would round
-            ``7.500001`` to ``7.5`` and saving another field would silently change this one.
+            ``7.500001`` to ``7.5`` and saving another field would silently change this one. A key neither file
+            sets is the validator's default, never the live snapshot: a save that is not live yet must not look
+            as though it were.
             """
-            return esc(raw_thresholds.get(key, getattr(cfg.thresholds, key)))
+            return esc(raw_thresholds.get(key, getattr(DEFAULT_THRESHOLDS, key)))
 
         hidden = document.get("hidden_source_hosts")
         hidden_text = "\n".join(str(host) for host in hidden) if isinstance(hidden, list) else ""
@@ -2648,10 +2653,10 @@ def create_app(
             why = {
                 "kev": "the CVE is in the CISA KEV catalog: exploitation observed in the wild.",
                 "ssvc": "CISA records active exploitation (SSVC).",
-                "remote": f"CVSS is at or above {thresholds.critical_cvss:g} with a remote, unauthenticated, "
+                "remote": f"CVSS is at or above {thresholds.critical_cvss} with a remote, unauthenticated, "
                 "no-interaction vector.",
-                "epss": f"CVSS is at or above {thresholds.critical_cvss:g} and EPSS is at or above "
-                f"{thresholds.critical_epss:g}.",
+                "epss": f"CVSS is at or above {thresholds.critical_cvss} and EPSS is at or above "
+                f"{thresholds.critical_epss}.",
             }.get(
                 reason or "",
                 "no CVE, score or exploitation signal reaches the critical rules, and the item is "
@@ -2735,9 +2740,9 @@ def create_app(
             "</form>"
         )
         thresholds_now = (
-            f"critical at CVSS <b>{cfg.thresholds.critical_cvss:g}</b> or EPSS "
-            f"<b>{cfg.thresholds.critical_epss:g}</b>, suppressed below CVSS "
-            f"<b>{cfg.thresholds.suppress_below_cvss:g}</b>"
+            f"critical at CVSS <b>{cfg.thresholds.critical_cvss}</b> or EPSS "
+            f"<b>{cfg.thresholds.critical_epss}</b>, suppressed below CVSS "
+            f"<b>{cfg.thresholds.suppress_below_cvss}</b>"
         )
         body = (
             "<p class='muted'>What one advisory would be classified as, and where the message would go, under "

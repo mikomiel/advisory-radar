@@ -18,7 +18,7 @@ from advisory_radar import core
 from advisory_radar.config import DEFAULT_THRESHOLDS, ConfigError, Thresholds, load_config
 from advisory_radar.runtime import Runtime
 from advisory_radar.settings import load_settings, settings_path
-from advisory_radar.state import save_state
+from advisory_radar.state import save_state, state_lock
 from advisory_radar.web import create_app
 
 TOKEN = "secret-token"
@@ -423,6 +423,41 @@ def test_an_empty_threshold_field_falls_back_to_the_yaml(tmp_path):
     assert save_thresholds(client, csrf, fingerprint).status_code == 303
     assert runtime.cfg.thresholds == Thresholds(7.0, 0.3, 4.0)
     assert "thresholds" not in load_settings(settings_path(runtime.cfg.state_path))
+
+
+def test_a_save_that_is_not_live_yet_does_not_render_its_old_values(tmp_path):
+    """A reset saved while a pass holds the lock must not come back on the next save of the form.
+
+    The form renders the saved document, so a deferred save shows what was saved -- rendering the still-running
+    values instead would make the browser resubmit them and undo the reset.
+    """
+    client, _, runtime = make_client(tmp_path)  # the YAML declares no thresholds block
+    csrf, fingerprint = config_form(client)
+    assert save_thresholds(client, csrf, fingerprint, critical_cvss="7.0").status_code == 303
+    assert runtime.cfg.thresholds.critical_cvss == 7.0
+
+    with state_lock(runtime.cfg.state_path, blocking=False):
+        csrf, fingerprint = config_form(client)
+        assert save_thresholds(client, csrf, fingerprint).status_code == 303  # clear every field
+    assert runtime.cfg.thresholds.critical_cvss == 7.0, "the reload was deferred, so the live value is stale"
+
+    page = client.get("/config").text
+    rendered = dict(re.findall(r"name='threshold:(\w+)' size='5'[^>]*value='([^']*)'", page))
+    assert rendered["critical_cvss"] == "9.0", "the form shows the saved default, not the stale live value"
+    assert rendered["critical_epss"] == "0.1" and rendered["suppress_below_cvss"] == "4.0"
+
+    # Saving the form as rendered must leave the configuration where the reset put it.
+    csrf, fingerprint = config_form(client)
+    saved = save_thresholds(
+        client,
+        csrf,
+        fingerprint,
+        critical_cvss=rendered["critical_cvss"],
+        critical_epss=rendered["critical_epss"],
+        suppress_below_cvss=rendered["suppress_below_cvss"],
+    )
+    assert saved.status_code == 303
+    assert runtime.cfg.thresholds == DEFAULT_THRESHOLDS, "the reset was not undone by a plain save"
 
 
 def test_a_refused_threshold_writes_nothing(tmp_path):
