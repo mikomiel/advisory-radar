@@ -205,8 +205,12 @@ def _url_secret_names(value: object) -> set[str]:
     _, separator, rest = value.partition("://")
     if not separator or not rest:
         return _reference_names(value)
-    authority, slash, tail = rest.partition("/")
-    names = _reference_names(f"{slash}{tail}")
+    # The authority ends at the first of the three separators that can follow it: a URL may carry its query
+    # straight after the host, with no path at all (``https://feeds.example.net?token=…``).
+    ends = [index for index in (rest.find("/"), rest.find("?"), rest.find("#")) if index >= 0]
+    cut = min(ends) if ends else len(rest)
+    authority, tail = rest[:cut], rest[cut:]
+    names = _reference_names(tail)
     if "@" in authority:
         names |= _reference_names(authority.split("@", 1)[0])
     return names

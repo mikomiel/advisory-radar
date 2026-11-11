@@ -316,17 +316,11 @@ def test_an_unsaved_probe_carries_the_values_into_a_save(tmp_path):
     )
     assert probed.status_code == 200
     assert "Add this source" in probed.text
-    # The page re-emits the probed fields, so saving is a click on that second form.
-    saved = client.post(
-        "/config/sources",
-        data={
-            "csrf": csrf,
-            "fingerprint": fingerprint,
-            "new:type": "rss",
-            "new:url": "https://nodejs.org/feed/vulnerability.xml",
-        },
-        follow_redirects=False,
-    )
+    # The page re-emits the probed fields: replay exactly the form it returned, so this pins "saves what it
+    # probed" rather than restating the values the test already knew.
+    fields = dict(re.findall(r"""name=['"]([^'"]+)['"] value=['"]([^'"]*)['"]""", probed.text))
+    assert {"csrf", "fingerprint", "new:type", "new:url"} <= set(fields)
+    saved = client.post("/config/sources", data=fields, follow_redirects=False)
     assert saved.status_code == 303
     runtime.reload(blocking=True)
     assert "nodejs-org" in [source.id for source in runtime.sources]
@@ -1515,10 +1509,12 @@ def test_a_token_bearing_url_cannot_lend_its_variable_to_an_id(tmp_path):
     )
     with pytest.raises(ConfigError, match="may not be composed from a variable that supplies a credential"):
         load_config(path, {"FEED_TOKEN": "AbCdEf123456"})
-    # The path and the userinfo are credential positions too.
+    # The path, the userinfo, and a query with no path at all are credential positions too.
     for url in (
         "https://feeds.example.net/${FEED_TOKEN}/security.xml",
         "https://${FEED_TOKEN}@feeds.example.net/security.xml",
+        "https://feeds.example.net?token=${FEED_TOKEN}",
+        "https://feeds.example.net#${FEED_TOKEN}",
     ):
         path = write_config(tmp_path, sources=[{"id": "feed-${FEED_TOKEN}", "type": "rss", "url": url}])
         with pytest.raises(ConfigError, match="may not be composed from a variable that supplies a credential"):
