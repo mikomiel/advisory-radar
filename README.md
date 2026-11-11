@@ -37,8 +37,9 @@ notifiers:
   - id: discord
     type: discord_webhook
     url: ${DISCORD_WEBHOOK_URL}
-# optional: scope alerts to what you run (see below)
-watchlist: ./config/watchlist.json
+# optional: scope alerts to what you run (see below); with no key the
+# document is watchlist.json beside state_path, and /watchlist edits it
+watchlist: /data/watchlist.json
 ```
 
 `watchlist.json` is optional. Without it every advisory that arrives is judged;
@@ -54,6 +55,25 @@ ones you do not run. Package patterns filter Debian DSA titles.
   "products": [{"id": "nodejs", "aliases": ["node.js"], "domains": ["nodejs.org"]}]
 }
 ```
+
+`/watchlist` edits that document in the browser: add a product with its aliases and domains,
+edit or remove one, and edit the package patterns and the exclusions. Every list field treats
+a repeated entry once, and a save applies to the next pass — the pass reads the policy on
+every run, so nothing needs restarting. A save that changes the scope makes each source be
+read in full once, because a conditional request would otherwise hide exactly the advisory
+that just became in scope.
+
+Where the document lives, in order: the path `watchlist:` names; otherwise
+`watchlist.json` beside `state_path` (on `/data`, which is writable — `/config` is
+read-only); otherwise the built-in default, which judges everything. `watchlist:` naming a
+file that does not exist yet is a configuration error that fails every pass, so a typo can
+never silently mean "judge everything"; the page names it and creates it when you save. A
+save writes nothing when the page is stale (the file changed under it), when a value is
+invalid (the rows you typed are re-rendered), or when the destination cannot be written.
+
+To check a rule before relying on it, paste an advisory's title and link into the page's
+*Check an advisory* form: it answers in scope or out of scope, names the products that
+matched, and is the same match and the same reason the pass uses.
 
 ### Risk thresholds
 
@@ -365,7 +385,7 @@ the reader's light or dark preference. These are from a local run with demo data
 advisories in them are not real findings. The set is
 reproducible: `uv run --with playwright python scripts/capture_screenshots.py` builds the
 demo config and state in a temporary directory, serves the app on loopback and writes the
-five PNGs (Playwright is opt-in and not a project dependency; see
+six PNGs (Playwright is opt-in and not a project dependency; see
 `docs/deployment.md`).
 
 ![Dashboard: pending, parked, seen-today and total counts above the last pass's sent, parked and exit result](docs/screenshots/dashboard.png)
@@ -374,9 +394,13 @@ five PNGs (Playwright is opt-in and not a project dependency; see
 |---|---|
 | ![Alert history: URL filters for tag, source, outcome, text and date, with severity badges and the advisory rows linked to their detail page](docs/screenshots/alerts.png) | ![Configuration: numbered sections for settings, sources, notifiers and routes, with the poll interval and the settings overlay status](docs/screenshots/config.png) |
 
-| Parked messages | Runs |
+| Watchlist | Parked messages |
 |---|---|
-| ![Parked queue: severity, title and advisory ids, with per-entry release and drop plus the bulk actions](docs/screenshots/parked.png) | ![Run history: sent, parked, pending and exit code per pass, filtered by exit code and day](docs/screenshots/runs.png) |
+| ![The product scope: one row per watched product with its aliases and domains, the Debian package patterns and exclusions, and the form that checks one advisory against the document](docs/screenshots/watchlist.png) | ![Parked queue: severity, title and advisory ids, with per-entry release and drop plus the bulk actions](docs/screenshots/parked.png) |
+
+| Runs |
+|---|
+| ![Run history: sent, parked, pending and exit code per pass, filtered by exit code and day](docs/screenshots/runs.png) |
 
 ## Sources
 

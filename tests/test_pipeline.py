@@ -926,3 +926,53 @@ def test_a_pass_honours_the_quiet_hours_policy(tmp_path):
     assert pipeline.run_pass(cfg, [], [notifier], http=fake_http, clock=lambda: day, sleep=lambda s: None) == 0
     assert [message["tag"] for message in notifier.sent] == ["critical", "warning"]
     assert cfg.store().load()["pending"] == []
+
+
+# --- the watchlist document the page writes -----------------------------------------------------
+
+
+def test_an_unconfigured_watchlist_is_read_beside_the_state_file(tmp_path):
+    """What ``/watchlist`` creates must be what a pass reads, with no YAML change and no reload."""
+    cfg = _webhook_config(tmp_path)  # no ``watchlist:`` key at all
+    (tmp_path / "watchlist.json").write_text(
+        json.dumps(
+            {
+                "schema": "security-watchlist.v1",
+                "debian_source_packages": ["curl"],
+                "excluded_products": [],
+                "products": [{"id": "libfoo", "aliases": ["libfoo"], "domains": ["libfoo.example"]}],
+            }
+        )
+    )
+    state = core.new_state()
+    state["seeded"] = {"wh": True}
+    state["webhook_inbox"] = {
+        "wh": [
+            {"guid": "keep", "title": "libfoo advisory", "link": "https://libfoo.example/a", "summary": ""},
+            {"guid": "drop", "title": "garden notes", "link": "https://other.example/b", "summary": ""},
+        ]
+    }
+    save_state(cfg.state_path, state)
+    notifier = FakeNotifier(200)
+    code = pipeline.run_pass(
+        cfg, [WebhookSource("wh")], [notifier], http=fake_http, clock=lambda: float(NOW), sleep=lambda s: None
+    )
+    assert code == 0
+    assert len(notifier.sent) == 1, "the item the scope kept is the only message"
+    stored = json.loads((tmp_path / "state.json").read_text())
+    assert stored["seen"]["src:wh:drop"]["outcome"] == "filtered"
+    assert stored["seen"].get("src:wh:keep", {}).get("outcome") != "filtered"
+    assert stored.get("webhook_inbox", {}) == {}, "both entries are released from the inbox"
+
+
+def test_an_unreadable_watchlist_fails_the_pass_instead_of_raising(tmp_path, caplog):
+    """The document is writable through /watchlist now, so a broken one is a state this program can reach."""
+    scope = tmp_path / "scope.json"
+    scope.write_text("{not json")
+    cfg_path = tmp_path / "broken.yml"
+    cfg_path.write_text(f"sources: []\nnotifiers: []\nstate_path: {tmp_path}/state.json\nwatchlist: {scope}\n")
+    cfg = load_config(cfg_path, {})
+    with caplog.at_level(logging.ERROR, logger="advisory_radar"):
+        code = pipeline.run_pass(cfg, [], [], http=fake_http, clock=lambda: float(NOW), sleep=lambda s: None)
+    assert code == 1, "a scope that cannot be read must fail the pass, not judge everything"
+    assert "did not run" in caplog.text

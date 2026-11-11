@@ -1391,6 +1391,7 @@ def test_every_page_carries_the_same_shell(tmp_path):
         "/parked": "/parked",
         "/config": "/config",
         "/sources": "/sources",
+        "/watchlist": "/watchlist",
         "/runs": "/runs",
         "/thresholds": "/config",
         f"/advisories/{advisory_token('CVE-2026-1')}": "/alerts",
@@ -1420,6 +1421,15 @@ def test_every_page_carries_the_same_shell(tmp_path):
     )
     _assert_shell(stale, active="/config", status=409)
     assert 'action="/logout"' in stale.text
+
+    # The scope page refuses a page rendered against another document the same way, chrome included.
+    stale_scope = client.post(
+        "/watchlist",
+        data={"csrf": csrf, "fingerprint": "0" * 64, "debian_packages": "*"},
+        headers={"accept": "text/html"},
+    )
+    _assert_shell(stale_scope, active="/watchlist", status=409)
+    assert 'action="/logout"' in stale_scope.text
 
     # A refused form token still renders the section the action came from.
     for path, active in (("/run", "/"), ("/reload", "/config"), ("/logout", "")):

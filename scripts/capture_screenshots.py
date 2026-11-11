@@ -19,6 +19,7 @@ script only writes them.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import secrets
 import socket
@@ -38,6 +39,7 @@ PAGES = (
     ("alerts", "/alerts"),
     ("parked", "/parked"),
     ("config", "/config"),
+    ("watchlist", "/watchlist"),
     ("runs", "/runs"),
 )
 #: Every image is captured at this width; the pages are fluid, so one width keeps the set consistent.
@@ -126,6 +128,29 @@ def demo_environment(token: str) -> dict[str, str]:
 def demo_config(state_path: Path) -> str:
     """The demo YAML: example hosts only, and every credential as a ``${NAME}`` reference."""
     return DEMO_CONFIG.replace("{state_path}", str(state_path))
+
+
+#: The scope document the watchlist page shows, written beside the demo state file -- which is also what an
+#: installation with no ``watchlist:`` key reads. Example hosts only, like the configuration.
+DEMO_WATCHLIST = {
+    "schema": "security-watchlist.v1",
+    "debian_source_packages": ["openssl", "curl", "libxml2"],
+    "excluded_products": ["legacy-portal"],
+    "products": [
+        {"id": "commerce", "aliases": ["Adobe Commerce", "Magento"], "domains": ["adobe.example.net"]},
+        {"id": "widgetd", "aliases": ["widgetd"], "domains": ["vendor.example.net"]},
+        {"id": "http-client", "aliases": ["http-client"], "domains": []},
+        {"id": "auth-gateway", "aliases": ["auth-gateway"], "domains": []},
+    ],
+}
+
+
+def demo_watchlist(state_path: Path) -> Path:
+    """Write the demo scope where the app reads it with no ``watchlist:`` key: beside the state file."""
+    path = state_path.with_name("watchlist.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(DEMO_WATCHLIST, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
 
 
 def _seen(cve: str, tag: str, source: str, title: str, level: str, score: float, delivered: list[str]):
@@ -341,7 +366,7 @@ def main(argv: list[str] | None = None) -> int:
         "--output-dir",
         type=Path,
         default=Path("docs/screenshots"),
-        help="where the five PNGs are written (default: docs/screenshots)",
+        help="where the six PNGs are written (default: docs/screenshots)",
     )
     arguments = parser.parse_args(argv)
     sync_playwright = load_playwright()
@@ -363,6 +388,7 @@ def main(argv: list[str] | None = None) -> int:
             config_path = root / "config.yml"
             config_path.write_text(demo_config(state_path), encoding="utf-8")
             save_state(state_path, demo_state())
+            demo_watchlist(state_path)
             runtime = Runtime.build(config_path, environment)
             try:
                 server, thread, port = start_server(create_app(runtime, environment))
