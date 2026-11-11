@@ -958,15 +958,15 @@ def test_a_probe_finds_a_yaml_source_by_the_id_the_page_shows(tmp_path):
     """``/sources`` renders the expanded configuration, so its button submits the value, not the reference."""
     client, runtime, _ = make_client(
         tmp_path,
-        sources=[{"id": "${FEED_ID}", "type": "rss", "url": "https://feeds.example.net/feed.xml"}],
-        environment={"FEED_ID": "vendor"},
+        sources=[{"id": "${PREFIX}dor", "type": "rss", "url": "https://feeds.example.net/feed.xml"}],
+        environment={"PREFIX": "ven"},
     )
     assert [source.id for source in runtime.sources] == ["vendor"]
     csrf, _ = signed_in(client)
     from_sources_page = client.post("/sources/probe", data={"csrf": csrf, "id": "vendor"})
     assert from_sources_page.status_code == 200
     assert "Answered with 2 entries." in from_sources_page.text
-    from_config_page = client.post("/config/sources/probe", data={"csrf": csrf, "id": "${FEED_ID}"})
+    from_config_page = client.post("/config/sources/probe", data={"csrf": csrf, "id": "${PREFIX}dor"})
     assert from_config_page.status_code == 200
     assert "Answered with 2 entries." in from_config_page.text
 
@@ -1013,13 +1013,13 @@ def test_a_disabled_source_cannot_shadow_the_row_that_was_probed(tmp_path):
         tmp_path,
         sources=[
             {
-                "id": "${FEED_ID}",
+                "id": "${PREFIX}dor",
                 "type": "rss",
                 "enabled": False,
                 "url": "https://old.example.net/feed.xml",
             }
         ],
-        environment={"FEED_ID": "vendor"},
+        environment={"PREFIX": "ven"},
         transport=distinct,
     )
     added = new_source(client, **{"new:id": "vendor", "new:type": "rss", "new:url": "https://new.example.net/x.xml"})
@@ -1035,8 +1035,8 @@ def test_a_disabled_source_cannot_shadow_the_row_that_was_probed(tmp_path):
 def test_a_derived_id_reserves_the_ids_in_use(tmp_path):
     client, _, _ = make_client(
         tmp_path,
-        sources=[{"id": "${FEED_ID}", "type": "rss", "url": "https://feeds.example.net/feed.xml"}],
-        environment={"FEED_ID": "nodejs-org"},
+        sources=[{"id": "nodejs-${SUFFIX}", "type": "rss", "url": "https://feeds.example.net/feed.xml"}],
+        environment={"SUFFIX": "org"},
     )
     assert new_source(client, **{"new:type": "rss", "new:url": "https://nodejs.org/feed/x.xml"}).status_code == 303
     assert overlay(tmp_path)["sources_added"][0]["id"] == "nodejs-org-2"
@@ -1114,8 +1114,8 @@ def test_a_source_whose_type_is_a_reference_can_be_probed(tmp_path, path):
 def test_the_route_warning_compares_the_values_routing_uses(tmp_path):
     client, _, _ = make_client(
         tmp_path,
-        sources=[{"id": "${FEED_ID}", "type": "rss", "url": "https://feeds.example.net/feed.xml"}],
-        environment={"FEED_ID": "vendor"},
+        sources=[{"id": "${PREFIX}dor", "type": "rss", "url": "https://feeds.example.net/feed.xml"}],
+        environment={"PREFIX": "ven"},
         extra="routes:\n  - match: {source: vendor}\n    notifiers: [chat]\n",
     )
     signed_in(client)
@@ -1128,13 +1128,13 @@ def test_a_derived_id_reserves_a_disabled_reference(tmp_path):
         tmp_path,
         sources=[
             {
-                "id": "${FEED_ID}",
+                "id": "nodejs-${SUFFIX}",
                 "type": "rss",
                 "enabled": False,
                 "url": "https://feeds.example.net/feed.xml",
             }
         ],
-        environment={"FEED_ID": "nodejs-org"},
+        environment={"SUFFIX": "org"},
     )
     assert new_source(client, **{"new:type": "rss", "new:url": "https://nodejs.org/feed/x.xml"}).status_code == 303
     assert overlay(tmp_path)["sources_added"][0]["id"] == "nodejs-org-2", "reserved conservatively by design"
@@ -1229,18 +1229,20 @@ def test_every_path_fetches_the_url_the_pass_fetches(tmp_path):
     assert config_url == pass_url, "a raw row expands once, exactly as the loader does"
 
 
-def test_a_disabled_webhook_does_not_print_its_resolved_id(tmp_path):
+def test_a_disabled_webhook_is_probeable_and_names_its_endpoint(tmp_path):
+    # A whole ``${NAME}`` id is refused by the validator now, so the fixture composes one -- which is the only
+    # way an id may carry a reference at all.
     client, _, _ = make_client(
         tmp_path,
-        sources=[{"id": "${SOME_SECRET}", "type": "webhook", "enabled": False}],
-        environment={"SOME_SECRET": "s3cret-token"},
+        sources=[{"id": "hook-${SUFFIX}", "type": "webhook", "enabled": False}],
+        environment={"SUFFIX": "vendor"},
     )
     csrf, _ = signed_in(client)
-    response = client.post("/config/sources/probe", data={"csrf": csrf, "id": "${SOME_SECRET}"})
+    response = client.post("/config/sources/probe", data={"csrf": csrf, "id": "hook-${SUFFIX}"})
     assert response.status_code == 200
     assert "no remote side" in response.text
-    assert "s3cret-token" not in response.text, "the webhook hint names the endpoint, not the credential"
-    assert "[redacted]" in response.text
+    # The endpoint is named from the effective id, redacted like every other place an id is rendered.
+    assert "/webhooks/hook-[redacted]" in response.text
 
 
 def test_a_bare_config_app_does_not_print_a_route_secret(tmp_path):
@@ -1278,24 +1280,28 @@ def test_a_bare_config_app_probes_the_url_the_pass_fetches(tmp_path):
     assert "${CHANNEL}" in probed
 
 
-def test_the_probe_page_title_does_not_print_a_resolved_id(tmp_path):
+def test_the_probe_page_title_redacts_a_resolved_id(tmp_path):
     """The title is part of the response: on the live path the id submitted *is* the expanded value."""
     path = write_config(
-        tmp_path, sources=[{"id": "${SOURCE_ID}", "type": "rss", "url": "https://feeds.example.net/feed.xml"}]
+        tmp_path,
+        sources=[{"id": "probe-${SOURCE_ID}", "type": "rss", "url": "https://feeds.example.net/feed.xml"}],
     )
     env = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, "SOURCE_ID": "s3cret-token"}
     runtime = Runtime.build(path, env)
-    assert [source.id for source in runtime.sources] == ["s3cret-token"]
+    assert [source.id for source in runtime.sources] == ["probe-s3cret-token"]
     # A file-backed runtime's /config renders the reference and looks up a raw id; a bare Config keeps the
     # expanded document, so the same page looks up the value.
     cases = (
-        (TestClient(create_app(runtime, env, http=fake_http, resolve=public_resolver)), "${SOURCE_ID}"),
-        (TestClient(create_app(load_config(path, env), env, http=fake_http, resolve=public_resolver)), "s3cret-token"),
+        (TestClient(create_app(runtime, env, http=fake_http, resolve=public_resolver)), "probe-${SOURCE_ID}"),
+        (
+            TestClient(create_app(load_config(path, env), env, http=fake_http, resolve=public_resolver)),
+            "probe-s3cret-token",
+        ),
     )
     for client, config_id in cases:
         csrf, _ = signed_in(client)
         for endpoint, identifier in (
-            ("/sources/probe", "s3cret-token"),
+            ("/sources/probe", "probe-s3cret-token"),
             ("/config/sources/probe", config_id),
         ):
             response = client.post(endpoint, data={"csrf": csrf, "id": identifier})
@@ -1303,5 +1309,26 @@ def test_the_probe_page_title_does_not_print_a_resolved_id(tmp_path):
             assert "s3cret-token" not in response.text, f"{endpoint} printed the resolved id"
     # the live path submits the value itself, so its title is where the redaction has to show
     csrf, _ = signed_in(cases[0][0])
-    live = cases[0][0].post("/sources/probe", data={"csrf": csrf, "id": "s3cret-token"})
-    assert "<title>[redacted] probe" in live.text
+    live = cases[0][0].post("/sources/probe", data={"csrf": csrf, "id": "probe-s3cret-token"})
+    assert "<title>probe-[redacted] probe" in live.text
+
+
+def test_a_whole_reference_id_is_refused_by_the_validator(tmp_path):
+    """An id appears in routes, logs and a metric label: a whole reference there would publish its value."""
+    path = write_config(tmp_path, sources=[{"id": "${SOURCE_ID}", "type": "rss", "url": "https://a.example.net"}])
+    with pytest.raises(ConfigError, match="a plugin id is a name"):
+        load_config(path, {"SOURCE_ID": "s3cret-token"})
+    # A composed id stays allowed: it is a naming scheme, and its author sees it in routes and logs anyway.
+    composed = write_config(tmp_path, sources=[{"id": "${PREFIX}dor", "type": "rss", "url": "https://a.example.net"}])
+    assert load_config(composed, {"PREFIX": "ven"}).sources[0]["id"] == "vendor"
+
+
+def test_the_metrics_label_is_the_configured_source_id(tmp_path):
+    client, runtime, _ = make_client(
+        tmp_path,
+        sources=[{"id": "nodejs-${SUFFIX}", "type": "rss", "url": "https://feeds.example.net/x.xml"}],
+        environment={"SUFFIX": "org"},
+    )
+    pipeline.run_pass(runtime.cfg, runtime.sources, runtime.notifiers, http=fake_http)
+    metrics = client.get("/metrics").text
+    assert 'advisory_radar_source_up{source="nodejs-org"} 1' in metrics

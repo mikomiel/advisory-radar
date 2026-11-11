@@ -2708,10 +2708,12 @@ def create_app(
             lines.append(f"# HELP advisory_radar_{name} {help_text}")
             lines.append(f"# TYPE advisory_radar_{name} {kind}")
             lines.append(f"advisory_radar_{name} {value}")
-        # Per-source health, labelled by the configured source id. A configured id is validated to
-        # ``[A-Za-z0-9._-]+``, so a label value never needs escaping, and the label set is bounded by the
-        # configuration rather than by anything a feed says. A source nobody has polled yet has no sample:
-        # absent is honest there, where 0 would claim it failed.
+        # Per-source health, labelled by the configured source id. That id is a *name*: the validator refuses a
+        # whole ``${NAME}`` reference in one, so a label cannot carry a credential, and a composed id
+        # (``tenant-${X}``) is a naming choice its author publishes in routes and logs as well. The charset is
+        # ``[A-Za-z0-9._-]+``, so a value never needs escaping, and the label set is bounded by the configuration
+        # rather than by anything a feed says. A source nobody has polled yet has no sample: absent is honest
+        # there, where 0 would claim it failed.
         raw_health = state.get("source_health")
         health = raw_health if isinstance(raw_health, dict) else {}
         configured = [str(source.get("id", "")) for source in runtime.cfg.sources]

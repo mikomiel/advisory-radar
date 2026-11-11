@@ -63,7 +63,7 @@ answering `ok` forever.
 | `advisory_radar_last_pass_exit` / `_sent` / `_parked` / `_pending` | what the last pass did |
 | `advisory_radar_ready` | `1` when `/readyz` would answer `200` |
 | `advisory_radar_state_readable` | `1` when the state document could be read; `0` means the scrape answered with only these two gauges (every other number is unknown, not zero) |
-| `advisory_radar_source_up{source}` | `1` when that source's last fetch succeeded, `0` when it failed; absent until the source has been polled once |
+| `advisory_radar_source_up{source}` | `1` when that source's last fetch succeeded, `0` when it failed; absent until the source has been polled once. The label is the configured source id, which the validator keeps a name — a whole `${NAME}` reference in an id is refused |
 | `advisory_radar_source_last_success_timestamp_seconds{source}` | when that source last answered (`0` = never) |
 | `advisory_radar_source_items{source}` | entries in that source's last window |
 

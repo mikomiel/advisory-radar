@@ -381,6 +381,14 @@ def config_from_document(
             "every source/notifier needs a string id",
         )
         _require(isinstance(entry.get("type"), str), f"{entry['id']}: missing type")
+        # An id is a name: it appears in routes, logs, the state and -- for a source -- a metric label on the
+        # unauthenticated ``/metrics`` endpoint. A whole ``${NAME}`` reference puts a credential in that
+        # position, which no reader could tell from a name, so it is refused here while a *composed* id such as
+        # ``tenant-${X}`` stays allowed. Credentials belong in a url, token or key.
+        _require(
+            _ENV_RE.fullmatch(entry["id"]) is None,
+            f"{entry['id']}: a plugin id is a name, not a whole ${{NAME}} reference",
+        )
         extra = set(entry) - (_SOURCE_KEYS if entry in sources else _NOTIFIER_KEYS)
         _require(not extra, f"{entry['id']}: unknown keys {sorted(extra)}")
         _require(isinstance(entry.get("enabled", True), bool), f"{entry['id']}: enabled must be a bool")

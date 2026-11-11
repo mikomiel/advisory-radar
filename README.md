@@ -262,10 +262,13 @@ must not hold it, and the isolation that does hold is a network one: run the
 container where it has no route to what it must not reach.
 
 Every origin the two pages show — a probe's answer and a configured source on
-`/sources` — every title a probe shows, and the source id itself are all restricted:
-the origins and titles are redacted against the secrets the configuration resolved,
-and an id the overlay adds must be literal text, because it is rendered on a page
-and used as a metric label on the unauthenticated `/metrics` endpoint.
+`/sources` — every title a probe shows, and every id are all restricted: the origins
+and titles are redacted against the secrets the configuration resolved, and an id is
+a name. The validator refuses a whole `${NAME}` reference in one, because an id
+appears in routes, logs, the state and — for a source — a metric label on the
+unauthenticated `/metrics` endpoint; a composed id such as `tenant-${X}` stays
+allowed, and the value it composes is what those places show. An id the overlay adds
+must be literal text, since there is no file to read it from.
 
 | Kind | Summary | Required keys | Optional keys |
 |---|---|---|---|
