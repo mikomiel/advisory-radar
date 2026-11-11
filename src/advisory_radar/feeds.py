@@ -121,6 +121,23 @@ def _string(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+#: Characters a feed identity must never carry: C0 controls, DEL, and the Unicode line and paragraph
+#: separators. A log record is one line, so a preserved newline in an identity lets a publisher write what
+#: looks like a second application record; the same characters would also reach a state key and a metric label.
+_IDENTITY_CONTROLS = re.compile("[\x00-\x1f\x7f\u2028\u2029]")
+
+
+def _identity(value: object) -> str:
+    """A feed identity that is safe to log and store: control characters removed, empty returned as empty.
+
+    Normalised at the boundary that owns the value -- the readers -- rather than at each log call, so every
+    present and future caller of ``FeedEntry.guid`` gets a single-line identity. The caller still decides
+    whether an empty result is an error, because a JSON document and an XML feed refuse one with their own
+    error type; the deduplication identity is the normalised string, so no other behaviour moves.
+    """
+    return _IDENTITY_CONTROLS.sub("", _string(value)).strip()
+
+
 def _local(tag: object) -> str:
     """An ElementTree tag without its namespace, lowercased for HTML/OPML name comparisons."""
     return tag.rsplit("}", 1)[-1].lower() if isinstance(tag, str) else ""
@@ -239,7 +256,7 @@ def _greader_export(document: object) -> FeedExport:
         identifier = node.get("id")
         match = GREADER_ID.match(identifier if isinstance(identifier, str) else "")
         link = _first_href(node.get("canonical")) or _first_href(node.get("alternate"))
-        guid = str(int(match.group(1), 16)) if match else link
+        guid = _identity(str(int(match.group(1), 16)) if match else link)
         title = _text(node.get("title"))
         if not guid or not title:
             raise FeedError("feed entry has no usable id or title")
@@ -313,7 +330,7 @@ def _json_feed_export(document: object) -> FeedExport:
         # ``url`` is the item's public page; ``external_url`` is used when the item has no page on this
         # site, and either is a better link than none. The id is the stable identity and wins outright.
         link = _string(node.get("url")) or _string(node.get("external_url"))
-        guid = _string(node.get("id")) or link
+        guid = _identity(node.get("id")) or _identity(link)
         if not guid:
             raise FeedError("feed entry has no usable id")
         title = _text(node.get("title"))
@@ -439,7 +456,7 @@ def _rss_2_export(root: ET.Element) -> FeedExport:
     items = []
     for node in channel.findall("item"):
         link = _text_of(node.find("link"))
-        guid = _text_of(node.find("guid")) or link
+        guid = _identity(_text_of(node.find("guid"))) or _identity(link)
         title = _text_of(node.find("title"))
         if not guid or not title:
             raise RssError("feed entry has no usable id or title")
@@ -468,7 +485,7 @@ def _atom_export(root: ET.Element) -> FeedExport:
             if candidate.get("rel") in (None, "alternate") and candidate.get("href"):
                 link = candidate.get("href", "")
                 break
-        guid = _text_of(node.find(f"{_ATOM}id")) or link
+        guid = _identity(_text_of(node.find(f"{_ATOM}id"))) or _identity(link)
         title = _text_of(node.find(f"{_ATOM}title"))
         if not guid or not title:
             raise RssError("feed entry has no usable id or title")
@@ -499,7 +516,7 @@ def _rdf_export(root: ET.Element) -> FeedExport:
     for node in entries:
         link = _text_of(node.find(f"{_RSS}link"))
         # rdf:about is the item's identity and survives a link change; the link is the fallback.
-        guid = (node.get(f"{_RDF}about") or "").strip() or link
+        guid = _identity(node.get(f"{_RDF}about")) or _identity(link)
         title = _text_of(node.find(f"{_RSS}title"))
         if not guid or not title:
             raise RssError("feed entry has no usable id or title")

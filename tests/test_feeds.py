@@ -305,3 +305,30 @@ def test_an_html_page_without_a_feed_link_is_refused():
 
     with pytest.raises(feeds.FeedError):
         feeds.fetch_any(no_link, PAGE_URL)
+
+
+def test_a_control_character_is_removed_from_a_feed_identity():
+    """``rdf:about`` is only stripped today, so a character reference can put a newline in an identity."""
+    rdf = RDF.replace(
+        b'rdf:about="https://vendor.example.com/apsb26-1"',
+        b'rdf:about="apsb26-1&#10;2026-10-22 INFO forged&#127;"',
+    )
+    entry = feeds.parse_rss(rdf).items[0]
+    assert entry.guid == "apsb26-12026-10-22 INFO forged"
+
+
+def test_an_identity_of_only_control_characters_is_refused():
+    json_feed = (
+        b'{"version": "https://jsonfeed.org/version/1.1", "items": ['
+        b'{"id": "\\u2028", "content_text": "Security update"}]}'
+    )
+    with pytest.raises(feeds.FeedError):
+        feeds.parse_json_feed(json_feed)
+    # A usable url is a derived identity, so the unusable id falls back to it rather than losing the item.
+    document = (
+        b'{"version": "https://jsonfeed.org/version/1.1", "items": ['
+        b'{"id": "\\u2028", "url": "https://vendor.example.com/a", "content_text": "Security update"}]}'
+    )
+    assert feeds.parse_json_feed(document).items[0].guid == "https://vendor.example.com/a"
+    with pytest.raises(feeds.RssError):
+        feeds.parse_rss(b"<rss><channel><item><title>t</title><guid>\x7f</guid></item></channel></rss>")

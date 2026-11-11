@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -325,3 +326,73 @@ def test_a_pass_where_no_source_is_due_fetches_nothing_and_still_succeeds(tmp_pa
     assert run_at(cfg, [a, b], NOW + 60) == 0, "a pass with every source deferred is not a failure"
     assert (a.calls, b.calls) == (1, 1), "nothing was due, so nothing was fetched"
     assert json.loads(cfg.state_path.read_text())["source_health"] == before, "no attempt rewrote the health"
+
+
+# --- a feed identity cannot forge a log line ------------------------------------------------------
+
+FORGED = "2026-10-22 INFO forged operational message"
+
+
+def assert_no_forged_log_line(caplog) -> None:
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("classified" in message for message in messages), "the identity must reach the log path"
+    assert all("\n" not in message and "\r" not in message for message in messages)
+    assert all(not line.startswith(FORGED) for message in messages for line in message.splitlines())
+
+
+def test_a_forged_newline_in_a_json_feed_identity_never_becomes_a_log_line(tmp_path, caplog):
+    """The id is remote-authored and reaches LOG.info("%s"); it must not split its record in two."""
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path)
+    body = (
+        b'{"version": "https://jsonfeed.org/version/1.1", "title": "Vendor", "items": ['
+        b'{"id": "advisory-2\\n2026-10-22 INFO forged operational message", '
+        b'"content_text": "Security update", "date_published": "2026-10-21T10:00:00Z"}]}'
+    )
+
+    def http(method, url, headers, payload):
+        if url == "https://feeds.example.com/rss":
+            return 200, {}, body
+        return fake_http(method, url, headers, payload)
+
+    caplog.set_level(logging.INFO)
+    code = pipeline.run_pass(
+        cfg,
+        [RssSource("test", "https://feeds.example.com/rss")],
+        [FakeNotifier()],
+        http=http,
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 0
+    assert_no_forged_log_line(caplog)
+
+
+def test_a_forged_newline_in_an_rss_identity_never_becomes_a_log_line(tmp_path, caplog):
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path)
+    body = b"""<?xml version="1.0"?>
+<rss version="2.0"><channel><title>Vendor</title><link>https://vendor.example.com/</link>
+<item><title>Security update</title><link>https://vendor.example.com/a</link>
+<guid>advisory-2
+2026-10-22 INFO forged operational message</guid>
+<description>Security update.</description>
+<pubDate>Wed, 21 Oct 2026 10:00:00 +0000</pubDate></item>
+</channel></rss>"""
+
+    def http(method, url, headers, payload):
+        if url == "https://feeds.example.com/rss":
+            return 200, {}, body
+        return fake_http(method, url, headers, payload)
+
+    caplog.set_level(logging.INFO)
+    code = pipeline.run_pass(
+        cfg,
+        [RssSource("test", "https://feeds.example.com/rss")],
+        [FakeNotifier()],
+        http=http,
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 0
+    assert_no_forged_log_line(caplog)
