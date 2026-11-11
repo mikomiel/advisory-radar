@@ -12,12 +12,14 @@ from __future__ import annotations
 import copy
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 
 from .catalogue import SOURCE_SPECS
+from .routing import MATCH_KEYS, SEVERITY_TAGS
 
 _ENV_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?:_FILE)?\}")
 
@@ -60,6 +62,20 @@ def _expand(value: object, env: dict[str, str], resolved: list[str] | None = Non
     return value
 
 
+def expand_entry(entry: dict, env: Mapping[str, str], resolved: list[str] | None = None) -> dict:
+    """One plugin entry with its ``${NAME}``/``${NAME_FILE}`` references resolved.
+
+    A form or a probe holds an entry as it is written -- a ``${FRESHRSS_TOKEN}`` reference rather than a token --
+    while a builder needs the value. A missing variable raises the ``ConfigError`` a configuration load would,
+    naming the variable and never its value: the message is rendered before any redaction exists. A caller that
+    may show an error adds the values it just resolved to ``resolved`` so they can be redacted.
+    """
+    expanded = _expand(copy.deepcopy(entry), dict(env), resolved)
+    if not isinstance(expanded, dict):  # unreachable for a mapping input; keeps the return type honest
+        raise ConfigError("a plugin entry must be a mapping")
+    return expanded
+
+
 @dataclass(frozen=True)
 class Config:
     sources: tuple[dict, ...]
@@ -71,6 +87,11 @@ class Config:
     adobe_commerce: bool = False
     #: A free NVD API key: raises the anonymous 5-per-30 s limit to 50 and shortens the pace in ``core.Intel``.
     nvd_api_key: str = ""
+    #: Whether a source added from the settings overlay may point into a private network. Off by default: the
+    #: check is an operator-controlled guard rail against pointing this instance at a router page by mistake,
+    #: turned off for an installation whose sources live on the LAN. It is not an isolation boundary -- see
+    #: :func:`advisory_radar.http.private_destination` for what it does and does not cover.
+    allow_private_sources: bool = False
     #: Ordered routing rules, first match wins. Empty means every message goes to every enabled notifier,
     #: exactly as it did before routing existed.
     routes: tuple[dict, ...] = ()
@@ -93,6 +114,9 @@ class Config:
 _SOURCE_KEYS = {"id", "type", "enabled"} | {
     key for spec in SOURCE_SPECS.values() for key in (*spec.required, *spec.optional)
 }
+#: The notifier keys whose value is a credential: the overlay accepts only a reference for them, and an id may
+#: not be composed from a variable that supplies one.
+NOTIFIER_SECRET_KEYS = ("url", "key", "password", "token")
 _NOTIFIER_KEYS = {
     "id",
     "type",
@@ -125,15 +149,95 @@ _TOP_KEYS = {
     "routes",
     "default",
     "web",
+    "allow_private_sources",
 }
-#: The keys a routing rule's ``match`` mapping may carry (see ``routing.py``).
-_MATCH_KEYS = frozenset({"source", "tag", "product", "ids"})
+#: The keys a routing rule itself may carry; the match keys and the tag set are ``routing.py``'s.
 _ROUTE_KEYS = frozenset({"match", "notifiers"})
 
 
 #: Spellings accepted for a boolean option that came from the environment (expansion yields strings).
 _TRUE_WORDS = frozenset({"true", "yes", "on", "1"})
 _FALSE_WORDS = frozenset({"false", "no", "off", "0", ""})
+
+
+def _base_name(name: str) -> str:
+    """The variable family a reference belongs to: ``X``, ``X_FILE`` and ``X_FILE_FILE`` share an ``X`` chain.
+
+    ``_expand`` reads ``${X_FILE}`` from ``X_FILE`` or ``X``, and ``${X_FILE_FILE}`` from ``X_FILE_FILE`` or
+    ``X_FILE`` -- so a spelling with more suffixes still reaches the same secret, and stripping one suffix would
+    let it slip past the id check.
+    """
+    while name.endswith("_FILE") and len(name) > len("_FILE"):
+        name = name[: -len("_FILE")]
+    return name
+
+
+def _reference_names(value: object) -> set[str]:
+    """Every environment reference a value carries, at any depth, as family names.
+
+    It walks lists and mappings: a credential position can hold either, and ``_expand`` resolves the strings
+    inside one, so a shape the scanner skipped would still supply the value an id borrows.
+    """
+    if isinstance(value, str):
+        return {_base_name(name) for name in _ENV_RE.findall(value)}
+    if isinstance(value, list):
+        return set().union(*(_reference_names(item) for item in value)) if value else set()
+    if isinstance(value, dict):
+        return set().union(*(_reference_names(item) for item in value.values())) if value else set()
+    return set()
+
+
+#: Every key any built-in source kind declares as a credential. The collector uses the union rather than the
+#: entry's own kind: ``type`` may itself be a reference, and a key that one kind ignores is still a credential
+#: position in the file.
+SOURCE_SECRET_KEYS = tuple(sorted({key for spec in SOURCE_SPECS.values() for key in spec.secret_keys}))
+
+
+def _url_secret_names(value: object) -> set[str]:
+    """References a source URL carries outside its host labels.
+
+    A reference in a host label names a host (``https://${TENANT}.example.net/feed``), so an id may use the same
+    variable. Anywhere else in the URL -- userinfo, path, query -- is a position a credential occupies
+    (``?token=${FEED_TOKEN}``), so an id may not borrow it. A URL with no scheme is scanned whole.
+    """
+    if not isinstance(value, str):
+        return set()
+    _, separator, rest = value.partition("://")
+    if not separator or not rest:
+        return _reference_names(value)
+    # The authority ends at the first of the three separators that can follow it: a URL may carry its query
+    # straight after the host, with no path at all (``https://feeds.example.net?token=…``).
+    ends = [index for index in (rest.find("/"), rest.find("?"), rest.find("#")) if index >= 0]
+    cut = min(ends) if ends else len(rest)
+    authority, tail = rest[:cut], rest[cut:]
+    names = _reference_names(tail)
+    if "@" in authority:
+        names |= _reference_names(authority.split("@", 1)[0])
+    return names
+
+
+def _credential_names(document: dict) -> set[str]:
+    """Every environment variable that supplies a credential somewhere in this configuration.
+
+    An id may not be composed from one of these: ``id: feed-${CD_TOKEN}`` beside ``api_key: ${CD_TOKEN}`` would
+    publish the key on every page, log line and metric label that shows the id. A variable that only names
+    something -- ``id: tenant-${TENANT}`` -- stays usable in an id. The scan is deliberately blind to whether an
+    entry is enabled or which kind it is: both are configuration, and both can supply a value an enabled entry's
+    id borrows.
+    """
+    names: set[str] = set()
+    for entry in document.get("sources") or []:
+        if isinstance(entry, dict):
+            for key in SOURCE_SECRET_KEYS:
+                names |= _reference_names(entry.get(key))
+            # A token-bearing feed URL is a supported shape the documentation names, so its references count too.
+            names |= _url_secret_names(entry.get("url"))
+    for entry in document.get("notifiers") or []:
+        if isinstance(entry, dict):
+            for key in (*NOTIFIER_SECRET_KEYS, "headers"):
+                names |= _reference_names(entry.get(key))
+    names |= _reference_names(document.get("nvd_api_key"))
+    return names
 
 
 def _bool_option(value: object, name: str) -> bool:
@@ -181,7 +285,7 @@ def load_document(path: Path, *, settings: dict | None = None) -> dict:
 
 
 def _merge_settings(document: dict, settings: dict) -> None:
-    """Overlay the six writable keys onto the raw YAML document, in place."""
+    """Overlay the seven writable keys onto the raw YAML document, in place."""
     from .settings import validate_settings  # lazy: settings.py imports ConfigError from this module
 
     validate_settings(settings)
@@ -203,6 +307,8 @@ def _merge_settings(document: dict, settings: dict) -> None:
         document["notifiers"] = merged
     if "sources" in settings:
         document["sources"] = _merge_sources(document.get("sources"), settings["sources"])
+    if "sources_added" in settings:
+        document["sources"] = _merge_added_sources(document.get("sources"), settings["sources_added"])
     if "poll_interval" in settings:
         document["poll_interval"] = settings["poll_interval"]
     if "hidden_source_hosts" in settings:
@@ -228,6 +334,32 @@ def _merge_sources(raw: object, overlay: dict) -> object:
         if entry is None:
             raise ConfigError(f"settings: no source with id {identifier!r} is defined in the YAML config")
         entry.update(changes)
+    return merged
+
+
+def _merge_added_sources(raw: object, added: object) -> object:
+    """Append the overlay's own source entries to the YAML list; a duplicate id is refused.
+
+    The YAML owns membership: the overlay may add a source the file does not define, never redefine one it does.
+    Two owners for one id would leave which URL is polled to the merge order, so the collision fails the load.
+    """
+    if not isinstance(added, list):
+        return raw  # ``validate_settings`` already refused a shape that is not a list
+    if raw is None:
+        raw = []
+    if not isinstance(raw, list):
+        return raw  # the validator refuses the YAML shape, which an overlay cannot repair
+    merged = [dict(entry) if isinstance(entry, dict) else entry for entry in raw]
+    known = {entry.get("id") for entry in merged if isinstance(entry, dict)}
+    for entry in added:
+        if not isinstance(entry, dict):
+            continue  # the config validator refuses a non-mapping entry with its own message
+        identifier = entry.get("id")
+        if identifier in known:
+            # The id was checked as a string by ``validate_settings``; it carries no secret, so it may be named.
+            raise ConfigError(f"settings: source id {identifier!r} is already defined in the YAML config")
+        known.add(identifier)
+        merged.append(dict(entry))
     return merged
 
 
@@ -283,10 +415,14 @@ def _routing(document: dict, notifiers: list[dict], *, strict: bool = True) -> t
         _require(not unknown, f"{where}: unknown keys {sorted(unknown)}")
         match = route.get("match")
         _require(isinstance(match, dict) and bool(match), f"{where}: match must be a non-empty mapping")
-        unknown_match = set(match) - _MATCH_KEYS
+        unknown_match = set(match) - MATCH_KEYS
         _require(not unknown_match, f"{where}: unknown match keys {sorted(unknown_match)}")
         for key, value in match.items():
             _require(isinstance(value, str) and bool(value), f"{where}: match.{key} must be a non-empty string")
+            if key == "tag":
+                # A message's tag is its severity word, so any other value is a rule that can never fire. Refuse
+                # it here: a route that silently delivers nothing is worse than a configuration error.
+                _require(value in SEVERITY_TAGS, f"{where}: match.tag must be one of {sorted(SEVERITY_TAGS)}")
         routes.append(
             {
                 "match": dict(match),
@@ -321,6 +457,7 @@ def config_from_document(
     # replaces them with their values.
     sources = document.get("sources") or []
     notifiers = document.get("notifiers") or []
+    credential_names = _credential_names(document)
     _require(isinstance(sources, list) and isinstance(notifiers, list), "sources/notifiers must be lists")
     for entry in (*sources, *notifiers):
         _require(
@@ -328,6 +465,21 @@ def config_from_document(
             "every source/notifier needs a string id",
         )
         _require(isinstance(entry.get("type"), str), f"{entry['id']}: missing type")
+        # An id is a name: it appears in routes, logs, the state and -- for a source -- a metric label on the
+        # unauthenticated ``/metrics`` endpoint. A whole ``${NAME}`` reference puts a credential in that
+        # position, which no reader could tell from a name, so it is refused here while a *composed* id such as
+        # ``tenant-${X}`` stays allowed. Credentials belong in a url, token or key.
+        _require(
+            _ENV_RE.fullmatch(entry["id"]) is None,
+            f"{entry['id']}: a plugin id is a name, not a whole ${{NAME}} reference",
+        )
+        # A composed id is allowed, but not from a variable that supplies a credential somewhere here: the id
+        # would publish that credential wherever an id is shown, including an unauthenticated metric label.
+        borrowed = _reference_names(entry["id"]) & credential_names
+        _require(
+            not borrowed,
+            f"{entry['id']}: an id may not be composed from a variable that supplies a credential",
+        )
         extra = set(entry) - (_SOURCE_KEYS if entry in sources else _NOTIFIER_KEYS)
         _require(not extra, f"{entry['id']}: unknown keys {sorted(extra)}")
         _require(isinstance(entry.get("enabled", True), bool), f"{entry['id']}: enabled must be a bool")
@@ -412,6 +564,7 @@ def config_from_document(
         state_path=state_path,
         hidden_source_hosts=hidden,
         adobe_commerce=_bool_option(document.get("adobe_commerce", False), "adobe_commerce"),
+        allow_private_sources=_bool_option(document.get("allow_private_sources", False), "allow_private_sources"),
         nvd_api_key=raw_nvd_key.strip(),
         routes=routes,
         default_notifiers=default_notifiers,

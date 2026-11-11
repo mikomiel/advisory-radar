@@ -19,6 +19,10 @@ class SourceSpec:
     ``required`` and ``optional`` are the keys an entry may carry besides ``id`` and ``type``. The example
     is loaded through ``load_config`` and built through ``build_source`` by the test suite, so a snippet
     here cannot rot into one nobody checked.
+
+    ``secret_keys`` names the keys the overlay refuses to store literally. A source URL is not one of them:
+    it is usually public configuration, and a URL that carries a token must be written as a ``${NAME}``
+    reference because nothing can tell the two apart.
     """
 
     kind: str
@@ -27,6 +31,8 @@ class SourceSpec:
     optional: tuple[str, ...]
     example: dict
     docs_anchor: str
+    #: Keys whose value is a credential; the overlay accepts only an environment reference for them.
+    secret_keys: tuple[str, ...] = ()
 
 
 #: Config ``type`` -> what the source is and which keys it takes; one entry per ``SOURCE_BUILDERS`` key.
@@ -56,6 +62,7 @@ SOURCE_SPECS: dict[str, SourceSpec] = {
             "user": "advisory-radar",
         },
         docs_anchor="README.md#sources",
+        secret_keys=("token",),
     ),
     "changedetection": SourceSpec(
         kind="changedetection",
@@ -70,6 +77,7 @@ SOURCE_SPECS: dict[str, SourceSpec] = {
             "tag": "advisories",
         },
         docs_anchor="README.md#sources",
+        secret_keys=("api_key",),
     ),
     "webhook": SourceSpec(
         kind="webhook",

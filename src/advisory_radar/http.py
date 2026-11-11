@@ -3,27 +3,92 @@
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
 import logging
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 
 USER_AGENT = "advisory-radar (+https://github.com/mikomiel/advisory-radar)"
 #: One Discord message holds 2000 characters; titles and bodies are capped below it.
 MESSAGE_LIMIT = 2000
 
 #: ``http(method, url, headers, body) -> (status, headers, body)``; status 0 is any network error.
-Http = "Callable[[str, str, Mapping[str, str], bytes | None], tuple[int, dict[str, str], bytes]]"
-
-from collections.abc import Callable  # noqa: E402
-
 Http = Callable[[str, str, Mapping[str, str], bytes | None], tuple[int, dict[str, str], bytes]]
 
 #: urllib buffers at most this many bytes plus one, so no response exhausts memory.
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 HTTP_TIMEOUT = 30
+
+
+def resolve_host(host: str) -> tuple[str, ...]:
+    """Every address a host resolves to, as text; empty when it cannot be resolved."""
+    return tuple(info[4][0] for info in socket.getaddrinfo(host, None))
+
+
+#: IPv6 ranges that are a wrapper around an IPv4 address: the address the connection finally reaches is the
+#: embedded one, so the embedded one is what the rule has to judge. ``::/96`` is the deprecated IPv4-compatible
+#: form, ``64:ff9b::/96`` the well-known NAT64 prefix and ``64:ff9b:1::/48`` its local-use variant, ``2002::/16``
+#: 6to4, ``2001::/32`` Teredo and ``::ffff:0:0:0/96`` the IPv4-translated form. IPv4-mapped ``::ffff:0:0/96``
+#: already reports the embedded address's own class.
+_EMBEDDED_IPV4 = tuple(
+    ipaddress.ip_network(prefix)
+    for prefix in ("::/96", "64:ff9b::/96", "64:ff9b:1::/48", "2002::/16", "2001::/32", "::ffff:0:0:0/96")
+)
+
+
+def _host_of(url: str) -> str | None:
+    """The host the transport will dial: the authority is unquoted, then userinfo and port are removed.
+
+    ``urllib.request.Request`` unquotes the whole authority *before* ``http.client`` splits it into host and
+    port, so ``http://127.0.0.1%3A8080/`` dials loopback on port 8080. Extracting the hostname first and
+    unquoting afterwards would judge ``127.0.0.1:8080`` as one unresolvable name and let it through.
+    """
+    try:
+        authority = urllib.parse.unquote(urllib.parse.urlsplit(url).netloc)
+    except ValueError:
+        return None
+    if "@" in authority:
+        authority = authority.rsplit("@", 1)[1]
+    try:
+        return urllib.parse.urlsplit(f"//{authority}").hostname
+    except ValueError:
+        return None
+
+
+def private_destination(url: str, resolve: Callable[[str], Iterable[str]] = resolve_host) -> bool:
+    """Whether this URL's host is, or resolves to, an address that is not on the public internet.
+
+    It is a guard rail against pointing this instance at a router page or a metadata service by mistake, not
+    an isolation boundary: the pass resolves the name again when it fetches, so a name whose answer changes is
+    followed, and the operator token can reach whatever the host can reach anyway. It answers a question about
+    a *form* -- checked when a source is added from the settings overlay and when a new source is probed -- and
+    a configured YAML source is never subject to it.
+    """
+    host = _host_of(url)
+    if not host:
+        return True  # a URL nobody can parse must not be fetched either
+    try:
+        addresses = tuple(resolve(host))
+    except (OSError, UnicodeError):
+        # Unresolvable is not private: the fetch fails and reports that, which is the more useful message.
+        return False
+    for address in addresses:
+        try:
+            parsed = ipaddress.ip_address(address.split("%", 1)[0])  # an IPv6 zone id is not part of the address
+        except ValueError:
+            continue
+        # ``is_global`` is the shortest statement of "routable on the public internet", and it is not enough on
+        # its own: IPv6 site-local ``fec0::/10`` and IPv4 multicast both report ``is_global`` true, and only an
+        # ``IPv6Address`` has ``is_site_local`` at all.
+        if not parsed.is_global or parsed.is_multicast or getattr(parsed, "is_site_local", False):
+            return True
+        if parsed.version == 6 and any(parsed in network for network in _EMBEDDED_IPV4):
+            return True
+    return False
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
@@ -41,6 +106,16 @@ _OPENER = urllib.request.build_opener(_NoRedirects)
 def urllib_http(
     method: str, url: str, headers: Mapping[str, str], body: bytes | None
 ) -> tuple[int, dict[str, str], bytes]:
+    try:
+        scheme = urllib.parse.urlsplit(url).scheme
+    except ValueError:
+        # A malformed URL (an unclosed IPv6 bracket) is a refused request, exactly as it was when the
+        # ``Request`` built it and raised inside the guard below.
+        return 0, {}, b""
+    if scheme not in ("http", "https"):
+        # ``urllib`` opens its other handlers too -- ``file://`` would read a local file as a feed. Every source
+        # and notifier this program talks to is HTTP(S), so any other scheme is a refused request, not a fetch.
+        return 0, {}, b""
     try:
         # Built inside the guard: a malformed URL raises a ValueError whose text carries the URL, and a URL
         # can carry a token.

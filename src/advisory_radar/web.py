@@ -20,7 +20,7 @@ import os
 import re
 import time
 import urllib.parse
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 
 import yaml
@@ -30,7 +30,8 @@ from itsdangerous import BadSignature, URLSafeSerializer
 
 from . import __version__, pipeline
 from .catalogue import SOURCE_SPECS
-from .config import Config, ConfigError, config_from_document, load_document, secret_values
+from .config import Config, ConfigError, config_from_document, expand_entry, load_document, secret_values
+from .http import Http, private_destination, resolve_host, urllib_http
 from .notifiers import NOTIFIER_BUILDERS
 from .runtime import Runtime
 from .settings import (
@@ -43,6 +44,7 @@ from .settings import (
 from .settings import (
     fingerprint as settings_fingerprint,
 )
+from .sources import build_source
 from .state import LockBusy, SourceError
 
 LOG = logging.getLogger("advisory_radar")
@@ -137,6 +139,8 @@ button:hover,.btn:hover{background:var(--hover)}
 .btn-quiet:hover{color:var(--ink)}
 label{display:grid;gap:.3rem;color:var(--muted);font-size:12px}
 label>input:not([type='checkbox']),label>select,label>textarea{width:100%}
+label.inline{display:flex;align-items:center;gap:.45rem;margin:.15rem 0}
+label.inline>input{flex:1;min-width:6rem}
 input,select,textarea{max-width:100%;padding:.35rem .5rem;border:1px solid var(--control);border-radius:2px;
 background:var(--surface);color:var(--ink);font-family:inherit;font-size:14px}
 input[type='checkbox']{width:1rem;height:1rem;padding:0;accent-color:var(--ink)}
@@ -290,6 +294,22 @@ def _public_url(url: str) -> str:
     if not parts.scheme or not parts.hostname:
         return ""
     return f"{parts.scheme}://{parts.hostname}"
+
+
+#: Why a source added from the settings overlay may not point into a private network. One wording, so the probe
+#: and the save form cannot drift.
+PRIVATE_SOURCE_REFUSAL = (
+    "this address is on a private network, and a source added on this page may not point there; "
+    "add it in config.yml, or set allow_private_sources: true"
+)
+
+
+def _url_scheme(url: str) -> str:
+    """The scheme of a URL a person typed, or "" when it cannot be parsed as one."""
+    try:
+        return urllib.parse.urlsplit(url).scheme
+    except ValueError:
+        return ""
 
 
 def _number(value: object, default: int = 0) -> int:
@@ -753,6 +773,14 @@ FORM_BODY_LIMIT = 64 * 1024
 #: Notifier keys the /config form edits. None of them carries a credential: a secret-bearing key is
 #: written only as an environment reference, and ``headers`` is not writable at all.
 NOTIFIER_FORM_KEYS = ("topic", "priority", "host", "port", "from", "to", "username", "use_tls", "implicit_tls")
+#: Every editable key of a built-in source kind, so the "new source" block offers one field per key rather than
+#: one form per kind. Which of them the chosen kind actually reads comes from the catalogue.
+SOURCE_FORM_KEYS = tuple(
+    sorted(
+        {key for spec in SOURCE_SPECS.values() for key in (*spec.required, *spec.optional)}
+        - {"id", "type", "enabled", "tag"}
+    )
+)
 #: The one secret-bearing key the "new notifier" row fills, per type. ``apprise`` (url+password) and
 #: ``gotify`` (url+token) need two references each, so they are added by editing the YAML.
 NEW_NOTIFIER_REFERENCE = {
@@ -872,16 +900,21 @@ def create_app(
     *,
     run_pass: Callable[..., int] | None = None,
     clock: Callable[[], float] = time.time,
+    http: Http = urllib_http,
+    resolve: Callable[[str], Iterable[str]] = resolve_host,
 ) -> FastAPI:
     """The web UI over one live configuration.
 
     ``runtime`` is the process's :class:`~advisory_radar.runtime.Runtime`; pages read ``runtime.cfg``
     and the intake looks the configured sources up per request, so a reload applies without a
     restart. A bare :class:`Config` is wrapped in a runtime that never reloads, for a caller that
-    constructs the app from an already-loaded config.
+    constructs the app from an already-loaded config. ``http`` is the transport a source probe uses; it is
+    injectable so a test can answer without a network.
     """
     if not isinstance(runtime, Runtime):
-        runtime = Runtime.from_config(runtime)
+        # The environment is kept: a bare Config's document is already expanded, but a form value the operator
+        # types into it still has to resolve against the same environment the configuration did.
+        runtime = Runtime.from_config(runtime, environment=dict(env))
     app = FastAPI(title="advisory-radar", docs_url=None, redoc_url=None)
     auth = Auth(env.get("ADVISORY_RADAR_AUTH_TOKEN", ""))
 
@@ -1460,25 +1493,429 @@ def create_app(
             )
         return "".join(rows)
 
-    def source_form_entries(entries) -> str:
-        """One row per configured source: its id and type, its enabled flag and its tag."""
-        rows = []
-        for entry in entries:
-            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
-                continue
-            identifier = entry["id"]
-            checked = " checked" if entry.get("enabled", True) is not False else ""
-            # The origin only: a source URL can carry a token in its userinfo, query or path.
-            public = _public_url(str(entry.get("url", "")))
-            rows.append(
-                f"<tr><td><b>{esc(identifier)}</b> <span class='muted'>{esc(entry.get('type', ''))}</span>"
-                + (f"<br><span class='muted small'>{esc(public)}</span>" if public else "")
-                + f"</td><td><input type='checkbox' name='enabled:{esc(identifier)}' value='1'{checked} "
-                f"aria-label='Enabled {esc(identifier)}'></td>"
-                f"<td><input type='text' name='tag:{esc(identifier)}' value='{esc(entry.get('tag', ''))}' "
-                f"aria-label='Tag for {esc(identifier)}'></td></tr>"
+    def source_spec(entry: dict):
+        """The catalogue entry for a configured source, or None for a type the catalogue does not know."""
+        kind = entry.get("type")
+        return SOURCE_SPECS.get(kind) if isinstance(kind, str) else None
+
+    def added_source_ids(settings: dict) -> set[str]:
+        """The ids the overlay itself adds; a configured row outside this set belongs to the YAML."""
+        added = settings.get("sources_added")
+        if not isinstance(added, list):
+            return set()
+        return {entry["id"] for entry in added if isinstance(entry, dict) and isinstance(entry.get("id"), str)}
+
+    def source_keys(spec) -> tuple[str, ...]:
+        """The editable keys of one kind: everything it declares except the id, type, enable flag and tag."""
+        return tuple(key for key in (*spec.required, *spec.optional) if key not in ("id", "type", "enabled", "tag"))
+
+    def saved_source_entries(overlay: dict) -> list[dict]:
+        """The merged source list the forms edit: every YAML entry plus every entry the overlay adds."""
+        document, _ = form_document(overlay)
+        sources = document.get("sources") if isinstance(document, dict) else None
+        return [entry for entry in (sources or []) if isinstance(entry, dict) and isinstance(entry.get("id"), str)]
+
+    def page_title(text: str) -> str:
+        """A page title with the configuration's secrets removed; ``page()`` escapes what it is given.
+
+        A title is not exempt from the rule the body follows: on the live path the submitted id is the expanded
+        one, so it can be a value a reference was meant to keep out of sight.
+        """
+        return pipeline.redact(text, secret_values(runtime.cfg))
+
+    def safe_text(value: object) -> str:
+        """A configuration-derived value rendered as text: redacted against the secrets, then escaped.
+
+        Diagnostics compare expanded values; what they *show* may be a reference, an id from the live snapshot or
+        a document that was already expanded (a bare ``Config`` runtime keeps one). Redacting every one of them
+        is cheaper than reasoning per call site about which document it came from.
+        """
+        return esc(pipeline.redact(str(value), secret_values(runtime.cfg)))
+
+    def expand_text(value: object) -> str:
+        """A configured string as the loader will use it, or as written when a reference cannot resolve."""
+        if not isinstance(value, str) or not value:
+            return ""
+        try:
+            return str(expand_entry({"value": value}, runtime.environment).get("value") or value)
+        except ConfigError:
+            return value
+
+    def effective_id(entry: dict) -> str:
+        """The id this configured entry occupies once its references are expanded."""
+        return expand_text(entry["id"]) or entry["id"]
+
+    def source_entry_by_id(overlay: dict, identifier: str, *, effective: bool) -> dict | None:
+        """The configured entry the submitted id names, looked up the way the page that submitted it renders.
+
+        ``/config`` renders the YAML as written, so its Test button submits a raw id, and raw ids are unique.
+        ``/sources`` renders the expanded configuration and lists the enabled sources only, so its button
+        submits an effective id and the lookup is limited to what that page could have shown -- otherwise a
+        disabled entry whose reference expands to the same value could shadow the row that was clicked.
+        """
+        candidates = saved_source_entries(overlay)
+        if effective:
+            candidates = [entry for entry in candidates if entry.get("enabled", True) is not False]
+            return next((entry for entry in candidates if effective_id(entry) == identifier), None)
+        return next((entry for entry in candidates if entry["id"] == identifier), None)
+
+    def derive_source_id(url: str, kind: str, taken: set[str]) -> str:
+        """A stable id from a source URL's host, unique against the ids already configured.
+
+        Deterministic on purpose: the same URL added twice yields the same base and takes the next free suffix,
+        so the operator can recognise the row and a collision can never silently take over another source.
+        """
+        try:
+            host = urllib.parse.urlsplit(url).hostname
+        except ValueError:
+            host = None  # a URL nobody can parse still yields a usable id; the fetch reports the rest
+        base = re.sub(r"[^a-z0-9]+", "-", (host or kind).lower()).strip("-")[:40] or kind
+        identifier, suffix = base, 1
+        while identifier in taken:
+            suffix += 1
+            identifier = f"{base}-{suffix}"
+        return identifier
+
+    def effective_plugin_ids(overlay: dict) -> set[str]:
+        """Every id the configuration occupies, sources and notifiers alike, as the validator will see them.
+
+        A derived id has to miss these, not merely the ids written in the file: an id is unique across both
+        plugin kinds, an entry written ``${FEED_ID}`` occupies the value it expands to, and a *disabled*
+        entry's raw id still takes part in the validator's raw-id check. Reserving the expanded ids of disabled
+        entries too is therefore deliberately conservative: a wasted suffix is cheaper than a save refused after
+        the operator has typed everything else.
+        """
+        document, _ = form_document(overlay)
+        ids: set[str] = set()
+        for key in ("sources", "notifiers"):
+            entries = document.get(key) if isinstance(document, dict) else None
+            for entry in entries or []:
+                if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+                    ids.add(effective_id(entry))
+        return ids
+
+    def new_source_from_form(form: dict[str, list[str]]) -> tuple[dict | None, str]:
+        """The source the "new source" block describes, or why it cannot be one yet.
+
+        Only the keys the chosen kind declares are kept: the block shows every kind's keys, so a value left in a
+        field another kind reads must not become a key this source ignores.
+        """
+        kind = first(form, "new:type").strip()
+        spec = SOURCE_SPECS.get(kind)
+        if spec is None:
+            return None, f"{kind or 'the new source'} is not a built-in source type"
+        entry: dict = {"type": kind}
+        for key in source_keys(spec):
+            value = first(form, f"new:{key}").strip()
+            if value:
+                entry[key] = value
+        identifier = first(form, "new:id").strip()
+        if not identifier and "url" in entry:
+            identifier = derive_source_id(entry["url"], kind, effective_plugin_ids(saved_overlay()[0]))
+        if identifier:
+            if "$" in identifier:
+                # An id becomes a page value and a metric label; a reference there would publish its value.
+                return None, "the id must be literal text, not a ${NAME} reference"
+            entry["id"] = identifier
+        if not entry.get("id"):
+            return None, "the new source needs an id, or a url to derive one from"
+        missing = [key for key in spec.required if not entry.get(key)]
+        if missing:
+            return None, f"{kind} needs {', '.join(missing)}"
+        return entry, ""
+
+    def new_source_used(form: dict[str, list[str]]) -> bool:
+        """Whether anything was typed into the "new source" block at all."""
+        return any(first(form, name).strip() for name in ("new:id", *(f"new:{key}" for key in SOURCE_FORM_KEYS)))
+
+    def added_source_fields(entry: dict, spec) -> str:
+        """The editable keys of one added source, as inline inputs.
+
+        The stored value is shown, not the origin: an operator fixing a feed path needs the whole URL. A URL
+        that carries a credential must be written as a ``${NAME}`` reference; the validator treats ``url`` as
+        ordinary configuration and cannot tell the two apart.
+        """
+        if spec is None:
+            return "<span class='muted small'>unknown type</span>"
+        cells = []
+        for key in source_keys(spec):
+            reference = " placeholder='${NAME}'" if key in spec.secret_keys else ""
+            value = str(entry.get(key, "") or "")
+            cells.append(
+                f"<label class='inline'>{esc(key)}"
+                f"<input type='text' name='added_{esc(key)}:{esc(entry['id'])}' value='{esc(value)}'"
+                f"{reference}></label>"
             )
-        return "".join(rows)
+        return "".join(cells)
+
+    def source_row(entry: dict, *, added: bool) -> str:
+        """One configured source: id, kind, origin, enable flag, watch tag, its keys and a probe button.
+
+        The row's fields belong to the save form; its ``Test`` button submits the same body to the probe endpoint
+        through ``formaction``, so one form serves both and no nested form is needed.
+        """
+        identifier = entry["id"]
+        spec = source_spec(entry)
+        checked = " checked" if entry.get("enabled", True) is not False else ""
+        # The origin only, redacted: a source URL can carry a token in its userinfo, query, path or host, and
+        # a runtime built from a bare Config renders the document it was given, which is already expanded.
+        public = redacted_origin(entry.get("url", ""), secret_values(runtime.cfg))
+        origin = f"<br><span class='muted small'>{esc(public)}</span>" if public else ""
+        badge = f"{_badge('added', 'neutral')} " if added else ""
+        editable = (
+            f"<td>{added_source_fields(entry, spec)}</td>"
+            if added
+            else "<td><span class='muted small'>keys in the YAML</span></td>"
+        )
+        remove = (
+            f"<td><input type='checkbox' name='remove:{esc(identifier)}' value='1' "
+            f"aria-label='Remove {esc(identifier)}'></td>"
+            if added
+            else "<td></td>"
+        )
+        return (
+            f"<tr><td>{badge}<b>{esc(identifier)}</b> <span class='muted'>{esc(str(entry.get('type', '')))}</span>"
+            f"{origin}</td>"
+            f"<td><input type='checkbox' name='enabled:{esc(identifier)}' value='1'{checked} "
+            f"aria-label='Enabled {esc(identifier)}'></td>"
+            f"<td><input type='text' name='tag:{esc(identifier)}' value='{esc(str(entry.get('tag') or ''))}' "
+            f"aria-label='Watch tag for {esc(identifier)}'></td>"
+            f"{editable}{remove}"
+            f"<td><button class='btn' type='submit' formaction='/config/sources/probe' "
+            f"name='id' value='{esc(identifier)}' title='fetches the saved values, not unsaved edits'>"
+            f"Test</button></td></tr>"
+        )
+
+    def source_form_entries(entries, added_ids: set[str]) -> str:
+        """One row per configured source, marking the ones the overlay adds as editable there."""
+        return "".join(
+            source_row(entry, added=entry["id"] in added_ids)
+            for entry in entries
+            if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+        )
+
+    def new_source_fields() -> str:
+        """The "new source" inputs: one per editable key, labelled with the kinds that read it."""
+        readers: dict[str, list[str]] = {}
+        secret: set[str] = set()
+        for spec in SOURCE_SPECS.values():
+            for key in source_keys(spec):
+                readers.setdefault(key, []).append(spec.kind)
+                if key in spec.secret_keys:
+                    secret.add(key)
+        return "".join(
+            f"<label>{esc(key)} <span class='muted small'>({esc(', '.join(sorted(readers[key])))})</span>"
+            f"<input type='text' name='new:{esc(key)}'{' placeholder=${{NAME}}' if key in secret else ''}></label>"
+            for key in sorted(readers)
+        )
+
+    def submitted_fields(form: dict[str, list[str]], prefix: str) -> str:
+        """Re-emit one block of a submitted form as hidden inputs, so a second form can carry it on unchanged."""
+        return "".join(
+            f"<input type='hidden' name='{esc(name)}' value='{esc(value)}'>"
+            for name in sorted(form)
+            if name.startswith(prefix)
+            for value in form[name][:1]
+        )
+
+    def redacted_origin(link: object, secrets: Sequence[str]) -> str:
+        """A link's origin with every secret removed, or a marker when removing one left nothing showable.
+
+        The redaction runs on the whole value *before* the origin is extracted: extracting lowercases a
+        hostname and would transform a reflected credential into a string the redactor no longer matches. A
+        redacted host is left bracketed (``[redacted].example.net``), which is not a URL any more, so the
+        fallback is the marker alone rather than a fabricated origin.
+        """
+        text = str(link or "")
+        redacted = pipeline.redact(text, secrets)
+        if redacted == text:
+            return _public_url(text)
+        return _public_url(redacted) or "[redacted]"
+
+    def probe_window(window, secrets: Sequence[str]) -> str:
+        """What one probe answered: the entry count, the truncation flag and the first few items.
+
+        A title is a value the *source* chose: a feed can echo a request token back in one, so every rendered
+        field is redacted before it is truncated and escaped, exactly as an error message is.
+        """
+        items = list(window.items)
+        rows = "".join(
+            f"<tr><td>{esc(_short(pipeline.redact(item.title, secrets), 80))}</td>"
+            f"<td class='mono nowrap'>{esc(_when(item.published))}</td>"
+            f"<td>{esc(redacted_origin(item.link, secrets))}</td></tr>"
+            for item in items[:5]
+        )
+        table = (
+            "<div class='scroll'><table><tr><th scope='col'>Title</th><th scope='col'>Published</th>"
+            f"<th scope='col'>Link</th></tr>{rows}</table></div>"
+            if items
+            else "<p class='muted'>The source answered, but its window holds no entries.</p>"
+        )
+        truncated = (
+            "<p class='muted small'>This export is truncated: it reports fewer entries than the source holds.</p>"
+            if window.truncated
+            else ""
+        )
+        return _notice(f"Answered with {len(items)} entr{'y' if len(items) == 1 else 'ies'}.", "ok") + truncated + table
+
+    def added_source_error(entry: dict) -> str:
+        """Why a source added on this page may not be used, or "" when it may.
+
+        The check runs on the *expanded* entry: ``${INTERNAL_HOST}`` is not a hostname, and the address it
+        resolves to is the one the fetcher would contact. The stored entry keeps its references. A kind with no
+        remote side (``webhook``) has no destination to judge.
+        """
+        try:
+            expanded = expand_entry(entry, runtime.environment)
+        except ConfigError as exc:
+            return str(exc)  # a missing variable is named by name, never by value
+        url = expanded.get("url")
+        if not isinstance(url, str) or not url:
+            return ""
+        if _url_scheme(url) not in ("http", "https"):
+            return "that source url is not an http or https url"
+        if runtime.cfg.allow_private_sources or not private_destination(url, resolve):
+            return ""
+        return PRIVATE_SOURCE_REFUSAL
+
+    def display_type(entry: dict) -> str:
+        """The type to show: the kind in use when it is one, else the value as written.
+
+        A ``type: ${SOME_KIND}`` that names a built-in shows the kind; one that resolves to anything else -- a
+        disabled entry is never expanded by a configuration load, so it can hold any reference -- is shown as
+        written rather than as resolved.
+        """
+        effective = expand_text(entry.get("type"))
+        return effective if effective in SOURCE_SPECS else str(entry.get("type", ""))
+
+    def probe_source(entry: dict, *, adding: bool, expand: bool = True) -> tuple[bool, str]:
+        """Fetch one source entry the way a pass would, and render what it answered. Nothing is written.
+
+        A probe can hold a source that was never saved, so the values it resolves are redacted together with the
+        configuration's own secrets -- in an error *and* in what the source answered.
+
+        ``adding`` marks the case this page has in common with the save form: a source that is not in the YAML
+        yet. Only that case is subject to the private-destination rule, because only that case is reachable
+        with the UI token alone.
+        """
+        resolved: list[str] = []
+        if not expand:
+            # A live entry was expanded when the configuration loaded, and expansion is not recursive: doing it
+            # again would resolve a reference that was part of a *value*, so the probe could fetch a different
+            # URL from the one the pass fetched.
+            expanded = dict(entry)
+        else:
+            try:
+                # Expanded before anything is judged: ``url: ${FEED_URL}`` and ``type: ${SOURCE_KIND}`` are
+                # configured values, and a missing variable must be named as one.
+                expanded = expand_entry(entry, runtime.environment, resolved)
+            except Exception as exc:
+                message = pipeline.redact(f"{type(exc).__name__}: {exc}", [*secret_values(runtime.cfg), *resolved])
+                return False, _notice(esc(message), "critical")
+        secrets = [*secret_values(runtime.cfg), *resolved]
+        kind = expanded.get("type")
+        spec = SOURCE_SPECS.get(kind) if isinstance(kind, str) else None
+        if spec is None:
+            # As written, not as expanded: a disabled entry may carry ``type: ${SOMETHING}``, and rendering the
+            # resolved value here would publish it.
+            return False, _notice(f"{safe_text(entry.get('type', ''))} is not a built-in source type.", "critical")
+        if kind == "webhook":
+            # Redacted with this probe's resolutions: a disabled source was never expanded by a load, so the
+            # configuration's own secret list does not carry the value just resolved here.
+            identifier = esc(pipeline.redact(str(expanded.get("id", "")), secrets))
+            return False, _notice(
+                "A webhook source has no remote side to read: push an item to "
+                f"<code>/webhooks/{identifier}</code> with the bearer secret.",
+                "warning",
+            )
+        url = expanded.get("url")
+        if not isinstance(url, str) or not url:
+            return False, _notice("This source has no url to fetch.", "critical")
+        scheme = _url_scheme(url)
+        if not scheme:
+            return False, _notice("That url cannot be read as a URL.", "critical")
+        if scheme not in ("http", "https"):
+            return False, _notice("Only http and https URLs can be fetched.", "critical")
+        if adding and not runtime.cfg.allow_private_sources and private_destination(url, resolve):
+            return False, _notice(esc(PRIVATE_SOURCE_REFUSAL), "critical")
+        try:
+            window = build_source(expanded, runtime.environment).fetch(http, {})
+        except Exception as exc:  # a probe reports every failure the pass would meet, and never a traceback
+            message = pipeline.redact(f"{type(exc).__name__}: {exc}", secrets)
+            return False, _notice(esc(message), "critical")
+        return True, probe_window(window, secrets)
+
+    def probe_result(request: Request, form: dict[str, list[str]], *, active: str) -> HTMLResponse:
+        """The probe result page: one configured source by id, or the fields of a source that is not saved yet."""
+        back = active if active in ("/config", "/sources") else "/config"
+        identifier = first(form, "id").strip()
+        add_form = ""
+        if identifier:
+            settings = saved_overlay()[0]
+            # ``/sources`` shows the live snapshot, so it probes the live snapshot: a saved overlay that could
+            # not be applied yet must not make a row fetch something other than the row says. ``/config`` edits
+            # the saved overlay, so it looks up what it renders -- a raw row id.
+            on_sources_page = active == "/sources"
+            if on_sources_page:
+                entry = next(
+                    (candidate for candidate in runtime.cfg.sources if candidate.get("id") == identifier), None
+                )
+            else:
+                entry = source_entry_by_id(settings, identifier, effective=False)
+            if entry is None:
+                return page(
+                    "Source probe",
+                    _notice(f"No configured source has id {safe_text(identifier)}.", "critical")
+                    + f"<p><a href='{back}'>Back</a></p>",
+                    active=active,
+                    actions=sign_out_form(request),
+                    status_code=404,
+                )
+            # Ownership, not "already saved": a disabled overlay source is still a source this page added, and
+            # probing it must not become the way around the destination rule. It is read off the entry that was
+            # selected, never off the submitted value, or the two could disagree.
+            ok, detail = probe_source(
+                entry,
+                adding=entry["id"] in added_source_ids(settings),
+                # Expanded exactly as often as the loader did: the live snapshot always is, the merged document
+                # of a file-backed runtime is not, and a bare ``Config`` runtime keeps the expanded one.
+                expand=runtime.config_path is not None and not on_sources_page,
+            )
+            tone = _badge("answered", "ok") if ok else _badge("failed", "critical")
+            heading = (
+                f"<h2>{safe_text(identifier)} <span class='muted'>{safe_text(display_type(entry))}</span> {tone}</h2>"
+                "<p class='muted small'>A configured source; the probe reads it and delivers nothing.</p>"
+            )
+            title = page_title(f"{identifier} probe")
+        else:
+            entry, problem = new_source_from_form(form)
+            if entry is None:
+                return page(
+                    "Source probe",
+                    _notice(esc(problem[:1].upper() + problem[1:]), "warning") + f"<p><a href='{back}'>Back</a></p>",
+                    active=active,
+                    actions=sign_out_form(request),
+                    status_code=400,
+                )
+            ok, detail = probe_source(entry, adding=True)
+            tone = _badge("answered", "ok") if ok else _badge("failed", "critical")
+            heading = (
+                f"<h2>New {safe_text(display_type(entry))} source {tone}</h2>"
+                "<p class='muted small'>Not saved yet: the probe fetched it with the values from the form.</p>"
+            )
+            # The probed values are carried into a real save, so a working probe is one click from being stored.
+            add_form = (
+                "<h2>Add this source</h2>"
+                "<p class='muted small'>Saving stores these values in the settings overlay; the source is polled "
+                "from the next pass.</p>"
+                f"<form method='post' action='/config/sources'>{csrf_field(request)}"
+                f"<input type='hidden' name='fingerprint' value='{esc(first(form, 'fingerprint'))}'>"
+                f"{submitted_fields(form, 'new:')}"
+                "<button class='btn btn-primary'>Add this source</button></form>"
+            )
+            title = "Source probe"
+        body = heading + detail + add_form + f"<p><a href='{back}'>&larr; Back</a></p>"
+        return page(title, body, active=active, actions=sign_out_form(request))
 
     def notifier_choices(entries) -> list[tuple[str, bool]]:
         """Every configured notifier id with its enabled flag; a route may only select an enabled one."""
@@ -1520,14 +1957,16 @@ def create_app(
             ) + "".join(f"<option value='{esc(value)}' selected>{esc(value)} (reference)</option>" for value in extra)
             rows.append(
                 f"<tr><td><input type='text' name='route:{index}:source' "
-                f"value='{esc(match.get('source', ''))}' placeholder='source id' "
+                # ``safe_text``: a runtime built from a bare Config renders the already-expanded document, and
+                # this field is a view of it. On the file-backed path the value is a reference and is unchanged.
+                f"value='{safe_text(match.get('source', ''))}' placeholder='source id' "
                 f"aria-label='Rule {index} source id'></td>"
                 f"<td><select name='route:{index}:tag' aria-label='Rule {index} tag'>{tag_options}</select></td>"
                 f"<td><input type='text' name='route:{index}:product' "
-                f"value='{esc(match.get('product', ''))}' placeholder='product id' "
+                f"value='{safe_text(match.get('product', ''))}' placeholder='product id' "
                 f"aria-label='Rule {index} product id'></td>"
                 f"<td><input type='text' name='route:{index}:ids' "
-                f"value='{esc(match.get('ids', ''))}' placeholder='CVE-2026-*' "
+                f"value='{safe_text(match.get('ids', ''))}' placeholder='CVE-2026-*' "
                 f"aria-label='Rule {index} ids pattern'></td>"
                 f"<td><select name='route:{index}:notifiers' multiple size='2' "
                 f"aria-label='Rule {index} notifiers'>{options}</select></td></tr>"
@@ -1639,17 +2078,108 @@ def create_app(
             stale = stale_form(request, form, base)
             if stale is not None:
                 return stale
-            changes = {}
-            for entry in base.get("sources") or []:
-                if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
-                    continue
-                identifier = entry["id"]
-                changes[identifier] = {
-                    "enabled": f"enabled:{identifier}" in form,
-                    "tag": first(form, f"tag:{identifier}").strip(),
-                }
-            overlay["sources"] = changes
+            # A row is only reconciled by a submission that rendered rows: every row submits at least its tag
+            # field, even when the box is unchecked and the text is cleared. The probe result page's "Add this
+            # source" form carries only the new block, and reconciling from it would read every row's absence as
+            # a deliberate disable and clear.
+            whole = any(name.startswith(("enabled:", "tag:", "remove:", "added_")) for name in form)
+            owned = added_source_ids(overlay)
+            if whole:
+                changes = {}
+                for entry in base.get("sources") or []:
+                    if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                        continue
+                    identifier = entry["id"]
+                    if identifier in owned:
+                        continue  # an added source is stored whole, below; two owners for one row would drift
+                    changes[identifier] = {
+                        "enabled": f"enabled:{identifier}" in form,
+                        "tag": first(form, f"tag:{identifier}").strip(),
+                    }
+                overlay["sources"] = changes
+            added: list[dict] = []
+            error = ""
+            stored = [entry for entry in (overlay.get("sources_added") or []) if isinstance(entry, dict)]
+            if not whole:
+                added = [dict(entry) for entry in stored]
+            else:
+                for entry in stored:
+                    if not isinstance(entry.get("id"), str):
+                        continue
+                    identifier = entry["id"]
+                    if f"remove:{identifier}" in form:
+                        continue
+                    updated = dict(entry)
+                    updated["enabled"] = f"enabled:{identifier}" in form
+                    tag = first(form, f"tag:{identifier}").strip()
+                    if tag:
+                        updated["tag"] = tag
+                    else:
+                        updated.pop("tag", None)
+                    spec = source_spec(updated)
+                    if spec is not None:
+                        for key in source_keys(spec):
+                            name = f"added_{key}:{identifier}"
+                            if name not in form:
+                                continue  # the row did not carry this field: keep what is stored
+                            value = first(form, name).strip()
+                            if value:
+                                updated[key] = value
+                            else:
+                                updated.pop(key, None)
+                    # Only what will actually run is judged: a disabled source is not built and not fetched, so
+                    # neither a missing key nor a destination that has since become internal may stop it being
+                    # disabled -- that would leave the operator unable to switch off a source they cannot edit.
+                    if spec is not None and updated["enabled"]:
+                        missing = [key for key in spec.required if not updated.get(key)]
+                        if missing:
+                            # Refused here, in words: letting the builder raise would report a bare KeyError.
+                            error = f"{identifier}: {spec.kind} needs {', '.join(missing)}"
+                            break
+                        problem = added_source_error(updated)
+                        if problem:
+                            error = f"{identifier}: {problem}"
+                            break
+                    added.append(updated)
+            if not whole and not new_source_used(form):
+                error = "this form carried no source to save"
+            if not error and new_source_used(form):
+                candidate, problem = new_source_from_form(form)
+                error = problem
+                if candidate is not None:
+                    if candidate["id"] in {entry.get("id") for entry in (base.get("sources") or [])}:
+                        error = f"source id {candidate['id']!r} is already configured; pick another id"
+                    else:
+                        error = added_source_error(candidate)
+                    if not error:
+                        added.append(candidate)
+            if error:
+                return page(
+                    "Not saved",
+                    _notice(esc(error), "critical") + "<p><a href='/config'>Back to configuration</a></p>",
+                    active="/config",
+                    actions=sign_out_form(request),
+                    status_code=400,
+                )
+            if added:
+                overlay["sources_added"] = added
+            else:
+                overlay.pop("sources_added", None)
             return commit_overlay(request, overlay)
+
+    @app.post("/config/sources/probe", dependencies=[Depends(require_csrf)])
+    def probe_config_source(request: Request):
+        """Probe one source from the configuration form: a configured row, or the fields of a new one."""
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        return probe_result(request, form_body(request), active="/config")
+
+    @app.post("/sources/probe", dependencies=[Depends(require_csrf)])
+    def probe_configured_source(request: Request):
+        """Probe one configured source from the sources page; it reads the source and writes nothing."""
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        return probe_result(request, form_body(request), active="/sources")
 
     @app.post("/config/notifiers", dependencies=[Depends(require_csrf)])
     def save_notifiers_form(request: Request):
@@ -1859,6 +2389,30 @@ def create_app(
         routes = routes if isinstance(routes, list) else []
         defaults = document.get("default")
         defaults = defaults if isinstance(defaults, list) else []
+        added_ids = added_source_ids(dict(saved_document["settings"]))
+        source_type_options = "".join(
+            f"<option value='{esc(kind)}'>{esc(kind)}</option>" for kind in sorted(SOURCE_SPECS)
+        )
+        # Compared as the loader will see them: routing matches expanded values, and so does the warning.
+        configured_source_ids = {
+            effective_id(entry) for entry in sources if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+        }
+        route_warnings = []
+        for index, route in enumerate(routes, start=1):
+            match = route.get("match") if isinstance(route, dict) else None
+            written = match.get("source") if isinstance(match, dict) else None
+            identifier = expand_text(written)
+            if identifier and identifier not in configured_source_ids:
+                # A rule for a source nobody configured can never fire. Staging a rule before its source is
+                # legitimate, so this is reported rather than refused -- unlike an unknown tag, which no
+                # configuration could ever match.
+                route_warnings.append(
+                    # The comparison needs the expanded value; the message shows what was written, which is a
+                    # reference as often as a name -- and a reference is never a credential.
+                    f"<li>Rule {index} matches source <code>{safe_text(written)}</code>, which no configured source "
+                    "has: it stays inert until that source exists.</li>"
+                )
+        route_notice = _notice(f"<ul>{''.join(route_warnings)}</ul>", "warning") if route_warnings else ""
         banner = ""
         if saved is not None:
             if live_now and saved == live_revision:
@@ -1901,11 +2455,29 @@ def create_app(
             "<p class='muted small'>Poll interval: 15m, 30s or 12h.</p>"
             "<button class='btn btn-primary'>Save settings</button></form>"
             "<h2><span class='sec-num'>02</span>Sources</h2>"
+            "<p class='muted small'>A source defined in the YAML keeps its keys there: this page edits its enable "
+            "flag and its watch tag, and can test it. A source added here is stored whole in the settings overlay, "
+            "so it needs no edit to a read-only config mount. The watch tag scopes a changedetection.io poll and "
+            "is ignored by the other kinds.</p>"
             f'<form method="post" action="/config/sources">{csrf}{fingerprint_field}'
             "<div class='scroll'><table><tr><th scope='col'>Source</th>"
             "<th scope='col' class='narrow'>Enabled</th>"
-            f"<th scope='col' class='tag-col'>Tag</th></tr>{source_form_entries(sources)}</table></div>"
-            "<button class='btn btn-primary'>Save sources</button></form>"
+            "<th scope='col' class='tag-col'>Watch tag</th>"
+            "<th scope='col'>Keys</th>"
+            "<th scope='col' class='narrow'>Remove</th>"
+            "<th scope='col' class='narrow'>Test</th>"
+            f"</tr>{source_form_entries(sources, added_ids)}</table></div>"
+            "<h3>New source</h3>"
+            "<div class='fields'><label>id <span class='muted small'>(optional)</span>"
+            "<input type='text' name='new:id'></label>"
+            f"<label>type<select name='new:type'>{source_type_options}</select></label></div>"
+            f"<div class='fields'>{new_source_fields()}</div>"
+            "<p class='muted small'>An id is derived from the URL host when it is empty. A field another kind "
+            "reads is ignored. A secret key takes a ${NAME} or ${NAME_FILE} reference and is stored instead of "
+            "the value.</p>"
+            "<button class='btn btn-primary'>Save sources</button> "
+            "<button class='btn' type='submit' formaction='/config/sources/probe'>Test the new source</button>"
+            "</form>"
             "<h2><span class='sec-num'>03</span>Notifiers</h2>"
             f'<form method="post" action="/config/notifiers">{csrf}{fingerprint_field}'
             f"{notifier_form_entries(notifiers)}"
@@ -1923,6 +2495,7 @@ def create_app(
             f'<form method="post" action="/config/routes">{csrf}{fingerprint_field}'
             f"{route_form_entries(routes, defaults, notifier_choices(notifiers))}"
             "<button class='btn btn-primary'>Save routes</button></form>"
+            f"{route_notice}"
             "<p class='muted small'>The YAML file stays the source of every other setting; environment changes "
             "still need a restart.</p>"
         )
@@ -1930,28 +2503,77 @@ def create_app(
 
     @app.get("/sources", response_class=HTMLResponse)
     def sources_page(request: Request):
-        """The whole built-in catalogue, rendered from its one owner, plus what this instance configured."""
+        """What this instance monitors and whether each source answers, plus the built-in catalogue.
+
+        The state column is the state's own record of the last fetch. Run history says a pass finished, not that a
+        feed answered, so one broken source needs its own line here -- and its own metric for a scraper.
+        """
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
+        csrf = csrf_field(request)
+        try:
+            stored_health = load_state().get("source_health")
+        except SourceError:
+            stored_health = None
+        health = stored_health if isinstance(stored_health, dict) else {}
+        added_ids = added_source_ids(saved_overlay()[0])
         rows = []
+        for source in runtime.cfg.sources:
+            identifier = str(source.get("id", ""))
+            record = health.get(identifier)
+            record = record if isinstance(record, dict) else {}
+            kind = str(source.get("type", ""))
+            origin = redacted_origin(source.get("url", ""), secret_values(runtime.cfg))
+            badge = f" {_badge('added', 'neutral')}" if identifier in added_ids else ""
+            tone = (
+                "<span class='muted small'>not polled yet</span>"
+                if not record
+                else (_badge("ok", "ok") if record.get("ok") else _badge("failing", "critical"))
+            )
+            error = pipeline.redact(str(record.get("error") or ""), secret_values(runtime.cfg))
+            # 0 is the state's "never", not midnight 1970: a source that has not succeeded must say so.
+            attempt = _when(record.get("at")) if record.get("at") else "never"
+            success = _when(record.get("ok_at")) if record.get("ok_at") else "never"
+            rows.append(
+                f"<tr><td><b>{esc(identifier)}</b>{badge}<br>"
+                f"<span class='muted small'>{esc(kind)}{' · ' + esc(origin) if origin else ''}</span></td>"
+                f"<td>{tone}</td>"
+                f"<td class='mono nowrap'>{esc(attempt)}</td>"
+                f"<td class='mono nowrap'>{esc(success)}</td>"
+                f"<td class='num'>{esc(str(_number(record.get('items'))))}</td>"
+                f"<td>{esc(_short(error, 90)) if error else ''}</td>"
+                f"<td><form method='post' action='/sources/probe'>{csrf}"
+                f"<input type='hidden' name='id' value='{esc(identifier)}'>"
+                f"<button class='btn'>Test</button></form></td></tr>"
+            )
+        configured = (
+            "<div class='scroll'><table><tr><th scope='col'>Source</th><th scope='col'>State</th>"
+            "<th scope='col'>Last attempt</th><th scope='col'>Last success</th>"
+            "<th scope='col' class='narrow'>Items</th><th scope='col'>Last error</th>"
+            f"<th scope='col' class='narrow'>Test</th></tr>{''.join(rows)}</table></div>"
+            if rows
+            else _empty("No source is enabled.", "Add one on the configuration page.")
+        )
+        catalogue_rows = []
         for spec in SOURCE_SPECS.values():
             example = yaml.safe_dump(spec.example, sort_keys=False)
-            rows.append(
+            catalogue_rows.append(
                 f"<tr><td><b>{esc(spec.kind)}</b></td><td>{esc(spec.summary)}</td>"
                 f"<td>{esc(', '.join(spec.required) or '(none)')}</td>"
                 f"<td>{esc(', '.join(spec.optional) or '(none)')}</td>"
                 f"<td><pre>{esc(example)}</pre></td><td><code>{esc(spec.docs_anchor)}</code></td></tr>"
             )
-        configured = "".join(
-            f"<li><b>{esc(source['id'])}</b> ({esc(source.get('type', ''))})</li>" for source in runtime.cfg.sources
-        )
         body = (
+            "<div class='strip'><p class='muted small'>Every enabled source, when it last answered, and the error "
+            "it reported when it did not. A probe reads the source now and delivers nothing.</p>"
+            "<a class='btn' href='/config'>Add or edit a source</a></div>"
+            f"<h2>Configured sources</h2>{configured}"
+            "<h2>Built-in types</h2>"
             "<p class='muted'>Every built-in source type, its keys and an example. Required keys have no default.</p>"
             "<div class='scroll'><table><tr><th scope='col'>Kind</th><th scope='col'>Summary</th>"
             "<th scope='col'>Required</th><th scope='col'>Optional</th><th scope='col'>Example</th>"
-            f"<th scope='col'>Docs</th></tr>{''.join(rows)}</table></div>"
-            f"<h2>Configured sources</h2><ul>{configured or '<li>(none)</li>'}</ul>"
-            "<p class='muted small'>Try one without delivering anything: "
+            f"<th scope='col'>Docs</th></tr>{''.join(catalogue_rows)}</table></div>"
+            "<p class='muted small'>The same probe from a shell: "
             "<code>advisory-radar sources test &lt;id&gt;</code>.</p>"
         )
         return page("Sources", body, active="/sources", actions=sign_out_form(request))
@@ -2086,6 +2708,31 @@ def create_app(
             lines.append(f"# HELP advisory_radar_{name} {help_text}")
             lines.append(f"# TYPE advisory_radar_{name} {kind}")
             lines.append(f"advisory_radar_{name} {value}")
+        # Per-source health, labelled by the configured source id. That id is a *name*: the validator refuses a
+        # whole ``${NAME}`` reference in one, so a label cannot carry a credential, and a composed id
+        # (``tenant-${X}``) is a naming choice its author publishes in routes and logs as well. The charset is
+        # ``[A-Za-z0-9._-]+``, so a value never needs escaping, and the label set is bounded by the configuration
+        # rather than by anything a feed says. A source nobody has polled yet has no sample: absent is honest
+        # there, where 0 would claim it failed.
+        raw_health = state.get("source_health")
+        health = raw_health if isinstance(raw_health, dict) else {}
+        configured = [str(source.get("id", "")) for source in runtime.cfg.sources]
+        for name, help_text, key in (
+            ("source_up", "1 when this source's last fetch succeeded", "ok"),
+            ("source_last_success_timestamp_seconds", "When this source last answered (epoch seconds)", "ok_at"),
+            ("source_items", "Entries in this source's last window", "items"),
+        ):
+            samples = []
+            for identifier in configured:
+                record = health.get(identifier)
+                if not isinstance(record, dict):
+                    continue
+                value = int(bool(record.get(key))) if key == "ok" else _number(record.get(key))
+                samples.append(f'advisory_radar_{name}{{source="{identifier}"}} {value}')
+            if samples:
+                lines.append(f"# HELP advisory_radar_{name} {help_text}")
+                lines.append(f"# TYPE advisory_radar_{name} gauge")
+                lines.extend(samples)
         return PlainTextResponse("\n".join(lines) + "\n")
 
     #: Webhook inbox bounds: an unauthenticated or abusive caller must not be able to grow the state without

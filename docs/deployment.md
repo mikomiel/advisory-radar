@@ -63,10 +63,16 @@ answering `ok` forever.
 | `advisory_radar_last_pass_exit` / `_sent` / `_parked` / `_pending` | what the last pass did |
 | `advisory_radar_ready` | `1` when `/readyz` would answer `200` |
 | `advisory_radar_state_readable` | `1` when the state document could be read; `0` means the scrape answered with only these two gauges (every other number is unknown, not zero) |
+| `advisory_radar_source_up{source}` | `1` when that source's last fetch succeeded, `0` when it failed; absent until the source has been polled once. The label is the configured source id, which the validator keeps a name — a whole `${NAME}` reference in an id is refused |
+| `advisory_radar_source_last_success_timestamp_seconds{source}` | when that source last answered (`0` = never) |
+| `advisory_radar_source_items{source}` | entries in that source's last window |
 
 Alert on `advisory_radar_ready == 0`, `advisory_radar_parked > 0`, and — for the
 earliest signal — on `time() - advisory_radar_last_pass_timestamp_seconds`
-exceeding a few poll intervals.
+exceeding a few poll intervals. A broken feed also fails the pass and shows up in
+`advisory_radar_last_pass_exit`, but that number says a pass failed, not which feed did:
+`advisory_radar_source_up{source}` is the per-source signal, and `/sources` shows the same
+state with the error text beside it.
 
 ## Configuration
 
@@ -109,9 +115,13 @@ in the container, `~/.local/share/advisory-radar/settings.json` for the rootless
 quadlet). It is created with mode `0600`, owned by the container user, and replaced
 atomically (a temporary file in the same directory, `fsync`, `os.replace`), so a
 half-written file cannot brick a start. `/config` stays read-only: the overlay holds
-only six keys — `notifiers`, per-source `enabled`/`tag`, `poll_interval`,
-`hidden_source_hosts`, and the routing `routes`/`default` block — and the YAML owns
-everything else. While the overlay holds a
+only seven keys — `notifiers`, per-source `enabled`/`tag`, the sources it adds itself
+(`sources_added`), `poll_interval`, `hidden_source_hosts`, and the routing `routes`/`default`
+block — and the YAML owns everything else. A source the overlay adds is stored whole, may not
+share an id with one the YAML defines, must have a literal id, and may not point into a private
+network unless the YAML sets `allow_private_sources: true`. That last check is a guard rail
+against a mistake rather than an isolation boundary — the pass resolves the name again when it
+fetches — and the operator token is a full-trust credential, so treat it accordingly. While the overlay holds a
 `notifiers` list it replaces the YAML's membership and ordinary fields, so a notifier
 added to the YAML later is not used until that section is removed from the overlay; a
 notifier's `headers` are the exception, staying in the YAML and carried over by id. A

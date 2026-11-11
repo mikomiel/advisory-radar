@@ -17,6 +17,11 @@ FEED_URL = "https://feeds.example.com/a"
 ENABLED = ["discord", "matrix", "phone"]
 
 
+def test_a_message_tag_is_one_of_the_levels_the_router_accepts():
+    """The closed set the config validator uses must be the set a message can actually carry."""
+    assert set(core.LEVEL_LABEL) == routing.SEVERITY_TAGS
+
+
 class TestSelect:
     """The matcher is a pure function: no state, plugins or HTTP."""
 

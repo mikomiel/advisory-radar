@@ -347,7 +347,9 @@ def test_sources_page_lists_the_catalogue_for_a_signed_in_user(tmp_path):
         example = html.escape(yaml.safe_dump(spec.example, sort_keys=False))
         assert example in page.text, "the page must show each example as YAML"
     assert "<a href='/sources' aria-current='page'>Sources</a>" in page.text, "the nav links the page, marked current"
-    assert "<li><b>vendor</b> (rss)</li>" in page.text, "configured source ids and types are listed"
+    assert "<b>vendor</b>" in page.text, "configured source ids are listed"
+    assert "<span class='muted small'>rss" in page.text, "each configured source names its kind"
+    assert "not polled yet" in page.text, "a source with no fetch on record says so instead of claiming health"
 
 
 def test_sources_page_requires_auth(tmp_path):

@@ -8,6 +8,26 @@ operator action, and the release workflow then builds and pushes the image to
 ## [Unreleased]
 
 ### Added
+- Sources can be added, edited and removed on `/config` without touching the read-only
+  config mount. The settings overlay gained `sources_added`: a source the YAML does not
+  define is stored whole in the overlay, while the YAML keeps owning the entries the file
+  defines. The two may not share an id (a collision fails the load instead of letting the
+  merge order decide which URL is polled), and a secret key (`token`, `api_key`) may only be
+  stored as a `${NAME}`/`${NAME_FILE}` reference. `SourceSpec.secret_keys` in the catalogue
+  is the one owner of which keys those are, so the config key allowlist, the form and the
+  overlay's rule are derived rather than repeated.
+- A source probe in the browser: **Test the new source** on `/config` and a **Test** button
+  on every row of `/config` and `/sources` perform the same fetch a pass performs, show the
+  entry count, the first entries or the error, and write nothing. A probe of an unsaved
+  source resolves its `${NAME}` references (reporting a missing variable by name, never its
+  value) and offers a form that saves exactly what it fetched. `create_app` takes an
+  injectable transport for it, so the tests answer without a network.
+- Per-source health: each pass records `source_health` (last attempt, last success, entries,
+  redacted error) in the same write as that source's validators, pruned to the configured
+  ids. `/sources` is now the operational page — one line per enabled source with its state,
+  timestamps, entries and error beside the probe button — and `/metrics` exports
+  `advisory_radar_source_up`, `_source_last_success_timestamp_seconds` and `_source_items`,
+  labelled by source id, so a failing feed is named rather than only failing the pass.
 - A source catalogue (`advisory_radar/catalogue.py`): one `SourceSpec` per
   built-in kind with its summary, required and optional keys, a tested example
   and a docs anchor. The config key allowlist is derived from it instead of
@@ -25,7 +45,9 @@ operator action, and the release workflow then builds and pushes the image to
   `hidden_source_hosts`. A shared configuration value fails with the `ConfigError` the YAML
   gives, and the overlay adds its own restrictions — a secret-bearing key must be a
   `${NAME}`/`${NAME_FILE}` reference, a source edit is `enabled`/`tag` only, and `headers`
-  may not be written — so no credential reaches the file.
+  may not be written. A credential is therefore only ever a reference, with one limit worth knowing: a
+  source `url` is ordinary configuration to the validator, so a URL that carries a token has to be
+  written as a reference and nothing here can tell whether it was.
 - Hot reload: a saved overlay, `POST /reload` and `SIGHUP` rebuild the plugins off to the
   side and swap them under the state lock; the scheduler reads the configuration per pass,
   and the wait between passes restarts on a reload so a shorter `poll_interval` takes
@@ -77,6 +99,23 @@ operator action, and the release workflow then builds and pushes the image to
   Playwright is not a project dependency, and no CI job runs it.
 
 ### Fixed
+- A first pass whose every source failed wrote no state at all, so `/sources` reported
+  "not polled yet" for each source and no per-source metric appeared while the pass log said
+  otherwise. It now persists the health records in a seeded-empty document: no validator
+  moves and no source is marked seeded, so the first pass that does read a feed still
+  bootstraps its history.
+- The probe judged a source's URL before expanding it, so a valid `url: ${FEED_URL}`
+  reference was refused as a bad scheme and a missing URL reference was reported as one
+  instead of naming the variable.
+- A source URL nobody can parse (`http://[oops/…`) raised while an id was derived from it or
+  while a probe checked its scheme, which answered 500. Both paths now refuse it in words.
+- A routing rule matching a `tag` outside `critical` and `warning` was accepted and could
+  never fire: `routing.SEVERITY_TAGS` is now the closed set the validator uses, and a rule
+  naming an unconfigured source id is reported on `/config` as inert (staging a rule before
+  its source is legitimate, so that one warns rather than fails).
+- `http.urllib_http` accepted any URL scheme, so a `file://` source would have been read as a
+  local file. A source or notifier URL is HTTP(S); every other scheme is now a refused
+  request, and the probe says so in words.
 - An automerge left its head branch behind: the repository's *automatically delete head branches*
   setting did not delete the branch of a merge made through the API (the branches of #36 and #43
   survived with the setting on). The workflow now deletes the merged head ref through
@@ -100,6 +139,11 @@ operator action, and the release workflow then builds and pushes the image to
   waiting for a sweep. The schedules stay as the backstop.
 
 ### Changed
+- `/sources` leads with what this instance monitors: each enabled source's state, last
+  attempt, last success, entries and error, with a probe per row. The built-in catalogue
+  stays on the page, below the configured sources it documents. The `/config` source table
+  gained the added-keys, remove and test columns, and the watch-tag column now says what it
+  is: a changedetection.io watch tag the other kinds ignore.
 - The web UI has one design: a shared shell with a brand, a marked current section and a footer
   (version and the probe links), design tokens measured for WCAG AA contrast in light and dark,
   hairline tables, severity and outcome badges, stat tiles on the dashboard, numbered
@@ -115,6 +159,44 @@ operator action, and the release workflow then builds and pushes the image to
   every guarded pattern is documented in that paragraph.
 
 ### Security
+- A plugin id is a name: the validator refuses a whole `${NAME}`/`${NAME_FILE}` reference in
+  one, and refuses an id composed from a variable that supplies a credential anywhere in the
+  same configuration (`id: feed-${CD_TOKEN}` beside `api_key: ${CD_TOKEN}`), because an id
+  appears in routes, logs, the state and -- for a source -- a metric label on the
+  unauthenticated `/metrics` endpoint. The inventory is deliberately blind to the entry's kind
+  and to its `enabled` flag -- `type` may itself be a reference, and a disabled entry can
+  supply the value an enabled id borrows -- and it includes a notifier's `headers` and the
+  top-level `nvd_api_key`. A source `url` counts wherever it can hold a credential — its
+  userinfo, path or query, including a query with no path at all
+  (`https://feeds.example.net?token=${FEED_TOKEN}`) — while a reference in a host label
+  (`https://${TENANT}.example.net/…`) stays a name an id may reuse. Reference identity follows
+  `_expand`'s own lookup: `${X}`, `${X_FILE}` and `${X_FILE_FILE}` are one variable family, and
+  a credential position holds its reference at any depth, because `_expand` resolves the
+  strings inside a list or mapping too. A name composed
+  from a naming variable (`tenant-${X}`, `a${Y}`) stays allowed, and the value it composes is
+  what those places show.
+- A source added from `/config` may not point into a private network unless the YAML sets
+  `allow_private_sources: true`. It is a guard rail against pointing this instance at a
+  router page by mistake, not a privilege the YAML keeps and the overlay does not.
+  The check reads the destination the way the transport does -- the authority is unquoted
+  before the host is separated from the port, so `%3A8080` is a port and not part of a name --
+  and refuses loopback, private, shared, link-local, site-local and multicast addresses and
+  the IPv6 ranges that wrap an IPv4 one (`::/96`, `64:ff9b::/96`, `2002::/16`). A disabled
+  source is not checked, so one whose host later resolves internally can still be switched
+  off; probing is judged by ownership instead, so a probe of a source the overlay added is
+  checked even while that source is disabled. This is a guard rail against a mistake, not an
+  isolation boundary: the pass resolves the name again when it fetches, and the operator
+  token can already reach whatever the host can reach. A configured YAML source is unaffected, so a LAN FreshRSS or
+  changedetection.io target behaves as before.
+- An id the settings overlay adds must be literal text: it is rendered on `/sources`, kept in
+  the state's health map and used as a metric label on the unauthenticated `/metrics`
+  endpoint, so a `${NAME}` reference there would publish the value it expands to.
+- A probe's answer is redacted against every secret the entry resolved, not only its error:
+  a source can echo a request token back in a feed title or in a link's host, and the probe
+  page must not become a way to read a `${NAME}` out. The origin is redacted before it is
+  extracted -- extraction lowercases a hostname, which would transform the value being matched
+  -- and `/sources` redacts the origin it shows for the same reason, because it reads the
+  expanded configuration rather than the references.
 - Every workflow action is pinned to a full commit SHA, with its version in a
   trailing comment so Dependabot keeps it current, and every job runs on
   `ubuntu-24.04` instead of the moving `ubuntu-latest`.

@@ -559,7 +559,7 @@ def test_a_pass_queued_before_a_reload_keeps_its_redaction(tmp_path, caplog):
     old_only = "OLD-ONLY-SECRET-VALUE"
     path = write_config(
         tmp_path,
-        {"sources": [{"id": "${SOURCE_ID}", "type": "rss", "url": "https://feeds.example.net/x"}]},
+        {"sources": [{"id": "vendor", "type": "rss", "url": "https://feeds.example.net/${SOURCE_ID}"}]},
     )
     runtime = Runtime.build(path, {"SOURCE_ID": old_only})
     write_config(tmp_path, {})  # the reloaded configuration no longer references the value
@@ -577,13 +577,13 @@ def test_a_queued_pass_with_an_overlapping_secret_stays_redacted(tmp_path, caplo
     # redacts the whole value.
     path = write_config(
         tmp_path,
-        {"sources": [{"id": "${OLD_ID}", "type": "rss", "url": "https://feeds.example.net/x"}]},
+        {"sources": [{"id": "vendor", "type": "rss", "url": "https://feeds.example.net/${OLD_ID}"}]},
     )
     # the same process environment serves both configurations; only the references differ
     runtime = Runtime.build(path, {"OLD_ID": "feed", "NEW_ID": "feed_private_value"})
     write_config(
         tmp_path,
-        {"sources": [{"id": "${NEW_ID}", "type": "rss", "url": "https://feeds.example.net/y"}]},
+        {"sources": [{"id": "vendor", "type": "rss", "url": "https://feeds.example.net/${NEW_ID}"}]},
     )
     save_overlay(tmp_path, {"poll_interval": "30s"})
     runtime.reload(blocking=False)

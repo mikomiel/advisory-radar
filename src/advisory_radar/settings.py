@@ -1,14 +1,17 @@
 """The settings overlay: a small JSON document applied over the YAML configuration.
 
 ``settings.json`` lives beside the state file (the writable volume), not beside the YAML
-(``/config`` is mounted read-only), and holds only the six keys the UI may change. The
+(``/config`` is mounted read-only), and holds only the seven keys the UI may change. The
 overlay is merged into the YAML *before* ``config.load_config`` validates, so a value the
 YAML would refuse is refused with the same message.
 
 Storage and the overlay-specific shape rules live here; the merge and the configuration
 validator own everything else. A secret-bearing notifier key may only be a ``${NAME}`` or
-``${NAME_FILE}`` reference, and ``headers`` cannot be written at all: no credential ever
-reaches this file.
+``${NAME_FILE}`` reference, ``headers`` cannot be written at all, and a source's
+``secret_keys`` are references: a credential the validator knows how to name never reaches
+this file. One limit worth knowing: a source ``url`` is ordinary configuration, so a URL
+that carries a token has to be written as a reference and nothing here can tell whether it
+was.
 """
 
 from __future__ import annotations
@@ -19,7 +22,8 @@ import re
 import threading
 from pathlib import Path
 
-from .config import ConfigError
+from .catalogue import SOURCE_SPECS
+from .config import NOTIFIER_SECRET_KEYS, ConfigError
 from .state import save_json, serialize_json
 
 #: The schema tag the stored document declares.
@@ -33,9 +37,12 @@ SETTINGS_NAME = "settings.json"
 #: A file larger than this is refused before it is parsed.
 MAX_SETTINGS_BYTES = 64 * 1024
 #: The only keys the overlay may carry. Everything else stays in the YAML.
-OVERLAY_KEYS = frozenset({"notifiers", "sources", "poll_interval", "hidden_source_hosts", "routes", "default"})
-#: Notifier keys that carry a credential: only a whole-value environment reference is accepted.
-SECRET_KEYS = ("url", "key", "password", "token")
+OVERLAY_KEYS = frozenset(
+    {"notifiers", "sources", "sources_added", "poll_interval", "hidden_source_hosts", "routes", "default"}
+)
+#: Notifier keys that carry a credential: only a whole-value environment reference is accepted. One owner:
+#: ``config`` lists them, and an id may not be composed from a variable that supplies one.
+SECRET_KEYS = NOTIFIER_SECRET_KEYS
 #: Exactly one ``${NAME}`` (optionally ``${NAME_FILE}``), with no surrounding text: a value with
 #: ``https://host/${TOKEN}`` in it would still put the rest of a credential-bearing URL in the file.
 SECRET_REFERENCE = re.compile(r"\$\{[A-Z_][A-Z0-9_]*(?:_FILE)?\}")
@@ -49,11 +56,11 @@ def is_reference(value: object) -> bool:
 def validate_settings(settings: object) -> dict:
     """Refuse an overlay the runtime could not apply, without repeating the config validator.
 
-    Only rules specific to the overlay live here: the six-key allowlist, the reference-only secret
-    rule, and the two-key source edit. Values the YAML validator checks -- a poll interval, a
-    hidden-host list, a notifier's keys and its ``enabled`` boolean, a route's match keys and whether
-    a selected notifier is enabled -- are merged and left to it, so both sources of truth fail with
-    one message.
+    Only rules specific to the overlay live here: the seven-key allowlist, the reference-only secret
+    rule, the two-key edit of a YAML source, and the shape of a complete source the overlay adds. Values
+    the YAML validator checks -- a poll interval, a hidden-host list, a notifier's keys and its ``enabled``
+    boolean, a source's remaining keys, a route's match keys and whether a selected notifier is enabled --
+    are merged and left to it, so both sources of truth fail with one message.
     """
     if not isinstance(settings, dict):
         raise ConfigError("settings: the overlay must be a mapping")
@@ -96,7 +103,59 @@ def validate_settings(settings: object) -> dict:
                 raise ConfigError(f"settings: source {identifier!r}: unknown keys {sorted(extra)}")
             if "tag" in changes and not isinstance(changes["tag"], str):
                 raise ConfigError(f"settings: source {identifier!r}: tag must be a string")
+    if "sources_added" in settings:
+        _validate_added_sources(settings["sources_added"])
     return settings
+
+
+def _validate_added_sources(added: object) -> None:
+    """A complete source the overlay adds: a mapping with a literal id, a built-in type and its required keys.
+
+    Credentials this module can recognise -- a kind's ``secret_keys`` -- must be references; a ``url`` is not
+    one of them, so a URL that embeds a token is stored as written.
+
+    A non-mapping is refused rather than skipped: ``config._merge_added_sources`` skips one it cannot read, so
+    the entry would vanish between the two owners and the operator would see a saved source that never ran.
+    """
+    if not isinstance(added, list):
+        raise ConfigError("settings: sources_added must be a list of complete source entries")
+    seen: set[str] = set()
+    for entry in added:
+        if not isinstance(entry, dict):
+            raise ConfigError("settings: every added source must be a mapping")
+        identifier = entry.get("id")
+        if not isinstance(identifier, str) or not identifier:
+            raise ConfigError("settings: every added source needs a string id")
+        if identifier in seen:
+            raise ConfigError(f"settings: added source {identifier!r} is defined twice")
+        if "$" in identifier:
+            # The id is rendered on `/sources`, kept in the state's health map and used as a metric label on the
+            # unauthenticated `/metrics` endpoint, so a reference here would publish the value it expands to.
+            # A YAML-composed id stays allowed: that file is written by whoever runs the host.
+            raise ConfigError(
+                f"settings: added source {identifier!r}: the id must be literal text, not a ${{NAME}} reference"
+            )
+        seen.add(identifier)
+        kind = entry.get("type")
+        if not isinstance(kind, str) or kind not in SOURCE_SPECS:
+            raise ConfigError(
+                f"settings: added source {identifier!r} has no built-in type (want one of {sorted(SOURCE_SPECS)})"
+            )
+        missing = [
+            key
+            for key in SOURCE_SPECS[kind].required
+            if not isinstance(entry.get(key), str) or not str(entry.get(key)).strip()
+        ]
+        if missing:
+            # A complete entry, not a shape that only looks like one: a source missing a required key would be
+            # stored and then fail the very build that saves it, with a bare KeyError from the builder.
+            raise ConfigError(f"settings: added source {identifier!r} ({kind}) needs {', '.join(missing)}")
+        for key in SOURCE_SPECS[kind].secret_keys:
+            if key in entry and not is_reference(entry[key]):
+                raise ConfigError(
+                    f"settings: added source {identifier!r}: {key} must be a ${{NAME}} or ${{NAME_FILE}} "
+                    "reference; a literal secret is never stored"
+                )
 
 
 def fingerprint(settings: dict) -> str:
