@@ -118,8 +118,19 @@ def scope_form(client: TestClient) -> tuple[str, str, str]:
 
 
 def submit(client: TestClient, csrf: str, fingerprint: str, **fields) -> object:
-    data = {"csrf": csrf, "fingerprint": fingerprint}
+    """Post the scope form as the page renders it: the envelope, both lists and the pending new row."""
+    data = {
+        "csrf": csrf,
+        "fingerprint": fingerprint,
+        "debian_packages": "*",
+        "excluded_products": "",
+        "new:id": "",
+        "new:aliases": "",
+        "new:domains": "",
+    }
     data.update(fields)
+    # ``None`` drops a default: a field the page renders read-only does not submit its visible counterpart at all.
+    data = {key: value for key, value in data.items() if value is not None}
     return client.post("/watchlist", data=data, follow_redirects=False)
 
 
@@ -484,6 +495,7 @@ def test_an_exclusion_its_field_cannot_hold_is_kept_exactly(tmp_path, entry):
         csrf,
         fingerprint,
         **{
+            "excluded_products": None,
             "excluded_products_json": html.unescape(rendered.group(1)),
             "product:nodejs:aliases": "node.js",
             "product:nodejs:domains": "nodejs.org",
@@ -650,46 +662,46 @@ def test_a_save_to_an_uninspectable_path_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(watchlist, "os", types.SimpleNamespace(lstat=denied))
     response = client.post(
         "/watchlist",
-        data={"csrf": csrf, "fingerprint": "", "new:id": "php", "new:aliases": "php", "debian_packages": "*"},
+        data={
+            "csrf": csrf,
+            "fingerprint": "",
+            "new:id": "php",
+            "new:aliases": "php",
+            "new:domains": "",
+            "debian_packages": "*",
+            "excluded_products": "",
+        },
     )
     assert response.status_code == 200
     assert "cannot be inspected" in response.text
     assert "value='php'" in response.text, "the row is re-rendered, nothing is written"
 
 
-def test_an_alias_with_a_line_break_is_kept_exactly(tmp_path):
-    """A single-line input drops the break, so the row is read-only and the exact list is what is submitted."""
-    watch = write_scope(
-        tmp_path / "scope.json",
-        products=[{"id": "acme", "aliases": ["Example\nServer"], "domains": []}],
-    )
-    client, _ = make_client(tmp_path, watch)
-    sign_in(client)
-    csrf, fingerprint, text = scope_form(client)
-    assert "readonly" in text and "kept exactly" in text
-    assert "name='product:acme:aliases'" not in text, "the lossy field is not submitted at all"
-    response = submit(
-        client,
-        csrf,
-        fingerprint,
-        **{
-            "product:acme:aliases_json": json.dumps(["Example\nServer"]),
-            "product:acme:domains": "",
-            "metadata_only:acme": "0",
-            "debian_packages": "*",
-        },
-    )
-    assert response.status_code == 303
-    assert json.loads(watch.read_text())["products"][0]["aliases"] == ["Example\nServer"]
-
-
 BROKEN_EXACT = (
-    {"excluded_products_json": "null"},  # readable JSON, not a list
-    {"excluded_products_json": "[7]"},  # a list, but not of entries
-    {"debian_packages_json": '[["curl"]]'},  # nested
-    {"product:nodejs:aliases_json": "[7]"},  # a row's exact list, malformed
+    {"excluded_products": None, "excluded_products_json": "null"},  # readable JSON, not a list
+    {"excluded_products": None, "excluded_products_json": "[7]"},  # a list, but not of entries
+    {"debian_packages": None, "debian_packages_json": '[["curl"]]'},  # nested
+    {"product:nodejs:aliases": None, "product:nodejs:aliases_json": "[7]"},  # a row's exact list
     {"excluded_products": "legacy", "excluded_products_json": '["legacy"]'},  # two representations at once
+    {"excluded_products": None, "excluded_products_json": ""},  # the page never renders an empty exact field
+    {"excluded_products": None, "excluded_products_json": "[" * 2000 + "]" * 2000},  # decoder recursion
 )
+
+
+def _valid_payload(csrf: str, fingerprint: str) -> dict:
+    """The form as the page renders it, so a test can break exactly one part of it."""
+    return {
+        "csrf": csrf,
+        "fingerprint": fingerprint,
+        "debian_packages": "*",
+        "excluded_products": "",
+        "product:nodejs:aliases": "node.js",
+        "product:nodejs:domains": "nodejs.org",
+        "metadata_only:nodejs": "0",
+        "new:id": "",
+        "new:aliases": "",
+        "new:domains": "",
+    }
 
 
 @pytest.mark.parametrize("fields", BROKEN_EXACT)
@@ -700,14 +712,60 @@ def test_a_malformed_exact_field_is_refused(tmp_path, fields):
     client, _ = make_client(tmp_path, watch)
     sign_in(client)
     csrf, fingerprint, _ = scope_form(client)
-    data = {
-        "product:nodejs:aliases": "node.js",
-        "product:nodejs:domains": "nodejs.org",
-        "metadata_only:nodejs": "0",
-        "debian_packages": "*",
-    }
+    data = _valid_payload(csrf, fingerprint)
     data.update(fields)
-    response = submit(client, csrf, fingerprint, **data)
+    response = client.post("/watchlist", data={k: v for k, v in data.items() if v is not None})
     assert response.status_code == 400, "a payload this page never emits is refused, not guessed at"
     assert "reload" in response.text
     assert watch.read_text() == before, "nothing is written"
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"excluded_products": ["legacy", "other"]},  # one field, two values
+        {"excluded_products_json": ['["legacy"]', "null"]},
+        {"new:id": ["php", "perl"]},
+    ],
+)
+def test_a_repeated_field_is_refused(tmp_path, fields):
+    """The first value would be used and the second ignored: a form says one thing per field."""
+    watch = write_scope(tmp_path / "scope.json")
+    before = watch.read_text()
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    csrf, fingerprint, _ = scope_form(client)
+    data = _valid_payload(csrf, fingerprint)
+    data.update(fields)
+    response = client.post("/watchlist", data={k: v for k, v in data.items() if v is not None})
+    assert response.status_code == 400
+    assert "was submitted" in response.text
+    assert watch.read_text() == before
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"product:nodejs:aliases": None},  # a row with no aliases: it would vanish and leave no scope
+        {"product:nodejs:domains": None},
+        {"metadata_only:nodejs": None},
+        {"product:nodejs:bogus": "x"},  # not a field of this form
+        {"unexpected": "x"},
+        {"product:Bad_Id:aliases": "x", "product:Bad_Id:domains": "", "metadata_only:Bad_Id": "0"},
+        {"remove:nodejs": "false"},  # the page sends 1 or nothing
+        {"metadata_only:nodejs": "true"},
+        {"metadata_only:nodejs": "garbage"},
+    ],
+)
+def test_a_shape_the_page_never_sends_is_refused(tmp_path, fields):
+    """Silently dropping a field is how a malformed row becomes an unrestricted scope."""
+    watch = write_scope(tmp_path / "scope.json")
+    before = watch.read_text()
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    csrf, fingerprint, _ = scope_form(client)
+    data = _valid_payload(csrf, fingerprint)
+    data.update(fields)
+    response = client.post("/watchlist", data={k: v for k, v in data.items() if v is not None})
+    assert response.status_code == 400
+    assert watch.read_text() == before

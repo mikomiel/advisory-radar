@@ -1425,7 +1425,15 @@ def test_every_page_carries_the_same_shell(tmp_path):
     # The scope page refuses a page rendered against another document the same way, chrome included.
     stale_scope = client.post(
         "/watchlist",
-        data={"csrf": csrf, "fingerprint": "0" * 64, "debian_packages": "*"},
+        data={
+            "csrf": csrf,
+            "fingerprint": "0" * 64,
+            "debian_packages": "*",
+            "excluded_products": "",
+            "new:id": "",
+            "new:aliases": "",
+            "new:domains": "",
+        },
         headers={"accept": "text/html"},
     )
     _assert_shell(stale_scope, active="/watchlist", status=409)

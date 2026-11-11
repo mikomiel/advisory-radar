@@ -1056,54 +1056,124 @@ class _BadForm(ValueError):
     """A submitted form this page did not issue: refused with a message rather than guessed at."""
 
 
-def _exact_or_split(form: Mapping[str, list[str]], name: str, split: Callable[[str], list[str]]) -> list[str]:
-    """A list field as submitted: the exact list when a hidden field carries one, else the field's own split.
+#: The fields one watchlist submission carries besides its per-row ones.
+_WATCHLIST_FIELDS = frozenset(
+    {
+        "csrf",
+        "fingerprint",
+        "debian_packages",
+        "excluded_products",
+        "debian_packages_json",
+        "excluded_products_json",
+        "new:id",
+        "new:aliases",
+        "new:domains",
+    }
+)
+#: What a product id in a field name must look like: the shape the document itself accepts.
+_PRODUCT_ID = re.compile(r"[a-z][a-z0-9-]+")
 
-    The exact form is what a row or a field the form cannot hold submits (see :func:`_alias_holds` and
-    :func:`_line_holds`). A hidden value that is present must be readable, a list of strings, and the only
-    representation of that field: falling back to the visible field would let a malformed payload silently clear a
-    list, and preferring one of two representations would let a crafted form say two things at once.
-    """
-    exact = _form_value(form, f"{name}_json")
-    if not exact:
-        return split(_form_value(form, name))
-    if form.get(name):
-        raise _BadForm(f"{name} was submitted twice")
+
+def _one(form: Mapping[str, list[str]], name: str) -> str | None:
+    """The single value a field carries, ``None`` when it is absent; a repeated field is refused."""
+    values = form.get(name)
+    if not values:
+        return None
+    if len(values) != 1:
+        raise _BadForm(f"{name} was submitted {len(values)} times")
+    return values[0]
+
+
+def _json_list(name: str, raw: str) -> list[str]:
+    """A hidden exact list: readable JSON, a list, and strings only. Anything else is refused."""
     try:
-        parsed = json.loads(exact)
-    except ValueError:
+        parsed = json.loads(raw)
+    except (ValueError, RecursionError):  # a deep enough nesting raises before it is a value
         raise _BadForm(f"{name} is not readable") from None
     if not isinstance(parsed, list) or any(not isinstance(item, str) for item in parsed):
         raise _BadForm(f"{name} is not a list of entries")
     return parsed
 
 
-def _submitted_products(form: Mapping[str, list[str]]) -> list[dict]:
-    """The product rows a submitted form carries, in the order the page rendered them.
+def _lists(form: Mapping[str, list[str]], name: str, split: Callable[[str], list[str]]) -> list[str]:
+    """Exactly one of a list's two representations: the visible field, or the exact hidden one.
 
-    A row's id is read back from its own field names. ``watchlist.parse_policy`` decides whether a shape typed
-    by hand is acceptable, so this function only has to be faithful to what was submitted.
+    Never both and never neither. The page renders one of them, so a payload with both says two things at once
+    and a payload with neither is a submission that never came from the page.
     """
-    products = []
-    seen: set[str] = set()
-    for name in form:
-        prefix, _, rest = name.partition(":")
+    plain, exact = _one(form, name), _one(form, f"{name}_json")
+    if (plain is None) == (exact is None):
+        raise _BadForm(f"{name} must be submitted once")
+    if exact is not None:
+        return _json_list(name, exact)
+    return split(plain)
+
+
+def _row_field(name: str) -> tuple[str, str] | None:
+    """``(id, leaf)`` for a per-product field name, or ``None`` when the name is not one."""
+    prefix, _, rest = name.partition(":")
+    if prefix == "product":
         identifier, _, leaf = rest.rpartition(":")
-        if prefix != "product" or leaf not in {"aliases", "aliases_json"} or not identifier:
+        return (identifier, leaf) if leaf in {"aliases", "aliases_json", "domains"} else None
+    if prefix in {"metadata_only", "remove"}:
+        return (rest, prefix) if rest and ":" not in rest else None
+    return None
+
+
+def _parse_watchlist_form(
+    form: Mapping[str, list[str]],
+) -> tuple[list[dict], list[str], list[str], dict[str, str]]:
+    """The rows, the two lists and the pending new row one submission carries, or a refusal.
+
+    The shape is checked whole before any of it is interpreted. An unknown field, a repeated field, a row field
+    whose row is missing its aliases or its metadata flag, a flag that is not the value the page sends, an id the
+    document could not hold, or two representations of one list are all payloads this page never emits -- and
+    guessing at one is how a malformed request clears a scope instead of being refused.
+    """
+    _one(form, "csrf")  # cardinality only: the CSRF dependency judged the value
+    _one(form, "fingerprint")
+    identifiers = []
+    for name in form:
+        if name in _WATCHLIST_FIELDS:
             continue
-        if identifier in seen:  # one row may carry either field, never both; the first is the row
-            continue
-        seen.add(identifier)
-        products.append(
+        field = _row_field(name)
+        if field is None:
+            raise _BadForm(f"{name} is not a field of this form")
+        identifier, _ = field
+        if not _PRODUCT_ID.fullmatch(identifier):
+            raise _BadForm(f"{identifier!r} is not a product id")
+        if identifier not in identifiers:
+            identifiers.append(identifier)
+    rows = []
+    for identifier in identifiers:
+        aliases = _lists(form, f"product:{identifier}:aliases", _form_words)
+        domains, metadata, remove = (
+            _one(form, f"product:{identifier}:domains"),
+            _one(form, f"metadata_only:{identifier}"),
+            _one(form, f"remove:{identifier}"),
+        )
+        if domains is None or metadata is None:
+            raise _BadForm(f"the row {identifier!r} is incomplete")
+        if metadata not in {"0", "1"}:
+            raise _BadForm(f"metadata_only:{identifier} is not a flag: {metadata!r}")
+        if remove not in (None, "1"):
+            raise _BadForm(f"remove:{identifier} is not a flag: {remove!r}")
+        rows.append(
             {
                 "id": identifier,
-                "aliases": _exact_or_split(form, f"product:{identifier}:aliases", _form_words),
-                "domains": _form_words(_form_value(form, f"product:{identifier}:domains")),
-                "metadata_only": _form_value(form, f"metadata_only:{identifier}") == "1",
-                "remove": _form_value(form, f"remove:{identifier}") not in ("", "0"),
+                "aliases": aliases,
+                "domains": _form_words(domains),
+                "metadata_only": metadata == "1",
+                "remove": remove == "1",
             }
         )
-    return products
+    pending = {name: (_one(form, f"new:{name}") or "").strip() for name in ("id", "aliases", "domains")}
+    return (
+        rows,
+        _lists(form, "debian_packages", _form_lines),
+        _lists(form, "excluded_products", _form_lines),
+        pending,
+    )
 
 
 def _watchlist_document(
@@ -3389,14 +3459,11 @@ def create_app(
             # document is missing.
             exists = True
         form = form_body(request)
-        expected = first(form, "fingerprint")
         try:
-            submitted = _submitted_products(form)
-            packages = _exact_or_split(form, "debian_packages", _form_lines)
-            excluded = _exact_or_split(form, "excluded_products", _form_lines)
+            submitted, packages, excluded, new_row = _parse_watchlist_form(form)
         except _BadForm as exc:
             # A payload this page never emits: there is no edit to preserve, and guessing what it meant is how a
-            # malformed hidden field silently clears a list.
+            # malformed request clears a scope instead of being refused.
             return page(
                 "Not saved",
                 f"<p>{esc(exc)}; reload <a href='/watchlist'>the watchlist</a> and make the change again.</p>",
@@ -3404,7 +3471,7 @@ def create_app(
                 actions=sign_out_form(request),
                 status_code=400,
             )
-        new_row = {name: first(form, f"new:{name}").strip() for name in ("id", "aliases", "domains")}
+        expected = first(form, "fingerprint")
         # A row being removed in this same save does not collide with the new one: the id is freed first.
         duplicate = (
             any(row["id"] == new_row["id"] and not row["remove"] for row in submitted) if new_row["id"] else False
