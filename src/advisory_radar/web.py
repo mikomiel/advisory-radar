@@ -1052,22 +1052,30 @@ def _product_rows(products: Sequence[Mapping[str, object]]) -> str:
     return "".join(rows)
 
 
+class _BadForm(ValueError):
+    """A submitted form this page did not issue: refused with a message rather than guessed at."""
+
+
 def _exact_or_split(form: Mapping[str, list[str]], name: str, split: Callable[[str], list[str]]) -> list[str]:
     """A list field as submitted: the exact list when a hidden field carries one, else the field's own split.
 
     The exact form is what a row or a field the form cannot hold submits (see :func:`_alias_holds` and
-    :func:`_line_holds`). A value that is not a list is ignored here and left to ``watchlist.parse_policy``,
-    which refuses the document it becomes.
+    :func:`_line_holds`). A hidden value that is present must be readable, a list of strings, and the only
+    representation of that field: falling back to the visible field would let a malformed payload silently clear a
+    list, and preferring one of two representations would let a crafted form say two things at once.
     """
     exact = _form_value(form, f"{name}_json")
-    if exact:
-        try:
-            parsed = json.loads(exact)
-        except ValueError:
-            parsed = None
-        if isinstance(parsed, list):
-            return parsed
-    return split(_form_value(form, name))
+    if not exact:
+        return split(_form_value(form, name))
+    if form.get(name):
+        raise _BadForm(f"{name} was submitted twice")
+    try:
+        parsed = json.loads(exact)
+    except ValueError:
+        raise _BadForm(f"{name} is not readable") from None
+    if not isinstance(parsed, list) or any(not isinstance(item, str) for item in parsed):
+        raise _BadForm(f"{name} is not a list of entries")
+    return parsed
 
 
 def _submitted_products(form: Mapping[str, list[str]]) -> list[dict]:
@@ -1098,32 +1106,35 @@ def _submitted_products(form: Mapping[str, list[str]]) -> list[dict]:
     return products
 
 
-def _watchlist_document(form: Mapping[str, list[str]]) -> dict:
+def _watchlist_document(
+    rows: Sequence[Mapping[str, object]],
+    packages: Sequence[str],
+    excluded: Sequence[str],
+    new_row: Mapping[str, str],
+) -> dict:
     """The document a submitted form describes, before it is validated or written.
 
-    Every list field is a set: a blank entry is dropped and a repeated one keeps its first place, so a pasted
-    list saves once instead of being refused. The shape -- which ids, domains and package patterns are
-    acceptable -- stays ``watchlist.parse_policy``'s answer, the same one a pass gets from the file.
+    Every list field is a set: a blank entry is dropped and a repeated one keeps its first place, so a pasted list
+    saves once instead of being refused. The shape -- which ids, domains and package patterns are acceptable --
+    stays ``watchlist.parse_policy``'s answer, the same one a pass gets from the file. The caller parses the form
+    once and passes the same rows and lists here and to the page a refusal re-renders, so the refusal cannot show
+    a different edit from the one it refused.
     """
-    products = [
-        {key: value for key, value in row.items() if key != "remove"}
-        for row in _submitted_products(form)
-        if not row["remove"]
-    ]
-    identifier = _form_value(form, "new:id").strip()
+    products = [{key: value for key, value in row.items() if key != "remove"} for row in rows if not row["remove"]]
+    identifier = new_row.get("id", "")
     if identifier:
         products.append(
             {
                 "id": identifier,
-                "aliases": _form_words(_form_value(form, "new:aliases")),
-                "domains": _form_words(_form_value(form, "new:domains")),
+                "aliases": _form_words(new_row.get("aliases", "")),
+                "domains": _form_words(new_row.get("domains", "")),
                 "metadata_only": False,
             }
         )
     return {
         "schema": watchlist.SCHEMA,
-        "debian_source_packages": _exact_or_split(form, "debian_packages", _form_lines),
-        "excluded_products": _exact_or_split(form, "excluded_products", _form_lines),
+        "debian_source_packages": list(packages),
+        "excluded_products": list(excluded),
         "products": products,
     }
 
@@ -3379,7 +3390,20 @@ def create_app(
             exists = True
         form = form_body(request)
         expected = first(form, "fingerprint")
-        submitted = _submitted_products(form)
+        try:
+            submitted = _submitted_products(form)
+            packages = _exact_or_split(form, "debian_packages", _form_lines)
+            excluded = _exact_or_split(form, "excluded_products", _form_lines)
+        except _BadForm as exc:
+            # A payload this page never emits: there is no edit to preserve, and guessing what it meant is how a
+            # malformed hidden field silently clears a list.
+            return page(
+                "Not saved",
+                f"<p>{esc(exc)}; reload <a href='/watchlist'>the watchlist</a> and make the change again.</p>",
+                active="/watchlist",
+                actions=sign_out_form(request),
+                status_code=400,
+            )
         new_row = {name: first(form, f"new:{name}").strip() for name in ("id", "aliases", "domains")}
         # A row being removed in this same save does not collide with the new one: the id is freed first.
         duplicate = (
@@ -3405,7 +3429,8 @@ def create_app(
             )
         else:
             try:
-                written = watchlist.save_watchlist(target, _watchlist_document(form), expected=expected)
+                document = _watchlist_document(submitted, packages, excluded, new_row)
+                written = watchlist.save_watchlist(target, document, expected=expected)
             except watchlist.StaleDocument:
                 return page(
                     "Not saved",
@@ -3431,8 +3456,8 @@ def create_app(
             target,
             exists=exists,
             rows=submitted,
-            packages=_exact_or_split(form, "debian_packages", _form_lines),
-            excluded=_exact_or_split(form, "excluded_products", _form_lines),
+            packages=packages,
+            excluded=excluded,
             new_row=new_row,
             expected=expected,
             notices=notice,

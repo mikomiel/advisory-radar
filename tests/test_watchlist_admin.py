@@ -681,3 +681,33 @@ def test_an_alias_with_a_line_break_is_kept_exactly(tmp_path):
     )
     assert response.status_code == 303
     assert json.loads(watch.read_text())["products"][0]["aliases"] == ["Example\nServer"]
+
+
+BROKEN_EXACT = (
+    {"excluded_products_json": "null"},  # readable JSON, not a list
+    {"excluded_products_json": "[7]"},  # a list, but not of entries
+    {"debian_packages_json": '[["curl"]]'},  # nested
+    {"product:nodejs:aliases_json": "[7]"},  # a row's exact list, malformed
+    {"excluded_products": "legacy", "excluded_products_json": '["legacy"]'},  # two representations at once
+)
+
+
+@pytest.mark.parametrize("fields", BROKEN_EXACT)
+def test_a_malformed_exact_field_is_refused(tmp_path, fields):
+    """Falling back to the visible field would let a malformed payload silently clear a list."""
+    watch = write_scope(tmp_path / "scope.json")
+    before = watch.read_text()
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    csrf, fingerprint, _ = scope_form(client)
+    data = {
+        "product:nodejs:aliases": "node.js",
+        "product:nodejs:domains": "nodejs.org",
+        "metadata_only:nodejs": "0",
+        "debian_packages": "*",
+    }
+    data.update(fields)
+    response = submit(client, csrf, fingerprint, **data)
+    assert response.status_code == 400, "a payload this page never emits is refused, not guessed at"
+    assert "reload" in response.text
+    assert watch.read_text() == before, "nothing is written"
