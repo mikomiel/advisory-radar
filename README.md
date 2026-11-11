@@ -266,7 +266,8 @@ Every origin the two pages show — a probe's answer and a configured source on
 and titles are redacted against the secrets the configuration resolved, and an id is
 a name. The validator refuses a whole `${NAME}` reference in one, and refuses an id
 composed from a variable that supplies a credential anywhere in the same
-configuration (`id: feed-${CD_TOKEN}` beside `api_key: ${CD_TOKEN}`), because an id
+configuration (`id: feed-${CD_TOKEN}` beside `api_key: ${CD_TOKEN}`, or beside
+`url: …?token=${CD_TOKEN}`), because an id
 appears in routes, logs, the state and — for a source — a metric label on the
 unauthenticated `/metrics` endpoint. A name composed from a naming variable
 (`tenant-${X}`) stays allowed, and the value it composes is what those places show.

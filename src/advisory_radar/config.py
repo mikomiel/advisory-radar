@@ -193,6 +193,25 @@ def _reference_names(value: object) -> set[str]:
 SOURCE_SECRET_KEYS = tuple(sorted({key for spec in SOURCE_SPECS.values() for key in spec.secret_keys}))
 
 
+def _url_secret_names(value: object) -> set[str]:
+    """References a source URL carries outside its host labels.
+
+    A reference in a host label names a host (``https://${TENANT}.example.net/feed``), so an id may use the same
+    variable. Anywhere else in the URL -- userinfo, path, query -- is a position a credential occupies
+    (``?token=${FEED_TOKEN}``), so an id may not borrow it. A URL with no scheme is scanned whole.
+    """
+    if not isinstance(value, str):
+        return set()
+    _, separator, rest = value.partition("://")
+    if not separator or not rest:
+        return _reference_names(value)
+    authority, slash, tail = rest.partition("/")
+    names = _reference_names(f"{slash}{tail}")
+    if "@" in authority:
+        names |= _reference_names(authority.split("@", 1)[0])
+    return names
+
+
 def _credential_names(document: dict) -> set[str]:
     """Every environment variable that supplies a credential somewhere in this configuration.
 
@@ -207,6 +226,8 @@ def _credential_names(document: dict) -> set[str]:
         if isinstance(entry, dict):
             for key in SOURCE_SECRET_KEYS:
                 names |= _reference_names(entry.get(key))
+            # A token-bearing feed URL is a supported shape the documentation names, so its references count too.
+            names |= _url_secret_names(entry.get("url"))
     for entry in document.get("notifiers") or []:
         if isinstance(entry, dict):
             for key in (*NOTIFIER_SECRET_KEYS, "headers"):

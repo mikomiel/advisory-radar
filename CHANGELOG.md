@@ -166,10 +166,12 @@ operator action, and the release workflow then builds and pushes the image to
   unauthenticated `/metrics` endpoint. The inventory is deliberately blind to the entry's kind
   and to its `enabled` flag -- `type` may itself be a reference, and a disabled entry can
   supply the value an enabled id borrows -- and it includes a notifier's `headers` and the
-  top-level `nvd_api_key`. Reference identity follows `_expand`'s own lookup: `${X}`,
-  `${X_FILE}` and `${X_FILE_FILE}` are one variable family, and a credential position holds
-  its reference at any depth, because `_expand` resolves the strings inside a list or mapping
-  too. A name composed
+  top-level `nvd_api_key`. A source `url` counts wherever it can hold a credential — its
+  userinfo, path or query, as in `?token=${FEED_TOKEN}` — while a reference in a host label
+  (`https://${TENANT}.example.net/…`) stays a name an id may reuse. Reference identity follows
+  `_expand`'s own lookup: `${X}`, `${X_FILE}` and `${X_FILE_FILE}` are one variable family, and
+  a credential position holds its reference at any depth, because `_expand` resolves the
+  strings inside a list or mapping too. A name composed
   from a naming variable (`tenant-${X}`, `a${Y}`) stays allowed, and the value it composes is
   what those places show.
 - A source added from `/config` may not point into a private network unless the YAML sets

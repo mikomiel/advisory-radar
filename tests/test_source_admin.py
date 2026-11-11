@@ -1499,3 +1499,72 @@ def test_a_notifier_header_credential_is_inventoried(tmp_path):
     path.write_text(yaml.safe_dump(document))
     with pytest.raises(ConfigError, match="may not be composed from a variable that supplies a credential"):
         load_config(path, {"HOOK": "https://hooks.example.net/x", "HOOK_TOKEN": "AbCdEf123456"})
+
+
+def test_a_token_bearing_url_cannot_lend_its_variable_to_an_id(tmp_path):
+    """``?token=${FEED_TOKEN}`` is a documented shape for a private feed, so it is a credential position."""
+    path = write_config(
+        tmp_path,
+        sources=[
+            {
+                "id": "feed-${FEED_TOKEN}",
+                "type": "rss",
+                "url": "https://feeds.example.net/security.xml?token=${FEED_TOKEN}",
+            }
+        ],
+    )
+    with pytest.raises(ConfigError, match="may not be composed from a variable that supplies a credential"):
+        load_config(path, {"FEED_TOKEN": "AbCdEf123456"})
+    # The path and the userinfo are credential positions too.
+    for url in (
+        "https://feeds.example.net/${FEED_TOKEN}/security.xml",
+        "https://${FEED_TOKEN}@feeds.example.net/security.xml",
+    ):
+        path = write_config(tmp_path, sources=[{"id": "feed-${FEED_TOKEN}", "type": "rss", "url": url}])
+        with pytest.raises(ConfigError, match="may not be composed from a variable that supplies a credential"):
+            load_config(path, {})
+
+
+def test_a_host_label_reference_is_a_name_and_may_compose_an_id(tmp_path):
+    path = write_config(
+        tmp_path,
+        sources=[{"id": "feed-${TENANT}", "type": "rss", "url": "https://${TENANT}.feeds.example.net/security.xml"}],
+    )
+    cfg = load_config(path, {"TENANT": "acme"})
+    assert cfg.sources[0]["id"] == "feed-acme"
+
+
+def test_a_nested_mapping_credential_position_is_inventoried(tmp_path):
+    path = write_config(
+        tmp_path,
+        sources=[
+            {
+                "id": "feed-${TOKEN}",
+                "type": "rss",
+                "url": "https://feeds.example.net/security.xml",
+                "token": {"outer": [{"inner": "${TOKEN}"}]},
+            }
+        ],
+    )
+    with pytest.raises(ConfigError, match="may not be composed from a variable that supplies a credential"):
+        load_config(path, {})
+
+
+def test_a_failed_attempt_keeps_the_last_success(tmp_path):
+    failing = {"on": False}
+
+    def toggling(method, url, headers, body):
+        return (0, {}, b"") if failing["on"] else (200, {"ETag": '"v1"'}, RSS)
+
+    _, runtime, _ = make_client(tmp_path, transport=toggling)
+    assert pipeline.run_pass(runtime.cfg, runtime.sources, runtime.notifiers, http=toggling) == 0
+    first = json.loads((tmp_path / "data" / "state.json").read_text())["source_health"]["vendor"]
+    assert first["ok"] is True and first["ok_at"] == first["at"]
+    failing["on"] = True
+    assert pipeline.run_pass(runtime.cfg, runtime.sources, runtime.notifiers, http=toggling) == 1
+    after = json.loads((tmp_path / "data" / "state.json").read_text())["source_health"]["vendor"]
+    assert after["ok"] is False
+    assert after["items"] == 0
+    assert "unreachable" in after["error"]
+    assert after["ok_at"] == first["ok_at"], "the last success survives a later failure"
+    assert after["at"] >= first["at"]
