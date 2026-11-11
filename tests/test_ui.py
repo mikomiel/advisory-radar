@@ -1147,3 +1147,133 @@ def test_the_overlay_routes_replace_the_yaml_block_and_one_validator_checks_memb
             {},
             settings={"routes": [{"match": {"tag": "critical"}, "notifiers": ["ghost"]}]},
         )
+
+
+#: The exact policy every page carries. Pinned here so a change to it is a deliberate change, not drift.
+EXPECTED_CSP = (
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+)
+
+
+def _assert_shell(response, *, active: str, status: int) -> None:
+    """The contract every page shares, whatever its status code, body or session."""
+    assert response.status_code == status
+    assert response.headers["content-security-policy"] == EXPECTED_CSP
+    text = response.text
+    assert "<html lang='en'>" in text
+    assert "<meta name='viewport'" in text
+    title = re.search(r"<title>(.*?)</title>", text)
+    assert text.count("<title>") == 1 and text.count("</title>") == 1
+    assert title is not None
+    heading = re.search(r"<h1>(.*?)</h1>", text)
+    assert text.count("<h1>") == 1 and heading is not None
+    assert title.group(1) == f"{heading.group(1)} · advisory-radar", "the tab names the page it shows"
+    assert text.count("<style>") == 1 and text.count("</style>") == 1, "one inline stylesheet"
+    assert text.count("<main") == 1 and "<main id='main'>" in text
+    assert "<a class='skip' href='#main'>Skip to content</a>" in text
+    assert "<script" not in text and " onclick=" not in text and " style=" not in text
+    # The stylesheet names the selector too, so the attribute is counted with its leading space.
+    assert text.count(" aria-current='page'") == (1 if active else 0)
+    if active:
+        assert f"<a href='{active}' aria-current='page'>" in text
+
+
+def test_every_page_carries_the_same_shell(tmp_path):
+    """One shell on every page: a language, a viewport, one title, one h1, one current section.
+
+    A rendered page cannot be unit-tested for its look, but the contract the stylesheet, the navigation and
+    the security headers depend on can: an error page and a signed-out page included, so a page added later
+    cannot quietly lose its landmarks, its per-page title or its session chrome.
+    """
+    state = core.new_state()
+    state["seen"]["CVE-2026-1"] = {"at": NOW, "outcome": "delivered", "tag": "critical", "title": "Seen"}
+    client, token, _ = make_client(tmp_path, state=state)
+    csrf = sign_in(client, token)
+    assert csrf
+    pages = {
+        "/": "/",
+        "/alerts": "/alerts",
+        "/parked": "/parked",
+        "/config": "/config",
+        "/sources": "/sources",
+        "/runs": "/runs",
+        f"/advisories/{advisory_token('CVE-2026-1')}": "/alerts",
+    }
+    # A page route added later must join this test instead of silently going unchecked.
+    served = {
+        route.path
+        for route in client.app.routes
+        if "GET" in (getattr(route, "methods", None) or set()) and "{" not in getattr(route, "path", "")
+    }
+    assert served - set(pages) == {"/login", "/healthz", "/readyz", "/metrics", "/api/state", "/openapi.json"}
+    for path, active in pages.items():
+        response = client.get(path, headers={"accept": "text/html"})
+        _assert_shell(response, active=active, status=200)
+        assert 'action="/logout"' in response.text, f"{path} must offer sign out"
+
+    # An unknown identifier is a 404 of the section it was reached from, chrome included.
+    missing = client.get(f"/advisories/{advisory_token('CVE-2026-404')}", headers={"accept": "text/html"})
+    _assert_shell(missing, active="/alerts", status=404)
+    assert 'action="/logout"' in missing.text
+
+    # A refused save is an authenticated configuration page, not a bare error.
+    stale = client.post(
+        "/config/settings",
+        data={"csrf": csrf, "fingerprint": "0" * 64},
+        headers={"accept": "text/html"},
+    )
+    _assert_shell(stale, active="/config", status=409)
+    assert 'action="/logout"' in stale.text
+
+    # A refused form token still renders the section the action came from.
+    for path, active in (("/run", "/"), ("/reload", "/config"), ("/logout", "")):
+        refused = client.post(path, data={"csrf": "0" * 64}, headers={"accept": "text/html"})
+        _assert_shell(refused, active=active, status=403)
+
+    # Signed out: the brand alone, the login page still signs in, and the throttle has a page too.
+    client.cookies.clear()
+    login = client.get("/login", headers={"accept": "text/html"})
+    _assert_shell(login, active="", status=200)
+    assert "<nav class='links'" not in login.text
+    for _ in range(6):
+        throttled = client.post("/login", data={"token": "nope"}, headers={"accept": "text/html"})
+        if throttled.status_code == 429:
+            break
+    else:
+        raise AssertionError("six wrong tokens must be refused by the login throttle")
+    _assert_shell(throttled, active="", status=429)
+
+
+def test_a_stored_value_is_data_not_a_lookup_key(tmp_path):
+    """A malformed stored value is shown as the absence it is; it used to raise or render a Python repr.
+
+    The state loader validates the document's shape, not each field's type, so a hand-edited record can hold a
+    list where a string or an integer belongs. Nothing rendered may hash that value or show its repr: the
+    alert list, the advisory page, the parked queue, the dashboard and the run history are all checked.
+    """
+    state = core.new_state()
+    state["seen"]["CVE-2026-1"] = {
+        "at": NOW,
+        "outcome": ["delivered"],
+        "tag": ["critical"],
+        "title": {"unexpected": "mapping"},
+        "link": ["https://vendor.example.net/advisory"],
+        "ids": ["CVE-2026-1", {"nested": "mapping"}],
+        "levels": {"CVE-2026-1": ["critical"]},
+        "scores": {"CVE-2026-1": {"unexpected": "mapping"}},
+    }
+    state["parked"] = [{"tag": ["critical"], "title": {"unexpected": "mapping"}, "ids": ["CVE-2026-2"]}]
+    state["runs"] = [{"at": NOW, "code": ["0"], "sent": 0, "parked": 0, "pending": 0}]
+    save_state(tmp_path / "state.json", state)
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    pages = ("/", "/alerts", "/parked", "/runs", f"/advisories/{advisory_token('CVE-2026-1')}")
+    for path in pages:
+        response = client.get(path)
+        assert response.status_code == 200, path
+        shown = html.unescape(response.text)
+        for rendered in ("['delivered']", "['critical']", "{'unexpected'", "['0']"):
+            assert rendered not in shown, f"{path} must not render {rendered}"
+    # An unusable exit code is unknown, not a recorded failure.
+    assert "<span class='badge badge-neutral'>?</span>" in client.get("/runs").text
+    assert "<span class='badge badge-neutral'>?</span>" in client.get("/").text
