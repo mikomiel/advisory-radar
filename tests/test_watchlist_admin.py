@@ -548,3 +548,71 @@ def test_a_path_that_cannot_be_inspected_is_reported_by_the_page(tmp_path, monke
     assert page.status_code == 200
     assert "cannot be inspected" in page.text
     assert "name='fingerprint'" not in page.text, "there is nothing safe to edit against"
+
+
+def test_a_missing_configured_document_has_no_verdict_to_show(tmp_path):
+    """The page must not answer for the built-in default while the pass reads the configured, missing path."""
+    watch = tmp_path / "missing" / "scope.json"
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    page = client.get("/watchlist", params={"preview": "1", "title": "anything at all"})
+    assert "In scope" not in page.text and "Out of scope" not in page.text
+    assert "nothing to check an advisory against" in page.text
+    assert "name='preview'" not in page.text, "the check form is absent, not just its answer"
+
+
+def test_a_symlinked_document_is_saved_through_its_link(tmp_path):
+    """A save must replace the file the link names, not the link: otherwise the operator's file is orphaned."""
+    real = write_scope(tmp_path / "scope.json")
+    link = tmp_path / "watchlist.json"
+    link.symlink_to(real)
+    client, _ = make_client(tmp_path, link)
+    sign_in(client)
+    csrf, fingerprint, _ = scope_form(client)
+    response = submit(
+        client,
+        csrf,
+        fingerprint,
+        **{
+            "product:nodejs:aliases": "node.js, nodejs",
+            "product:nodejs:domains": "nodejs.org",
+            "metadata_only:nodejs": "0",
+            "debian_packages": "*",
+        },
+    )
+    assert response.status_code == 303
+    assert link.is_symlink(), "the operator's link is untouched"
+    assert json.loads(real.read_text())["products"][0]["aliases"] == ["node.js", "nodejs"]
+
+
+def test_the_configuration_page_survives_an_uninspectable_scope(tmp_path, monkeypatch):
+    """The scope path is one line of /config: failing to name it must not hide every other setting."""
+    client, _ = make_client(tmp_path)
+    sign_in(client)
+
+    def denied(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(watchlist, "os", types.SimpleNamespace(lstat=denied))
+    page = client.get("/config")
+    assert page.status_code == 200
+    assert "scope <a href='/watchlist'>unavailable</a>" in page.text
+    assert "cannot be inspected" in page.text
+
+
+def test_a_save_to_an_uninspectable_path_is_refused(tmp_path, monkeypatch):
+    client, _ = make_client(tmp_path)
+    sign_in(client)
+    csrf = CSRF_RE.search(client.get("/").text).group(1)
+
+    def denied(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(watchlist, "os", types.SimpleNamespace(lstat=denied))
+    response = client.post(
+        "/watchlist",
+        data={"csrf": csrf, "fingerprint": "", "new:id": "php", "new:aliases": "php", "debian_packages": "*"},
+    )
+    assert response.status_code == 200
+    assert "cannot be inspected" in response.text
+    assert "value='php'" in response.text, "the row is re-rendered, nothing is written"

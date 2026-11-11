@@ -181,14 +181,23 @@ def save_watchlist(path: Path, document: dict, *, expected: str) -> str:
     The read, the check and the replacement happen under one lock on ``<document>.lock``, which is what makes the
     check mean anything: two processes that both read the same digest would otherwise both pass it and the later
     replacement would silently lose the earlier edit.
+
+    A symlinked document is replaced at the file it names, never at the link: replacing the link would leave the
+    operator's own document untouched and every later edit of it silently ignored. The lock is taken on the same
+    resolved path, so two names for one document cannot save past each other.
     """
     parse_policy(document)
-    with WATCHLIST_LOCK, state_lock(path):
+    target = path.resolve()
+    if path.is_symlink() and not present(target):
+        # The link names a file that is not there. Creating it would leave the operator editing a document they
+        # did not name, with whatever the link pointed at before gone from their point of view.
+        raise SourceError(f"{path} is a link to {target}, which does not exist; refusing to create it")
+    with WATCHLIST_LOCK, state_lock(target):
         current = ""
-        if present(path):
+        if present(target):
             # Reading first is what stops a misconfigured path from being overwritten: only a document this
             # module can read as a watchlist is a document it may replace.
-            current = digest(read_watchlist(path))
+            current = digest(read_watchlist(target))
         if current != expected:
             raise StaleDocument(f"{path} changed since this page was loaded")
         payload = serialize_json(document)
@@ -197,5 +206,5 @@ def save_watchlist(path: Path, document: dict, *, expected: str) -> str:
                 f"the watchlist would be {len(payload.encode('utf-8'))} bytes, more than the "
                 f"{MAX_WATCHLIST_BYTES} a save accepts; shorten a product's aliases or domains"
             )
-        save_json(path, document)
+        save_json(target, document)
         return digest(document)

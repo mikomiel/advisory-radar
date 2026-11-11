@@ -2986,10 +2986,18 @@ def create_app(
         csrf = csrf_field(request)
         fingerprint = form_fingerprint(document)
         fingerprint_field = f"<input type='hidden' name='fingerprint' value='{fingerprint}'>"
+        try:
+            scope_link = (
+                f"<a href='/watchlist'><code>{esc(watchlist.active_path(cfg.watchlist_path, cfg.state_path))}"
+                "</code></a>"
+            )
+        except SourceError as exc:
+            # The document cannot even be inspected. Naming why is better than failing the whole page: every other
+            # setting here still has to be editable, and the message is the one /watchlist and a pass would show.
+            scope_link = f"<a href='/watchlist'>unavailable</a> ({esc(exc)})"
         body = (
             f"<div class='strip'><p class='muted small'>Live poll interval <b>{cfg.poll_interval_seconds}s</b> · "
-            f"state <code>{esc(cfg.state_path)}</code> · scope "
-            f"<a href='/watchlist'><code>{esc(watchlist.active_path(cfg.watchlist_path, cfg.state_path))}</code></a>"
+            f"state <code>{esc(cfg.state_path)}</code> · scope {scope_link}"
             f"</p>"
             f'<form method="post" action="/reload">{csrf}<button class="btn">Reload configuration</button></form>'
             "</div>"
@@ -3285,9 +3293,18 @@ def create_app(
                     "critical",
                 )
                 return watchlist_scope_page(request, target, exists=exists, notices=notices)
-        extra = watchlist_preview_form(values)
-        if "preview" in params:
-            extra += watchlist_preview_verdict(document, values)
+        if not exists and cfg.watchlist_path is not None:
+            # A configured document that has not been created yet fails every pass, so checking an advisory
+            # against the built-in default would answer for a scope the pass never applies.
+            extra = _notice(
+                f"There is nothing to check an advisory against: <code>{esc(target)}</code> does not exist, so "
+                "every pass fails until it is saved.",
+                "warning",
+            )
+        else:
+            extra = watchlist_preview_form(values)
+            if "preview" in params:
+                extra += watchlist_preview_verdict(document, values)
         return watchlist_scope_page(
             request,
             target,

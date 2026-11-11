@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 
@@ -321,9 +322,22 @@ def test_a_save_does_not_replace_a_broken_link_with_a_file(tmp_path):
     """Replacing the link would leave the operator's own document ignored the moment the target came back."""
     target = tmp_path / "watchlist.json"
     target.symlink_to(tmp_path / "gone.json")
-    with pytest.raises(SourceError, match="cannot be read"):
+    with pytest.raises(SourceError, match="refusing to create it"):
         save_watchlist(target, document(), expected="")
     assert target.is_symlink(), "the link is the operator's, not this program's"
+    assert not (tmp_path / "gone.json").exists(), "the link's target is not created behind the operator's back"
+
+
+def test_a_save_through_a_link_updates_the_file_it_names(tmp_path):
+    """A readable link stays a link: the document it names is replaced, and the operator's link keeps working."""
+    real = write(tmp_path / "scope.json", document())
+    link = tmp_path / "watchlist.json"
+    link.symlink_to(real)
+    save_watchlist(link, document(products=[]), expected=digest(document()))
+    assert link.is_symlink(), "the link is not replaced by a regular file"
+    assert read_watchlist(real)["products"] == []
+    assert (tmp_path / "scope.json.lock").exists(), "the lock is taken on the document, not on the link"
+    assert not (tmp_path / "watchlist.json.lock").exists(), "one document, one lock, whatever names it"
 
 
 def test_a_path_that_cannot_be_inspected_is_not_an_absent_document(tmp_path, monkeypatch):
@@ -342,23 +356,31 @@ def test_a_path_that_cannot_be_inspected_is_not_an_absent_document(tmp_path, mon
 
 
 RACE_CHILD = """
-import sys
+import sys, time
 from pathlib import Path
 from advisory_radar.watchlist import StaleDocument, save_watchlist
 
 target, expected = Path(sys.argv[1]), sys.argv[2]
 document = {"schema": "security-watchlist.v1", "debian_source_packages": ["*"], "excluded_products": [],
             "products": []}
+print("ready", flush=True)
+started = time.monotonic()
 try:
     save_watchlist(target, document, expected=expected)
 except StaleDocument:
+    print(f"stale {time.monotonic() - started:.3f}", flush=True)
     raise SystemExit(3)
 raise SystemExit(0)
 """
 
 
 def test_a_second_process_saving_the_same_page_is_refused(tmp_path, monkeypatch):
-    """The sidecar lock is what makes the digest check mean something between processes, not only threads."""
+    """The sidecar lock is what makes the digest check mean something between processes, not only threads.
+
+    The child announces itself after its imports, then blocks: while the first save holds the lock it cannot
+    reach its read at all, and the elapsed time it reports is the wait, so this is contention rather than two
+    sequential saves.
+    """
     target = write(tmp_path / "watchlist.json", document())
     stale = digest(document())
     writing = threading.Event()
@@ -374,9 +396,16 @@ def test_a_second_process_saving_the_same_page_is_refused(tmp_path, monkeypatch)
     first = threading.Thread(target=lambda: save_watchlist(target, document(products=[]), expected=stale))
     first.start()
     assert writing.wait(20), "the first save must reach the write while holding the lock"
-    child = subprocess.Popen([sys.executable, "-c", RACE_CHILD, str(target), stale])
-    release.set()
-    first.join(20)
+    child = subprocess.Popen([sys.executable, "-c", RACE_CHILD, str(target), stale], stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "ready"
+        time.sleep(0.3)
+        assert child.poll() is None, "the child is blocked on the lock the first save holds"
+    finally:
+        release.set()
+        first.join(20)
+    reported = child.stdout.readline().split()
     child.wait(timeout=30)
     assert child.returncode == 3, "the second process reads the first one's document and refuses"
+    assert float(reported[1]) >= 0.2, "the child waited for the lock before it read"
     assert read_watchlist(target)["products"] == []
