@@ -1512,25 +1512,11 @@ def _claimed(state: dict) -> set[str]:
     stored = set(state["seen"]) | {
         identifier for entry in (*state["pending"], *state.get("parked", ())) for identifier in entry["ids"]
     }
-    claims = {claim_key(value) for value in stored if isinstance(value, str)}
-    # An older version prefixed the source id twice for a webhook entry, so its claim is one namespace longer
-    # than today's identity for the same item. Both spellings are claimed, which can only recognise the same
-    # advisory earlier -- never claim a different one, because the second key exists only for that shape.
-    claims |= {_doubled_namespace(value) for value in stored if isinstance(value, str)}
-    return claims
-
-
-def _doubled_namespace(value: str) -> str:
-    """The claim a doubled-namespace stored identity names, or ``value`` when it is not one."""
-    if not value.startswith("src:"):
-        return value
-    body = value[len("src:") :]
-    source, separator, guid = body.partition(":")
-    prefix = f"{source}:"
-    if not separator or not guid.startswith(prefix):
-        return value
-    rest = guid[len(prefix) :]
-    return f"src:{source}:{normalise_identity(rest) or synthetic_identity(rest)}"
+    # No compatibility alias is derived from the shape of a stored claim. A guid may legitimately begin with
+    # its source id, so inferring a second spelling from "the prefix appears twice" can claim a *different*
+    # advisory and lose it silently -- a far worse outcome than the single duplicate delivery that a claim
+    # written by the old double-prefix bug can still cause after an upgrade.
+    return {claim_key(value) for value in stored if isinstance(value, str)}
 
 
 def claim_key(value: str) -> str:

@@ -671,29 +671,6 @@ def test_a_filtered_webhook_entry_with_a_cve_leaves_the_inbox(tmp_path):
     assert not (stored.get("webhook_inbox") or {}).get("wh"), "a filtered entry must not accumulate"
 
 
-def test_a_legacy_doubled_claim_suppresses_a_replayed_webhook(tmp_path):
-    """An older version claimed a webhook entry with the source id twice; a replay must not re-send it."""
-    from advisory_radar.sources import WebhookSource
-
-    cfg = _webhook_config(tmp_path)
-    state = core.new_state()
-    state["seen"]["src:wh:wh:\ud800legacy"] = {"at": NOW, "outcome": "delivered"}
-    state["webhook_inbox"] = {
-        "wh": [{"guid": "\ud800legacy", "title": "Vendor advisory", "summary": "", "link": "https://v.example/a"}]
-    }
-    save_state(cfg.state_path, state)
-    notifier = FakeNotifier()
-    pipeline.run_pass(
-        cfg,
-        [WebhookSource("wh")],
-        [notifier],
-        http=lambda *a: (404, {}, b""),
-        clock=lambda: float(NOW),
-        sleep=lambda s: None,
-    )
-    assert not notifier.sent, "the advisory was already delivered under the legacy spelling"
-
-
 def test_a_legacy_clock_key_with_an_unusable_guid_keeps_its_deadline(tmp_path):
     """The pending clock must be found through the restored stand-in, or a 24h wait restarts as 2h."""
     pending = core.restored_guid("wh:\ud800legacy")
