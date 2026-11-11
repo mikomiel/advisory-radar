@@ -10,6 +10,7 @@ from pathlib import Path
 
 from . import core
 from .config import Config, secret_values
+from .feeds import normalise_identity
 from .http import Http, RedactFilter, urllib_http
 from .kev import load_kev
 from .notifiers import build_notifier
@@ -41,6 +42,68 @@ def _drop_disabled_sources(state: dict, enabled_ids: set[str]) -> None:
     if isinstance(health, dict):
         for stale in [source_id for source_id in health if source_id not in enabled_ids]:
             health.pop(stale, None)
+
+
+def _normalised_seen_key(key: str) -> str:
+    """A ``seen`` key with its ``src:`` identity normalised; other keys are identifiers, not feed identities."""
+    body = key[len("src:") :]
+    source, separator, guid = body.partition(":")
+    if not separator:
+        return f"src:{normalise_identity(body)}"
+    return f"src:{source}:{normalise_identity(guid)}"
+
+
+def _normalise_stored_identities(state: dict) -> None:
+    """Rewrite identities an older reader stored, so dedupe and logging see today's value.
+
+    Normalisation is idempotent, so a second pass on the same document changes nothing. Only containers that
+    *own* a feed identity are rewritten: ``seen`` keys whose identity is the part after ``src:<source>:``,
+    ``carry`` row guids (a carried candidate reaches ``classified %s`` without passing a reader again), and
+    ``windows`` guid lists, which the next window is compared against. A collision keeps the first record, so
+    history is neither lost nor doubled. ``deliveries`` is content-addressed; ``pending``/``parked`` entries
+    are already-decided messages, ``watch`` is keyed by extracted CVE ids, and the source-keyed maps
+    (``feeds``, ``seeded``, ``source_health``) hold config-validated source ids, none of which is a feed guid.
+    """
+    seen = state.get("seen")
+    if isinstance(seen, dict):
+        rewritten: dict = {}
+        for key, record in seen.items():
+            rewritten_key = _normalised_seen_key(key) if isinstance(key, str) and key.startswith("src:") else key
+            if rewritten_key in rewritten:
+                continue  # the first record wins; the duplicate names the same advisory
+            rewritten[rewritten_key] = record
+        state["seen"] = rewritten
+
+    carry = state.get("carry")
+    if isinstance(carry, dict):
+        for source, rows in list(carry.items()):
+            if not isinstance(rows, list):
+                continue
+            kept: list = []
+            guids: set[str] = set()
+            for row in rows:
+                if isinstance(row, dict) and isinstance(row.get("guid"), str):
+                    guid = normalise_identity(row["guid"])
+                    if guid in guids:
+                        continue  # first wins, as in ``seen``
+                    guids.add(guid)
+                    row = {**row, "guid": guid}
+                kept.append(row)
+            carry[source] = kept
+
+    windows = state.get("windows")
+    if isinstance(windows, dict):
+        for source, guids in list(windows.items()):
+            if not isinstance(guids, list):
+                continue
+            rewritten_guids: list[str] = []
+            for guid in guids:
+                if not isinstance(guid, str):
+                    continue
+                value = normalise_identity(guid)
+                if value not in rewritten_guids:
+                    rewritten_guids.append(value)
+            windows[source] = rewritten_guids
 
 
 def _fetch_due(record: object, now: int, interval: int) -> bool:
@@ -159,6 +222,10 @@ def _run_pass(
     core.HIDDEN_SOURCE_HOSTS = cfg.hidden_source_hosts
 
     state = core.new_state() if stored is None else stored
+    # Do this before anything reads an identity: a document written by an older reader still holds raw guids,
+    # and the seen key would no longer match the same item (delivered twice) while a carried guid could put a
+    # publisher-authored newline into ``classified %s``.
+    _normalise_stored_identities(state)
     _reset_validators_on_policy_change(state, policy)
     state.setdefault("parked", [])
     core._prune(state, now)

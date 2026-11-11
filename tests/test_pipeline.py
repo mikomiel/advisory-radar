@@ -396,3 +396,59 @@ def test_a_forged_newline_in_an_rss_identity_never_becomes_a_log_line(tmp_path, 
     )
     assert code == 0
     assert_no_forged_log_line(caplog)
+
+
+def test_a_document_from_an_older_reader_is_normalised_before_it_is_judged(tmp_path, caplog):
+    """Identities an older reader stored must not deliver twice, nor forge a log line, on the next pass."""
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path)
+    state = core.new_state()
+    # What the previous version could leave behind: a link-cased identity carrying DEL in ``seen``, and a
+    # carried candidate whose identity carries a publisher-authored newline. Neither passes a reader again.
+    state["seen"]["src:test:https://vendor.example.com/a\u007f"] = {"at": NOW, "outcome": "delivered"}
+    state["carry"] = {
+        "test": [
+            {
+                "guid": "carry-1\n2026-10-22 INFO forged operational message",
+                "title": "Carried advisory",
+                "link": "",
+                "summary": "no identifiers",
+                "published": None,
+                "explicit": [],
+                "source_title": "",
+                "source_url": "",
+            }
+        ]
+    }
+    state["seeded"] = {"test": True}
+    save_state(cfg.state_path, state)
+    body = (
+        b'<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>'
+        b"<item><title>Unrelated advisory</title><link>https://vendor.example.com/a</link>"
+        b"<guid>https://vendor.example.com/a</guid><description>no identifiers</description></item>"
+        b"</channel></rss>"
+    )
+    notifier = FakeNotifier()
+
+    def http(method, url, headers, payload):
+        if url == "https://feeds.example.com/rss":
+            return 200, {}, body
+        return fake_http(method, url, headers, payload)
+
+    caplog.set_level(logging.INFO)
+    code = pipeline.run_pass(
+        cfg,
+        [RssSource("test", "https://feeds.example.com/rss")],
+        [notifier],
+        http=http,
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 0
+    assert_no_forged_log_line(caplog)
+    assert not [entry for entry in notifier.sent if entry.get("link") == "https://vendor.example.com/a"], (
+        "the advisory recorded under a control-bearing identity must not be delivered again"
+    )
+    stored = json.loads((tmp_path / "state.json").read_text())
+    assert "src:test:https://vendor.example.com/a" in stored["seen"]
+    assert not [key for key in stored["seen"] if key.endswith("\u007f")]

@@ -231,8 +231,13 @@ _NAV = (
 )
 
 
+def _response_text(value: str) -> str:
+    """``value`` made UTF-8 encodable: one legacy surrogate in state must not fail the whole page."""
+    return value.encode("utf-8", "replace").decode("utf-8")
+
+
 def esc(value: object) -> str:
-    return html.escape(str(value))
+    return html.escape(_response_text(str(value)))
 
 
 def _nav(active: str) -> str:
@@ -378,8 +383,12 @@ SEEN_OUTCOMES = ("delivered", "dropped", "filtered", "suppressed", "backlog", "a
 
 
 def _advisory_token(identifier: str) -> str:
-    """A slash-free path segment for an identifier, which may itself be (or contain) a URL."""
-    return base64.urlsafe_b64encode(identifier.encode("utf-8")).decode("ascii").rstrip("=")
+    """A slash-free path segment for an identifier, which may itself be (or contain) a URL.
+
+    A legacy identity in state may not be a Unicode scalar value. Encoding it defensively makes a token that
+    does not resolve, which is a 404 on that one link rather than a 500 on the whole page.
+    """
+    return base64.urlsafe_b64encode(identifier.encode("utf-8", "replace")).decode("ascii").rstrip("=")
 
 
 def _advisory_identifier(token: str) -> str:
@@ -408,8 +417,12 @@ def _day_start(value: str, where: str) -> int:
 
 
 def _cursor_encode(at: int, identifier: str) -> str:
-    """A page position as URL-safe base64 of ``at:identifier``, without padding."""
-    return base64.urlsafe_b64encode(f"{at}:{identifier}".encode()).decode("ascii").rstrip("=")
+    """A page position as URL-safe base64 of ``at:identifier``, without padding.
+
+    The identifier may be a legacy state key that is not a Unicode scalar value, so it is encoded
+    defensively: a page whose cursor cannot name that one record must still render the rest.
+    """
+    return base64.urlsafe_b64encode(f"{at}:{identifier}".encode("utf-8", "replace")).decode("ascii").rstrip("=")
 
 
 def _cursor_decode(value: str) -> tuple[int, str]:

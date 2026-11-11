@@ -1249,3 +1249,15 @@ def test_a_kev_value_that_is_not_a_boolean_is_refused(tmp_path):
     assert "match.kev must be true or false" in refused.text
     assert not (tmp_path / "settings.json").exists()
     assert runtime.cfg.routes[0]["match"]["kev"] is True, "the running rules are unchanged"
+
+
+def test_a_legacy_identity_utf8_cannot_encode_still_renders_the_alerts_page(tmp_path):
+    """One record written before identities were normalised must not turn the whole page into a 500."""
+    client, token = make_client(tmp_path)
+    path = tmp_path / "state.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["seen"]["src:test:x\ud800y"] = {"at": 1792600000, "outcome": "delivered"}
+    path.write_text(json.dumps(state), encoding="utf-8")
+    signed_in(client, token)
+    page = client.get("/alerts")
+    assert page.status_code == 200

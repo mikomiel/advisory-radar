@@ -332,3 +332,29 @@ def test_an_identity_of_only_control_characters_is_refused():
     assert feeds.parse_json_feed(document).items[0].guid == "https://vendor.example.com/a"
     with pytest.raises(feeds.RssError):
         feeds.parse_rss(b"<rss><channel><item><title>t</title><guid>\x7f</guid></item></channel></rss>")
+
+
+def test_an_identity_utf8_cannot_encode_is_refused_or_falls_back():
+    """An escaped unpaired surrogate passes JSON decoding but can never be logged or rendered."""
+    unusable = (
+        b'{"version": "https://jsonfeed.org/version/1.1", "items": ['
+        b'{"id": "\\ud800", "content_text": "Security update"}]}'
+    )
+    with pytest.raises(feeds.FeedError):
+        feeds.parse_json_feed(unusable)
+    with_url = (
+        b'{"version": "https://jsonfeed.org/version/1.1", "items": ['
+        b'{"id": "\\ud800", "url": "https://vendor.example.com/a", "content_text": "Security update"}]}'
+    )
+    assert feeds.parse_json_feed(with_url).items[0].guid == "https://vendor.example.com/a"
+
+
+def test_feed_text_utf8_cannot_encode_is_replaced_rather_than_raised():
+    """A log record and an HTTP response both encode; neither may fail because a publisher sent a surrogate."""
+    document = (
+        b'{"version": "https://jsonfeed.org/version/1.1", "title": "\\ud800 feed", "items": ['
+        b'{"id": "a1", "title": "\\ud800 advisory", "content_text": "Security update"}]}'
+    )
+    export = feeds.parse_json_feed(document)
+    export.items[0].title.encode("utf-8")
+    assert "advisory" in export.items[0].title

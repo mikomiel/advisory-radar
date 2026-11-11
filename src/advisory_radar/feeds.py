@@ -97,11 +97,21 @@ class _TextExtractor(html.parser.HTMLParser):
             self.parts.append(" ")
 
 
+def _encodable(value: str) -> str:
+    """``value`` with characters UTF-8 cannot encode replaced, so a response can always render it.
+
+    A JSON string may carry an escaped unpaired surrogate: ``json.loads`` accepts it, but ``str.encode`` and
+    the web response encoder refuse it, which would turn one bad item into a 500 page. Feed text is
+    untrusted, so it is made encodable when it leaves the reader, not at each response.
+    """
+    return value.encode("utf-8", "replace").decode("utf-8")
+
+
 def clean_text(value: str) -> str:
     extractor = _TextExtractor()
     extractor.feed(value)
     extractor.close()
-    return " ".join("".join(extractor.parts).split())
+    return _encodable(" ".join("".join(extractor.parts).split()))
 
 
 def _text(value: object) -> str:
@@ -114,7 +124,7 @@ def _plain(value: object) -> str:
     ``content_text`` is already text, so running it through the HTML parser would eat a legitimate ``<`` --
     "fixed in <2.0" would lose the version, and with it the shard of evidence the source was added for.
     """
-    return " ".join(value.split()) if isinstance(value, str) else ""
+    return _encodable(" ".join(value.split())) if isinstance(value, str) else ""
 
 
 def _string(value: object) -> str:
@@ -127,15 +137,22 @@ def _string(value: object) -> str:
 _IDENTITY_CONTROLS = re.compile("[\x00-\x1f\x7f\u2028\u2029]")
 
 
-def _identity(value: object) -> str:
-    """A feed identity that is safe to log and store: control characters removed, empty returned as empty.
+def normalise_identity(value: object) -> str:
+    """A feed identity that is safe to log and store, or "" when nothing usable remains.
 
-    Normalised at the boundary that owns the value -- the readers -- rather than at each log call, so every
-    present and future caller of ``FeedEntry.guid`` gets a single-line identity. The caller still decides
-    whether an empty result is an error, because a JSON document and an XML feed refuse one with their own
-    error type; the deduplication identity is the normalised string, so no other behaviour moves.
+    Normalised at the boundary that owns the value -- the readers, and the state loader that may hold their
+    older answers -- rather than at each log call, so every present and future caller of ``FeedEntry.guid``
+    gets a single-line identity. A string that is not a Unicode scalar value (an escaped unpaired surrogate)
+    is refused as empty too, because it cannot be written to a log or a response at all. The caller still
+    decides whether an empty result is an error, because a JSON document and an XML feed refuse one with
+    their own error type; the deduplication identity is the normalised string, so no other behaviour moves.
     """
-    return _IDENTITY_CONTROLS.sub("", _string(value)).strip()
+    raw = value.strip() if isinstance(value, str) else ""
+    try:
+        raw.encode("utf-8")
+    except UnicodeEncodeError:
+        return ""
+    return _IDENTITY_CONTROLS.sub("", raw).strip()
 
 
 def _local(tag: object) -> str:
@@ -215,7 +232,7 @@ def _first_line(value: object, *, html_text: bool) -> str:
     if not isinstance(value, str):
         return ""
     for line in value.splitlines():
-        line = _text(line) if html_text else " ".join(line.split())
+        line = _text(line) if html_text else _plain(line)
         if line:
             return line
     return ""
@@ -256,7 +273,7 @@ def _greader_export(document: object) -> FeedExport:
         identifier = node.get("id")
         match = GREADER_ID.match(identifier if isinstance(identifier, str) else "")
         link = _first_href(node.get("canonical")) or _first_href(node.get("alternate"))
-        guid = _identity(str(int(match.group(1), 16)) if match else link)
+        guid = normalise_identity(str(int(match.group(1), 16)) if match else link)
         title = _text(node.get("title"))
         if not guid or not title:
             raise FeedError("feed entry has no usable id or title")
@@ -279,11 +296,11 @@ def _greader_export(document: object) -> FeedExport:
             FeedEntry(
                 guid,
                 title,
-                link,
+                _encodable(link),
                 summary,
                 published if type(published) is int and _plausible(published) else None,
                 _text(origin.get("title")),
-                source_url.strip() if isinstance(source_url, str) else "",
+                _encodable(source_url.strip()) if isinstance(source_url, str) else "",
             )
         )
     return FeedExport(tuple(items), bool(document.get("continuation")) or len(entries) >= FEED_ITEMS)
@@ -322,7 +339,7 @@ def _json_feed_export(document: object) -> FeedExport:
     if not isinstance(entries, list):
         raise FeedError("feed has no items list")
     feed_title = _text(document.get("title"))
-    feed_link = _string(document.get("home_page_url"))
+    feed_link = _encodable(_string(document.get("home_page_url")))
     items = []
     for node in entries:
         if not isinstance(node, dict):
@@ -330,7 +347,7 @@ def _json_feed_export(document: object) -> FeedExport:
         # ``url`` is the item's public page; ``external_url`` is used when the item has no page on this
         # site, and either is a better link than none. The id is the stable identity and wins outright.
         link = _string(node.get("url")) or _string(node.get("external_url"))
-        guid = _identity(node.get("id")) or _identity(link)
+        guid = normalise_identity(node.get("id")) or normalise_identity(link)
         if not guid:
             raise FeedError("feed entry has no usable id")
         title = _text(node.get("title"))
@@ -349,7 +366,7 @@ def _json_feed_export(document: object) -> FeedExport:
             # without either content field is technically invalid but does occur.
             summary = _plain(node.get("summary"))
         published = _epoch_of(node.get("date_published")) or _epoch_of(node.get("date_modified"))
-        items.append(FeedEntry(guid, title, link, summary, published, feed_title, feed_link))
+        items.append(FeedEntry(guid, title, _encodable(link), summary, published, feed_title, feed_link))
     return FeedExport(tuple(items), False)
 
 
@@ -456,7 +473,7 @@ def _rss_2_export(root: ET.Element) -> FeedExport:
     items = []
     for node in channel.findall("item"):
         link = _text_of(node.find("link"))
-        guid = _identity(_text_of(node.find("guid"))) or _identity(link)
+        guid = normalise_identity(_text_of(node.find("guid"))) or normalise_identity(link)
         title = _text_of(node.find("title"))
         if not guid or not title:
             raise RssError("feed entry has no usable id or title")
@@ -485,7 +502,7 @@ def _atom_export(root: ET.Element) -> FeedExport:
             if candidate.get("rel") in (None, "alternate") and candidate.get("href"):
                 link = candidate.get("href", "")
                 break
-        guid = _identity(_text_of(node.find(f"{_ATOM}id"))) or _identity(link)
+        guid = normalise_identity(_text_of(node.find(f"{_ATOM}id"))) or normalise_identity(link)
         title = _text_of(node.find(f"{_ATOM}title"))
         if not guid or not title:
             raise RssError("feed entry has no usable id or title")
@@ -516,7 +533,7 @@ def _rdf_export(root: ET.Element) -> FeedExport:
     for node in entries:
         link = _text_of(node.find(f"{_RSS}link"))
         # rdf:about is the item's identity and survives a link change; the link is the fallback.
-        guid = _identity(node.get(f"{_RDF}about")) or _identity(link)
+        guid = normalise_identity(node.get(f"{_RDF}about")) or normalise_identity(link)
         title = _text_of(node.find(f"{_RSS}title"))
         if not guid or not title:
             raise RssError("feed entry has no usable id or title")
