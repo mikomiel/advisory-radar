@@ -329,46 +329,49 @@ def test_an_html_page_without_a_feed_link_is_refused():
         feeds.fetch_any(no_link, PAGE_URL)
 
 
-def test_a_control_character_is_removed_from_a_feed_identity():
-    """``rdf:about`` is only stripped today, so a character reference can put a newline in an identity."""
+def test_a_control_character_in_a_feed_identity_is_kept_exactly():
+    """An identity is compared, never rewritten: the log and display boundaries escape it instead."""
     rdf = RDF.replace(
         b'rdf:about="https://vendor.example.com/apsb26-1"',
         b'rdf:about="apsb26-1&#10;2026-10-22 INFO forged&#127;"',
     )
     entry = feeds.parse_rss(rdf).items[0]
-    assert entry.guid == "apsb26-12026-10-22 INFO forged"
+    assert entry.guid == "apsb26-1\n2026-10-22 INFO forged\x7f"
 
 
-def test_an_identity_of_only_control_characters_is_refused():
-    json_feed = (
+def test_an_identity_of_only_control_characters_is_kept_verbatim():
+    """An odd-looking id is still the publisher's identity; replacing it can reach a different advisory."""
+    document = (
         b'{"version": "https://jsonfeed.org/version/1.1", "items": ['
         b'{"id": "\\u2028", "content_text": "Security update"}]}'
     )
-    with pytest.raises(feeds.FeedError):
-        feeds.parse_json_feed(json_feed)
-    # A usable url is a derived identity, so the unusable id falls back to it rather than losing the item.
-    document = (
+    assert feeds.parse_json_feed(document).items[0].guid == "\u2028"
+    # The id wins over a perfectly usable url, because falling back would silently rename the advisory.
+    with_url = (
         b'{"version": "https://jsonfeed.org/version/1.1", "items": ['
         b'{"id": "\\u2028", "url": "https://vendor.example.com/a", "content_text": "Security update"}]}'
     )
-    assert feeds.parse_json_feed(document).items[0].guid == "https://vendor.example.com/a"
-    with pytest.raises(feeds.RssError):
-        feeds.parse_rss(b"<rss><channel><item><title>t</title><guid>\x7f</guid></item></channel></rss>")
+    assert feeds.parse_json_feed(with_url).items[0].guid == "\u2028"
+    rss = b"<rss><channel><item><title>t</title><guid>\x7f</guid></item></channel></rss>"
+    assert feeds.parse_rss(rss).items[0].guid == "\x7f"
 
 
-def test_an_identity_utf8_cannot_encode_is_refused_or_falls_back():
-    """An escaped unpaired surrogate passes JSON decoding but can never be logged or rendered."""
-    unusable = (
+def test_an_identity_utf8_cannot_encode_is_kept_verbatim():
+    """A guid that is not a Unicode scalar value is legal in state now, so the reader accepts it raw.
+
+    The log and display boundaries escape it: this reader no longer refuses, nor falls back to a different
+    value, because either would change which advisory the identity names.
+    """
+    document = (
         b'{"version": "https://jsonfeed.org/version/1.1", "items": ['
         b'{"id": "\\ud800", "content_text": "Security update"}]}'
     )
-    with pytest.raises(feeds.FeedError):
-        feeds.parse_json_feed(unusable)
+    assert feeds.parse_json_feed(document).items[0].guid == "\ud800"
     with_url = (
         b'{"version": "https://jsonfeed.org/version/1.1", "items": ['
         b'{"id": "\\ud800", "url": "https://vendor.example.com/a", "content_text": "Security update"}]}'
     )
-    assert feeds.parse_json_feed(with_url).items[0].guid == "https://vendor.example.com/a"
+    assert feeds.parse_json_feed(with_url).items[0].guid == "\ud800"
 
 
 def test_feed_text_utf8_cannot_encode_is_replaced_rather_than_raised():

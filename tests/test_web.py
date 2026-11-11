@@ -1252,7 +1252,7 @@ def test_a_kev_value_that_is_not_a_boolean_is_refused(tmp_path):
 
 
 def test_a_legacy_identity_utf8_cannot_encode_still_renders_the_alerts_page(tmp_path):
-    """One record written before identities were normalised must not turn the whole page into a 500."""
+    """One stored identity that is not a Unicode scalar value must not turn the whole page into a 500."""
     client, token = make_client(tmp_path)
     path = tmp_path / "state.json"
     state = json.loads(path.read_text(encoding="utf-8"))

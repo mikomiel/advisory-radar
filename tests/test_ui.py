@@ -26,7 +26,7 @@ from advisory_radar.http import RedactFilter
 from advisory_radar.runtime import Runtime
 from advisory_radar.settings import load_settings, settings_path
 from advisory_radar.state import load_state_document, save_state, serialize_json, state_lock
-from advisory_radar.web import create_app
+from advisory_radar.web import _advisory_token, create_app
 
 LOG = logging.getLogger("advisory_radar")
 NOW = 1792600000  # 2026-10-21 16:26:40 UTC
@@ -519,6 +519,33 @@ def test_an_identifier_with_slashes_round_trips_through_the_alert_link(tmp_path)
     # A segment the list never produced is a 400 page, not a crash.
     assert client.get("/advisories/!!!!").status_code == 400
     assert client.get("/advisories/").status_code == 404
+
+
+def test_two_stored_identities_that_would_share_a_replacement_get_their_own_links(tmp_path):
+    """Replacing the unpaired surrogate gave both identities one token, so one row opened the other's record."""
+    surrogate = "src:wh:wh:a\ud800b"
+    question = "src:wh:wh:a?b"
+    state = core.new_state()
+    state["seen"][surrogate] = seen(NOW, title="Surrogate advisory")
+    state["seen"][question] = seen(NOW, title="Question advisory")
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+
+    surrogate_token = _advisory_token(surrogate)
+    question_token = _advisory_token(question)
+    assert surrogate_token != question_token, "two identities must never share one advisory token"
+    alerts = client.get("/alerts").text
+    assert f"/advisories/{surrogate_token}" in alerts
+    assert f"/advisories/{question_token}" in alerts
+
+    surrogate_page = client.get(f"/advisories/{surrogate_token}")
+    assert surrogate_page.status_code == 200
+    assert "Surrogate advisory" in surrogate_page.text
+    assert "Question advisory" not in surrogate_page.text, "the link must open its own record"
+    question_page = client.get(f"/advisories/{question_token}")
+    assert question_page.status_code == 200
+    assert "Question advisory" in question_page.text
+    assert "Surrogate advisory" not in question_page.text, "the link must open its own record"
 
 
 def test_a_malformed_stored_link_renders_as_text_not_a_crash(tmp_path):

@@ -412,13 +412,13 @@ def test_a_forged_newline_in_an_rss_identity_never_becomes_a_log_line(tmp_path, 
     assert_no_forged_log_line(caplog)
 
 
-def test_a_document_from_an_older_reader_is_normalised_before_it_is_judged(tmp_path, caplog):
-    """Identities an older reader stored must not deliver twice, nor forge a log line, on the next pass."""
+def test_a_stored_legacy_identity_is_still_recognised_as_claimed(tmp_path, caplog):
+    """An older document holds the publisher's raw guid, so the same raw guid read again must match exactly."""
     make_policy(tmp_path)
     cfg = make_config(tmp_path)
     state = core.new_state()
-    # What the previous version could leave behind: a link-cased identity carrying DEL in ``seen``, and a
-    # carried candidate whose identity carries a publisher-authored newline. Neither passes a reader again.
+    # What an older version left behind: the raw guid, DEL included, in ``seen``; and a carried candidate whose
+    # identity carries a publisher-authored newline. Neither is rewritten, so both are compared exactly.
     state["seen"]["src:test:https://vendor.example.com/a\u007f"] = {"at": NOW, "outcome": "delivered"}
     state["carry"] = {
         "test": [
@@ -439,7 +439,7 @@ def test_a_document_from_an_older_reader_is_normalised_before_it_is_judged(tmp_p
     body = (
         b'<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>'
         b"<item><title>Unrelated advisory</title><link>https://vendor.example.com/a</link>"
-        b"<guid>https://vendor.example.com/a</guid><description>no identifiers</description></item>"
+        b"<guid>https://vendor.example.com/a&#127;</guid><description>no identifiers</description></item>"
         b"</channel></rss>"
     )
     notifier = FakeNotifier()
@@ -461,16 +461,16 @@ def test_a_document_from_an_older_reader_is_normalised_before_it_is_judged(tmp_p
     assert code == 0
     assert_no_forged_log_line(caplog)
     assert not [entry for entry in notifier.sent if entry.get("link") == "https://vendor.example.com/a"], (
-        "the advisory recorded under a control-bearing identity must not be delivered again"
+        "the advisory recorded under the raw identity must not be delivered again"
     )
     stored = json.loads((tmp_path / "state.json").read_text())
     assert "src:test:https://vendor.example.com/a\u007f" in stored["seen"], (
-        "the stored document is not rewritten: the claim is compared in its normalised form instead"
+        "the stored document is not rewritten: the raw claim is matched exactly"
     )
 
 
 def test_two_unusable_guids_are_two_advisories_not_one(tmp_path):
-    """Normalising an unencodable guid to nothing must not fold two distinct advisories into one identity."""
+    """The raw guids are already distinct; normalising one to an empty string used to fold them together."""
     make_policy(tmp_path)
     cfg = make_config(tmp_path)
     source = WindowSource(
@@ -486,13 +486,11 @@ def test_two_unusable_guids_are_two_advisories_not_one(tmp_path):
     assert len(notifier.sent) == 2, "the second advisory must not be dropped as already claimed"
     stored = json.loads((tmp_path / "state.json").read_text())
     identities = sorted(key for key in stored["seen"] if key.startswith("src:s1:"))
-    assert len(identities) == 2
-    assert all(key.startswith("src:s1:x-") for key in identities), "a synthetic identity must be unmistakable"
-    assert all(set(key[len("src:s1:x-") :]) <= set("0123456789abcdef") for key in identities)
+    assert identities == ["src:s1:\ud800", "src:s1:\ud801"], "each raw guid is its own identity"
 
 
-def test_a_legacy_enrichment_clock_key_is_found_through_its_normalised_form(tmp_path):
-    """An older document's key carries a control character; restarting it would shorten a 24-hour clock."""
+def test_a_stored_enrichment_clock_key_is_found_by_its_exact_identity(tmp_path):
+    """A document written before this version already holds the raw key, so an exact lookup finds its clock."""
     make_policy(tmp_path)
     cfg = make_config(tmp_path)
     nodejs = core.Item(
@@ -505,9 +503,8 @@ def test_a_legacy_enrichment_clock_key_is_found_through_its_normalised_form(tmp_
     )
     state = core.new_state()
     state["seeded"] = {"s1": True}
-    # What an older version stored: the identity still carries the newline the readers now remove. The item's
-    # restored identity is s1:wh:ab, so a verbatim lookup would miss this 3-hour-old 24-hour pending clock and
-    # start a fresh 2-hour retry clock instead.
+    # The stored key is the publisher's raw identity, namespaced once. A transformed lookup would miss this
+    # 3-hour-old 24-hour pending clock and start a fresh 2-hour retry clock instead.
     state["enrich_pending"] = {"s1:wh:a\nb": NOW - 3 * 3600}
     save_state(cfg.state_path, state)
     code = pipeline.run_pass(
@@ -520,7 +517,7 @@ def test_a_legacy_enrichment_clock_key_is_found_through_its_normalised_form(tmp_
     )
     assert code == 0
     stored = json.loads((tmp_path / "state.json").read_text())
-    assert stored["carry"]["s1"][0]["guid"] == "s1:wh:ab", "the item waits on the pending clock"
+    assert stored["carry"]["s1"][0]["guid"] == "s1:wh:a\nb", "the item waits on the pending clock"
     assert "enrich_retry" not in stored, "the pending clock must not restart as a 2-hour retry clock"
     assert stored["enrich_pending"] == {"s1:wh:a\nb": NOW - 3 * 3600}, (
         "the found key keeps its spelling and first-fault time; the document is not rewritten"
@@ -580,7 +577,7 @@ def _webhook_config(tmp_path: Path, watchlist: dict | None = None):
 
 
 def test_two_carried_advisories_with_unusable_guids_both_survive(tmp_path):
-    """Normalising a whole namespaced guid would empty both, and the second advisory would look claimed."""
+    """Two raw carried identities stay distinct; a stand-in was only needed because normalising erased them."""
     make_policy(tmp_path)
     cfg = make_config(tmp_path)
     state = core.new_state()
@@ -622,7 +619,7 @@ def test_two_carried_advisories_with_unusable_guids_both_survive(tmp_path):
 
 
 def test_a_webhook_entry_whose_guid_cannot_be_encoded_leaves_the_inbox(tmp_path):
-    """The claim is derived with the stand-in identity, so cleanup matches what classification recorded."""
+    """Cleanup builds the claim from the raw guid, so it matches what classification recorded."""
     from advisory_radar.sources import WebhookSource
 
     cfg = _webhook_config(tmp_path)
@@ -671,8 +668,38 @@ def test_a_filtered_webhook_entry_with_a_cve_leaves_the_inbox(tmp_path):
     assert not (stored.get("webhook_inbox") or {}).get("wh"), "a filtered entry must not accumulate"
 
 
-def test_a_legacy_clock_key_with_an_unusable_guid_keeps_its_deadline(tmp_path):
-    """The pending clock must be found through the restored stand-in, or a 24h wait restarts as 2h."""
-    pending = core.restored_guid("wh:\ud800legacy")
-    clock = {"wh:\ud800legacy": NOW - 3600}
-    assert core._clock_key(clock, pending) == "wh:\ud800legacy", "the stored key must be reused"
+def test_two_webhook_guids_that_differ_only_by_a_control_character_both_arrive(tmp_path):
+    """Stripping DEL made ``a\\x7fb`` and ``ab`` one identity, so one of the two advisories was silently lost."""
+    from advisory_radar.sources import webhook_item_from_payload
+
+    cfg = _webhook_config(tmp_path)
+    state = core.new_state()
+    state["webhook_inbox"] = {
+        "wh": [
+            webhook_item_from_payload(
+                {"title": "Vendor advisory one", "text": "no identifiers", "guid": "a\x7fb", "url": "https://v/1"}
+            ),
+            webhook_item_from_payload(
+                {"title": "Vendor advisory two", "text": "no identifiers", "guid": "ab", "url": "https://v/2"}
+            ),
+        ]
+    }
+    state["seeded"] = {"wh": True}
+    save_state(cfg.state_path, state)
+    notifier = FakeNotifier()
+    for _ in range(2):
+        code = pipeline.run_pass(
+            cfg,
+            [WebhookSource("wh")],
+            [notifier],
+            http=lambda *a: (404, {}, b""),
+            clock=lambda: float(NOW),
+            sleep=lambda s: None,
+        )
+        assert code == 0
+    assert sorted(entry["link"] for entry in notifier.sent) == ["https://v/1", "https://v/2"], (
+        "both distinct guids must reach a channel, and only once each"
+    )
+    stored = json.loads((tmp_path / "state.json").read_text())
+    assert {"src:wh:wh:a\x7fb", "src:wh:wh:ab"} <= set(stored["seen"])
+    assert not (stored.get("webhook_inbox") or {}).get("wh"), "both accepted entries must leave the inbox"

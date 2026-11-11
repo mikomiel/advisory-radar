@@ -90,7 +90,9 @@ container needs:
 | `ADVISORY_RADAR_INSECURE_COOKIES` | `1` only for a plain-HTTP development instance: stops marking the session cookie `Secure` |
 | plus one per referenced secret | e.g. `DISCORD_WEBHOOK_URL`, `APPRISE_PASSWORD`, `FRESHRSS_TOKEN` |
 
-Volumes: `/config` (read-only) and `/data` (state + KEV cache).
+Volumes: `/config` (read-only) and `/data` (state + KEV cache). An advisory's identity is
+kept exactly as the publisher sent it — only its log and display spelling is escaped —
+because transforming an identity can merge two advisories into one.
 
 `advisory-radar sources list` prints every built-in source kind with its required
 and optional keys and needs no config file. `advisory-radar sources test <id>

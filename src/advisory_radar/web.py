@@ -383,18 +383,26 @@ SEEN_OUTCOMES = ("delivered", "dropped", "filtered", "suppressed", "backlog", "a
 
 
 def _advisory_token(identifier: str) -> str:
-    """A slash-free path segment for an identifier, which may itself be (or contain) a URL.
+    """A slash-free path segment that resolves this exact record, which may itself be (or contain) a URL.
 
-    A legacy identity in state may not be a Unicode scalar value. Encoding it defensively makes a token that
-    does not resolve, which is a 404 on that one link rather than a 500 on the whole page.
+    The token is an address, not display text: it must be lossless and injective. Replacing a character that
+    UTF-8 cannot encode makes two identities share one token, so following one advisory's row opens another's
+    record. ``surrogatepass`` encodes the exact code points instead; the value is a stored identity, and the
+    matching decoder reads it back the same way.
     """
-    return base64.urlsafe_b64encode(identifier.encode("utf-8", "replace")).decode("ascii").rstrip("=")
+    return base64.urlsafe_b64encode(identifier.encode("utf-8", "surrogatepass")).decode("ascii").rstrip("=")
 
 
 def _advisory_identifier(token: str) -> str:
-    """The identifier an advisory link names; a 400 page when the segment was not produced by the list."""
+    """The identifier an advisory link names; a 400 page when the segment was not produced by the list.
+
+    Decoded with the same ``surrogatepass`` the token encoder uses, so an identity that is not a Unicode
+    scalar value names its own record rather than becoming a 400 page.
+    """
     try:
-        identifier = base64.b64decode(token + "=" * (-len(token) % 4), altchars=b"-_", validate=True).decode("utf-8")
+        identifier = base64.b64decode(token + "=" * (-len(token) % 4), altchars=b"-_", validate=True).decode(
+            "utf-8", "surrogatepass"
+        )
     except (binascii.Error, ValueError):
         raise HTTPException(status_code=400, detail="malformed advisory link; open /alerts and follow a row") from None
     if not identifier:
@@ -1297,7 +1305,9 @@ def create_app(
                 if isinstance(entry, dict) and identifier in (entry.get("ids") or ()):
                     body = _queued_advisory(label, entry)
                     return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
-        raise HTTPException(status_code=404, detail=f"no advisory {identifier} is recorded")
+        # The detail is display text and a JSON encoder cannot write a raw surrogate, so it is escaped here;
+        # the identifier itself was already compared exactly above.
+        raise HTTPException(status_code=404, detail=f"no advisory {_response_text(identifier)} is recorded")
 
     @app.get("/parked", response_class=HTMLResponse)
     def parked_page(request: Request):

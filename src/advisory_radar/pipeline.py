@@ -10,7 +10,6 @@ from pathlib import Path
 
 from . import core
 from .config import Config, secret_values
-from .feeds import normalise_identity
 from .http import Http, RedactFilter, urllib_http
 from .kev import load_kev
 from .notifiers import build_notifier
@@ -97,15 +96,12 @@ def _reset_validators_on_policy_change(state: dict, policy: object) -> None:
 def _namespaced(item: core.Item, source_id: str) -> core.Item:
     """Give an item a source-scoped guid: two feeds may both publish guid ``1`` for unrelated advisories.
 
-    The guid is normalised here, at the one door every source's items pass through, so a webhook payload or a
-    carried candidate cannot insert an identity in a spelling classification never compares against. A guid
-    that normalises to nothing -- an unpaired surrogate, say -- is replaced by a synthetic identity derived from
-    its raw value: the bare source prefix would be one identity shared by every such entry, so the second would
-    look already claimed and be dropped silently, losing its advisory.
+    The publisher's guid is kept exactly: a namespace is a scope, not a rewriting. Transforming the value here
+    would let two distinct advisories share one identity, and the second would look already claimed and be
+    dropped silently.
     """
-    identity = normalise_identity(item.guid) or core.synthetic_identity(item.guid)
     return core.Item(
-        f"{source_id}:{identity}",
+        f"{source_id}:{item.guid}",
         item.title,
         item.link,
         item.summary,
@@ -224,12 +220,7 @@ def _run_pass(
         # there is undetectable; see README, "Sources".
         # An empty previous window proves nothing: the source had no entries, so "no overlap" is expected and a
         # gap there would reject every later full window forever.
-        if (
-            window.truncated
-            and previous
-            and not {normalise_identity(guid) for guid in previous}
-            & {normalise_identity(item.guid) for item in window.items}
-        ):
+        if window.truncated and previous and not set(previous) & {item.guid for item in window.items}:
             LOG.error(
                 "source %s: window gap: the window is full (%d entries) and shares none with the previous "
                 "pass; items may have been missed. Keeping the last trusted window and deferring this source",
@@ -350,16 +341,15 @@ def _run_pass(
             for entry in inbox:
                 # An entry is done when either disposition has been recorded for it: the ids its text names
                 # (classified in scope) or its source-scoped identity (filtered out of scope, or delivered with
-                # no identifier at all). The scoped identity is derived exactly as the source door derives it --
-                # stand-in included -- because a guid that normalises to nothing would otherwise never match and
-                # the entry would stay in the inbox forever, exhausting it until new intake is refused.
+                # no identifier at all). The scoped identity is built exactly as the source door builds it --
+                # the guid kept raw -- so a value no reader can spell still matches what classification recorded.
                 identities = core.extract_ids(
                     str(entry.get("title", "")), str(entry.get("summary", "")), str(entry.get("link", ""))
                 )
                 guid = str(entry.get("guid", ""))
-                scoped = f"src:{source.id}:{normalise_identity(guid) or core.synthetic_identity(guid)}"
-                done = core.claim_key(scoped) in claimed or (
-                    bool(identities) and all(core.claim_key(identifier) in claimed for identifier in identities)
+                scoped = f"src:{source.id}:{guid}"
+                done = scoped in claimed or (
+                    bool(identities) and all(identifier in claimed for identifier in identities)
                 )
                 if not done:
                     kept.append(entry)
@@ -394,15 +384,11 @@ def _run_pass(
         for row in rows
         if isinstance(row, dict)
     }
-    # Compared in the normalised form the readers now produce: a document written by an older version can hold
-    # a key that still carries a control character, and dropping it here would restart the item's clock.
-    live = {core.restored_guid(guid) for guid in live_guids | carried_guids}
+    # Compared exactly: an identity is never rewritten, so a document written before this version already
+    # holds the publisher's raw guid and its clock key is the same value read back.
+    live = live_guids | carried_guids
     for key in ("enrich_retry", "enrich_pending"):
-        kept = {
-            guid
-            for guid in (state.get(key) or {})
-            if guid.split(":", 1)[0] not in fetched_ids or core.restored_guid(guid) in live
-        }
+        kept = {guid for guid in (state.get(key) or {}) if guid.split(":", 1)[0] not in fetched_ids or guid in live}
         core._prune_enrich_clock(state, key, kept)
 
     adobe_ok = core.adobe_pass(state, http, kev, kev_known, now) if cfg.adobe_commerce else True

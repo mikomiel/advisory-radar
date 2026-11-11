@@ -131,28 +131,14 @@ def _string(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-#: Characters a feed identity must never carry: C0 controls, DEL, and the Unicode line and paragraph
-#: separators. A log record is one line, so a preserved newline in an identity lets a publisher write what
-#: looks like a second application record; the same characters would also reach a state key and a metric label.
-_IDENTITY_CONTROLS = re.compile("[\x00-\x1f\x7f\u2028\u2029]")
+def _identity(value: object) -> str:
+    """The publisher's own identity string, unaltered.
 
-
-def normalise_identity(value: object) -> str:
-    """A feed identity that is safe to log and store, or "" when nothing usable remains.
-
-    Normalised at the boundary that owns the value -- the readers, and the state loader that may hold their
-    older answers -- rather than at each log call, so every present and future caller of ``FeedEntry.guid``
-    gets a single-line identity. A string that is not a Unicode scalar value (an escaped unpaired surrogate)
-    is refused as empty too, because it cannot be written to a log or a response at all. The caller still
-    decides whether an empty result is an error, because a JSON document and an XML feed refuse one with
-    their own error type; the deduplication identity is the normalised string, so no other behaviour moves.
+    An identity is compared, never rendered as prose: rewriting it -- removing a control character, replacing
+    one that UTF-8 cannot encode -- can map two distinct entries onto one identity and lose an advisory. The
+    log and display boundaries escape it instead, so nothing here has to be safe to print.
     """
-    raw = value.strip() if isinstance(value, str) else ""
-    try:
-        raw.encode("utf-8")
-    except UnicodeEncodeError:
-        return ""
-    return _IDENTITY_CONTROLS.sub("", raw).strip()
+    return value if isinstance(value, str) else ""
 
 
 def _local(tag: object) -> str:
@@ -161,10 +147,11 @@ def _local(tag: object) -> str:
 
 
 def _first_href(links: object) -> str:
+    """The first non-empty href exactly as written; callers strip it only for display, never for identity."""
     for entry in links if isinstance(links, list) else []:
         href = entry.get("href") if isinstance(entry, dict) else None
         if isinstance(href, str) and href.strip():
-            return href.strip()
+            return href
     return ""
 
 
@@ -273,7 +260,7 @@ def _greader_export(document: object) -> FeedExport:
         identifier = node.get("id")
         match = GREADER_ID.match(identifier if isinstance(identifier, str) else "")
         link = _first_href(node.get("canonical")) or _first_href(node.get("alternate"))
-        guid = normalise_identity(str(int(match.group(1), 16)) if match else link)
+        guid = str(int(match.group(1), 16)) if match else link
         title = _text(node.get("title"))
         if not guid or not title:
             raise FeedError("feed entry has no usable id or title")
@@ -296,7 +283,7 @@ def _greader_export(document: object) -> FeedExport:
             FeedEntry(
                 guid,
                 title,
-                _encodable(link),
+                _encodable(link.strip()),
                 summary,
                 published if type(published) is int and _plausible(published) else None,
                 _text(origin.get("title")),
@@ -345,9 +332,10 @@ def _json_feed_export(document: object) -> FeedExport:
         if not isinstance(node, dict):
             raise FeedError("feed entry is not an object")
         # ``url`` is the item's public page; ``external_url`` is used when the item has no page on this
-        # site, and either is a better link than none. The id is the stable identity and wins outright.
+        # site, and either is a better link than none. The id is the stable identity and wins outright; the
+        # fallback is the item's own raw URL, because an identity may not lose a character on its way in.
         link = _string(node.get("url")) or _string(node.get("external_url"))
-        guid = normalise_identity(node.get("id")) or normalise_identity(link)
+        guid = _identity(node.get("id")) or _identity(node.get("url")) or _identity(node.get("external_url"))
         if not guid:
             raise FeedError("feed entry has no usable id")
         title = _text(node.get("title"))
@@ -439,6 +427,11 @@ def _text_of(node: ET.Element | None) -> str:
     return clean_text("".join(parts))
 
 
+def _raw_text(node: ET.Element | None) -> str:
+    """An element's own text, unaltered, for a value that is an identity rather than display prose."""
+    return "".join(node.itertext()) if node is not None else ""
+
+
 def _published_of(node: ET.Element | None) -> int | None:
     return _epoch_of(node.text) if node is not None else None
 
@@ -473,7 +466,7 @@ def _rss_2_export(root: ET.Element) -> FeedExport:
     items = []
     for node in channel.findall("item"):
         link = _text_of(node.find("link"))
-        guid = normalise_identity(_text_of(node.find("guid"))) or normalise_identity(link)
+        guid = _raw_text(node.find("guid")) or _raw_text(node.find("link"))
         title = _text_of(node.find("title"))
         if not guid or not title:
             raise RssError("feed entry has no usable id or title")
@@ -502,7 +495,7 @@ def _atom_export(root: ET.Element) -> FeedExport:
             if candidate.get("rel") in (None, "alternate") and candidate.get("href"):
                 link = candidate.get("href", "")
                 break
-        guid = normalise_identity(_text_of(node.find(f"{_ATOM}id"))) or normalise_identity(link)
+        guid = _raw_text(node.find(f"{_ATOM}id")) or link
         title = _text_of(node.find(f"{_ATOM}title"))
         if not guid or not title:
             raise RssError("feed entry has no usable id or title")
@@ -533,7 +526,7 @@ def _rdf_export(root: ET.Element) -> FeedExport:
     for node in entries:
         link = _text_of(node.find(f"{_RSS}link"))
         # rdf:about is the item's identity and survives a link change; the link is the fallback.
-        guid = normalise_identity(node.get(f"{_RDF}about")) or normalise_identity(link)
+        guid = _identity(node.get(f"{_RDF}about")) or _raw_text(node.find(f"{_RSS}link"))
         title = _text_of(node.find(f"{_RSS}title"))
         if not guid or not title:
             raise RssError("feed entry has no usable id or title")

@@ -188,7 +188,9 @@ case-insensitive text search (identifier and title) and an inclusive UTC day ran
 filter lives in the URL query string, so a reload or a shared link keeps it. The list is
 paged with a keyset cursor (50 rows, newest first by time then identifier) instead of a
 fixed cap, and each row links to the advisory's page (the identifier is encoded in the path,
-so a stored GUID or URL containing slashes still opens). `/advisories/<id>` shows the stored
+so a stored GUID or URL containing slashes still opens). An advisory's identity is kept
+exactly as the publisher sent it — only its log and display spelling is escaped — because
+transforming an identity can merge two advisories into one. `/advisories/<id>` shows the stored
 classification — tag, source, title, the identifiers and CVEs, whether any was KEV-only,
 the watchlist products the item matched, the per-CVE levels and CVSS, and the notifiers
 that accepted the message — for a delivered message, a pending one or a parked one. It never
