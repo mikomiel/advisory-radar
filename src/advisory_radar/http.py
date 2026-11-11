@@ -31,9 +31,13 @@ def resolve_host(host: str) -> tuple[str, ...]:
 
 #: IPv6 ranges that are a wrapper around an IPv4 address: the address the connection finally reaches is the
 #: embedded one, so the embedded one is what the rule has to judge. ``::/96`` is the deprecated IPv4-compatible
-#: form, ``64:ff9b::/96`` the well-known NAT64 prefix, ``2002::/16`` 6to4. IPv4-mapped ``::ffff:0:0/96``
+#: form, ``64:ff9b::/96`` the well-known NAT64 prefix and ``64:ff9b:1::/48`` its local-use variant, ``2002::/16``
+#: 6to4, ``2001::/32`` Teredo and ``::ffff:0:0:0/96`` the IPv4-translated form. IPv4-mapped ``::ffff:0:0/96``
 #: already reports the embedded address's own class.
-_EMBEDDED_IPV4 = tuple(ipaddress.ip_network(prefix) for prefix in ("::/96", "64:ff9b::/96", "2002::/16"))
+_EMBEDDED_IPV4 = tuple(
+    ipaddress.ip_network(prefix)
+    for prefix in ("::/96", "64:ff9b::/96", "64:ff9b:1::/48", "2002::/16", "2001::/32", "::ffff:0:0:0/96")
+)
 
 
 def _host_of(url: str) -> str | None:

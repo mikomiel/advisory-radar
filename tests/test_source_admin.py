@@ -892,6 +892,8 @@ def test_a_percent_encoded_credential_in_a_link_is_redacted(tmp_path):
         "::ffff:224.0.0.1",  # IPv4-mapped multicast
         "64:ff9b::7f00:1",  # NAT64 wrapper around 127.0.0.1
         "2002:7f00:1::1",  # 6to4 wrapper around 127.0.0.1
+        "64:ff9b:1::7f00:1",  # local-use NAT64 wrapper
+        "2001:0:7f00:1::1",  # Teredo
         "fe80::1%eth0",  # link-local with a zone id
     ],
 )

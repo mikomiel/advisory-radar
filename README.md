@@ -256,7 +256,8 @@ mistake, not an isolation boundary. The pass resolves the name again when it
 fetches, so a name whose answer changes is followed, and the UI token is a
 full-trust credential besides: it can read every advisory, rewrite every
 notification target and run a pass. Anyone who must not reach the internal network
-must not hold it.
+must not hold it, and the isolation that does hold is a network one: run the
+container where it has no route to what it must not reach.
 
 Every origin the two pages show — a probe's answer and a configured source on
 `/sources` — every title a probe shows, and the source id itself are all restricted:
