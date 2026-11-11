@@ -26,6 +26,7 @@ from advisory_radar.http import RedactFilter
 from advisory_radar.runtime import Runtime
 from advisory_radar.settings import load_settings, settings_path
 from advisory_radar.state import load_state_document, save_state, serialize_json, state_lock
+from advisory_radar.storage import JsonStore
 from advisory_radar.web import _advisory_token, create_app
 
 LOG = logging.getLogger("advisory_radar")
@@ -79,13 +80,17 @@ def make_client(
     state: dict | None = None,
     environment: dict[str, str] | None = None,
     clock: int = NOW,
+    storage: str = "",
 ):
     """A signed-out client over a real Runtime, the token, and the runtime itself."""
     cfg_path = tmp_path / "config.yml"
-    cfg_path.write_text(f"{body}\nstate_path: {tmp_path / 'state.json'}\n")
+    config = f"{body}\nstate_path: {tmp_path / 'state.json'}\n"
+    if storage:
+        config += f"storage: {storage}\n"
+    cfg_path.write_text(config)
     env = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, **(environment or {})}
     runtime = Runtime.build(cfg_path, env, clock=lambda: float(clock))
-    save_state(runtime.cfg.state_path, state if state is not None else core.new_state())
+    runtime.cfg.store().save(state if state is not None else core.new_state())
     client = TestClient(create_app(runtime, env, clock=lambda: float(clock)))
     return client, TOKEN, runtime
 
@@ -467,7 +472,7 @@ def test_a_dropped_message_with_no_acceptor_says_so_on_the_page(tmp_path):
     state = core.new_state()
     state["parked"] = [parked_entry("CVE-2026-8888")]
     save_state(tmp_path / "state.json", state)
-    assert core.manage_parked_entry(tmp_path / "state.json", 0, release=False, now=NOW) is True
+    assert core.manage_parked_entry(JsonStore(tmp_path / "state.json"), 0, release=False, now=NOW) is True
     stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
     client, token, _ = make_client(tmp_path, state=stored)
     sign_in(client, token)
@@ -495,7 +500,7 @@ def test_a_dropped_message_is_recorded_with_no_accepted_notifier(tmp_path):
     state = core.new_state()
     state["parked"] = [parked_entry("CVE-2026-7777")]
     save_state(tmp_path / "state.json", state)
-    assert core.manage_parked_entry(tmp_path / "state.json", 0, release=False, now=NOW) is True
+    assert core.manage_parked_entry(JsonStore(tmp_path / "state.json"), 0, release=False, now=NOW) is True
     stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
     record = stored["seen"]["CVE-2026-7777"]
     assert record["outcome"] == "dropped"
@@ -580,7 +585,7 @@ def test_a_dropped_message_keeps_the_channel_that_already_accepted_it(tmp_path):
     state["parked"] = [entry]
     state_path = tmp_path / "state.json"
     save_state(state_path, state)
-    assert core.manage_parked_entry(state_path, 0, release=False, now=NOW) is True
+    assert core.manage_parked_entry(JsonStore(state_path), 0, release=False, now=NOW) is True
     stored = load_state_document(state_path, core.STATE_SCHEMA, "advisory state")
     record = stored["seen"]["CVE-2026-9000"]
     assert record["outcome"] == "dropped"
@@ -824,7 +829,7 @@ def test_core_releases_one_parked_message_by_position(tmp_path):
     state = core.new_state()
     state["parked"] = [parked_entry("CVE-2026-1"), parked_entry("CVE-2026-2", "warning")]
     save_state(tmp_path / "state.json", state)
-    assert core.manage_parked_entry(tmp_path / "state.json", 1, release=True, now=NOW) is True
+    assert core.manage_parked_entry(JsonStore(tmp_path / "state.json"), 1, release=True, now=NOW) is True
     stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
     assert [entry["ids"][0] for entry in stored["parked"]] == ["CVE-2026-1"]
     assert [entry["ids"][0] for entry in stored["pending"]] == ["CVE-2026-2"]
@@ -838,10 +843,10 @@ def test_core_drops_one_parked_message_and_refuses_a_stale_position(tmp_path):
     state["parked"] = [parked_entry("CVE-2026-1"), parked_entry("CVE-2026-2", "warning")]
     save_state(tmp_path / "state.json", state)
     before = (tmp_path / "state.json").read_bytes()
-    assert core.manage_parked_entry(tmp_path / "state.json", 5, release=False, now=NOW) is False
-    assert core.manage_parked_entry(tmp_path / "state.json", -1, release=False, now=NOW) is False
+    assert core.manage_parked_entry(JsonStore(tmp_path / "state.json"), 5, release=False, now=NOW) is False
+    assert core.manage_parked_entry(JsonStore(tmp_path / "state.json"), -1, release=False, now=NOW) is False
     assert (tmp_path / "state.json").read_bytes() == before, "a stale position must not write the state"
-    assert core.manage_parked_entry(tmp_path / "state.json", 0, release=False, now=NOW) is True
+    assert core.manage_parked_entry(JsonStore(tmp_path / "state.json"), 0, release=False, now=NOW) is True
     stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
     assert [entry["ids"][0] for entry in stored["parked"]] == ["CVE-2026-2"]
     assert stored["seen"]["CVE-2026-1"]["outcome"] == "dropped"
@@ -881,6 +886,33 @@ def test_a_per_entry_release_or_drop_changes_exactly_one_message(tmp_path):
     assert stored["seen"]["CVE-2026-2"]["outcome"] == "dropped"
     assert "CVE-2026-1" not in stored["seen"], "a released message was never delivered, so it is not seen"
     assert [entry["ids"][0] for entry in stored["pending"]] == ["CVE-2026-1"]
+
+
+def test_the_per_entry_queue_action_works_on_a_sqlite_store(tmp_path):
+    """The queue action must read and write the configured store, not the file it used to live in."""
+    first, second = parked_entry("CVE-2026-1"), parked_entry("CVE-2026-2", "warning")
+    state = core.new_state()
+    state["parked"] = [first, second]
+    client, token, runtime = make_client(tmp_path, state=state, storage=f"sqlite:///{tmp_path}/state.db")
+    assert not (tmp_path / "state.json").exists(), "a SQLite instance must not touch the JSON file"
+    csrf = sign_in(client, token)
+    assert "CVE-2026-2" in client.get("/parked").text, "the page reads the same store"
+
+    released = client.post(
+        "/parked/0/release", data={"csrf": csrf, "token": core.parked_token(first)}, follow_redirects=False
+    )
+    assert released.status_code == 303
+    stored = runtime.cfg.store().load()
+    assert [entry["ids"][0] for entry in stored["pending"]] == ["CVE-2026-1"]
+    assert [entry["ids"][0] for entry in stored["parked"]] == ["CVE-2026-2"]
+
+    dropped = client.post(
+        "/parked/0/drop", data={"csrf": csrf, "token": core.parked_token(second)}, follow_redirects=False
+    )
+    assert dropped.status_code == 303
+    stored = runtime.cfg.store().load()
+    assert stored["parked"] == []
+    assert stored["seen"]["CVE-2026-2"]["outcome"] == "dropped"
 
 
 def test_a_stale_parked_index_is_a_404(tmp_path):

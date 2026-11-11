@@ -80,6 +80,10 @@ class JsonStore:
         self._schema = schema
         self._owner = owner
 
+    def __repr__(self) -> str:
+        # A path identifies the store and carries no credential; a message can quote it.
+        return f"JsonStore({str(self._path)!r})"
+
     def load(self) -> dict | None:
         return load_state_document(self._path, self._schema, self._owner)
 
@@ -149,7 +153,14 @@ class SqliteStore:
         self._timeout = timeout
         self._ready = False
 
+    def __repr__(self) -> str:
+        return f"SqliteStore({str(self._path)!r})"
+
     def load(self) -> dict | None:
+        if not self._path.exists():
+            # A read creates nothing: the JSON store answers a missing file the same way, and a dry run over a
+            # store that was never written must not leave an empty database behind.
+            return None
         connection = None
         try:
             connection = self._connect()

@@ -90,9 +90,9 @@ container needs:
 | `ADVISORY_RADAR_INSECURE_COOKIES` | `1` only for a plain-HTTP development instance: stops marking the session cookie `Secure` |
 | plus one per referenced secret | e.g. `DISCORD_WEBHOOK_URL`, `APPRISE_PASSWORD`, `FRESHRSS_TOKEN` |
 
-Volumes: `/config` (read-only) and `/data` (state + KEV cache). An advisory's identity is
-kept exactly as the publisher sent it — only its log and display spelling is escaped —
-because transforming an identity can merge two advisories into one.
+Volumes: `/config` (read-only) and `/data` (the state file, `settings.json` and the KEV cache). An
+advisory's identity is kept exactly as the publisher sent it — only its log and display spelling
+is escaped — because transforming an identity can merge two advisories into one.
 
 `advisory-radar sources list` prints every built-in source kind with its required
 and optional keys and needs no config file. `advisory-radar sources test <id>
@@ -110,13 +110,35 @@ throttle on failed logins (five per five minutes per peer address). Put it behin
 a TLS-terminating reverse proxy; the session cookie is only sent over HTTPS unless
 `ADVISORY_RADAR_INSECURE_COOKIES=1`.
 
+### Storage
+
+`storage:` in `config.yml` moves the state document without changing its model. Empty is
+the default and means the JSON file at `state_path`; `sqlite:///data/state.db` keeps one
+file on the volume for one host; `postgresql://user:password@host/database` shares one
+document between instances and needs the optional driver:
+
+```bash
+python -m pip install 'psycopg[binary]'
+```
+
+The key is YAML-only. The overlay cannot move the store, and a reload refuses a changed
+`storage:` as it refuses a changed `state_path`, so moving it is a restart.
+`settings.json` and the KEV cache stay beside `state_path` and are not part of the
+document, which is why `state_path` is still required when the document lives elsewhere.
+
+`advisory-radar migrate --config /config/config.yml --to sqlite:///data/state.db` copies
+the document read through the configured store into another one. It refuses a target that
+already holds a document and prints both stores, never the URL, which can carry a password.
+The source is left in place: set `storage:` and restart once the copy looks right.
+
 ### The settings overlay
 
-`/config` writes `settings.json` beside the state file on `/data` (`/data/settings.json`
+`/config` writes `settings.json` beside `state_path` on `/data` (`/data/settings.json`
 in the container, `~/.local/share/advisory-radar/settings.json` for the rootless
 quadlet). It is created with mode `0600`, owned by the container user, and replaced
 atomically (a temporary file in the same directory, `fsync`, `os.replace`), so a
-half-written file cannot brick a start. `/config` stays read-only: the overlay holds
+half-written file cannot brick a start. It is not part of the state document, whichever
+store holds that. `/config` stays read-only: the overlay holds
 only eight keys — `notifiers`, per-source `enabled`/`tag`/`thresholds`/`interval`, the sources it
 adds itself (`sources_added`), `poll_interval`, `hidden_source_hosts`, the routing
 `routes`/`default` block and the risk `thresholds` — and the YAML owns everything else. A source the overlay adds is stored whole, may not
@@ -154,7 +176,7 @@ every existing notifier must already use `${NAME}`/`${NAME_FILE}` references for
 `key`, `password` and `token`; a literal secret in the YAML is refused with an error
 naming that notifier, and has to be moved to the environment first. Pending and parked messages are not touched by a
 reload. A reload re-reads the YAML and the overlay, so an edit to `config.yml` is picked
-up too; `web.host`, `web.port` and `state_path` are refused rather than reported as
+up too; `web.host`, `web.port`, `state_path` and `storage` are refused rather than reported as
 applied, because they are bound when the process starts, and environment variables are
 read at start, so changing one still needs a restart. Deleting `settings.json` and
 reloading returns to the YAML (the empty overlay is applied as revision 0). The overlay itself is capped at 64 KiB: a value that would make the file larger

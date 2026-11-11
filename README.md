@@ -7,7 +7,7 @@ severity per CVE, and deliver one deduplicated alert per new advisory to the
 channels you configure (Discord, Matrix, ntfy, Gotify, Apprise, generic webhook,
 SMTP). A built-in web UI shows a filterable alert history, a page per advisory,
 the parked queue, sources, notifiers and run history. One container, one process,
-JSON state on a volume, YAML + environment configuration.
+state on a volume (JSON by default), YAML + environment configuration.
 
 ## Quickstart
 
@@ -219,15 +219,15 @@ the YAML owns the list and the overlay may only **add** to it, so a source added
 `/config` needs no edit to a read-only config mount while a YAML edit never loses to an
 older overlay. The two may not share an id — the overlay refuses one the YAML already
 defines, so which URL is polled is never decided by merge order. A save writes
-`settings.json` next to the state file (on the `/data`
-volume) and applies immediately when the state lock is free; if a pass holds the lock, the
+`settings.json` next to `state_path` (on the `/data` volume); it is not part of the state
+document, whatever store holds that. The save applies immediately when the state lock is free; if a pass holds the lock, the
 page says the revision is not live yet, and Reload applies it when the pass finishes. Each
 form carries a fingerprint of the configuration it was rendered from, so a second tab —
 after another save, a YAML edit, or the overlay being deleted and recreated — is refused
 with `409` instead of overwriting rows it never saw.
 `SIGHUP` re-reads `config.yml` and the overlay, for a configuration edited by hand. Every
 other setting stays in `config/config.yml`; editing most of it needs a reload (the button
-or `SIGHUP`), not a restart — `web.host`, `web.port` and `state_path` are bound when the
+or `SIGHUP`), not a restart — `web.host`, `web.port`, `state_path` and `storage` are bound when the
 process starts, and a change to one of them needs a restart.
 
 Secrets stay in the environment. The overlay stores a notifier's `url`, `key`,
@@ -246,10 +246,27 @@ overlay is reported with
 the validator's message; the running configuration stays; a pass that already started finishes with the
 configuration it started with, and the next pass uses the reloaded one. The wait between
 passes follows the live interval, so shortening `poll_interval` takes effect without sleeping
-out the old one. A reload re-reads both files; it refuses `web.host`, `web.port` and `state_path` rather than report them
+out the old one. A reload re-reads both files; it refuses `web.host`, `web.port`, `state_path` and `storage` rather than report them
 applied, because they are bound when the process starts. Environment variables are read at
 start too, so changing one still needs a restart. Deleting `settings.json` and reloading
 returns to the YAML: the empty overlay is applied as revision 0.
+
+### Storage
+
+`state_path` is a single JSON document by default, and the `storage:` key moves those bytes
+without changing the document model, the pages or the commands. `sqlite:///data/state.db`
+keeps one file for one host (WAL, `synchronous=FULL`, mode `0600`); `postgresql://` shares
+one document between instances and needs the optional driver
+(`python -m pip install 'psycopg[binary]'`). The YAML owns the key: the overlay cannot move
+the store, and a reload refuses a changed `storage:` exactly as it refuses a changed
+`state_path`. `settings.json` and the KEV cache stay beside `state_path`; neither is part of
+the document.
+
+`advisory-radar migrate --config config/config.yml --to sqlite:///data/state.db` copies the
+document read through the configured store into another one, and prints both stores — never
+the URL, which can carry a password. It refuses a target that already holds a document, so a
+wrong `--to` cannot overwrite a live state, and it leaves the source in place: set `storage:`
+to the new store and restart once the copy looks right.
 
 ### Gap detection
 
@@ -278,7 +295,8 @@ turns critical, and never re-sends what you already received.
 - Filterable `/alerts` and `/runs` lists with their state in the URL, keyset pagination for
   the alert history, and a per-advisory page (`/advisories/<id>`) showing the stored
   classification and delivery record
-- Web UI + REST API, in-process scheduler (default every 15 min), atomic JSON state on a volume
+- Web UI + REST API, in-process scheduler (default every 15 min), atomic state on a volume:
+  a JSON file by default, SQLite or PostgreSQL when `storage` says so
 - Per-entry release/drop on the parked queue, next to the bulk actions; `routes`/`default`
   editable on `/config` with the other settings
 - Docker and Podman deployment (compose file + quadlet/kube YAML), `/healthz` and `/metrics`

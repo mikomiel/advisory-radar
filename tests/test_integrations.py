@@ -229,7 +229,7 @@ def test_a_delivered_webhook_entry_leaves_the_inbox(tmp_path):
             {"guid": "no-ids", "title": "routine maintenance", "summary": "", "link": "https://v.example/b"},
         ]
     }
-    core.save_state(cfg.state_path, state)
+    cfg.store().save(state)
 
     sent = []
 

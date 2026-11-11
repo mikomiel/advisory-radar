@@ -41,7 +41,8 @@ from .config import DEFAULT_THRESHOLDS, Thresholds
 from .feeds import FeedExport
 from .feeds import parse_feed as parse_greader
 from .http import MESSAGE_LIMIT, Http, inert, log_safe, parse_json
-from .state import SourceError, load_state_document, save_state
+from .state import SourceError
+from .storage import Store, StoreUnavailable
 from .watchlist import Policy, Product
 
 LOG = logging.getLogger("advisory_radar")
@@ -2464,15 +2465,19 @@ def _released(entry: dict) -> dict:
     return {key: value for key, value in entry.items() if key not in PARKED_ATTEMPT_KEYS}
 
 
-def manage_parked(state_path: Path, release: bool, now: int) -> int:
-    """The operator's decision on the parked messages; sends nothing and needs no secret."""
+def manage_parked(store: Store, release: bool, now: int) -> int:
+    """The operator's decision on the parked messages; sends nothing and needs no secret.
+
+    The caller holds the store's lock, so the read and the write are one transaction. A store that cannot be
+    read is logged and reported, never treated as an empty queue: an unreachable database is not a decision.
+    """
     try:
-        state = load_state_document(state_path, STATE_SCHEMA, "advisory state")
-    except SourceError as exc:
+        state = store.load()
+    except (SourceError, StoreUnavailable) as exc:
         LOG.error("%s", exc)
         return 1
     if state is None:
-        LOG.error("no state file at %s; nothing is parked", state_path)
+        LOG.error("no state document in %s; nothing is parked", store)
         return 1
     parked = state.setdefault("parked", [])
     if release:
@@ -2481,7 +2486,7 @@ def manage_parked(state_path: Path, release: bool, now: int) -> int:
         for entry in parked:
             _delivered(state, entry, now, outcome="dropped", delivered_to=entry.get("sent_to") or ())
     state["parked"] = []
-    save_state(state_path, state)
+    store.save(state)
     LOG.info(
         "%s %d parked message(s): %s",
         "released" if release else "dropped",
@@ -2502,21 +2507,21 @@ def parked_token(entry: Mapping) -> str:
     return hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
 
 
-def manage_parked_entry(state_path: Path, index: int, release: bool, now: int, *, expected: str | None = None) -> bool:
+def manage_parked_entry(store: Store, index: int, release: bool, now: int, *, expected: str | None = None) -> bool:
     """The operator's decision on one parked message, by its position in ``state["parked"]``.
 
     The same effect as :func:`manage_parked` for one entry. False when the state cannot be read, that
     position no longer exists, or ``expected`` names a different message: the page that offered the button
     may be older than the queue, and a stale row must refuse rather than act on whatever message moved into
-    it. The caller holds the state lock, exactly as for the bulk action.
+    it. The caller holds the store's lock, exactly as for the bulk action.
     """
     try:
-        state = load_state_document(state_path, STATE_SCHEMA, "advisory state")
-    except SourceError as exc:
+        state = store.load()
+    except (SourceError, StoreUnavailable) as exc:
         LOG.error("%s", exc)
         return False
     if state is None:
-        LOG.error("no state file at %s; nothing is parked", state_path)
+        LOG.error("no state document in %s; nothing is parked", store)
         return False
     parked = state.get("parked")
     if not isinstance(parked, list) or not 0 <= index < len(parked):
@@ -2540,7 +2545,7 @@ def manage_parked_entry(state_path: Path, index: int, release: bool, now: int, *
         # A partial delivery may already have been accepted by one notifier: the record keeps that fact even
         # though no escalation state may advance for a dropped message.
         _delivered(state, entry, now, outcome="dropped", delivered_to=entry.get("sent_to") or ())
-    save_state(state_path, state)
+    store.save(state)
     LOG.info(
         "%s parked message at position %d: %s",
         "released" if release else "dropped",

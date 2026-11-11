@@ -20,7 +20,8 @@ from pathlib import Path
 from . import config, core, pipeline, settings
 from .config import Config, ConfigError, load_document
 from .http import RedactFilter
-from .state import LockBusy, load_state_document, save_state, state_lock
+from .state import LockBusy
+from .storage import StoreUnavailable
 
 LOG = logging.getLogger("advisory_radar")
 
@@ -203,14 +204,19 @@ class Runtime:
             # The overlay cannot move the state file, but the YAML can, and a reload would then take one
             # file's lock, read that file and write the document to the other path. That is a restart's job.
             raise ConfigError("state_path is file-only and a reload cannot move it; restart to use a new state file")
+        if candidate.cfg.storage != self.cfg.storage:
+            # The store is YAML-only for the same reason: a reload writes the applied marker through the live
+            # store, so a candidate pointing elsewhere would record it in one store and serve another.
+            raise ConfigError("storage is file-only and a reload cannot move it; restart to use a new store")
         if (candidate.cfg.web_host, candidate.cfg.web_port) != (self.cfg.web_host, self.cfg.web_port):
             # uvicorn binds the socket once, when the process starts; recording a new address as applied while
             # the server keeps its old one would make the UI report a configuration that is not in force.
             raise ConfigError(
                 "web.host and web.port are bound when the process starts and a reload cannot change them; restart"
             )
-        with state_lock(self.cfg.state_path, blocking=blocking):
-            state = load_state_document(self.cfg.state_path, core.STATE_SCHEMA, "advisory state")
+        store = self.cfg.store()
+        with store.lock(blocking=blocking):
+            state = store.load()
             if state is None:
                 state = core.new_state()
             # A candidate is built before the lock, so another reload can publish a newer revision in
@@ -236,8 +242,8 @@ class Runtime:
                 "fingerprint": settings.fingerprint(candidate.overlay["settings"]),
             }
             try:
-                save_state(self.cfg.state_path, state)
-            except OSError as exc:
+                store.save(state)
+            except (OSError, StoreUnavailable) as exc:
                 raise ConfigError(f"the overlay was not applied: cannot record it in the state: {exc}") from exc
             self._live = candidate.snapshot()
             self.overlay = candidate.overlay

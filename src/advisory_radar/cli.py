@@ -16,7 +16,8 @@ from .catalogue import SOURCE_SPECS
 from .config import Config, ConfigError, load_config, secret_values
 from .http import Http, urllib_http
 from .runtime import Runtime, read_config
-from .state import state_lock
+from .state import SourceError, serialize_json
+from .storage import StoreUnavailable, store_for
 
 LOG = logging.getLogger("advisory_radar")
 DEFAULT_CONFIG = Path("config/config.yml")
@@ -51,6 +52,17 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("test-notify", help="send one test message through every notifier")
     sub.add_parser("release-parked", help="queue the parked messages again and exit")
     sub.add_parser("drop-parked", help="record the parked messages as handled and discard them")
+    migrate = sub.add_parser("migrate", help="copy the state document from the configured store to another one")
+    # Both spellings of the global option work for this command, and a default here would overwrite a
+    # ``--config`` given before the subcommand: SUPPRESS leaves the namespace as the global parser set it.
+    migrate.add_argument(
+        "--config", type=Path, default=argparse.SUPPRESS, help="YAML config path (default: the global --config)"
+    )
+    migrate.add_argument(
+        "--to",
+        required=True,
+        help="target store: sqlite:///path/to/state.db or postgresql://host/database",
+    )
     sources = sub.add_parser("sources", help="inspect the built-in source catalogue, or test one configured source")
     sources_sub = sources.add_subparsers(dest="sources_command", required=True)
     sources_sub.add_parser("list", help="print every built-in kind with its keys (no config file needed)")
@@ -169,6 +181,44 @@ def install_sighup(runtime: Runtime) -> bool:
     return True
 
 
+def _migrate(cfg: Config, target_value: str) -> int:
+    """Copy the state document from the configured store to ``--to``, refusing to overwrite a document.
+
+    The source is only read, so no lock is taken: every store's save is atomic, which makes one ``load()`` a
+    consistent snapshot even while a pass runs. The target is checked before it is written, because a
+    migration that replaced a live document would destroy the only record of what had already been sent.
+    """
+    if target_value == cfg.storage:
+        LOG.error("--to is the configured store, so a migration would move nothing")
+        return 1
+    try:
+        target = store_for(target_value, cfg.state_path)
+    except ValueError as exc:
+        LOG.error("%s", exc)
+        return 1
+    source = cfg.store()
+    try:
+        document = source.load()
+    except (SourceError, StoreUnavailable) as exc:
+        LOG.error("%s", exc)
+        return 1
+    if document is None:
+        LOG.error("%s holds no state document yet; nothing to migrate", source)
+        return 1
+    try:
+        if target.load() is not None:
+            LOG.error("%s already holds a state document; refusing to overwrite it", target)
+            return 1
+        target.save(document)
+    except (SourceError, StoreUnavailable, OSError) as exc:
+        LOG.error("%s", exc)
+        return 1
+    # Only the stores' reprs are shown: a PostgreSQL locator carries a password, and this line is output an
+    # operator may paste into an issue.
+    print(f"migrated the state document ({len(serialize_json(document))} bytes) from {source} to {target}")
+    return 0
+
+
 def run_scheduler(
     runtime: Runtime,
     stopping: threading.Event,
@@ -227,6 +277,17 @@ def main(
     # either, so it is dispatched before load_config.
     if args.command == "sources" and args.sources_command == "list":
         return _list_sources()
+    if args.command == "migrate":
+        try:
+            cfg = load_config(args.config, environment, lenient=True)
+        except ConfigError as exc:
+            LOG.error("config: %s", exc)
+            return 1
+        redactor = pipeline.attach_redaction(secret_values(cfg))
+        try:
+            return _migrate(cfg, args.to)
+        finally:
+            LOG.removeFilter(redactor)
     if args.command in {"release-parked", "drop-parked"}:
         # State-only recovery. It needs the state path and nothing else: no source or notifier is built,
         # so an unrelated plugin with a missing credential cannot block recovery; the overlay cannot
@@ -237,9 +298,13 @@ def main(
             LOG.error("config: %s", exc)
             return 1
         redactor = pipeline.attach_redaction(secret_values(cfg))
+        store = cfg.store()
         try:
-            with state_lock(cfg.state_path):
-                return core.manage_parked(cfg.state_path, release=args.command == "release-parked", now=int(clock()))
+            with store.lock():
+                return core.manage_parked(store, release=args.command == "release-parked", now=int(clock()))
+        except StoreUnavailable as exc:
+            LOG.error("%s; the queue was not changed", exc)
+            return 1
         finally:
             LOG.removeFilter(redactor)
     if args.command == "sources":

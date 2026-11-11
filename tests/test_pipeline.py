@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from pathlib import Path
 
 import pytest
 
-from advisory_radar import core, pipeline
+from advisory_radar import core, pipeline, storage
 from advisory_radar.config import ConfigError, load_config
 from advisory_radar.plugins import SourceWindow
 from advisory_radar.sources import RssSource, WebhookSource
@@ -178,6 +179,116 @@ def test_source_fault_fails_pass_but_keeps_state(tmp_path):
     assert state["watch"] == {}
     assert state["feeds"] == {}, "no validator may advance for a source that never answered"
     assert not state.get("seeded"), "nothing was seeded, so a first successful pass still bootstraps"
+
+
+def test_storage_defaults_to_the_json_file_and_validates_at_load(tmp_path):
+    plain = tmp_path / "plain.yml"
+    plain.write_text("sources: []\nnotifiers: []\n")
+    cfg = load_config(plain, {})
+    assert cfg.storage == ""
+    assert isinstance(cfg.store(), storage.JsonStore)
+
+    sqlite = tmp_path / "sqlite.yml"
+    sqlite.write_text(f"sources: []\nnotifiers: []\nstorage: sqlite:///{tmp_path}/state.db\n")
+    assert isinstance(load_config(sqlite, {}).store(), storage.SqliteStore)
+
+    # A malformed value fails with every other bad key, and the refusal never quotes what it rejected:
+    # the value can be a PostgreSQL URL with a password in it.
+    bad = tmp_path / "bad.yml"
+    bad.write_text("sources: []\nnotifiers: []\nstorage: mysql://db.example/radar\n")
+    with pytest.raises(ConfigError) as caught:
+        load_config(bad, {})
+    assert "sqlite:///" in str(caught.value)
+    assert "mysql" not in str(caught.value)
+
+
+def test_a_pass_delivers_identically_from_a_sqlite_store(tmp_path):
+    """The document model does not change with the store: the same pass produces the same document."""
+    global CURRENT_FEED
+    CURRENT_FEED = FEED  # an earlier test leaves the stale window behind, and this one needs today's
+    make_policy(tmp_path)
+    json_cfg = make_config(tmp_path)
+    assert (
+        pipeline.run_pass(
+            json_cfg,
+            [rss_source(FEED)[0]],
+            [FakeNotifier(200)],
+            http=fake_http,
+            clock=lambda: 1792600000.0,
+            sleep=lambda s: None,
+        )
+        == 0
+    )
+    sqlite_cfg = make_config(tmp_path, storage=f"sqlite:///{tmp_path}/state.db")
+    notifier = FakeNotifier(200)
+    assert (
+        pipeline.run_pass(
+            sqlite_cfg,
+            [rss_source(FEED)[0]],
+            [notifier],
+            http=fake_http,
+            clock=lambda: 1792600000.0,
+            sleep=lambda s: None,
+        )
+        == 0
+    )
+    from_json = json.loads((tmp_path / "state.json").read_text())
+    from_sqlite = sqlite_cfg.store().load()
+    assert from_sqlite == from_json, "the store must not change what a pass reads and writes"
+    assert notifier.sent[0]["tag"] == "critical"
+    assert from_sqlite["seen"]["CVE-2026-4242"]["outcome"] == "delivered"
+
+
+def test_a_dry_run_over_a_new_sqlite_store_writes_nothing(tmp_path):
+    global CURRENT_FEED
+    CURRENT_FEED = FEED
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path, storage=f"sqlite:///{tmp_path}/state.db")
+    code = pipeline.run_pass(
+        cfg,
+        [rss_source(FEED)[0]],
+        [FakeNotifier()],
+        http=fake_http,
+        clock=lambda: 1792600000.0,
+        sleep=lambda s: None,
+        dry_run=True,
+    )
+    assert code == 0
+    assert not (tmp_path / "state.db").exists(), "a dry run reads the configured store and creates nothing"
+
+
+def test_an_unavailable_store_fails_a_dry_run_without_reseeding(tmp_path, monkeypatch, caplog):
+    # No driver is installed, so the store cannot be opened: a deployment fault, never an empty document.
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path, storage="postgresql://radar:s3cr3t-pass@db.example/radar")
+    with caplog.at_level(logging.ERROR):
+        code = pipeline.run_pass(
+            cfg,
+            [rss_source(FEED)[0]],
+            [FakeNotifier()],
+            http=fake_http,
+            clock=lambda: 1.0,
+            sleep=lambda s: None,
+            dry_run=True,
+        )
+    assert code == 1
+    assert "not re-seeding" in caplog.text, "an unavailable store must read like an unreadable document"
+    assert "psycopg" in caplog.text
+    assert "s3cr3t-pass" not in caplog.text
+
+
+def test_an_unavailable_store_fails_a_pass_instead_of_raising(tmp_path, monkeypatch, caplog):
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path, storage="postgresql://radar@db.example/radar")
+    with caplog.at_level(logging.ERROR):
+        code = pipeline.run_pass(
+            cfg, [rss_source(FEED)[0]], [FakeNotifier()], http=fake_http, clock=lambda: 1.0, sleep=lambda s: None
+        )
+    assert code == 1, "an unavailable lock is a failed pass, not a traceback"
+    assert "the pass did not run" in caplog.text
+    assert not (tmp_path / "state.json").exists(), "a failed pass must not have written a document"
 
 
 def test_config_env_expansion_and_unknown_key(tmp_path):

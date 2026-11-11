@@ -126,6 +126,16 @@ def test_a_bad_notifier_key_fails_with_the_message_the_yaml_gives(tmp_path):
     assert str(from_overlay.value) == str(from_yaml.value)
 
 
+def test_the_overlay_cannot_move_the_store(tmp_path):
+    # The store locator is YAML-only: a browser save must not be able to point the next pass at another
+    # document, exactly as it cannot move state_path.
+    path = write_config(tmp_path, {})
+    with pytest.raises(ConfigError) as caught:
+        load_config(path, {}, settings={"storage": f"sqlite:///{tmp_path}/state.db"})
+    assert "unknown overlay keys" in str(caught.value)
+    assert "storage" in str(caught.value)
+
+
 def test_an_overlay_key_outside_the_four_is_refused(tmp_path):
     path = write_config(tmp_path, {})
     with pytest.raises(ConfigError) as caught:
@@ -436,6 +446,20 @@ def test_a_reload_cannot_move_the_state_file(tmp_path):
     assert not (tmp_path / "moved.json").exists()
 
 
+def test_a_reload_cannot_move_the_store(tmp_path):
+    # A hand-edited YAML can move the store; a reload records the applied revision through the live store, so
+    # publishing the candidate would write the marker into one store and serve another. Refuse and keep running.
+    path = write_config(tmp_path, {})
+    runtime = Runtime.build(path, {})
+    moved = tmp_path / "moved.db"
+    write_config(tmp_path, {"storage": f"sqlite:///{moved}"})
+    with pytest.raises(ConfigError) as caught:
+        runtime.reload(blocking=False)
+    assert "storage" in str(caught.value)
+    assert runtime.cfg.storage == ""
+    assert not moved.exists()
+
+
 def test_an_overlay_over_the_reader_limit_is_never_written(tmp_path):
     # JSON escaping can push an accepted value past the limit the reader enforces; writing that file would
     # brick the next start, so the size is checked against the exact text that is about to be written.
@@ -454,7 +478,7 @@ def test_a_reload_whose_state_write_fails_keeps_the_old_configuration(tmp_path, 
     def fails(*args, **kwargs):
         raise OSError("No space left on device")
 
-    monkeypatch.setattr("advisory_radar.runtime.save_state", fails)
+    monkeypatch.setattr("advisory_radar.storage.save_state", fails)
     with pytest.raises(ConfigError) as caught:
         runtime.reload(blocking=False)
     assert "not applied" in str(caught.value)

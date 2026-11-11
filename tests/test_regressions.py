@@ -1756,15 +1756,15 @@ def test_a_window_is_saved_together_with_its_classification(tmp_path, monkeypatc
     """A checkpoint after source A must not persist source B's new window before B was classified."""
     cfg = config(tmp_path)
     snapshots = []
-    import advisory_radar.pipeline as pipeline_module
+    from advisory_radar.storage import JsonStore
 
-    real_save = pipeline_module.save_state
+    real_save = JsonStore.save
 
-    def recording(state_path, state):
-        real_save(state_path, state)
-        snapshots.append(json.loads(json.dumps(state)))
+    def recording(store, document):
+        real_save(store, document)
+        snapshots.append(json.loads(json.dumps(document)))
 
-    monkeypatch.setattr(pipeline_module, "save_state", recording)
+    monkeypatch.setattr(JsonStore, "save", recording)
     pipeline.run_pass(
         cfg,
         [WindowSource("s1", [item("a1", "first source")]), WindowSource("s2", [item("b1", "second source")])],
@@ -2719,12 +2719,12 @@ def test_an_adobe_bulletin_outstanding_from_an_earlier_window_is_still_delivered
 
 def test_parked_queue_can_be_dropped_without_notifier_credentials(tmp_path):
     from advisory_radar import cli
-    from advisory_radar.state import load_state_document
+    from advisory_radar.state import load_state_document, save_state
 
     state_path = tmp_path / "state.json"
     state = core.new_state()
     state["parked"] = [{"kind": "alert", "tag": "warning", "title": "t", "body": "b", "ids": ["CVE-2026-1"]}]
-    core.save_state(state_path, state)
+    save_state(state_path, state)
     path = tmp_path / "c.yml"
     path.write_text(
         "sources: []\n"
@@ -2769,12 +2769,12 @@ def test_an_unreadable_supported_cvss_metric_prevents_suppression():
 def test_parked_queue_recovery_survives_an_unbuildable_plugin(tmp_path):
     """Recovery must not depend on a plugin that cannot even be built."""
     from advisory_radar import cli
-    from advisory_radar.state import load_state_document
+    from advisory_radar.state import load_state_document, save_state
 
     state_path = tmp_path / "state.json"
     state = core.new_state()
     state["parked"] = [{"kind": "alert", "tag": "warning", "title": "t", "body": "b", "ids": ["CVE-2026-1"]}]
-    core.save_state(state_path, state)
+    save_state(state_path, state)
     path = tmp_path / "c.yml"
     path.write_text(
         "sources: []\n"
