@@ -193,6 +193,10 @@ def save_watchlist(path: Path, document: dict, *, expected: str) -> str:
         # did not name, with whatever the link pointed at before gone from their point of view.
         raise SourceError(f"{path} is a link to {target}, which does not exist; refusing to create it")
     with WATCHLIST_LOCK, state_lock(target):
+        if path.resolve() != target:
+            # The link moved while this save waited for the lock. Replacing the old target would report success
+            # for a document a pass no longer reads, so the retargeted save is the one that has to retry.
+            raise StaleDocument(f"{path} now names another document; reload and make the change again")
         current = ""
         if present(target):
             # Reading first is what stops a misconfigured path from being overwritten: only a document this

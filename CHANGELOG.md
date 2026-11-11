@@ -18,8 +18,9 @@ operator action, and the release workflow then builds and pushes the image to
   checking and replacing the document, so two tabs or two processes cannot silently replace each
   other's edit; a page rendered against another document is refused with a reload link, and a save
   writes nothing and re-renders the rows as they were typed when a value is invalid or the
-  destination cannot be written. A row whose alias contains a comma is read-only in the form — the
-  document keeps it exactly, and it is edited in the file. A read-only form checks one advisory
+  destination cannot be written. A row holding an alias the field cannot represent — a comma, or a
+  line break — is read-only in the form: the document keeps it exactly, and it is edited in the
+  file. A read-only form checks one advisory
   against the saved document and explains the verdict with the same reason the pass uses. A
   configured `watchlist:` that does not exist still fails every pass — the page names it and
   creates it on save — and `state_path` may no longer be named `watchlist.json`, which is the

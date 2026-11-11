@@ -8,6 +8,7 @@ being read are the same failure: an instance that judges every advisory, or none
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
@@ -22,7 +23,7 @@ import pytest
 
 from advisory_radar import core, watchlist
 from advisory_radar.config import ConfigError, load_config
-from advisory_radar.state import SourceError
+from advisory_radar.state import SourceError, state_lock
 from advisory_radar.watchlist import (
     DEFAULT_DOCUMENT,
     StaleDocument,
@@ -409,3 +410,27 @@ def test_a_second_process_saving_the_same_page_is_refused(tmp_path, monkeypatch)
     assert child.returncode == 3, "the second process reads the first one's document and refuses"
     assert float(reported[1]) >= 0.2, "the child waited for the lock before it read"
     assert read_watchlist(target)["products"] == []
+
+
+def test_a_link_retargeted_while_the_save_waits_is_refused(tmp_path, monkeypatch):
+    """Resolving before the lock leaves a window: the configured name can move while the save waits for it."""
+    first = write(tmp_path / "first.json", document())
+    second = write(tmp_path / "second.json", document(products=[]))
+    link = tmp_path / "watchlist.json"
+    link.symlink_to(first)
+
+    @contextlib.contextmanager
+    def retarget_then_lock(path):
+        # Exactly the window the save must not close its eyes to: the name moved before the lock was taken, so the
+        # path it resolved is no longer the document a pass reads.
+        link.unlink()
+        link.symlink_to(second)
+        with state_lock(path):
+            yield
+
+    monkeypatch.setattr(watchlist, "state_lock", retarget_then_lock)
+    before_first, before_second = first.read_text(), second.read_text()
+    with pytest.raises(StaleDocument, match="now names another document"):
+        save_watchlist(link, document(products=[]), expected=digest(document()))
+    assert first.read_text() == before_first
+    assert second.read_text() == before_second

@@ -965,15 +965,24 @@ def _form_lines(value: str) -> list[str]:
     return list(dict.fromkeys(line.strip() for line in value.splitlines() if line.strip()))
 
 
+def _field_holds_alias(alias: str) -> bool:
+    """Whether a single-line comma-separated field can round-trip this alias unchanged.
+
+    A comma splits it into two aliases, and a browser's text input drops line breaks; a control character does
+    not survive a form at all. Saving any of those unchanged would silently alter what a product matches, which
+    is why such a row is read-only here and edited in the document instead.
+    """
+    return "," not in alias and all(" " <= character != "\x7f" for character in alias)
+
+
 def _product_rows(products: Sequence[Mapping[str, object]]) -> str:
     """One editable row per product: its aliases, its domains, and whether it is being removed.
 
     The id is rendered as text, not as an editable field: it is what a routing rule and an exclusion name, so
     a rename would silently change both. Renaming is a remove and an add.
 
-    A row whose aliases contain a comma is rendered read-only with the exact list in a hidden field: this form
-    separates aliases with commas, so splitting such a value would silently widen the scope on a save the
-    operator never meant to change. The document is the place to edit it.
+    A row holding an alias the field cannot represent (see :func:`_field_holds_alias`) is rendered read-only with
+    the exact list in a hidden field: the document is the place to edit it.
     """
     rows = []
     for product in products:
@@ -984,18 +993,18 @@ def _product_rows(products: Sequence[Mapping[str, object]]) -> str:
         # it through every save rather than dropping a key this page does not understand.
         metadata = "1" if product.get("metadata_only") is True else "0"
         removed = " checked" if product.get("remove") is True else ""
-        if any("," in alias for alias in aliases):
+        if all(_field_holds_alias(alias) for alias in aliases):
+            aliases_cell = (
+                f"<td><input type='text' size='{_ALIASES_SIZE}' name='product:{esc(identifier)}:aliases' "
+                f"value='{esc(', '.join(aliases))}' aria-label='aliases for {esc(identifier)}'></td>"
+            )
+        else:
             aliases_cell = (
                 f"<td><input type='text' size='{_ALIASES_SIZE}' value='{esc(', '.join(aliases))}' readonly "
                 f"aria-label='aliases for {esc(identifier)}, read-only'>"
                 f"<input type='hidden' name='product:{esc(identifier)}:aliases_json' "
                 f"value='{esc(json.dumps(aliases))}'>"
-                "<br><span class='muted small'>kept exactly: an alias contains a comma</span></td>"
-            )
-        else:
-            aliases_cell = (
-                f"<td><input type='text' size='{_ALIASES_SIZE}' name='product:{esc(identifier)}:aliases' "
-                f"value='{esc(', '.join(aliases))}' aria-label='aliases for {esc(identifier)}'></td>"
+                "<br><span class='muted small'>kept exactly: a comma or a line break is inside an alias</span></td>"
             )
         rows.append(
             f"<tr><td><b>{esc(identifier)}</b>"

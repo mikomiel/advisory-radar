@@ -616,3 +616,29 @@ def test_a_save_to_an_uninspectable_path_is_refused(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert "cannot be inspected" in response.text
     assert "value='php'" in response.text, "the row is re-rendered, nothing is written"
+
+
+def test_an_alias_with_a_line_break_is_kept_exactly(tmp_path):
+    """A single-line input drops the break, so the row is read-only and the exact list is what is submitted."""
+    watch = write_scope(
+        tmp_path / "scope.json",
+        products=[{"id": "acme", "aliases": ["Example\nServer"], "domains": []}],
+    )
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    csrf, fingerprint, text = scope_form(client)
+    assert "readonly" in text and "kept exactly" in text
+    assert "name='product:acme:aliases'" not in text, "the lossy field is not submitted at all"
+    response = submit(
+        client,
+        csrf,
+        fingerprint,
+        **{
+            "product:acme:aliases_json": json.dumps(["Example\nServer"]),
+            "product:acme:domains": "",
+            "metadata_only:acme": "0",
+            "debian_packages": "*",
+        },
+    )
+    assert response.status_code == 303
+    assert json.loads(watch.read_text())["products"][0]["aliases"] == ["Example\nServer"]
