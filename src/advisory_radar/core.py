@@ -2343,14 +2343,37 @@ def item_to_state(item: Item) -> dict:
     }
 
 
+def synthetic_identity(raw: str) -> str:
+    """A deterministic stand-in for a guid that normalises to nothing.
+
+    A guid that is not a Unicode scalar value cannot be stored or logged, so ``normalise_identity`` returns "".
+    A digest of the raw value keeps two distinct entries distinct and is stable across passes, so the same entry
+    is still recognised as already claimed when it is read again. The ``x-`` prefix makes it unmistakable that
+    this is not a guid a feed published.
+    """
+    return "x-" + hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
+def restored_guid(value: str) -> str:
+    """A carried guid in the form classification will compare it: namespace kept, unusable part replaced.
+
+    A carried guid is already source-namespaced, so normalising the whole string would lose the namespace as
+    well as the guid -- and two rows that both normalised to "" would become one identity, dropping the second
+    advisory silently. The prefix is therefore split off first, and the remainder gets the same stand-in the
+    source door uses.
+    """
+    source, separator, guid = value.partition(":")
+    if not separator:
+        return normalise_identity(value) or synthetic_identity(value)
+    return f"{source}:{normalise_identity(guid) or synthetic_identity(guid)}"
+
+
 def item_from_state(row: object) -> Item:
     data = row if isinstance(row, dict) else {}
     published = data.get("published")
     explicit = data.get("explicit")
     return Item(
-        # A carried guid is already source-namespaced; normalising it here keeps it comparable with the claim
-        # classification records, which is the only spelling it will ever be checked against.
-        normalise_identity(str(data.get("guid", ""))),
+        restored_guid(str(data.get("guid", ""))),
         str(data.get("title", "")),
         str(data.get("link", "")),
         str(data.get("summary", "")),

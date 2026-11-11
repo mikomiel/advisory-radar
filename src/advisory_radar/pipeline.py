@@ -94,17 +94,6 @@ def _reset_validators_on_policy_change(state: dict, policy: object) -> None:
     state["policy_digest"] = digest
 
 
-def _synthetic_identity(raw: str) -> str:
-    """A deterministic stand-in for a guid that normalises to nothing.
-
-    A guid that is not a Unicode scalar value cannot be stored or logged, so ``normalise_identity`` returns "".
-    A digest of the raw value keeps two distinct entries distinct and is stable across passes, so the same entry
-    is still recognised as already claimed when it is read again. The ``x-`` prefix makes it unmistakable
-    that this is not a guid a feed published.
-    """
-    return "x-" + hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()[:16]
-
-
 def _namespaced(item: core.Item, source_id: str) -> core.Item:
     """Give an item a source-scoped guid: two feeds may both publish guid ``1`` for unrelated advisories.
 
@@ -114,7 +103,7 @@ def _namespaced(item: core.Item, source_id: str) -> core.Item:
     its raw value: the bare source prefix would be one identity shared by every such entry, so the second would
     look already claimed and be dropped silently, losing its advisory.
     """
-    identity = normalise_identity(item.guid) or _synthetic_identity(item.guid)
+    identity = normalise_identity(item.guid) or core.synthetic_identity(item.guid)
     return core.Item(
         f"{source_id}:{identity}",
         item.title,
@@ -359,12 +348,20 @@ def _run_pass(
             claimed = core._claimed(state)
             kept = []
             for entry in inbox:
-                # The identity classification records for an id-less item: guids are namespaced per source,
-                # so the claim is `src:{source}:{guid}`.
+                # An entry is done when either disposition has been recorded for it: the ids its text names
+                # (classified in scope) or its source-scoped identity (filtered out of scope, or delivered with
+                # no identifier at all). The scoped identity is derived exactly as the source door derives it --
+                # stand-in included -- because a guid that normalises to nothing would otherwise never match and
+                # the entry would stay in the inbox forever, exhausting it until new intake is refused.
                 identities = core.extract_ids(
                     str(entry.get("title", "")), str(entry.get("summary", "")), str(entry.get("link", ""))
-                ) or (f"src:{source.id}:{normalise_identity(entry.get('guid', ''))}",)
-                if not all(core.claim_key(identifier) in claimed for identifier in identities):
+                )
+                guid = str(entry.get("guid", ""))
+                scoped = f"src:{source.id}:{normalise_identity(guid) or core.synthetic_identity(guid)}"
+                done = core.claim_key(scoped) in claimed or (
+                    bool(identities) and all(core.claim_key(identifier) in claimed for identifier in identities)
+                )
+                if not done:
                     kept.append(entry)
             if kept:
                 state.setdefault("webhook_inbox", {})[source.id] = kept

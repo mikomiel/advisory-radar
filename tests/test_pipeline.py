@@ -562,3 +562,110 @@ def test_a_filtered_webhook_entry_is_released_from_the_inbox(tmp_path):
     stored = json.loads((tmp_path / "state.json").read_text())
     assert stored.get("webhook_inbox", {}) == {}, "a filtered entry must be released, not held forever"
     assert stored["seen"]["src:wh:wh:noise"]["outcome"] == "filtered"
+
+
+def _webhook_config(tmp_path: Path, watchlist: dict | None = None):
+    """A configuration with one webhook source, and a watchlist when the test needs a filter."""
+    watch = ""
+    if watchlist is not None:
+        path = tmp_path / "watchlist.json"
+        path.write_text(json.dumps({"schema": "security-watchlist.v1", **watchlist}))
+        watch = f"watchlist: {path}\n"
+    path = tmp_path / "webhook.yml"
+    path.write_text(
+        f"sources:\n  - id: wh\n    type: webhook\nnotifiers:\n  - id: fake\n    type: webhook\n"
+        f"    url: https://hooks.example.com/x\nstate_path: {tmp_path}/state.json\n{watch}"
+    )
+    return load_config(path, {})
+
+
+def test_two_carried_advisories_with_unusable_guids_both_survive(tmp_path):
+    """Normalising a whole namespaced guid would empty both, and the second advisory would look claimed."""
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path)
+    state = core.new_state()
+    state["carry"] = {
+        "test": [
+            {
+                "guid": f"test:{letter}\ud800",
+                "title": f"Advisory {letter}",
+                "link": "",
+                "summary": "no identifiers",
+                "published": None,
+                "explicit": [],
+                "source_title": "",
+                "source_url": "",
+            }
+            for letter in ("a", "b")
+        ]
+    }
+    state["seeded"] = {"test": True}
+    save_state(cfg.state_path, state)
+    body = b'<?xml version="1.0"?><rss version="2.0"><channel><title>T</title><link>https://v/</link></channel></rss>'
+    notifier = FakeNotifier()
+
+    def http(method, url, headers, payload):
+        if url == "https://feeds.example.com/rss":
+            return 200, {}, body
+        return fake_http(method, url, headers, payload)
+
+    code = pipeline.run_pass(
+        cfg,
+        [RssSource("test", "https://feeds.example.com/rss")],
+        [notifier],
+        http=http,
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 0
+    assert len(notifier.sent) == 2, "both carried advisories must reach a channel"
+
+
+def test_a_webhook_entry_whose_guid_cannot_be_encoded_leaves_the_inbox(tmp_path):
+    """The claim is derived with the stand-in identity, so cleanup matches what classification recorded."""
+    from advisory_radar.sources import WebhookSource
+
+    cfg = _webhook_config(tmp_path)
+    state = core.new_state()
+    state["webhook_inbox"] = {
+        "wh": [{"guid": "\ud800legacy", "title": "Vendor advisory", "summary": "", "link": "https://v.example/a"}]
+    }
+    save_state(cfg.state_path, state)
+    notifier = FakeNotifier()
+    for _ in range(2):
+        pipeline.run_pass(
+            cfg,
+            [WebhookSource("wh")],
+            [notifier],
+            http=lambda *a: (404, {}, b""),
+            clock=lambda: float(NOW),
+            sleep=lambda s: None,
+        )
+    assert len(notifier.sent) == 1, "the entry must be sent once, not on every pass"
+    stored = json.loads((tmp_path / "state.json").read_text())
+    assert not (stored.get("webhook_inbox") or {}).get("wh"), "an accepted entry must leave the inbox"
+
+
+def test_a_filtered_webhook_entry_with_a_cve_leaves_the_inbox(tmp_path):
+    """A filtered entry is terminal by its own claim, even when its text names an identifier."""
+    from advisory_radar.sources import WebhookSource
+
+    cfg = _webhook_config(
+        tmp_path, {"debian_source_packages": ["curl"], "excluded_products": ["libbar"], "products": []}
+    )
+    state = core.new_state()
+    state["webhook_inbox"] = {
+        "wh": [{"guid": "noise", "title": "libbar fixes CVE-2026-1234", "summary": "", "link": "https://v.example/b"}]
+    }
+    save_state(cfg.state_path, state)
+    notifier = FakeNotifier()
+    pipeline.run_pass(
+        cfg,
+        [WebhookSource("wh")],
+        [notifier],
+        http=lambda *a: (404, {}, b""),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    stored = json.loads((tmp_path / "state.json").read_text())
+    assert not (stored.get("webhook_inbox") or {}).get("wh"), "a filtered entry must not accumulate"
