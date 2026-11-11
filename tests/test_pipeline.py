@@ -489,6 +489,39 @@ def test_two_unusable_guids_are_two_advisories_not_one(tmp_path):
     assert identities == ["src:s1:\ud800", "src:s1:\ud801"], "each raw guid is its own identity"
 
 
+def test_a_scalar_identity_survives_a_save_and_reload_without_a_second_delivery(tmp_path):
+    """A reader's identity must be the same string after the state document is written and read back."""
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path)
+    scalar = "\U00010000"
+    body = (
+        b'{"version": "https://jsonfeed.org/version/1.1", "title": "Vendor", "items": [{"id": "apsb-'
+        + scalar.encode()
+        + b'", "title": "Vendor advisory", "content_text": "notes"}]}'
+    )
+
+    def http(method, url, headers, payload):
+        if url == "https://feeds.example.com/rss":
+            return 200, {}, body
+        return fake_http(method, url, headers, payload)
+
+    notifier = FakeNotifier()
+    for _ in range(2):
+        # Each pass loads the state from disk: the second one sees the identity the first one persisted.
+        code = pipeline.run_pass(
+            cfg,
+            [RssSource("test", "https://feeds.example.com/rss")],
+            [notifier],
+            http=http,
+            clock=lambda: float(NOW),
+            sleep=lambda s: None,
+        )
+        assert code == 0
+    assert len(notifier.sent) == 1, "the saved and reloaded identity must still be claimed on the second pass"
+    stored = json.loads((tmp_path / "state.json").read_text())
+    assert f"src:test:apsb-{scalar}" in stored["seen"], "the scalar is the same key after the round trip"
+
+
 def test_a_stored_enrichment_clock_key_is_found_by_its_exact_identity(tmp_path):
     """A document written before this version already holds the raw key, so an exact lookup finds its clock."""
     make_policy(tmp_path)

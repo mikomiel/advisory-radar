@@ -7,7 +7,7 @@ import hashlib
 from . import feeds
 from .catalogue import SOURCE_SPECS
 from .core import Item, _host, dsa_id, extract_ids
-from .http import Http, parse_json
+from .http import Http, json_text, parse_json
 from .plugins import Source, SourceWindow
 
 
@@ -135,7 +135,10 @@ class ChangedetectionSource:
             raise RuntimeError(
                 f"changedetection.io answered HTTP {status}" if status else "changedetection.io is unreachable"
             )
-        document = parse_json(body)
+        text = json_text(body)
+        if text is None:
+            raise RuntimeError("changedetection.io response is not valid UTF-8")
+        document = parse_json(text)
         watches = document if isinstance(document, dict) else None
         if watches is None:
             raise RuntimeError("changedetection.io response is not a watch map")

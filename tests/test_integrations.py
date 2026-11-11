@@ -74,6 +74,17 @@ def test_changedetection_source_emits_only_new_changes():
     assert second.items[0].link == "https://shop.example.com/item"
 
 
+def test_a_changedetection_response_that_is_not_valid_utf8_is_refused():
+    """A watch uuid is part of an item identity; raw WTF-8 would be rewritten by the next state save."""
+    source = ChangedetectionSource("cd", "https://cd.example.com", "KEY")
+
+    def http(method, url, headers, body):
+        return 200, {}, b'{"' + b"\xed\xa0\x80\xed\xb0\x80" + b'": {"last_changed": 1}}'
+
+    with pytest.raises(RuntimeError, match="not valid UTF-8"):
+        source.fetch(http, {})
+
+
 def test_webhook_payload_mapping():
     entry = webhook_item_from_payload(
         {"watch_uuid": "u1", "watch_title": "Shop", "watch_url": "https://x.example", "diff": "price changed"}
@@ -129,6 +140,22 @@ def test_a_webhook_guid_that_cannot_be_encoded_is_still_accepted(tmp_path):
     assert response.json()["queued"] == "wh:\ud800legacy"
     state = json.loads((tmp_path / "state.json").read_text())
     assert state["webhook_inbox"]["wh"][0]["guid"] == "wh:\ud800legacy"
+
+
+def test_a_webhook_body_that_is_not_valid_utf8_is_refused(tmp_path):
+    """The guid is an identity; ``json.loads`` on bytes would accept WTF-8 that a save then rewrites."""
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_WEBHOOK_SECRET": "s3cret"}
+    app = create_app(Runtime.build(cfg_path, environment), environment)
+    client = TestClient(app)
+    response = client.post(
+        "/webhooks/wh",
+        content=b'{"title": "Vendor advisory", "guid": "' + b"\xed\xa0\x80\xed\xb0\x80" + b'"}',
+        headers={"Authorization": "Bearer s3cret", "Content-Type": "application/json"},
+    )
+    assert response.status_code == 400
+    assert not (tmp_path / "state.json").exists(), "a refused intake writes nothing"
 
 
 def test_notifier_payload_shapes():

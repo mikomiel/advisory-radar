@@ -141,13 +141,39 @@ def urllib_http(
         return 0, {}, b""
 
 
-def parse_json(body: bytes) -> object | None:
+def json_text(body: bytes) -> str | None:
+    """A JSON body as text, or None when it is not valid UTF-8.
+
+    JSON text exchanged between systems is UTF-8. ``json.loads`` on bytes instead decodes with
+    ``surrogatepass``: the malformed bytes ``ED A0 80 ED B0 80`` become a high/low surrogate pair rather than
+    failing, and ``json.dumps(ensure_ascii=True)`` spells that pair exactly like the single scalar ``U+10000``.
+    A value taken from such a document would stop being the same identity after a save and reload, so a caller
+    that takes one must refuse the body here. A body this returns None for is not a JSON document to read.
+    """
+    try:
+        return body.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def parse_json(body: bytes | str) -> object | None:
     """Untrusted body parsed as JSON; invalid JSON is None (a failed lookup), never an exception."""
     try:
         return json.loads(body)
     except (ValueError, RecursionError):
         # RecursionError: a few thousand nested arrays defeat the decoder with a tiny body.
         return None
+
+
+def log_safe(value: str) -> str:
+    """The spelling a log record gives ``value``: one line, ASCII-only, and every character accounted for.
+
+    ``unicode_escape`` writes a newline as ``\\n`` and an unpaired surrogate as ``\\ud800`` instead of dropping
+    either, so the record stays one line and a log handler can always encode it. The identity is unchanged;
+    only its spelling is. ``RedactFilter`` must know this spelling too, because a log argument is escaped
+    before the filter sees the finished record, and a credential must not become invisible to redaction.
+    """
+    return value.encode("unicode_escape").decode("ascii")
 
 
 def header(headers: Mapping[str, str], name: str) -> str:
@@ -178,10 +204,16 @@ class RedactFilter(logging.Filter):
         cumulative filter must know all of them: chained filters would let a short old value replace its part
         of a longer new secret before the new filter could match it. Longest first is what makes that order
         safe, including for the percent-encoded form a token takes inside a URL.
+
+        The escaped spelling matters as much as the raw one: ``log_safe`` changes a backslash or a non-ASCII
+        character before the filter sees the record, so a credential that only knew its raw spelling would
+        pass through. A percent-encoded form is ASCII and carries no backslash, so ``log_safe`` leaves it
+        unchanged and it needs no separate escaped variant.
         """
         self._raw.update(secret for secret in secrets if secret)
         encoded = {urllib.parse.quote(secret, safe="") for secret in self._raw}
-        self.secrets = sorted({*self._raw, *encoded}, key=len, reverse=True)
+        escaped = {log_safe(secret) for secret in self._raw}
+        self.secrets = sorted({*self._raw, *encoded, *escaped}, key=len, reverse=True)
 
     def filter(self, record: logging.LogRecord) -> bool:
         text = record.getMessage()

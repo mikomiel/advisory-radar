@@ -374,6 +374,29 @@ def test_an_identity_utf8_cannot_encode_is_kept_verbatim():
     assert feeds.parse_json_feed(with_url).items[0].guid == "\ud800"
 
 
+def test_a_feed_body_that_is_not_valid_utf8_is_refused():
+    """Raw ``ED A0 80 ED B0 80`` is accepted by ``json.loads`` as two surrogates, which stop being the same
+    identity after ``ensure_ascii`` spells them like the scalar ``U+10000`` and the decoder recombines them."""
+    pair = b"\xed\xa0\x80\xed\xb0\x80"
+    malformed = (
+        b'{"version": "https://jsonfeed.org/version/1.1", "items": [{"id": "'
+        + pair
+        + b'", "content_text": "Security update"}]}'
+    )
+    for reader in (feeds.parse_json_feed, feeds.parse_feed, feeds.parse_any):
+        with pytest.raises(feeds.FeedError, match="not valid UTF-8"):
+            reader(malformed)
+    # The valid UTF-8 encoding of the same scalar is one code point and is read as itself, unchanged.
+    scalar = "\U00010000"
+    valid = (
+        b'{"version": "https://jsonfeed.org/version/1.1", "items": [{"id": "'
+        + scalar.encode()
+        + b'", "content_text": "Security update"}]}'
+    )
+    assert feeds.parse_json_feed(valid).items[0].guid == scalar
+    assert feeds.parse_any(valid).items[0].guid == scalar
+
+
 def test_feed_text_utf8_cannot_encode_is_replaced_rather_than_raised():
     """A log record and an HTTP response both encode; neither may fail because a publisher sent a surrogate."""
     document = (

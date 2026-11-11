@@ -16,7 +16,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 
-from .http import header, parse_json, private_destination
+from .http import header, json_text, parse_json, private_destination
 
 Http = Callable[[str, str, Mapping[str, str], bytes | None], tuple[int, dict[str, str], bytes]]
 FEED_ITEMS = 100
@@ -30,6 +30,22 @@ DERIVED_TITLE_CHARS = 200
 
 class FeedError(Exception):
     pass
+
+
+def _feed_json(body: bytes) -> object | None:
+    """A feed body as JSON, refused unless it is valid UTF-8.
+
+    ``json.loads`` on bytes decodes them with ``surrogatepass``, so the raw bytes ``ED A0 80 ED B0 80`` become
+    two surrogate code points rather than failing. A high surrogate followed by a low one is a valid pair in
+    that representation, and ``json.dumps(ensure_ascii=True)`` spells the pair exactly like the single scalar
+    ``U+10000``; an accepted identity would therefore read back as a different one after a save, so a claim
+    could be missed or two records could merge. A JSON feed that is not valid UTF-8 is not a document this
+    program reads, so it is refused here, before an identity is taken from it.
+    """
+    text = json_text(body)
+    if text is None:
+        raise FeedError("feed is not valid UTF-8")
+    return parse_json(text)
 
 
 @dataclass(frozen=True)
@@ -240,7 +256,7 @@ def _derived_title(node: Mapping[str, object]) -> str:
 
 def parse_feed(body: bytes) -> FeedExport:
     """The FreshRSS GReader JSON export."""
-    return _greader_export(parse_json(body))
+    return _greader_export(_feed_json(body))
 
 
 def _greader_export(document: object) -> FeedExport:
@@ -314,7 +330,7 @@ def parse_json_feed(body: bytes) -> FeedExport:
     is not the same as a document that cannot be read, and the latter raises. There is no continuation
     token in this format, so the whole feed is always read and ``truncated`` is always false.
     """
-    return _json_feed_export(parse_json(body))
+    return _json_feed_export(_feed_json(body))
 
 
 def _json_feed_export(document: object) -> FeedExport:
@@ -693,7 +709,7 @@ def parse_any(body: bytes) -> FeedExport:
     """
     head = body.lstrip(b"\xef\xbb\xbf \t\r\n")
     if head[:1] in (b"{", b"["):
-        document = parse_json(body)
+        document = _feed_json(body)
         if isinstance(document, dict) and _is_json_feed(document):
             return _json_feed_export(document)
         if _is_greader_export(document):

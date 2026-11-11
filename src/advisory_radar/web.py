@@ -41,7 +41,7 @@ from .config import (
     load_document,
     secret_values,
 )
-from .http import Http, private_destination, resolve_host, urllib_http
+from .http import Http, json_text, private_destination, resolve_host, urllib_http
 from .notifiers import NOTIFIER_BUILDERS
 from .runtime import Runtime
 from .settings import (
@@ -3388,8 +3388,11 @@ def create_app(
             body = await _body(request, WEBHOOK_BODY_LIMIT)
         except BodyTooLarge:
             return JSONResponse({"error": "payload too large"}, status_code=413)
+        text = json_text(body) if body else "null"
+        if text is None:
+            return JSONResponse({"error": "payload is not JSON"}, status_code=400)
         try:
-            payload = json.loads(body or b"null")
+            payload = json.loads(text)
         except ValueError:
             return JSONResponse({"error": "payload is not JSON"}, status_code=400)
         entry = webhook_item_from_payload(payload)

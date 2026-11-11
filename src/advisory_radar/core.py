@@ -40,7 +40,7 @@ from . import adobe, routing
 from .config import DEFAULT_THRESHOLDS, Thresholds
 from .feeds import FeedExport
 from .feeds import parse_feed as parse_greader
-from .http import MESSAGE_LIMIT, Http, inert, parse_json
+from .http import MESSAGE_LIMIT, Http, inert, log_safe, parse_json
 from .state import SourceError, load_state_document, save_state
 from .watchlist import Policy, Product
 
@@ -1522,9 +1522,10 @@ def _log_id(value: str) -> str:
     differently but must not change which advisory it names. Nothing is shortened here either: redaction runs
     on the finished record and replaces a whole configured credential, so shortening first would leave its
     prefix in the log where the redactor could no longer recognise it. The length bound therefore lives in
-    ``http.RedactFilter.filter``, after the replacements.
+    ``http.RedactFilter.filter``, after the replacements. The spelling itself is ``http.log_safe``, which the
+    redactor also knows, so escaping the argument first cannot hide a credential from it.
     """
-    return value.encode("unicode_escape").decode("ascii")
+    return log_safe(value)
 
 
 def classify_new(
