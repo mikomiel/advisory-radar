@@ -11,6 +11,7 @@ from advisory_radar import core, pipeline
 from advisory_radar.config import ConfigError, load_config
 from advisory_radar.plugins import SourceWindow
 from advisory_radar.sources import RssSource
+from advisory_radar.state import save_state
 from advisory_radar.watchlist import load_policy
 
 
@@ -216,9 +217,14 @@ def interval_config(tmp_path: Path, entries: list[dict]):
     return load_config(cfg_path, {})
 
 
-def run_at(cfg, sources, now: int) -> int:
+def run_at(cfg, sources, now: int, notifier=None) -> int:
     return pipeline.run_pass(
-        cfg, sources, [FakeNotifier()], http=fake_http, clock=lambda: float(now), sleep=lambda s: None
+        cfg,
+        sources,
+        [notifier if notifier is not None else FakeNotifier()],
+        http=fake_http,
+        clock=lambda: float(now),
+        sleep=lambda s: None,
     )
 
 
@@ -267,3 +273,55 @@ def test_a_fast_and_a_slow_source_are_polled_at_their_own_paces(tmp_path):
     assert (fast.calls, slow.calls) == (2, 1)
     run_at(cfg, [fast, slow], NOW + 240)
     assert (fast.calls, slow.calls) == (3, 1)
+
+
+def test_a_skipped_source_keeps_its_carry_clocks_seen_and_pending(tmp_path):
+    """The interval skips the fetch only: work already in the state is neither dropped nor duplicated."""
+    cfg = interval_config(tmp_path, [{"id": "slow", "interval": "12h"}])
+    source = CountingSource("slow")
+    state = core.new_state()
+    state["seeded"] = {"slow": True}
+    state["source_health"] = {"slow": {"at": NOW, "ok": True, "ok_at": NOW, "items": 0, "error": ""}}
+    carried = core.Item("slow:carried", "carried advisory", "https://vendor.example.net/a", "notes", NOW - 60, ())
+    state["carry"] = {"slow": [core.item_to_state(carried)]}
+    state["enrich_retry"] = {"slow:carried": NOW - 10}
+    state["enrich_pending"] = {"slow:carried": NOW - 10}
+    state["seen"] = {"CVE-2026-9999": {"at": NOW - 100, "outcome": "delivered"}}
+    queued = [
+        {
+            "kind": "new",
+            "tag": "warning",
+            "title": f"queued {index}",
+            "body": "b",
+            "ids": [f"src:queued-{index}"],
+            "cves": [],
+            "levels": {},
+            "source": "other",
+            "link": "",
+        }
+        for index in range(core.DELIVERY_CAP)
+    ]
+    state["pending"] = queued
+    save_state(cfg.state_path, state)
+
+    # A failing notifier leaves the queue in place; delivery still ran, which is the point of not throttling it.
+    assert run_at(cfg, [source], NOW + 60, notifier=FakeNotifier(500)) == 1
+    assert source.calls == 0
+    saved = json.loads(cfg.state_path.read_text())
+    assert saved["source_health"]["slow"]["at"] == NOW, "a skipped fetch records no attempt"
+    assert [row["guid"] for row in saved["carry"]["slow"]] == ["slow:carried"]
+    assert saved["enrich_retry"]["slow:carried"] == NOW - 10
+    assert saved["enrich_pending"]["slow:carried"] == NOW - 10
+    assert saved["seen"]["CVE-2026-9999"]["outcome"] == "delivered"
+    assert [entry["ids"] for entry in saved["pending"]] == [entry["ids"] for entry in queued]
+
+
+def test_a_pass_where_no_source_is_due_fetches_nothing_and_still_succeeds(tmp_path):
+    cfg = interval_config(tmp_path, [{"id": "a", "interval": "12h"}, {"id": "b", "interval": "12h"}])
+    a, b = CountingSource("a"), CountingSource("b")
+    assert run_at(cfg, [a, b], NOW) == 0
+    assert (a.calls, b.calls) == (1, 1)
+    before = json.loads(cfg.state_path.read_text())["source_health"]
+    assert run_at(cfg, [a, b], NOW + 60) == 0, "a pass with every source deferred is not a failure"
+    assert (a.calls, b.calls) == (1, 1), "nothing was due, so nothing was fetched"
+    assert json.loads(cfg.state_path.read_text())["source_health"] == before, "no attempt rewrote the health"

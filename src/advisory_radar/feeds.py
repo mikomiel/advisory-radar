@@ -16,13 +16,16 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 
-from .http import header, parse_json
+from .http import header, parse_json, private_destination
 
 Http = Callable[[str, str, Mapping[str, str], bytes | None], tuple[int, dict[str, str], bytes]]
 FEED_ITEMS = 100
 GREADER_ID = re.compile(r"^tag:google\.com,2005:reader/item/([0-9a-fA-F]+)$")
 #: A JSON Feed names itself in ``version`` (``https://jsonfeed.org/version/1.1``); no other JSON export does.
 JSON_FEED_VERSION = "jsonfeed.org"
+#: A title derived from an untitled item's content is cut here: a notification title is a headline, not the
+#: first paragraph of the advisory.
+DERIVED_TITLE_CHARS = 200
 
 
 class FeedError(Exception):
@@ -166,6 +169,54 @@ def _is_json_feed(document: object) -> bool:
     return isinstance(version, str) and JSON_FEED_VERSION in version.lower()
 
 
+def _is_greader_export(document: object) -> bool:
+    """Whether a JSON object carries positive evidence of the GReader stream format.
+
+    An ``items`` list alone is not evidence: any JSON API can have one, and reading ``{"items": []}`` as a
+    healthy, unchanged GReader export would make a misconfigured endpoint look like a publisher with no news.
+    The stream ``id`` is the marker an empty-but-real FreshRSS/Google Reader answer carries; otherwise at
+    least one item must have the format's own item id.
+    """
+    if not isinstance(document, dict):
+        return False
+    stream = document.get("id")
+    if isinstance(stream, str) and stream.startswith(("user/", "feed/")):
+        return True
+    entries = document.get("items")
+    return isinstance(entries, list) and any(
+        isinstance(node, dict) and isinstance(node.get("id"), str) and GREADER_ID.match(node["id"]) is not None
+        for node in entries
+    )
+
+
+def _first_line(value: object, *, html_text: bool) -> str:
+    """The first non-empty line of one item field, without HTML parsing plain text.
+
+    Only ``content_html`` is treated as markup: ``content_text`` may legitimately contain ``<``, and the HTML
+    parser would drop the version that follows it.
+    """
+    if not isinstance(value, str):
+        return ""
+    for line in value.splitlines():
+        line = _text(line) if html_text else " ".join(line.split())
+        if line:
+            return line
+    return ""
+
+
+def _derived_title(node: Mapping[str, object]) -> str:
+    """A usable title for a JSON Feed item that has none, from its content or summary, capped.
+
+    ``title`` is optional in JSON Feed 1.0/1.1, so one untitled item must not make every advisory in the
+    document unreadable. The caller falls back to the item id when even the content is empty.
+    """
+    for field, html_text in (("content_text", False), ("content_html", True), ("summary", False)):
+        line = _first_line(node.get(field), html_text=html_text)[:DERIVED_TITLE_CHARS].strip()
+        if line:
+            return line
+    return ""
+
+
 def parse_feed(body: bytes) -> FeedExport:
     """The FreshRSS GReader JSON export."""
     return _greader_export(parse_json(body))
@@ -263,9 +314,13 @@ def _json_feed_export(document: object) -> FeedExport:
         # site, and either is a better link than none. The id is the stable identity and wins outright.
         link = _string(node.get("url")) or _string(node.get("external_url"))
         guid = _string(node.get("id")) or link
+        if not guid:
+            raise FeedError("feed entry has no usable id")
         title = _text(node.get("title"))
-        if not guid or not title:
-            raise FeedError("feed entry has no usable id or title")
+        if not title:
+            # ``title`` is optional in JSON Feed 1.0/1.1, so one untitled item must not make the whole
+            # document unreadable; the content's first line, then the item id, stand in for it.
+            title = _derived_title(node) or guid[:DERIVED_TITLE_CHARS]
         # Both content fields are read, because some publishers put the advisory identifier in only one.
         # An exact duplicate is kept once: JSON Feed requires the two renderings to say the same thing, so
         # joining both unconditionally would repeat every advisory in the evidence and in the notification.
@@ -604,15 +659,19 @@ def parse_any(body: bytes) -> FeedExport:
     """Parse whichever feed format these bytes are, deciding from what the document says about itself.
 
     A caller's guess is not evidence: sniffing on the presence of an ``items`` key would read a JSON Feed
-    with the GReader rules and a GReader export with the JSON Feed rules. An HTML page is refused here
-    because autodiscovery needs the page URL, which only ``fetch_any`` has.
+    with the GReader rules and a GReader export with the JSON Feed rules, and would read any unrelated JSON
+    API's ``{"items": []}`` as a healthy GReader source with no news. The JSON branch therefore needs the
+    JSON Feed version or positive GReader evidence. An HTML page is refused here because autodiscovery needs
+    the page URL, which only ``fetch_any`` has.
     """
     head = body.lstrip(b"\xef\xbb\xbf \t\r\n")
     if head[:1] in (b"{", b"["):
         document = parse_json(body)
         if isinstance(document, dict) and _is_json_feed(document):
             return _json_feed_export(document)
-        return _greader_export(document)
+        if _is_greader_export(document):
+            return _greader_export(document)
+        raise FeedError("feed is neither JSON Feed nor a GReader export")
     if _looks_like_html(body):
         raise FeedError("page is not a feed")
     return parse_rss(body)
@@ -649,6 +708,13 @@ def fetch_any(
         target = discover_feed(body, url)
         if target is None:
             raise FeedError("page offers no feed link")
+        # The page is remote-authored, so its link is too: without this check a public page could aim the next
+        # poll at loopback or the metadata service. ``allow_private_sources`` deliberately does not apply --
+        # that allowance is for an operator-authored source URL, and an operator who needs a private feed can
+        # configure that feed directly. The refusal has to come before the request; a rejection after the
+        # response cannot unmake the internal GET.
+        if private_destination(target):
+            raise FeedError("page advertises a feed on a private address")
         status, _, body = http("GET", target, {"Accept": _FEED_ACCEPT}, None)
         if status != 200:
             raise RssError(f"feed answered HTTP {status}" if status else "feed is unreachable")

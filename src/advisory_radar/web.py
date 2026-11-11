@@ -2385,14 +2385,18 @@ def create_app(
             candidates: list[dict] = []
             skipped: list[str] = []
             for title, xml_url, _html_url in importable:
+                # An imported URL may be a ``${NAME}`` reference. Compare what it resolves to, or the same
+                # subscription is added twice: once literal in the YAML and once by reference here. The entry
+                # still stores the reference as written, exactly as a single add would.
+                effective = expand_text(xml_url).strip()
                 # A second occurrence in one document is the same subscription, not a second source; the same
                 # URL already configured must not gain a suffixed id and be polled twice.
-                if xml_url in seen or xml_url in configured:
+                if effective in seen or effective in configured:
                     skipped.append(
                         pipeline.redact(title, values).strip() if title else redacted_origin(xml_url, values)
                     )
                     continue
-                seen.add(xml_url)
+                seen.add(effective)
                 entry = {"id": derive_source_id(xml_url, "rss", taken), "type": "rss", "url": xml_url}
                 problem = added_source_error(entry)
                 if problem:

@@ -145,6 +145,34 @@ def test_parse_json_feed():
     assert second.published == 1792663200  # date_modified when date_published is absent
 
 
+def test_a_json_feed_item_without_a_title_derives_a_usable_one():
+    """``title`` is optional in JSON Feed: one untitled entry must not make the document unreadable."""
+    body = b"""{
+      "version": "https://jsonfeed.org/version/1.1",
+      "items": [
+        {"id": "first", "content_text": "APSB26-9 fixes CVE-2026-5555.\\nSecond line."},
+        {"id": "second", "content_html": "<p>APSB26-10 fixes CVE-2026-6666.</p>"},
+        {"id": "third", "summary": "APSB26-11 summary line"},
+        {"id": "fourth"}
+      ]
+    }"""
+    first, second, third, fourth = feeds.parse_json_feed(body).items
+    assert first.title == "APSB26-9 fixes CVE-2026-5555."  # the content's first line
+    assert second.title == "APSB26-10 fixes CVE-2026-6666."  # the text of the HTML content
+    assert third.title == "APSB26-11 summary line"  # the summary when no content is present
+    assert fourth.title == "fourth"  # the id as the last resort
+
+
+def test_a_derived_json_feed_title_is_capped():
+    content = b"x" * (feeds.DERIVED_TITLE_CHARS + 50)
+    export = feeds.parse_json_feed(
+        b'{"version": "https://jsonfeed.org/version/1.1", "items": [{"id": "long", "content_text": "'
+        + content
+        + b'"}]}'
+    )
+    assert export.items[0].title == "x" * feeds.DERIVED_TITLE_CHARS
+
+
 def test_parse_rdf_feed():
     export = feeds.parse_rss(RDF)
     (entry,) = export.items
@@ -183,6 +211,19 @@ def test_parse_any_dispatches_by_version_and_root():
         feeds.parse_feed(JSON_FEED)
 
 
+def test_parse_any_requires_positive_evidence_for_each_json_shape():
+    """An ``items`` list is not evidence: an unrelated JSON API must not look like an unchanged source."""
+    with pytest.raises(feeds.FeedError, match="neither JSON Feed nor a GReader export"):
+        feeds.parse_any(b'{"items": []}')
+    with pytest.raises(feeds.FeedError, match="neither JSON Feed nor a GReader export"):
+        feeds.parse_any(b'{"items": [{"id": "plain", "title": "not a GReader item"}]}')
+    # An empty-but-real stream carries its stream marker, so it is still recognised.
+    empty_stream = b'{"id": "user/-/state/com.google/reading-list", "updated": 1792600000, "items": []}'
+    assert feeds.parse_any(empty_stream).items == ()
+    # The explicit FreshRSS reader keeps its permissive contract; only the sniffing path is strict.
+    assert feeds.parse_feed(b'{"items": []}').items == ()
+
+
 def test_parse_any_rejects_a_json_feed_without_items():
     with pytest.raises(feeds.FeedError):
         feeds.parse_any(b'{"version": "https://jsonfeed.org/version/1.1", "title": "Nothing to read"}')
@@ -217,6 +258,25 @@ def test_fetch_any_follows_one_autodiscovery_hop():
     assert "text/html" not in calls[1][1]["Accept"]
     # A page's validators describe the page, not the feed it advertises, so none are stored.
     assert stored == {}
+
+
+def test_fetch_any_refuses_a_discovered_private_feed_before_fetching_it():
+    """The page is remote-authored: its link must not aim this poll at loopback or a metadata service."""
+    calls = []
+
+    def http(method, url, headers, body):
+        calls.append(url)
+        return (
+            200,
+            {},
+            b"""<html><head>
+        <link rel="alternate" type="application/rss+xml" href="http://127.0.0.1:8080/feed.xml">
+        </head></html>""",
+        )
+
+    with pytest.raises(feeds.FeedError):
+        feeds.fetch_any(http, "https://vendor.example.com/security")
+    assert calls == ["https://vendor.example.com/security"], "the internal GET must never be issued"
 
 
 def test_fetch_any_reads_a_json_feed_and_keeps_its_validators():

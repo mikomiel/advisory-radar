@@ -1827,3 +1827,33 @@ def test_opml_import_refuses_a_private_destination(tmp_path):
     assert response.status_code == 400
     assert "private network" in response.text
     assert not (tmp_path / "data" / "settings.json").exists()
+
+
+def test_opml_import_expands_an_imported_reference_when_skipping_a_configured_feed(tmp_path):
+    client, _, _ = make_client(
+        tmp_path,
+        sources=[{"id": "vendor", "type": "rss", "url": "https://feeds.example.net/security.xml"}],
+        environment={"FEED_URL": "https://feeds.example.net/security.xml"},
+    )
+    response = import_opml(client, opml("${FEED_URL}"))
+    assert response.status_code == 200
+    assert "added 0, skipped 1" in response.text
+    assert not (tmp_path / "data" / "settings.json").exists(), "an already-configured feed writes nothing"
+
+
+def test_opml_import_treats_a_reference_and_its_literal_as_one_subscription(tmp_path):
+    client, _, _ = make_client(tmp_path, environment={"FEED_URL": "https://a.example.net/feed.xml"})
+    response = import_opml(client, opml("https://a.example.net/feed.xml", "${FEED_URL}"))
+    assert response.status_code == 200
+    assert "added 1, skipped 1" in response.text
+    assert [entry["url"] for entry in overlay(tmp_path)["sources_added"]] == ["https://a.example.net/feed.xml"]
+
+
+def test_opml_import_stores_an_imported_reference_as_written(tmp_path):
+    client, runtime, _ = make_client(tmp_path, environment={"FEED_URL": "https://b.example.net/feed.xml"})
+    response = import_opml(client, opml("${FEED_URL}"))
+    assert response.status_code == 200
+    assert "added 1, skipped 0" in response.text
+    assert overlay(tmp_path)["sources_added"][0]["url"] == "${FEED_URL}"
+    runtime.reload(blocking=True)
+    assert "https://b.example.net/feed.xml" in [source.url for source in runtime.sources]
