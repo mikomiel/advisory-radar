@@ -8,11 +8,13 @@ the preview is checked against the decision the pass makes rather than against i
 
 from __future__ import annotations
 
+import html
 import json
 import re
 import types
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from advisory_radar import pipeline, watchlist
@@ -428,32 +430,69 @@ def test_an_id_being_removed_in_the_same_save_can_be_added_again(tmp_path):
     assert saved["products"][0]["aliases"] == ["node js", "nodejs"]
 
 
-def test_an_alias_containing_a_comma_is_kept_exactly(tmp_path):
-    """The aliases field separates on commas, so splitting this value would silently widen the scope."""
+LOSSY_ALIASES = (
+    "Example, Inc.",  # the field's own separator
+    "Example\nServer",  # a browser drops it from a single-line input
+    "Example\rServer",
+    "Example\x00Server",  # a control character does not survive a form
+    "Example\ud800Server",  # not renderable at all: esc() would replace it
+)
+
+
+@pytest.mark.parametrize("alias", LOSSY_ALIASES)
+def test_an_alias_its_field_cannot_hold_is_kept_exactly(tmp_path, alias):
+    """The row is read-only and the rendered hidden value is what round-trips, not a field that would alter it."""
     watch = write_scope(
         tmp_path / "scope.json",
-        products=[{"id": "acme", "aliases": ["Example, Inc."], "domains": []}],
+        products=[{"id": "acme", "aliases": [alias], "domains": []}],
     )
     client, _ = make_client(tmp_path, watch)
     sign_in(client)
     csrf, fingerprint, text = scope_form(client)
     assert "readonly" in text and "kept exactly" in text
+    assert "name='product:acme:aliases'" not in text, "the lossy field is not submitted at all"
+    rendered = re.search(r"name='product:acme:aliases_json' value='([^']*)'", text)
+    assert rendered, "the exact list is carried in the form"
     response = submit(
         client,
         csrf,
         fingerprint,
         **{
-            "product:acme:aliases_json": json.dumps(["Example, Inc."]),
+            "product:acme:aliases_json": html.unescape(rendered.group(1)),
             "product:acme:domains": "",
             "metadata_only:acme": "0",
             "debian_packages": "*",
-            "excluded_products": "legacy",
         },
     )
     assert response.status_code == 303
-    saved = json.loads(watch.read_text())
-    assert saved["products"][0]["aliases"] == ["Example, Inc."]
-    assert saved["excluded_products"] == ["legacy"]
+    assert json.loads(watch.read_text())["products"][0]["aliases"] == [alias]
+
+
+@pytest.mark.parametrize("entry", ["Example\nServer", "Example\x00Server"])
+def test_an_exclusion_its_field_cannot_hold_is_kept_exactly(tmp_path, entry):
+    """An exclusion is a matching rule: splitting one into two broader names widens what is dropped."""
+    watch = write_scope(tmp_path / "scope.json", excluded_products=[entry])
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    csrf, fingerprint, text = scope_form(client)
+    assert "readonly" in text and "kept exactly" in text
+    assert "name='excluded_products'" not in text, "the lossy field is not submitted at all"
+    rendered = re.search(r"name='excluded_products_json' value='([^']*)'", text)
+    assert rendered, "the exact list is carried in the form"
+    response = submit(
+        client,
+        csrf,
+        fingerprint,
+        **{
+            "excluded_products_json": html.unescape(rendered.group(1)),
+            "product:nodejs:aliases": "node.js",
+            "product:nodejs:domains": "nodejs.org",
+            "metadata_only:nodejs": "0",
+            "debian_packages": "*",
+        },
+    )
+    assert response.status_code == 303
+    assert json.loads(watch.read_text())["excluded_products"] == [entry]
 
 
 def test_a_new_row_without_an_id_is_refused_and_kept(tmp_path):

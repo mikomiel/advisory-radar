@@ -965,14 +965,47 @@ def _form_lines(value: str) -> list[str]:
     return list(dict.fromkeys(line.strip() for line in value.splitlines() if line.strip()))
 
 
-def _field_holds_alias(alias: str) -> bool:
-    """Whether a single-line comma-separated field can round-trip this alias unchanged.
+def _representable(value: str) -> bool:
+    """Whether a form control can carry this value at all.
 
-    A comma splits it into two aliases, and a browser's text input drops line breaks; a control character does
-    not survive a form at all. Saving any of those unchanged would silently alter what a product matches, which
-    is why such a row is read-only here and edited in the document instead.
+    A control character does not survive a form, and a lone surrogate cannot be rendered, so a value holding one
+    would come back changed from a save nobody meant to change. It is offered as text instead.
     """
-    return "," not in alias and all(" " <= character != "\x7f" for character in alias)
+    if any(character < " " or character == "\x7f" for character in value):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _alias_holds(alias: str) -> bool:
+    """Whether the comma-separated aliases field can round-trip this alias unchanged: the field's own answer."""
+    return _representable(alias) and _form_words(alias) == [alias]
+
+
+def _line_holds(entry: str) -> bool:
+    """Whether a one-entry-per-line textarea can round-trip this entry unchanged: the field's own answer."""
+    return _representable(entry) and _form_lines(entry) == [entry]
+
+
+def _list_field(name: str, label: str, entries: Sequence[str]) -> str:
+    """One one-entry-per-line field: editable, or read-only with the exact list beside it.
+
+    Read-only is the same rule a product row follows: an entry the textarea would split or rewrite (a line break,
+    a control character) is carried exactly in a hidden field instead of being changed by a save nobody meant to
+    make.
+    """
+    text = "\n".join(entries)
+    if all(_line_holds(entry) for entry in entries):
+        return f"<label>{esc(label)} (one per line)<textarea name='{name}' rows='4'>{esc(text)}</textarea></label>"
+    return (
+        f"<label>{esc(label)} (one per line, read-only)"
+        f"<textarea rows='4' readonly>{esc(text)}</textarea>"
+        f"<input type='hidden' name='{name}_json' value='{esc(json.dumps(list(entries)))}'>"
+        "<span class='muted small'>kept exactly: this field cannot hold one of these entries</span></label>"
+    )
 
 
 def _product_rows(products: Sequence[Mapping[str, object]]) -> str:
@@ -981,8 +1014,9 @@ def _product_rows(products: Sequence[Mapping[str, object]]) -> str:
     The id is rendered as text, not as an editable field: it is what a routing rule and an exclusion name, so
     a rename would silently change both. Renaming is a remove and an add.
 
-    A row holding an alias the field cannot represent (see :func:`_field_holds_alias`) is rendered read-only with
-    the exact list in a hidden field: the document is the place to edit it.
+    A row holding an alias its field cannot carry (see :func:`_alias_holds`) is rendered read-only with the exact
+    list in a hidden field, because the field would otherwise split or rewrite it on an unchanged save. The
+    document is the place to edit it.
     """
     rows = []
     for product in products:
@@ -993,7 +1027,7 @@ def _product_rows(products: Sequence[Mapping[str, object]]) -> str:
         # it through every save rather than dropping a key this page does not understand.
         metadata = "1" if product.get("metadata_only") is True else "0"
         removed = " checked" if product.get("remove") is True else ""
-        if all(_field_holds_alias(alias) for alias in aliases):
+        if all(_alias_holds(alias) for alias in aliases):
             aliases_cell = (
                 f"<td><input type='text' size='{_ALIASES_SIZE}' name='product:{esc(identifier)}:aliases' "
                 f"value='{esc(', '.join(aliases))}' aria-label='aliases for {esc(identifier)}'></td>"
@@ -1004,7 +1038,7 @@ def _product_rows(products: Sequence[Mapping[str, object]]) -> str:
                 f"aria-label='aliases for {esc(identifier)}, read-only'>"
                 f"<input type='hidden' name='product:{esc(identifier)}:aliases_json' "
                 f"value='{esc(json.dumps(aliases))}'>"
-                "<br><span class='muted small'>kept exactly: a comma or a line break is inside an alias</span></td>"
+                "<br><span class='muted small'>kept exactly: this field cannot hold an alias here</span></td>"
             )
         rows.append(
             f"<tr><td><b>{esc(identifier)}</b>"
@@ -1018,13 +1052,14 @@ def _product_rows(products: Sequence[Mapping[str, object]]) -> str:
     return "".join(rows)
 
 
-def _row_aliases(form: Mapping[str, list[str]], identifier: str) -> list[str]:
-    """A row's aliases: the exact list when the form carried one, else the comma-separated field.
+def _exact_or_split(form: Mapping[str, list[str]], name: str, split: Callable[[str], list[str]]) -> list[str]:
+    """A list field as submitted: the exact list when a hidden field carries one, else the field's own split.
 
-    The exact form is what a read-only row submits. A value that is not a list of strings is ignored here and
-    left to ``watchlist.parse_policy``, which refuses the document it becomes.
+    The exact form is what a row or a field the form cannot hold submits (see :func:`_alias_holds` and
+    :func:`_line_holds`). A value that is not a list is ignored here and left to ``watchlist.parse_policy``,
+    which refuses the document it becomes.
     """
-    exact = _form_value(form, f"product:{identifier}:aliases_json")
+    exact = _form_value(form, f"{name}_json")
     if exact:
         try:
             parsed = json.loads(exact)
@@ -1032,7 +1067,7 @@ def _row_aliases(form: Mapping[str, list[str]], identifier: str) -> list[str]:
             parsed = None
         if isinstance(parsed, list):
             return parsed
-    return _form_words(_form_value(form, f"product:{identifier}:aliases"))
+    return split(_form_value(form, name))
 
 
 def _submitted_products(form: Mapping[str, list[str]]) -> list[dict]:
@@ -1054,7 +1089,7 @@ def _submitted_products(form: Mapping[str, list[str]]) -> list[dict]:
         products.append(
             {
                 "id": identifier,
-                "aliases": _row_aliases(form, identifier),
+                "aliases": _exact_or_split(form, f"product:{identifier}:aliases", _form_words),
                 "domains": _form_words(_form_value(form, f"product:{identifier}:domains")),
                 "metadata_only": _form_value(form, f"metadata_only:{identifier}") == "1",
                 "remove": _form_value(form, f"remove:{identifier}") not in ("", "0"),
@@ -1087,8 +1122,8 @@ def _watchlist_document(form: Mapping[str, list[str]]) -> dict:
         )
     return {
         "schema": watchlist.SCHEMA,
-        "debian_source_packages": _form_lines(_form_value(form, "debian_packages")),
-        "excluded_products": _form_lines(_form_value(form, "excluded_products")),
+        "debian_source_packages": _exact_or_split(form, "debian_packages", _form_lines),
+        "excluded_products": _exact_or_split(form, "excluded_products", _form_lines),
         "products": products,
     }
 
@@ -3180,8 +3215,8 @@ def create_app(
         *,
         exists: bool,
         rows: Sequence[Mapping[str, object]] | None = None,
-        packages: str = "",
-        excluded: str = "",
+        packages: Sequence[str] = (),
+        excluded: Sequence[str] = (),
         new_row: Mapping[str, str] | None = None,
         expected: str = "",
         notices: str = "",
@@ -3224,10 +3259,8 @@ def create_app(
             "<th scope='col'>Domains</th><th scope='col' class='narrow'>Remove</th></tr>"
             f"{_product_rows(rows)}<tr>{new_cells}<td class='muted small'>new</td></tr></table></div>"
             "<div class='fields'>"
-            "<label>Debian source packages (one per line)"
-            f"<textarea name='debian_packages' rows='4'>{esc(packages)}</textarea></label>"
-            "<label>Excluded products (one per line)"
-            f"<textarea name='excluded_products' rows='4'>{esc(excluded)}</textarea></label>"
+            f"{_list_field('debian_packages', 'Debian source packages', packages)}"
+            f"{_list_field('excluded_products', 'Excluded products', excluded)}"
             "</div>"
             "<p class='muted small'>A product matches when one of its aliases appears as a whole word in the "
             "advisory's title, summary or feed title, or when a link points at one of its domains or a "
@@ -3319,8 +3352,8 @@ def create_app(
             target,
             exists=exists,
             rows=list(document["products"]),
-            packages="\n".join(document["debian_source_packages"]),
-            excluded="\n".join(document["excluded_products"]),
+            packages=document["debian_source_packages"],
+            excluded=document["excluded_products"],
             new_row={},
             expected=expected,
             notices=notices,
@@ -3398,8 +3431,8 @@ def create_app(
             target,
             exists=exists,
             rows=submitted,
-            packages=first(form, "debian_packages"),
-            excluded=first(form, "excluded_products"),
+            packages=_exact_or_split(form, "debian_packages", _form_lines),
+            excluded=_exact_or_split(form, "excluded_products", _form_lines),
             new_row=new_row,
             expected=expected,
             notices=notice,

@@ -73,9 +73,10 @@ without the search bit — fails the pass the same way, and the page refuses to 
 save writes nothing when the page is stale (the file changed under it), when a value is
 invalid (the rows you typed are re-rendered), or when the destination cannot be written. The
 read, the check and the write happen under one lock on the document, so two tabs — or two
-processes — cannot silently replace each other's edit. A row holding an alias a single-line field
-cannot carry — a comma, which separates aliases, or a line break — is read-only in the form: the
-document keeps it exactly, and it is edited in the file.
+processes — cannot silently replace each other's edit. A value one of these fields cannot carry — a
+comma inside an alias, or a line break or control character inside an alias or an excluded product —
+is rendered read-only with the exact value beside it: the document keeps it, and it is edited in the
+file.
 
 To check a rule before relying on it, paste an advisory's title and link into the page's
 *Check an advisory* form: it answers in scope or out of scope, names the products that
