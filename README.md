@@ -244,6 +244,14 @@ line per enabled source — the last attempt, the last success, the entries in t
 window and the error that attempt reported — with the same numbers exported as
 metrics (see `docs/deployment.md`).
 
+A source added on that page may not point into a private network: the form is
+reachable with the UI token alone, and aiming this process at an internal address
+is a decision for whoever runs the host. A configured YAML source is never subject
+to the rule — a FreshRSS or changedetection.io instance on the LAN stays a supported
+target — and `allow_private_sources: true` in the YAML lifts it for added sources
+too. Both a URL and the titles it answers are redacted against every secret the
+configuration resolved, so a probe cannot be used to read a `${NAME}` back out.
+
 | Kind | Summary | Required keys | Optional keys |
 |---|---|---|---|
 | `rss` | Any RSS 2.0 or Atom feed URL, read in one conditional GET. | `url` | `tag`, `enabled` |

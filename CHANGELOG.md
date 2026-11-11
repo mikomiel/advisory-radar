@@ -98,6 +98,16 @@ operator action, and the release workflow then builds and pushes the image to
   Playwright is not a project dependency, and no CI job runs it.
 
 ### Fixed
+- A first pass whose every source failed wrote no state at all, so `/sources` reported
+  "not polled yet" for each source and no per-source metric appeared while the pass log said
+  otherwise. It now persists the health records in a seeded-empty document: no validator
+  moves and no source is marked seeded, so the first pass that does read a feed still
+  bootstraps its history.
+- The probe judged a source's URL before expanding it, so a valid `url: ${FEED_URL}`
+  reference was refused as a bad scheme and a missing URL reference was reported as one
+  instead of naming the variable.
+- A source URL nobody can parse (`http://[oops/…`) raised while an id was derived from it or
+  while a probe checked its scheme, which answered 500. Both paths now refuse it in words.
 - A routing rule matching a `tag` outside `critical` and `warning` was accepted and could
   never fire: `routing.SEVERITY_TAGS` is now the closed set the validator uses, and a rule
   naming an unconfigured source id is reported on `/config` as inert (staging a rule before
@@ -148,6 +158,14 @@ operator action, and the release workflow then builds and pushes the image to
   every guarded pattern is documented in that paragraph.
 
 ### Security
+- A source added from `/config` may not point into a private network unless the YAML sets
+  `allow_private_sources: true`: the settings overlay is reachable with the UI token alone,
+  and only whoever writes the YAML should be able to aim the fetcher at an internal address.
+  A configured YAML source is unaffected, so a LAN FreshRSS or changedetection.io target
+  behaves as before.
+- A probe's answer is redacted against every secret the entry resolved, not only its error:
+  a source can echo a request token back in a feed title, and the probe page must not become
+  a way to read a `${NAME}` out.
 - Every workflow action is pinned to a full commit SHA, with its version in a
   trailing comment so Dependabot keeps it current, and every job runs on
   `ubuntu-24.04` instead of the moving `ubuntu-latest`.

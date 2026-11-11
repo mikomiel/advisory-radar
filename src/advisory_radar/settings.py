@@ -127,6 +127,15 @@ def _validate_added_sources(added: object) -> None:
             raise ConfigError(
                 f"settings: added source {identifier!r} has no built-in type (want one of {sorted(SOURCE_SPECS)})"
             )
+        missing = [
+            key
+            for key in SOURCE_SPECS[kind].required
+            if not isinstance(entry.get(key), str) or not str(entry.get(key)).strip()
+        ]
+        if missing:
+            # A complete entry, not a shape that only looks like one: a source missing a required key would be
+            # stored and then fail the very build that saves it, with a bare KeyError from the builder.
+            raise ConfigError(f"settings: added source {identifier!r} ({kind}) needs {', '.join(missing)}")
         for key in SOURCE_SPECS[kind].secret_keys:
             if key in entry and not is_reference(entry[key]):
                 raise ConfigError(

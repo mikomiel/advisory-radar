@@ -152,7 +152,15 @@ def test_source_fault_fails_pass_but_keeps_state(tmp_path):
 
     code = pipeline.run_pass(cfg, [source], [FakeNotifier()], http=broken, clock=lambda: 1.0, sleep=lambda s: None)
     assert code == 1
-    assert not (tmp_path / "state.json").exists()  # first run with no readable source writes nothing
+    # A first run with no readable source records the failure and nothing else: a fresh install whose every
+    # source fails must not look like one that never polled, and must still bootstrap when a source answers.
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["source_health"]["test"]["ok"] is False
+    assert "unreachable" in state["source_health"]["test"]["error"]
+    assert state["seen"] == {}
+    assert state["watch"] == {}
+    assert state["feeds"] == {}, "no validator may advance for a source that never answered"
+    assert not state.get("seeded"), "nothing was seeded, so a first successful pass still bootstraps"
 
 
 def test_config_env_expansion_and_unknown_key(tmp_path):

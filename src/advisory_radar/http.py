@@ -3,27 +3,59 @@
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
 import logging
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 
 USER_AGENT = "advisory-radar (+https://github.com/mikomiel/advisory-radar)"
 #: One Discord message holds 2000 characters; titles and bodies are capped below it.
 MESSAGE_LIMIT = 2000
 
 #: ``http(method, url, headers, body) -> (status, headers, body)``; status 0 is any network error.
-Http = "Callable[[str, str, Mapping[str, str], bytes | None], tuple[int, dict[str, str], bytes]]"
-
-from collections.abc import Callable  # noqa: E402
-
 Http = Callable[[str, str, Mapping[str, str], bytes | None], tuple[int, dict[str, str], bytes]]
 
 #: urllib buffers at most this many bytes plus one, so no response exhausts memory.
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 HTTP_TIMEOUT = 30
+
+
+def resolve_host(host: str) -> tuple[str, ...]:
+    """Every address a host resolves to, as text; empty when it cannot be resolved."""
+    return tuple(info[4][0] for info in socket.getaddrinfo(host, None))
+
+
+def private_destination(url: str, resolve: Callable[[str], Iterable[str]] = resolve_host) -> bool:
+    """Whether this URL's host is, or resolves to, an address that is not on the public internet.
+
+    This answers a question about a *form*, not about every fetch: it is checked when a source is added from
+    the settings overlay and when a new source is probed. A public name that later resolves to a private
+    address is out of reach of a save-time check, so the rule it feeds is "who may point this instance at an
+    internal address", and the YAML -- written by whoever runs the host -- is never subject to it.
+    """
+    try:
+        host = urllib.parse.urlsplit(url).hostname
+    except ValueError:
+        return True  # a URL nobody can parse must not be fetched either
+    if not host:
+        return True
+    try:
+        addresses = tuple(resolve(host))
+    except (OSError, UnicodeError):
+        # Unresolvable is not private: the fetch fails and reports that, which is the more useful message.
+        return False
+    for address in addresses:
+        try:
+            parsed = ipaddress.ip_address(address.split("%", 1)[0])  # an IPv6 zone id is not part of the address
+        except ValueError:
+            continue
+        if parsed.is_private or parsed.is_loopback or parsed.is_link_local or parsed.is_reserved or parsed.is_multicast:
+            return True
+    return False
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):

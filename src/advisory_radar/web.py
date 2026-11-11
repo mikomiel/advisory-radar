@@ -20,7 +20,7 @@ import os
 import re
 import time
 import urllib.parse
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 
 import yaml
@@ -31,7 +31,7 @@ from itsdangerous import BadSignature, URLSafeSerializer
 from . import __version__, pipeline
 from .catalogue import SOURCE_SPECS
 from .config import Config, ConfigError, config_from_document, expand_entry, load_document, secret_values
-from .http import Http, urllib_http
+from .http import Http, private_destination, resolve_host, urllib_http
 from .notifiers import NOTIFIER_BUILDERS
 from .runtime import Runtime
 from .settings import (
@@ -294,6 +294,22 @@ def _public_url(url: str) -> str:
     if not parts.scheme or not parts.hostname:
         return ""
     return f"{parts.scheme}://{parts.hostname}"
+
+
+#: Why a source added from the settings overlay may not point into a private network. One wording, so the probe
+#: and the save form cannot drift.
+PRIVATE_SOURCE_REFUSAL = (
+    "this address is on a private network, and a source added on this page may not point there; "
+    "add it in config.yml, or set allow_private_sources: true"
+)
+
+
+def _url_scheme(url: str) -> str:
+    """The scheme of a URL a person typed, or "" when it cannot be parsed as one."""
+    try:
+        return urllib.parse.urlsplit(url).scheme
+    except ValueError:
+        return ""
 
 
 def _number(value: object, default: int = 0) -> int:
@@ -885,6 +901,7 @@ def create_app(
     run_pass: Callable[..., int] | None = None,
     clock: Callable[[], float] = time.time,
     http: Http = urllib_http,
+    resolve: Callable[[str], Iterable[str]] = resolve_host,
 ) -> FastAPI:
     """The web UI over one live configuration.
 
@@ -1502,8 +1519,11 @@ def create_app(
         Deterministic on purpose: the same URL added twice yields the same base and takes the next free suffix,
         so the operator can recognise the row and a collision can never silently take over another source.
         """
-        host = urllib.parse.urlsplit(url).hostname or kind
-        base = re.sub(r"[^a-z0-9]+", "-", host.lower()).strip("-")[:40] or kind
+        try:
+            host = urllib.parse.urlsplit(url).hostname
+        except ValueError:
+            host = None  # a URL nobody can parse still yields a usable id; the fetch reports the rest
+        base = re.sub(r"[^a-z0-9]+", "-", (host or kind).lower()).strip("-")[:40] or kind
         identifier, suffix = base, 1
         while identifier in taken:
             suffix += 1
@@ -1629,11 +1649,16 @@ def create_app(
             for value in form[name][:1]
         )
 
-    def probe_window(window) -> str:
-        """What one probe answered: the entry count, the truncation flag and the first few items."""
+    def probe_window(window, secrets: Sequence[str]) -> str:
+        """What one probe answered: the entry count, the truncation flag and the first few items.
+
+        A title is a value the *source* chose: a feed can echo a request token back in one, so every rendered
+        field is redacted before it is truncated and escaped, exactly as an error message is.
+        """
         items = list(window.items)
         rows = "".join(
-            f"<tr><td>{esc(_short(item.title, 80))}</td><td class='mono'>{esc(_when(item.published))}</td>"
+            f"<tr><td>{esc(_short(pipeline.redact(item.title, secrets), 80))}</td>"
+            f"<td class='mono nowrap'>{esc(_when(item.published))}</td>"
             f"<td>{esc(_public_url(item.link))}</td></tr>"
             for item in items[:5]
         )
@@ -1650,11 +1675,29 @@ def create_app(
         )
         return _notice(f"Answered with {len(items)} entr{'y' if len(items) == 1 else 'ies'}.", "ok") + truncated + table
 
-    def probe_source(entry: dict) -> tuple[bool, str]:
+    def added_source_error(url: str) -> str:
+        """Why a source added on this page may not point at this URL, or "" when it may.
+
+        Two rules meet here. The address must be one this program can fetch at all, and -- unless the YAML says
+        otherwise -- a source added with the UI token alone may not aim the fetcher at a private network.
+        """
+        if not url:
+            return "that source has no url"
+        if _url_scheme(url) not in ("http", "https"):
+            return "that source url is not an http or https url"
+        if runtime.cfg.allow_private_sources or not private_destination(url, resolve):
+            return ""
+        return PRIVATE_SOURCE_REFUSAL
+
+    def probe_source(entry: dict, *, adding: bool) -> tuple[bool, str]:
         """Fetch one source entry the way a pass would, and render what it answered. Nothing is written.
 
         A probe can hold a source that was never saved, so the values it resolves are redacted together with the
-        configuration's own secrets: this page must not become a way to read a ``${VAR}`` back out.
+        configuration's own secrets -- in an error *and* in what the source answered.
+
+        ``adding`` marks the case this page has in common with the save form: a source that is not in the YAML
+        yet. Only that case is subject to the private-destination rule, because only that case is reachable
+        with the UI token alone.
         """
         kind = entry.get("type")
         spec = SOURCE_SPECS.get(kind) if isinstance(kind, str) else None
@@ -1667,19 +1710,31 @@ def create_app(
                 f"<code>/webhooks/{identifier}</code> with the bearer secret.",
                 "warning",
             )
-        url = entry.get("url")
-        if not isinstance(url, str) or not url:
-            return False, _notice("This source has no url to fetch.", "critical")
-        if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
-            return False, _notice("Only http and https URLs can be fetched.", "critical")
         resolved: list[str] = []
         try:
+            # Expanded before the URL is judged: ``url: ${FEED_URL}`` is a configured value, not a bad scheme,
+            # and a missing variable must be named as one.
             expanded = expand_entry(entry, runtime.environment, resolved)
-            window = build_source(expanded, runtime.environment).fetch(http, {})
-        except Exception as exc:  # a probe reports every failure the pass would meet, and never a traceback
+        except Exception as exc:
             message = pipeline.redact(f"{type(exc).__name__}: {exc}", [*secret_values(runtime.cfg), *resolved])
             return False, _notice(esc(message), "critical")
-        return True, probe_window(window)
+        secrets = [*secret_values(runtime.cfg), *resolved]
+        url = expanded.get("url")
+        if not isinstance(url, str) or not url:
+            return False, _notice("This source has no url to fetch.", "critical")
+        scheme = _url_scheme(url)
+        if not scheme:
+            return False, _notice("That url cannot be read as a URL.", "critical")
+        if scheme not in ("http", "https"):
+            return False, _notice("Only http and https URLs can be fetched.", "critical")
+        if adding and not runtime.cfg.allow_private_sources and private_destination(url, resolve):
+            return False, _notice(esc(PRIVATE_SOURCE_REFUSAL), "critical")
+        try:
+            window = build_source(expanded, runtime.environment).fetch(http, {})
+        except Exception as exc:  # a probe reports every failure the pass would meet, and never a traceback
+            message = pipeline.redact(f"{type(exc).__name__}: {exc}", secrets)
+            return False, _notice(esc(message), "critical")
+        return True, probe_window(window, secrets)
 
     def probe_result(request: Request, form: dict[str, list[str]], *, active: str) -> HTMLResponse:
         """The probe result page: one configured source by id, or the fields of a source that is not saved yet."""
@@ -1700,7 +1755,7 @@ def create_app(
                     actions=sign_out_form(request),
                     status_code=404,
                 )
-            ok, detail = probe_source(entry)
+            ok, detail = probe_source(entry, adding=False)
             tone = _badge("answered", "ok") if ok else _badge("failed", "critical")
             heading = (
                 f"<h2>{esc(identifier)} <span class='muted'>{esc(str(entry.get('type', '')))}</span> {tone}</h2>"
@@ -1717,7 +1772,7 @@ def create_app(
                     actions=sign_out_form(request),
                     status_code=400,
                 )
-            ok, detail = probe_source(entry)
+            ok, detail = probe_source(entry, adding=True)
             tone = _badge("answered", "ok") if ok else _badge("failed", "critical")
             heading = (
                 f"<h2>New {esc(str(entry.get('type', '')))} source {tone}</h2>"
@@ -1950,6 +2005,11 @@ def create_app(
                             # Refused here, in words: letting the builder raise would report a bare KeyError.
                             error = f"{identifier}: {spec.kind} needs {', '.join(missing)}"
                             break
+                        if updated.get("url") != entry.get("url"):
+                            problem = added_source_error(str(updated.get("url") or ""))
+                            if problem:
+                                error = f"{identifier}: {problem}"
+                                break
                     added.append(updated)
             if not whole and not new_source_used(form):
                 error = "this form carried no source to save"
@@ -1960,6 +2020,8 @@ def create_app(
                     if candidate["id"] in {entry.get("id") for entry in (base.get("sources") or [])}:
                         error = f"source id {candidate['id']!r} is already configured; pick another id"
                     else:
+                        error = added_source_error(str(candidate.get("url") or ""))
+                    if not error:
                         added.append(candidate)
             if error:
                 return page(

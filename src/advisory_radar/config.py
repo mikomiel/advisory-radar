@@ -87,6 +87,10 @@ class Config:
     adobe_commerce: bool = False
     #: A free NVD API key: raises the anonymous 5-per-30 s limit to 50 and shortens the pace in ``core.Intel``.
     nvd_api_key: str = ""
+    #: Whether a source added from the settings overlay may point into a private network. Off by default: the
+    #: YAML is written by whoever runs the host, an overlay entry by whoever holds the UI token, and only the
+    #: first of those should be able to aim this process at an internal address.
+    allow_private_sources: bool = False
     #: Ordered routing rules, first match wins. Empty means every message goes to every enabled notifier,
     #: exactly as it did before routing existed.
     routes: tuple[dict, ...] = ()
@@ -141,6 +145,7 @@ _TOP_KEYS = {
     "routes",
     "default",
     "web",
+    "allow_private_sources",
 }
 #: The keys a routing rule itself may carry; the match keys and the tag set are ``routing.py``'s.
 _ROUTE_KEYS = frozenset({"match", "notifiers"})
@@ -459,6 +464,7 @@ def config_from_document(
         state_path=state_path,
         hidden_source_hosts=hidden,
         adobe_commerce=_bool_option(document.get("adobe_commerce", False), "adobe_commerce"),
+        allow_private_sources=_bool_option(document.get("allow_private_sources", False), "allow_private_sources"),
         nvd_api_key=raw_nvd_key.strip(),
         routes=routes,
         default_notifiers=default_notifiers,

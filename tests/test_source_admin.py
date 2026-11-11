@@ -62,12 +62,24 @@ def write_config(tmp_path: Path, sources: list[dict] | None = None, extra: str =
     return path
 
 
-def make_client(tmp_path: Path, sources: list[dict] | None = None, environment: dict[str, str] | None = None):
-    """A signed-out client, the runtime it serves and the config file behind it."""
-    path = write_config(tmp_path, sources)
+def make_client(
+    tmp_path: Path,
+    sources: list[dict] | None = None,
+    environment: dict[str, str] | None = None,
+    transport=None,
+    resolve: tuple[str, ...] = ("93.184.216.34",),
+    extra: str = "",
+):
+    """A signed-out client, the runtime it serves and the config file behind it.
+
+    The resolver is injected so no test depends on DNS: the default is a public unicast address, and a test
+    that needs a private destination passes ``172.16.0.9`` instead.
+    """
+    path = write_config(tmp_path, sources, extra)
     env = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, **(environment or {})}
     runtime = Runtime.build(path, env)
-    return TestClient(create_app(runtime, env, http=fake_http)), runtime, path
+    app = create_app(runtime, env, http=transport or fake_http, resolve=lambda host: resolve)
+    return TestClient(app), runtime, path
 
 
 def signed_in(client: TestClient) -> tuple[str, str]:
@@ -221,7 +233,13 @@ def test_an_edit_that_drops_a_required_key_is_refused_readably(tmp_path):
         ("not a list", "must be a list"),
         ([{"type": "rss", "url": "https://a.example.net"}], "needs a string id"),
         ([{"id": "a", "type": "nope"}], "has no built-in type"),
-        ([{"id": "a", "type": "rss"}, {"id": "a", "type": "rss"}], "defined twice"),
+        (
+            [
+                {"id": "a", "type": "rss", "url": "https://a.example.net/feed.xml"},
+                {"id": "a", "type": "rss", "url": "https://b.example.net/feed.xml"},
+            ],
+            "defined twice",
+        ),
         ([{"id": "a", "type": "changedetection", "url": "https://c.example.net", "api_key": "literal"}], "reference"),
     ],
 )
@@ -456,3 +474,144 @@ def test_adding_from_a_probe_keeps_the_sources_already_added(tmp_path):
     assert [entry["id"] for entry in added] == ["nodejs-org", "nodejs-org-2"]
     # The first source is untouched: no row was rendered, so nothing about it was decided by this request.
     assert added[0] == {"id": "nodejs-org", "type": "rss", "url": "https://nodejs.org/feed/a.xml"}
+
+
+# --- destinations: the page may not aim the fetcher at a private network --------------------------
+
+
+def test_a_source_that_points_into_a_private_network_is_refused(tmp_path):
+    client, _, _ = make_client(tmp_path, resolve=("172.16.0.9",))
+    response = new_source(client, **{"new:type": "rss", "new:url": "https://nas.example.net/feed.xml"})
+    assert response.status_code == 400
+    assert "private network" in response.text
+    assert not (tmp_path / "data" / "settings.json").exists()
+
+
+def test_a_private_destination_is_allowed_when_the_yaml_allows_it(tmp_path):
+    client, runtime, _ = make_client(tmp_path, resolve=("172.16.0.9",), extra="allow_private_sources: true\n")
+    response = new_source(client, **{"new:type": "rss", "new:url": "https://nas.example.net/feed.xml"})
+    assert response.status_code == 303
+    runtime.reload(blocking=True)
+    assert "nas-example-net" in [source.id for source in runtime.sources]
+
+
+def test_a_probe_of_a_new_source_refuses_a_private_destination(tmp_path):
+    client, _, _ = make_client(tmp_path, resolve=("172.20.5.7",))
+    csrf, fingerprint = signed_in(client)
+    response = client.post(
+        "/config/sources/probe",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "new:type": "rss",
+            "new:url": "http://printer.example.net/feed.xml",
+        },
+    )
+    assert response.status_code == 200
+    assert "private network" in response.text
+
+
+def test_a_configured_source_may_still_point_into_a_private_network(tmp_path):
+    # The YAML is written by whoever runs the host, so an existing source is not subject to that rule.
+    client, _, _ = make_client(
+        tmp_path,
+        sources=[{"id": "freshrss", "type": "rss", "url": "https://rss.example.net/feed.xml"}],
+        resolve=("172.16.0.9",),
+    )
+    csrf, fingerprint = signed_in(client)
+    response = client.post("/config/sources/probe", data={"csrf": csrf, "fingerprint": fingerprint, "id": "freshrss"})
+    assert response.status_code == 200
+    assert "Answered with 2 entries." in response.text
+
+
+def test_a_probe_reports_a_url_that_is_not_http(tmp_path):
+    client, _, _ = make_client(tmp_path)
+    csrf, fingerprint = signed_in(client)
+    response = client.post(
+        "/config/sources/probe",
+        data={"csrf": csrf, "fingerprint": fingerprint, "new:type": "rss", "new:url": "ftp://example.net/feed.xml"},
+    )
+    assert response.status_code == 200
+    assert "Only http and https URLs can be fetched." in response.text
+
+
+# --- references and the values they resolve ------------------------------------------------------
+
+
+def test_a_whole_url_reference_is_probed_after_expansion(tmp_path):
+    client, _, _ = make_client(tmp_path, environment={"FEED_URL": "https://feeds.example.net/feed.xml"})
+    csrf, fingerprint = signed_in(client)
+    response = client.post(
+        "/config/sources/probe",
+        data={"csrf": csrf, "fingerprint": fingerprint, "new:type": "rss", "new:url": "${FEED_URL}"},
+    )
+    assert response.status_code == 200
+    assert "Answered with 2 entries." in response.text
+
+
+def test_a_credential_echoed_by_the_source_is_redacted(tmp_path):
+    """A title is the source's text: a server can reflect a request token back in one."""
+    watches = json.dumps(
+        {
+            "abc": {
+                "last_changed": 1792600000,
+                "title": "watch named s3cret-token",
+                "link": "https://changes.example.net/w/abc",
+            }
+        }
+    ).encode()
+
+    def echoing(method, url, headers, body):
+        if "changes.example.net" in url:
+            return 200, {}, watches
+        return 200, {}, RSS
+
+    client, _, _ = make_client(
+        tmp_path,
+        sources=[
+            {
+                "id": "changes",
+                "type": "changedetection",
+                "url": "https://changes.example.net",
+                "api_key": "${CHANGEDETECTION_API_KEY}",
+            }
+        ],
+        environment={"CHANGEDETECTION_API_KEY": "s3cret-token"},
+        transport=echoing,
+    )
+    csrf, fingerprint = signed_in(client)
+    response = client.post("/config/sources/probe", data={"csrf": csrf, "fingerprint": fingerprint, "id": "changes"})
+    assert response.status_code == 200
+    assert "s3cret-token" not in response.text, "a resolved credential must never reach the page"
+    assert "[redacted]" in response.text
+
+
+def test_an_unparseable_url_is_refused_without_a_crash(tmp_path):
+    client, _, _ = make_client(tmp_path)
+    # An explicit id skips derivation, so the save path has to refuse the address itself.
+    with_id = new_source(client, **{"new:id": "broken", "new:type": "rss", "new:url": "http://[oops/feed.xml"})
+    assert with_id.status_code == 400
+    assert "not an http or https url" in with_id.text
+    # Without one, the id is derived from a URL nobody can parse; the pass must still answer.
+    csrf, fingerprint = signed_in(client)
+    derived = client.post(
+        "/config/sources/probe",
+        data={"csrf": csrf, "fingerprint": fingerprint, "new:type": "rss", "new:url": "http://[oops/feed.xml"},
+    )
+    assert derived.status_code == 200
+    assert "cannot be read as a URL" in derived.text
+
+
+# --- durability of the health record -------------------------------------------------------------
+
+
+def test_a_pass_that_dies_before_classifying_records_no_health(tmp_path, monkeypatch):
+    _, runtime, _ = make_client(tmp_path)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("classification failed")
+
+    monkeypatch.setattr(pipeline.core, "classify_new", boom)
+    with pytest.raises(RuntimeError):
+        pipeline.run_pass(runtime.cfg, runtime.sources, runtime.notifiers, http=fake_http)
+    assert not runtime.cfg.state_path.exists(), "health is written only after this window's work is durable"

@@ -322,7 +322,13 @@ def _run_pass(
         state.pop("carry", None)  # only after every source has written into the attached dict
 
     if stored is None and not fetched_ids and not cfg.adobe_commerce:
-        LOG.error("no source could be read on the first pass; nothing to persist")
+        # Nothing was read, so nothing may be classified -- but a failed read is evidence, and a fresh install
+        # whose every source fails would otherwise report "not polled yet" for each of them while this log line
+        # said otherwise. Only health is added to a seeded-empty document: no validator moves and no source is
+        # marked seeded, so the first pass that does read a feed still bootstraps that feed's history.
+        if not dry_run and state.get("source_health"):
+            save_state(cfg.state_path, state)
+        LOG.error("no source could be read on the first pass; only the source health was recorded")
         return 1
 
     # Prune once, against every window fetched this pass, and only for sources that answered: a source
