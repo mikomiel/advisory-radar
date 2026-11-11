@@ -190,9 +190,10 @@ share a message. The title states how many advisories it covers, the body lists 
 advisory (its title, plus up to three short identifiers), and the digest is tagged `critical`
 when any covered advisory is critical. It lists at most 20 advisories and never exceeds the
 character budget one Discord message accepts; anything beyond either cap is counted in a final
-`(+N more not listed)` line rather than dropped. One POST covers the whole group, so a failed
-attempt counts once against every covered advisory, and delivery records each of them
-separately.
+`(+N more not listed)` line rather than dropped. A digest is posted once per destination, so a
+failed attempt counts once against every advisory it covered, and delivery records each of them
+separately; a destination that already accepted an advisory is not sent it again, and a digest
+rebuilt after a partial acknowledgement carries only the advisories that destination still needs.
 
 ```yaml
 digest: true                 # one message per routing group instead of one per advisory
@@ -201,7 +202,8 @@ quiet_hours: 22:00-07:00     # local time, wraps midnight; empty or absent means
 
 `quiet_hours` holds **non-critical** messages until the window ends: they stay in `pending`,
 are not counted as failed attempts, and go out on the first pass after the window. A critical
-message is never held. The window is half-open, so `07:00` is already outside
+message is never held, and a held message does not take one of the pass's delivery slots, so a
+queue of them cannot push a critical advisory behind it. The window is half-open, so `07:00` is already outside
 `22:00-07:00`; `00:00-00:00` is an empty window. It is read in the process's local timezone, so
 set `TZ` on the container if the service should not run in UTC. Both keys are overlay-writable,
 so the Settings form on `/config` changes them without a restart.

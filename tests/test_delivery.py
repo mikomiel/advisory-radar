@@ -11,6 +11,7 @@ import datetime
 import pytest
 
 from advisory_radar import core, delivery
+from advisory_radar.config import DEFAULT_THRESHOLDS
 
 
 def entry(
@@ -406,3 +407,75 @@ def test_a_failed_digest_marks_one_attempt_per_covered_entry_and_retries_only_th
     # The third failed attempt parks every covered entry, and the pass then continues rather than stopping.
     assert core.deliver(state, [good, bad], no_http, NOW + 2, digest=True) is True
     assert state["pending"] == [] and len(state["parked"]) == 2
+
+
+def test_a_critical_escalation_is_selected_ahead_of_five_held_warnings():
+    """A full queue of held warnings must not take the delivery window's slots from a critical advisory."""
+    window = delivery.parse_quiet_hours("22:00-07:00")
+    night = local_at(23)
+    state = core.new_state()
+    state["pending"] = [queued(f"CVE-2026-{number}") for number in range(1, 6)]
+    cve = "CVE-2026-9000"
+    state["watch"][cve] = {
+        "since": night - 3 * 86400,
+        "last_eval": night - 2 * 86400,
+        "level": "warning",
+        "title": "vendored widget",
+        "link": "https://vendor.example/9000",
+        "cvss": 7.5,
+    }
+
+    class EscalatingIntel:
+        """One CVE, measured remote and unauthenticated at CVSS 9.5, with no cache and no network."""
+
+        def cves(self, cves, **ignored):
+            return {identifier: core.CveFacts(9.5, None, 0.5, None, True, remote_unauth=True) for identifier in cves}
+
+    core.reevaluate(state, EscalatingIntel(), frozenset(), True, night, "", thresholds=DEFAULT_THRESHOLDS)
+    assert [entry["kind"] for entry in state["pending"]] == ["new"] * 5 + ["escalation"]
+    assert state["pending"][-1]["tag"] == "critical"
+
+    ops = Recorder()
+    assert core.deliver(state, [ops], no_http, night, quiet_hours=window) is True
+    assert [message["kind"] for message in ops.sent] == ["escalation"], "the critical behind the held warnings goes"
+    assert ops.sent[0]["tag"] == "critical"
+    assert [entry["ids"][0] for entry in state["pending"]] == [f"CVE-2026-{number}" for number in range(1, 6)]
+    assert all("attempts" not in entry for entry in state["pending"]), "held warnings are not attempts"
+    assert state["watch"][cve]["level"] == "critical", "the delivery advanced the watch record"
+
+
+def test_a_partially_acknowledged_digest_does_not_resend_the_entries_it_already_delivered():
+    state = core.new_state()
+    state["pending"] = [queued("CVE-2026-1"), queued("CVE-2026-2")]
+    good, bad = Recorder("good"), Recorder("bad", status=500)
+    assert core.deliver(state, [good, bad], no_http, NOW, digest=True) is False
+    assert [message["ids"] for message in good.sent] == [["CVE-2026-1", "CVE-2026-2"]]
+    assert [entry["sent_to"] for entry in state["pending"]] == [["good"], ["good"]]
+
+    state["pending"].append(queued("CVE-2026-3"))
+    assert core.deliver(state, [good, bad], no_http, NOW + 1, digest=True) is False
+    assert [message["ids"] for message in good.sent] == [
+        ["CVE-2026-1", "CVE-2026-2"],
+        ["CVE-2026-3"],
+    ], "good already accepted the first two, so its redelivery carries only the new advisory"
+    assert [message["ids"] for message in bad.sent] == [
+        ["CVE-2026-1", "CVE-2026-2"],
+        ["CVE-2026-1", "CVE-2026-2", "CVE-2026-3"],
+    ], "bad never accepted anything, so its digest is the whole group"
+    assert [entry["sent_to"] for entry in state["pending"]] == [["good"], ["good"], ["good"]]
+    assert [entry["attempts"] for entry in state["pending"]] == [2, 2, 1]
+
+
+def test_equivalent_destination_sets_share_one_digest():
+    state = core.new_state()
+    state["pending"] = [queued("CVE-2026-1", source_id="one"), queued("CVE-2026-2", source_id="two")]
+    routes = [
+        {"match": {"source": "one"}, "notifiers": ["ops", "phone"]},
+        {"match": {"source": "two"}, "notifiers": ["phone", "ops"]},
+    ]
+    ops, phone = Recorder("ops"), Recorder("phone")
+    assert core.deliver(state, [ops, phone], no_http, NOW, digest=True, routes=routes) is True
+    assert len(ops.sent) == 1 and len(phone.sent) == 1, "the same destination set is one group, whatever its order"
+    assert ops.sent[0]["ids"] == ["CVE-2026-1", "CVE-2026-2"]
+    assert phone.sent[0]["ids"] == ["CVE-2026-1", "CVE-2026-2"]
+    assert state["pending"] == []

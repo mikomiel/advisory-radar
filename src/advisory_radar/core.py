@@ -2360,11 +2360,14 @@ def deliver(
     With ``digest`` and ``quiet_hours`` both unset this is the message-by-message loop it has always been,
     kept whole in :func:`_deliver_each` so turning the features off changes no request, no state field and no
     log line. When either is set, the routing decision is made per entry and the entries are grouped by the
-    notifiers it selects, because a digest may only cover advisories that reach the same channels. Each group
-    is planned once (:func:`delivery.plan`): a digest becomes one POST covering the group, and an entry held
-    by quiet hours is absent from every batch, stays pending and does not count as a failed attempt. Success
-    or failure is then recorded per covered entry -- one POST that covered several advisories is one attempt
-    for each of them -- so the parking rule and ``state["seen"]`` stay honest.
+    set of notifiers it selects, because a digest may only cover advisories that reach the same channels.
+    Entries quiet hours hold are skipped while the delivery window is filled, so a queue of held warnings
+    cannot take the slot a critical advisory needs; they stay pending and are looked at again on a later pass.
+    Each group is planned once (:func:`delivery.plan`): a digest becomes one POST per destination covering the
+    entries that still need it, and an entry held by quiet hours is absent from every batch, stays pending
+    and does not count as a failed attempt. Success or failure is then recorded per covered entry -- one
+    POST that covered several advisories is one attempt for each of them -- so the parking rule and
+    ``state["seen"]`` stay honest.
     """
     if not notifiers:  # an empty notifier list must never mark a message delivered
         return not state["pending"]
@@ -2492,21 +2495,32 @@ def _deliver_grouped(
 ) -> bool:
     """Deliver this pass's messages by routing group, batching each group through :func:`delivery.plan`.
 
-    The walk is done before the first POST so a group is complete when it is planned: a later advisory that
-    routes to the same channels belongs in the same digest. A selection that names no built notifier therefore
-    fails the pass before any of this pass's messages is posted, and every message stays pending. Groups keep
-    the order in which their first entry appeared, and held entries are simply not sent.
+    The delivery window is filled from entries this pass may actually send, not from the head of the queue:
+    a held entry is skipped and leaves its slot to the next entry, so five held warnings cannot hide a
+    critical advisory queued behind them. Held entries stay in ``pending`` and are looked at again on a later
+    pass. The walk is done before the first POST so a group is complete when it is planned: a later advisory
+    that routes to the same channels belongs in the same digest. Groups are keyed by the set of destination
+    ids, so two rules that name the same notifiers in another order share one digest, and the entries keep
+    the order in which they first appeared. A selection that names no built notifier therefore fails the pass
+    before any of this pass's messages is posted, and every message stays pending.
     """
+    window = []
+    for entry in state["pending"]:
+        if len(window) >= DELIVERY_CAP:
+            break
+        if delivery.is_held(now, entry, quiet_hours):
+            continue  # still queued: the cap counts entries this pass may send, not held ones
+        window.append(entry)
     candidates = []
-    for entry in list(state["pending"][:DELIVERY_CAP]):
+    for entry in window:
         if entry.get("attempts", 0) >= MAX_DELIVERY_ATTEMPTS:  # only a full parked list leaves one here
             entry.setdefault("first_attempt_at", now)
             if not _park(state, entry, entry.get("last_status", 0), now):
                 return False
             continue
         candidates.append(entry)
-    groups: dict[tuple[str, ...], list[dict]] = {}
-    targets_by_group: dict[tuple[str, ...], list] = {}
+    groups: dict[frozenset[str], list[dict]] = {}
+    targets_by_group: dict[frozenset[str], list] = {}
     for entry in candidates:
         selected, label = routing.select(entry, routes, default, enabled_ids)
         targets = [notifier for notifier in notifiers if notifier.id in set(selected)]
@@ -2521,14 +2535,14 @@ def _deliver_grouped(
                 ",".join(selected) or "none",
             )
             return False
-        key = tuple(selected)
+        key = frozenset(selected)
         if key not in groups:
             groups[key] = []
             targets_by_group[key] = targets
         groups[key].append(entry)
     for key, group in groups.items():
         for batch in delivery.plan(group, now, digest=digest, quiet=quiet_hours):
-            if not _deliver_batch(state, http, now, persist, batch, targets_by_group[key]):
+            if not _deliver_batch(state, http, now, persist, batch, targets_by_group[key], digest=digest):
                 return False
     return True
 
@@ -2540,42 +2554,63 @@ def _deliver_batch(
     persist: Callable[[], None] | None,
     batch: delivery.Batch,
     targets: Sequence,
+    *,
+    digest: bool,
 ) -> bool:
-    """Send one planned batch and record the outcome on every covered entry; False stops the pass.
+    """Send one planned batch, destination by destination, and record the outcome per covered entry.
 
-    A notifier is skipped only when every covered entry has already had it, which is the one condition under
-    which skipping loses nothing: a channel that accepted some of the entries but not all of them still needs
-    this message. One POST is one attempt for each covered entry, and a batch whose entries all park lets the
-    pass continue, exactly as a single parked message does.
+    Each destination receives only the entries that still need it: ``sent_to`` is kept across passes, so a
+    digest rebuilt after a partial acknowledgement must not carry an advisory that destination already
+    accepted. With digesting on, a destination gets one digest of its own subset; with it off, each of those
+    entries is posted as it was rendered. An entry whose destinations have all accepted is delivered even
+    when another entry in the batch failed, an entry with a refused destination takes one attempt for the
+    pass, and a batch whose entries all park lets the pass continue, exactly as a single parked message does.
     """
     covered = list(batch.entries)
-    payload = batch.message if batch.message is not None else covered[0]
     for entry in covered:
         entry.setdefault("first_attempt_at", now)
-    already = set.intersection(*(set(entry.get("sent_to") or ()) for entry in covered))
-    statuses = []
-    accepted_here: set[str] = set()
+    statuses: list[int] = []
+    failure_status: list[int | None] = [None] * len(covered)
     for notifier in targets:
-        if notifier.id in already:  # a retry only re-sends to the channels that have not had all of it
+        need = [index for index, entry in enumerate(covered) if notifier.id not in set(entry.get("sent_to") or ())]
+        if not need:
+            # Every covered entry has already had this destination; a retry may not send it anything.
             statuses.append(200)
             continue
-        try:
-            status = notifier.send(payload, http)
-        except Exception as exc:  # a broken notifier is a failed attempt, never a crash or a duplicate
-            LOG.error("notifier %s raised %s: %s", notifier.id, type(exc).__name__, exc)
-            status = 0
-        if 200 <= status < 300:
-            accepted_here.add(notifier.id)
-            if persist is not None:
-                # Persist the acknowledgement now: a shutdown between channels must not resend it.
-                for entry in covered:
-                    entry["sent_to"] = sorted(set(entry.get("sent_to") or ()) | accepted_here)
-                persist()
-        statuses.append(status)
-    if all(200 <= status < 300 for status in statuses):
+        sends = (
+            [(delivery.digest_message([covered[index] for index in need]), need)]
+            if digest
+            else [(covered[index], [index]) for index in need]
+        )
+        for payload, indices in sends:
+            try:
+                status = notifier.send(payload, http)
+            except Exception as exc:  # a broken notifier is a failed attempt, never a crash or a duplicate
+                LOG.error("notifier %s raised %s: %s", notifier.id, type(exc).__name__, exc)
+                status = 0
+            statuses.append(status)
+            if 200 <= status < 300:
+                for index in indices:
+                    entry = covered[index]
+                    entry["sent_to"] = sorted(set(entry.get("sent_to") or ()) | {notifier.id})
+                if persist is not None:
+                    # Persist the acknowledgement now: a shutdown between channels must not resend it.
+                    persist()
+            else:
+                for index in indices:
+                    # Keep the worst status seen for the entry, as the single-message path always reported.
+                    previous = failure_status[index]
+                    failure_status[index] = status if previous is None else max(previous, status)
+    delivered = {
+        index
+        for index, entry in enumerate(covered)
+        if all(notifier.id in set(entry.get("sent_to") or ()) for notifier in targets)
+    }
+    if delivered:
         status_text = "/".join(str(status) for status in statuses)
-        for entry in covered:
-            accepted = sorted(set(entry.get("sent_to") or ()) | accepted_here)
+        for index in sorted(delivered):
+            entry = covered[index]
+            accepted = sorted(entry.get("sent_to") or ())
             entry.pop("sent_to", None)
             state["pending"].remove(entry)
             _delivered(state, entry, now, delivered_to=accepted)
@@ -2587,20 +2622,21 @@ def _deliver_batch(
                 status_text,
                 " ".join(entry["title"].split()),
             )
-        return True
-    status = max(statuses)  # 0 is a network error and the worst outcome
-    for entry in covered:
-        entry["sent_to"] = sorted(set(entry.get("sent_to") or ()) | accepted_here)
+    remaining = []
+    for index, entry in enumerate(covered):
+        if index in delivered:
+            continue
+        status = failure_status[index]
+        if status is None:  # a pending entry always has a destination that refused or failed it
+            status = max(statuses)
         entry["attempts"] = entry.get("attempts", 0) + 1
         entry["last_status"] = status
-    remaining = []
-    for entry in covered:
         if entry["attempts"] >= MAX_DELIVERY_ATTEMPTS or now - entry["first_attempt_at"] > PARK_AFTER:
             if not _park(state, entry, status, now):
                 return False
         else:
-            remaining.append(entry)
-    for entry in remaining:
+            remaining.append((entry, status))
+    for entry, status in remaining:
         LOG.error(
             "delivery of %s refused or unreachable (HTTP %s, attempt %d of %d); %d message(s) stay pending",
             _audit_ids(entry),

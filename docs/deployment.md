@@ -291,12 +291,16 @@ body lists one advisory per line (title plus up to three short identifiers), the
 `critical` when any covered advisory is, and the message is capped at 20 lines and at the
 character budget one Discord message accepts. Anything beyond either cap is counted in a final
 `(+N more not listed)` line. Entries are grouped by the notifiers `routing.select` chooses, so
-a digest never mixes channels. One POST covers the group, so a failed attempt counts once
-against every covered advisory, and delivery records each of them separately.
+a digest never mixes channels. A digest is posted once per destination, so a failed attempt
+counts once against every covered advisory, and delivery records each of them separately; a
+destination that already accepted an advisory is not sent it again, and a rebuilt digest carries
+only the advisories that destination still needs.
 
 `quiet_hours: "22:00-07:00"` is a local-time window, wrapping midnight and half-open (07:00 is
 outside it) during which **non-critical** messages wait in `pending`; they are not failed
-attempts and go out after the window. A critical message is never held. An empty value turns
+attempts and go out after the window. A critical message is never held, and a held message does
+not take one of the pass's delivery slots, so a queue of them cannot delay a critical advisory
+behind it. An empty value turns
 the window off, and `00:00-00:00` is an empty window. The window is read in the process's local
 timezone, which is UTC in the container unless `TZ` is set. Both keys are overlay-writable.
 
