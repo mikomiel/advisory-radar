@@ -396,12 +396,12 @@ def _run_pass(
     }
     # Compared in the normalised form the readers now produce: a document written by an older version can hold
     # a key that still carries a control character, and dropping it here would restart the item's clock.
-    live = {normalise_identity(guid) for guid in live_guids | carried_guids}
+    live = {core.restored_guid(guid) for guid in live_guids | carried_guids}
     for key in ("enrich_retry", "enrich_pending"):
         kept = {
             guid
             for guid in (state.get(key) or {})
-            if guid.split(":", 1)[0] not in fetched_ids or normalise_identity(guid) in live
+            if guid.split(":", 1)[0] not in fetched_ids or core.restored_guid(guid) in live
         }
         core._prune_enrich_clock(state, key, kept)
 

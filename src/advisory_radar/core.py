@@ -1512,7 +1512,25 @@ def _claimed(state: dict) -> set[str]:
     stored = set(state["seen"]) | {
         identifier for entry in (*state["pending"], *state.get("parked", ())) for identifier in entry["ids"]
     }
-    return {claim_key(value) for value in stored if isinstance(value, str)}
+    claims = {claim_key(value) for value in stored if isinstance(value, str)}
+    # An older version prefixed the source id twice for a webhook entry, so its claim is one namespace longer
+    # than today's identity for the same item. Both spellings are claimed, which can only recognise the same
+    # advisory earlier -- never claim a different one, because the second key exists only for that shape.
+    claims |= {_doubled_namespace(value) for value in stored if isinstance(value, str)}
+    return claims
+
+
+def _doubled_namespace(value: str) -> str:
+    """The claim a doubled-namespace stored identity names, or ``value`` when it is not one."""
+    if not value.startswith("src:"):
+        return value
+    body = value[len("src:") :]
+    source, separator, guid = body.partition(":")
+    prefix = f"{source}:"
+    if not separator or not guid.startswith(prefix):
+        return value
+    rest = guid[len(prefix) :]
+    return f"src:{source}:{normalise_identity(rest) or synthetic_identity(rest)}"
 
 
 def claim_key(value: str) -> str:
@@ -1521,8 +1539,8 @@ def claim_key(value: str) -> str:
         body = value[len("src:") :]
         source, separator, guid = body.partition(":")
         if separator:
-            return f"src:{source}:{normalise_identity(guid)}"
-        return f"src:{normalise_identity(body)}"
+            return f"src:{source}:{normalise_identity(guid) or synthetic_identity(guid)}"
+        return f"src:{normalise_identity(body) or synthetic_identity(body)}"
     return normalise_identity(value) or value
 
 
@@ -1548,11 +1566,11 @@ def _clock_key(clock: Mapping[str, int], guid: str) -> str:
     key is reused, so the stored document keeps its spelling and the first-fault time is preserved; with no
     such key the normalised spelling is used, which is what a new entry needs.
     """
-    wanted = normalise_identity(guid) or guid
+    wanted = restored_guid(guid)
     if wanted in clock:
         return wanted
     for stored in clock:
-        if normalise_identity(stored) == wanted:
+        if restored_guid(stored) == wanted:
             return stored
     return wanted
 
