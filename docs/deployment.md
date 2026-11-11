@@ -98,8 +98,10 @@ is escaped — because transforming an identity can merge two advisories into on
 `/watchlist` edits the scope document where it lives. With no `watchlist:` key that is
 `watchlist.json` beside `state_path`, which is writable: a document on the `/config` mount can be
 read but not saved, so a deployment that wants the browser editor keeps it on `/data`. The
-document is replaced atomically with mode `0600`, and a save is refused when the file changed
-under the page, so two tabs cannot silently overwrite each other.
+document is replaced atomically with mode `0600` under a lock on `watchlist.json.lock` (the same
+sidecar-lock mechanism the state file uses), and a save is refused when the file changed under the
+page, so two tabs or two processes cannot silently overwrite each other. A save needs no reload:
+the pass reads the policy on every run.
 
 `advisory-radar sources list` prints every built-in source kind with its required
 and optional keys and needs no config file. `advisory-radar sources test <id>

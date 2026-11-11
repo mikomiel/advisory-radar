@@ -8,7 +8,9 @@ being read are the same failure: an instance that judges every advisory, or none
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -250,3 +252,71 @@ def test_passes_filter_is_the_same_decision_as_its_reason():
     policy = parse_policy(document())
     for probe in (item("node.js advisory"), item("unrelated news"), item("legacy advisory")):
         assert core.passes_filter(probe, policy) is (core.filter_reason(probe, policy) == "")
+
+
+# ---------------------------------------------------------------------------
+# Concurrency and a document that is present but unreadable
+
+
+def _sidecar_is_locked(document: Path) -> bool:
+    """Whether another open file description already holds the document's lock.
+
+    ``flock`` locks belong to the open file description, so a second ``open`` in this same process conflicts
+    exactly as another process would: that is what makes this probe a real test of the lock.
+    """
+    descriptor = os.open(document.with_name(document.name + ".lock"), os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def test_a_save_holds_the_lock_across_the_read_the_check_and_the_write(tmp_path, monkeypatch):
+    """A digest check is only a check if no other process can save between reading it and replacing the file."""
+    target = write(tmp_path / "watchlist.json", document())
+    observed: list[tuple[str, bool]] = []
+    read, save = watchlist.read_watchlist, watchlist.save_json
+
+    def probe_read(path):
+        observed.append(("read", _sidecar_is_locked(target)))
+        return read(path)
+
+    def probe_save(path, value):
+        observed.append(("write", _sidecar_is_locked(target)))
+        return save(path, value)
+
+    monkeypatch.setattr(watchlist, "read_watchlist", probe_read)
+    monkeypatch.setattr(watchlist, "save_json", probe_save)
+    save_watchlist(target, document(products=[]), expected=digest(document()))
+    assert observed == [("read", True), ("write", True)]
+
+
+def test_the_lock_is_not_held_once_the_save_returns(tmp_path):
+    target = write(tmp_path / "watchlist.json", document())
+    save_watchlist(target, document(), expected=digest(document()))
+    assert _sidecar_is_locked(target) is False, "the lock is released, so the next save is not blocked"
+
+
+def test_a_broken_link_is_a_present_document_not_a_missing_one(tmp_path):
+    """Falling back to the packaged default would judge every advisory on a broken link."""
+    state_path = tmp_path / "data" / "state.json"
+    link = state_path.with_name("watchlist.json")
+    link.parent.mkdir(parents=True)
+    link.symlink_to(tmp_path / "gone.json")
+    assert active_path(None, state_path) == link
+    with pytest.raises(SourceError, match="cannot be read"):
+        read_watchlist(active_path(None, state_path))
+
+
+def test_a_save_does_not_replace_a_broken_link_with_a_file(tmp_path):
+    """Replacing the link would leave the operator's own document ignored the moment the target came back."""
+    target = tmp_path / "watchlist.json"
+    target.symlink_to(tmp_path / "gone.json")
+    with pytest.raises(SourceError, match="cannot be read"):
+        save_watchlist(target, document(), expected="")
+    assert target.is_symlink(), "the link is the operator's, not this program's"

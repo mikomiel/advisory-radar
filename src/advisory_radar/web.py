@@ -970,27 +970,60 @@ def _product_rows(products: Sequence[Mapping[str, object]]) -> str:
 
     The id is rendered as text, not as an editable field: it is what a routing rule and an exclusion name, so
     a rename would silently change both. Renaming is a remove and an add.
+
+    A row whose aliases contain a comma is rendered read-only with the exact list in a hidden field: this form
+    separates aliases with commas, so splitting such a value would silently widen the scope on a save the
+    operator never meant to change. The document is the place to edit it.
     """
     rows = []
     for product in products:
         identifier = str(product.get("id", ""))
-        aliases = ", ".join(str(alias) for alias in product.get("aliases") or ())
+        aliases = [str(alias) for alias in product.get("aliases") or ()]
         domains = ", ".join(str(domain) for domain in product.get("domains") or ())
         # ``metadata_only`` is read and validated by the document but consumed by nothing yet; the row carries
         # it through every save rather than dropping a key this page does not understand.
         metadata = "1" if product.get("metadata_only") is True else "0"
         removed = " checked" if product.get("remove") is True else ""
+        if any("," in alias for alias in aliases):
+            aliases_cell = (
+                f"<td><input type='text' size='{_ALIASES_SIZE}' value='{esc(', '.join(aliases))}' readonly "
+                f"aria-label='aliases for {esc(identifier)}, read-only'>"
+                f"<input type='hidden' name='product:{esc(identifier)}:aliases_json' "
+                f"value='{esc(json.dumps(aliases))}'>"
+                "<br><span class='muted small'>kept exactly: an alias contains a comma</span></td>"
+            )
+        else:
+            aliases_cell = (
+                f"<td><input type='text' size='{_ALIASES_SIZE}' name='product:{esc(identifier)}:aliases' "
+                f"value='{esc(', '.join(aliases))}' aria-label='aliases for {esc(identifier)}'></td>"
+            )
         rows.append(
             f"<tr><td><b>{esc(identifier)}</b>"
             f"<input type='hidden' name='metadata_only:{esc(identifier)}' value='{metadata}'></td>"
-            f"<td><input type='text' size='{_ALIASES_SIZE}' name='product:{esc(identifier)}:aliases' "
-            f"value='{esc(aliases)}' aria-label='aliases for {esc(identifier)}'></td>"
+            f"{aliases_cell}"
             f"<td><input type='text' size='{_DOMAINS_SIZE}' name='product:{esc(identifier)}:domains' "
             f"value='{esc(domains)}' aria-label='domains for {esc(identifier)}'></td>"
             f"<td><input type='checkbox' name='remove:{esc(identifier)}' value='1'{removed} "
             f"aria-label='remove {esc(identifier)}'></td></tr>"
         )
     return "".join(rows)
+
+
+def _row_aliases(form: Mapping[str, list[str]], identifier: str) -> list[str]:
+    """A row's aliases: the exact list when the form carried one, else the comma-separated field.
+
+    The exact form is what a read-only row submits. A value that is not a list of strings is ignored here and
+    left to ``watchlist.parse_policy``, which refuses the document it becomes.
+    """
+    exact = _form_value(form, f"product:{identifier}:aliases_json")
+    if exact:
+        try:
+            parsed = json.loads(exact)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, list):
+            return parsed
+    return _form_words(_form_value(form, f"product:{identifier}:aliases"))
 
 
 def _submitted_products(form: Mapping[str, list[str]]) -> list[dict]:
@@ -1000,15 +1033,19 @@ def _submitted_products(form: Mapping[str, list[str]]) -> list[dict]:
     by hand is acceptable, so this function only has to be faithful to what was submitted.
     """
     products = []
+    seen: set[str] = set()
     for name in form:
         prefix, _, rest = name.partition(":")
         identifier, _, leaf = rest.rpartition(":")
-        if prefix != "product" or leaf != "aliases" or not identifier:
+        if prefix != "product" or leaf not in {"aliases", "aliases_json"} or not identifier:
             continue
+        if identifier in seen:  # one row may carry either field, never both; the first is the row
+            continue
+        seen.add(identifier)
         products.append(
             {
                 "id": identifier,
-                "aliases": _form_words(_form_value(form, f"product:{identifier}:aliases")),
+                "aliases": _row_aliases(form, identifier),
                 "domains": _form_words(_form_value(form, f"product:{identifier}:domains")),
                 "metadata_only": _form_value(form, f"metadata_only:{identifier}") == "1",
                 "remove": _form_value(form, f"remove:{identifier}") not in ("", "0"),
@@ -3141,7 +3178,7 @@ def create_app(
         strip = (
             "<div class='strip'><p class='muted small'>"
             f"Document <code>{esc(target)}</code>"
-            + ("" if target.exists() else " (not created yet)")
+            + ("" if watchlist.present(target) else " (not created yet)")
             + f" · {len(rows or ())} product{'s' if len(rows or ()) != 1 else ''} · read at the start of every "
             "pass, so a save applies to the next one</p>"
             "<a class='btn' href='/config'>Configuration</a></div>"
@@ -3202,7 +3239,7 @@ def create_app(
         notices = ""
         if saved is not None:
             notices += _notice(f"Scope <code>{esc(saved)}</code> saved. The next pass reads it.", "ok")
-        if target.exists():
+        if watchlist.present(target):
             try:
                 document = watchlist.read_watchlist(target)
             except SourceError as exc:
@@ -3268,8 +3305,17 @@ def create_app(
         duplicate = (
             any(row["id"] == new_row["id"] and not row["remove"] for row in submitted) if new_row["id"] else False
         )
+        # A new row is only ignored when nothing was typed in it: aliases without an id would otherwise be saved
+        # away as a success, leaving an installation that thinks it has a scope with none.
+        partial = bool(any(new_row.values())) and not new_row["id"]
         notice = ""
-        if duplicate:
+        if partial:
+            notice = _notice(
+                "Not saved: the new product needs an id; the aliases and domains you typed are kept below. An id "
+                "is lowercase letters, digits and hyphens, at least two characters.",
+                "critical",
+            )
+        elif duplicate:
             # Refused before the document is built: ``parse_policy`` would call this an invalid identity,
             # which says nothing about the real mistake -- adding a product that already has a row.
             notice = _notice(

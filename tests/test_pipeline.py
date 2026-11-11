@@ -976,3 +976,10 @@ def test_an_unreadable_watchlist_fails_the_pass_instead_of_raising(tmp_path, cap
         code = pipeline.run_pass(cfg, [], [], http=fake_http, clock=lambda: float(NOW), sleep=lambda s: None)
     assert code == 1, "a scope that cannot be read must fail the pass, not judge everything"
     assert "did not run" in caplog.text
+
+
+def test_a_broken_link_to_the_scope_fails_the_pass(tmp_path):
+    """A scope that is present but unreadable must not fall back to the default, which judges every advisory."""
+    cfg = _webhook_config(tmp_path)  # no ``watchlist:`` key, so the document is read beside the state file
+    (tmp_path / "watchlist.json").symlink_to(tmp_path / "gone.json")
+    assert pipeline.run_pass(cfg, [], [], http=fake_http, clock=lambda: float(NOW), sleep=lambda s: None) == 1

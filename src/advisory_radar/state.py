@@ -85,9 +85,11 @@ class LockBusy(RuntimeError):
 
 @contextlib.contextmanager
 def state_lock(state_path: Path, *, blocking: bool = True) -> Generator[None]:
-    """Exclusive lock beside the state file, held for a whole pass or operator action.
+    """Exclusive lock beside a document on the data volume, held for a whole pass or operator action.
 
-    ``blocking=False`` raises :class:`LockBusy` instead of waiting, so an HTTP handler can answer
+    The state file takes it around a pass; the watchlist document takes it around a save, because a check-then-write
+    is only a check if no other process can write between the two. ``blocking=False`` raises :class:`LockBusy`
+    instead of waiting, so an HTTP handler can answer
     409 rather than stalling until a long pass finishes.
     """
     state_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)

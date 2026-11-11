@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from .state import SourceError, save_json, serialize_json
+from .state import SourceError, save_json, serialize_json, state_lock
 
 #: The filename an installation gets when the YAML names no document; one owner, used for the default and
 #: for the path beside the state file.
@@ -129,6 +130,16 @@ def editable_path(configured: Path | None, state_path: Path) -> Path:
     return configured if configured is not None else state_path.with_name(WATCHLIST_NAME)
 
 
+def present(path: Path) -> bool:
+    """Whether the directory entry exists, including a symlink that points at nothing.
+
+    ``Path.exists()`` is false for a broken link, and a scope that is present but unreadable must fail the pass
+    instead of falling back to the packaged default: the fallback judges every advisory. It is also what stops a
+    save from replacing the link with a regular file, which would leave the operator's own document ignored.
+    """
+    return os.path.lexists(path)
+
+
 def active_path(configured: Path | None, state_path: Path) -> Path:
     """The document a pass reads: the configured one, the saved one beside the state, else the packaged default.
 
@@ -138,7 +149,7 @@ def active_path(configured: Path | None, state_path: Path) -> Path:
     if configured is not None:
         return configured
     beside = state_path.with_name(WATCHLIST_NAME)
-    return beside if beside.exists() else DEFAULT_DOCUMENT
+    return beside if present(beside) else DEFAULT_DOCUMENT
 
 
 def digest(document: object) -> str:
@@ -159,11 +170,15 @@ def save_watchlist(path: Path, document: dict, *, expected: str) -> str:
     replace an edit it never saw is refused instead of overwriting it. The target is read before it is
     replaced, so a path that points at another document -- the state file, the settings overlay -- is refused
     rather than overwritten with a watchlist.
+
+    The read, the check and the replacement happen under one lock on ``<document>.lock``, which is what makes the
+    check mean anything: two processes that both read the same digest would otherwise both pass it and the later
+    replacement would silently lose the earlier edit.
     """
     parse_policy(document)
-    with WATCHLIST_LOCK:
+    with WATCHLIST_LOCK, state_lock(path):
         current = ""
-        if path.exists():
+        if present(path):
             # Reading first is what stops a misconfigured path from being overwritten: only a document this
             # module can read as a watchlist is a document it may replace.
             current = digest(read_watchlist(path))

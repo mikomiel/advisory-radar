@@ -425,3 +425,110 @@ def test_an_id_being_removed_in_the_same_save_can_be_added_again(tmp_path):
     saved = json.loads(watch.read_text())
     assert len(saved["products"]) == 1
     assert saved["products"][0]["aliases"] == ["node js", "nodejs"]
+
+
+def test_an_alias_containing_a_comma_is_kept_exactly(tmp_path):
+    """The aliases field separates on commas, so splitting this value would silently widen the scope."""
+    watch = write_scope(
+        tmp_path / "scope.json",
+        products=[{"id": "acme", "aliases": ["Example, Inc."], "domains": []}],
+    )
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    csrf, fingerprint, text = scope_form(client)
+    assert "readonly" in text and "kept exactly" in text
+    response = submit(
+        client,
+        csrf,
+        fingerprint,
+        **{
+            "product:acme:aliases_json": json.dumps(["Example, Inc."]),
+            "product:acme:domains": "",
+            "metadata_only:acme": "0",
+            "debian_packages": "*",
+            "excluded_products": "legacy",
+        },
+    )
+    assert response.status_code == 303
+    saved = json.loads(watch.read_text())
+    assert saved["products"][0]["aliases"] == ["Example, Inc."]
+    assert saved["excluded_products"] == ["legacy"]
+
+
+def test_a_new_row_without_an_id_is_refused_and_kept(tmp_path):
+    """Saving it away as a success would leave an installation that thinks it has a scope with none."""
+    watch = write_scope(tmp_path / "scope.json")
+    before = watch.read_text()
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    csrf, fingerprint, _ = scope_form(client)
+    response = submit(
+        client,
+        csrf,
+        fingerprint,
+        **{
+            "product:nodejs:aliases": "node.js",
+            "product:nodejs:domains": "nodejs.org",
+            "metadata_only:nodejs": "0",
+            "debian_packages": "*",
+            "new:aliases": "php",
+            "new:domains": "php.net",
+        },
+    )
+    assert response.status_code == 200
+    assert "needs an id" in response.text
+    assert "value='php'" in response.text and "value='php.net'" in response.text
+    assert watch.read_text() == before
+
+
+def test_a_broken_link_to_the_document_is_reported_and_not_replaced(tmp_path):
+    watch = tmp_path / "scope.json"
+    watch.symlink_to(tmp_path / "gone.json")
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    page = client.get("/watchlist")
+    assert page.status_code == 200
+    assert "cannot be read" in page.text
+    assert "name='fingerprint'" not in page.text, "there is nothing to edit against"
+    assert watch.is_symlink(), "the page never replaces the operator's link"
+
+
+def test_a_document_value_is_escaped_everywhere_it_is_rendered(tmp_path):
+    nasty = '"><script>alert(1)</script>'
+    watch = write_scope(
+        tmp_path / "scope.json",
+        products=[{"id": "acme", "aliases": [nasty], "domains": []}],
+        excluded_products=[nasty],
+    )
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    page = client.get("/watchlist")
+    assert "<script>" not in page.text
+    assert "&lt;script&gt;" in page.text
+    preview = client.get("/watchlist", params={"preview": "1", "title": "<img src=x onerror=alert(1)>"})
+    assert "<img" not in preview.text
+
+
+def test_a_metadata_only_flag_survives_an_unchanged_save(tmp_path):
+    """The flag has no consumer yet; the page still may not drop a key it does not understand."""
+    watch = write_scope(
+        tmp_path / "scope.json",
+        products=[{"id": "nodejs", "aliases": ["node.js"], "domains": [], "metadata_only": True}],
+    )
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    csrf, fingerprint, text = scope_form(client)
+    assert "name='metadata_only:nodejs' value='1'" in text
+    response = submit(
+        client,
+        csrf,
+        fingerprint,
+        **{
+            "product:nodejs:aliases": "node.js",
+            "product:nodejs:domains": "",
+            "metadata_only:nodejs": "1",
+            "debian_packages": "*",
+        },
+    )
+    assert response.status_code == 303
+    assert json.loads(watch.read_text())["products"][0]["metadata_only"] is True

@@ -69,7 +69,11 @@ read-only); otherwise the built-in default, which judges everything. `watchlist:
 file that does not exist yet is a configuration error that fails every pass, so a typo can
 never silently mean "judge everything"; the page names it and creates it when you save. A
 save writes nothing when the page is stale (the file changed under it), when a value is
-invalid (the rows you typed are re-rendered), or when the destination cannot be written.
+invalid (the rows you typed are re-rendered), or when the destination cannot be written. The
+read, the check and the write happen under one lock on the document, so two tabs — or two
+processes — cannot silently replace each other's edit. A row whose alias contains a comma is
+read-only in the form, because the field separates aliases with commas: the document keeps it
+exactly, and it is edited in the file.
 
 To check a rule before relying on it, paste an advisory's title and link into the page's
 *Check an advisory* form: it answers in scope or out of scope, names the products that
