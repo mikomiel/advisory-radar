@@ -160,9 +160,12 @@ operator action, and the release workflow then builds and pushes the image to
 
 ### Security
 - A plugin id is a name: the validator refuses a whole `${NAME}`/`${NAME_FILE}` reference in
-  one, because an id appears in routes, logs, the state and -- for a source -- a metric label
-  on the unauthenticated `/metrics` endpoint. A composed id (`tenant-${X}`, `a${Y}`) stays
-  allowed, and the value it composes is what those places show.
+  one, and refuses an id composed from a variable that supplies a credential anywhere in the
+  same configuration (`id: feed-${CD_TOKEN}` beside `api_key: ${CD_TOKEN}`), because an id
+  appears in routes, logs, the state and -- for a source -- a metric label on the
+  unauthenticated `/metrics` endpoint. A name composed from a naming variable
+  (`tenant-${X}`, `a${Y}`) stays allowed, and the value it composes is what those places
+  show.
 - A source added from `/config` may not point into a private network unless the YAML sets
   `allow_private_sources: true`. It is a guard rail against pointing this instance at a
   router page by mistake, not a privilege the YAML keeps and the overlay does not.

@@ -1332,3 +1332,44 @@ def test_the_metrics_label_is_the_configured_source_id(tmp_path):
     pipeline.run_pass(runtime.cfg, runtime.sources, runtime.notifiers, http=fake_http)
     metrics = client.get("/metrics").text
     assert 'advisory_radar_source_up{source="nodejs-org"} 1' in metrics
+
+
+def test_an_id_may_not_borrow_a_credential_variable(tmp_path):
+    """The case the whole-reference rule alone missed: the same variable names the source and supplies its key."""
+    path = write_config(
+        tmp_path,
+        sources=[
+            {
+                "id": "feed-${CD_TOKEN}",
+                "type": "changedetection",
+                "url": "https://changes.example.net",
+                "api_key": "${CD_TOKEN}",
+            }
+        ],
+    )
+    with pytest.raises(ConfigError, match="may not be composed from a variable that supplies a credential"):
+        load_config(path, {"CD_TOKEN": "AbCdEf123456"})
+    # the same source with a name for the id and the credential only in api_key is exactly how it should look
+    literal = write_config(
+        tmp_path,
+        sources=[
+            {"id": "changes", "type": "changedetection", "url": "https://changes.example.net", "api_key": "${CD_TOKEN}"}
+        ],
+    )
+    cfg = load_config(literal, {"CD_TOKEN": "AbCdEf123456"})
+    assert cfg.sources[0]["id"] == "changes"
+    assert "AbCdEf123456" in cfg.secret_values
+
+
+def test_a_notifier_id_may_not_borrow_a_credential_variable(tmp_path):
+    path = write_config(
+        tmp_path,
+        extra="",  # the helper writes one notifier; this one is written whole, below
+    )
+    document = yaml.safe_load(path.read_text())
+    document["notifiers"] = [
+        {"id": "hook-${HOOK}", "type": "webhook", "url": "${HOOK}"},
+    ]
+    path.write_text(yaml.safe_dump(document))
+    with pytest.raises(ConfigError, match="may not be composed from a variable that supplies a credential"):
+        load_config(path, {"HOOK": "https://hooks.example.net/secret"})

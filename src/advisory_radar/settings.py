@@ -23,7 +23,7 @@ import threading
 from pathlib import Path
 
 from .catalogue import SOURCE_SPECS
-from .config import ConfigError
+from .config import NOTIFIER_SECRET_KEYS, ConfigError
 from .state import save_json, serialize_json
 
 #: The schema tag the stored document declares.
@@ -40,8 +40,9 @@ MAX_SETTINGS_BYTES = 64 * 1024
 OVERLAY_KEYS = frozenset(
     {"notifiers", "sources", "sources_added", "poll_interval", "hidden_source_hosts", "routes", "default"}
 )
-#: Notifier keys that carry a credential: only a whole-value environment reference is accepted.
-SECRET_KEYS = ("url", "key", "password", "token")
+#: Notifier keys that carry a credential: only a whole-value environment reference is accepted. One owner:
+#: ``config`` lists them, and an id may not be composed from a variable that supplies one.
+SECRET_KEYS = NOTIFIER_SECRET_KEYS
 #: Exactly one ``${NAME}`` (optionally ``${NAME_FILE}``), with no surrounding text: a value with
 #: ``https://host/${TOKEN}`` in it would still put the rest of a credential-bearing URL in the file.
 SECRET_REFERENCE = re.compile(r"\$\{[A-Z_][A-Z0-9_]*(?:_FILE)?\}")

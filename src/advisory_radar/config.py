@@ -114,6 +114,9 @@ class Config:
 _SOURCE_KEYS = {"id", "type", "enabled"} | {
     key for spec in SOURCE_SPECS.values() for key in (*spec.required, *spec.optional)
 }
+#: The notifier keys whose value is a credential: the overlay accepts only a reference for them, and an id may
+#: not be composed from a variable that supplies one.
+NOTIFIER_SECRET_KEYS = ("url", "key", "password", "token")
 _NOTIFIER_KEYS = {
     "id",
     "type",
@@ -155,6 +158,45 @@ _ROUTE_KEYS = frozenset({"match", "notifiers"})
 #: Spellings accepted for a boolean option that came from the environment (expansion yields strings).
 _TRUE_WORDS = frozenset({"true", "yes", "on", "1"})
 _FALSE_WORDS = frozenset({"false", "no", "off", "0", ""})
+
+
+def _reference_names(value: object) -> set[str]:
+    """The environment variable names a value references, with the ``_FILE`` suffix normalised away.
+
+    ``${TOKEN}`` and ``${TOKEN_FILE}`` are the same variable's two spellings, so an id composed from one must
+    meet a credential supplied by the other.
+    """
+    if not isinstance(value, str):
+        return set()
+    return {name.removesuffix("_FILE") for name in _ENV_RE.findall(value)}
+
+
+def _credential_names(document: dict) -> set[str]:
+    """Every environment variable that supplies a credential somewhere in this configuration.
+
+    An id may not be composed from one of these: ``id: feed-${CD_TOKEN}`` beside ``api_key: ${CD_TOKEN}`` would
+    publish the key on every page, log line and metric label that shows the id. A variable that only names
+    something -- ``id: tenant-${TENANT}`` -- stays usable in an id.
+    """
+    names: set[str] = set()
+    for entry in document.get("sources") or []:
+        if not isinstance(entry, dict):
+            continue
+        kind = entry.get("type")
+        spec = SOURCE_SPECS.get(kind) if isinstance(kind, str) else None
+        for key in spec.secret_keys if spec is not None else ():
+            names |= _reference_names(entry.get(key))
+    for entry in document.get("notifiers") or []:
+        if not isinstance(entry, dict):
+            continue
+        for key in (*NOTIFIER_SECRET_KEYS, "headers"):
+            value = entry.get(key)
+            if isinstance(value, dict):
+                for item in value.values():
+                    names |= _reference_names(item)
+            else:
+                names |= _reference_names(value)
+    return names
 
 
 def _bool_option(value: object, name: str) -> bool:
@@ -374,6 +416,7 @@ def config_from_document(
     # replaces them with their values.
     sources = document.get("sources") or []
     notifiers = document.get("notifiers") or []
+    credential_names = _credential_names(document)
     _require(isinstance(sources, list) and isinstance(notifiers, list), "sources/notifiers must be lists")
     for entry in (*sources, *notifiers):
         _require(
@@ -388,6 +431,13 @@ def config_from_document(
         _require(
             _ENV_RE.fullmatch(entry["id"]) is None,
             f"{entry['id']}: a plugin id is a name, not a whole ${{NAME}} reference",
+        )
+        # A composed id is allowed, but not from a variable that supplies a credential somewhere here: the id
+        # would publish that credential wherever an id is shown, including an unauthenticated metric label.
+        borrowed = _reference_names(entry["id"]) & credential_names
+        _require(
+            not borrowed,
+            f"{entry['id']}: an id may not be composed from a variable that supplies a credential",
         )
         extra = set(entry) - (_SOURCE_KEYS if entry in sources else _NOTIFIER_KEYS)
         _require(not extra, f"{entry['id']}: unknown keys {sorted(extra)}")
