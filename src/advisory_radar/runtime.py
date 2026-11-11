@@ -20,7 +20,8 @@ from pathlib import Path
 from . import config, core, pipeline, settings
 from .config import Config, ConfigError, load_document
 from .http import RedactFilter
-from .state import LockBusy, load_state_document, save_state, state_lock
+from .state import LockBusy
+from .storage import StoreUnavailable
 
 LOG = logging.getLogger("advisory_radar")
 
@@ -198,63 +199,77 @@ class Runtime:
             _RELOAD_LOCK.release()
 
     def _publish(self, candidate: Runtime, *, blocking: bool) -> None:
-        """Install a built candidate, refusing the changes only a restart can make."""
+        """Install a built candidate, refusing the changes only a restart can make.
+
+        The lock, the document read and the applied marker are one publication. An unreachable store at any of
+        them is refused as a ``ConfigError`` -- the answer both web callers already show -- rather than
+        escaping as a ``StoreUnavailable`` after ``settings.json`` was written.
+        """
         if candidate.cfg.state_path != self.cfg.state_path:
             # The overlay cannot move the state file, but the YAML can, and a reload would then take one
             # file's lock, read that file and write the document to the other path. That is a restart's job.
             raise ConfigError("state_path is file-only and a reload cannot move it; restart to use a new state file")
+        if candidate.cfg.storage != self.cfg.storage:
+            # The store is YAML-only for the same reason: a reload writes the applied marker through the live
+            # store, so a candidate pointing elsewhere would record it in one store and serve another.
+            raise ConfigError("storage is file-only and a reload cannot move it; restart to use a new store")
         if (candidate.cfg.web_host, candidate.cfg.web_port) != (self.cfg.web_host, self.cfg.web_port):
             # uvicorn binds the socket once, when the process starts; recording a new address as applied while
             # the server keeps its old one would make the UI report a configuration that is not in force.
             raise ConfigError(
                 "web.host and web.port are bound when the process starts and a reload cannot change them; restart"
             )
-        with state_lock(self.cfg.state_path, blocking=blocking):
-            state = load_state_document(self.cfg.state_path, core.STATE_SCHEMA, "advisory state")
-            if state is None:
-                state = core.new_state()
-            # A candidate is built before the lock, so another reload can publish a newer revision in
-            # between. Publishing this one then would silently roll the configuration back; refuse and
-            # tell the operator, who can reload again to pick up what is on disk now.
-            live_revision = int(self.overlay.get("revision", 0))
-            candidate_revision = int(candidate.overlay["revision"])
-            # A deleted overlay is revision 0 with no settings, and applying it is the documented way back
-            # to the YAML; any other lower revision is a stale candidate and must not roll the live
-            # configuration back under a newer file.
-            reset = candidate_revision == 0 and not candidate.overlay["settings"]
-            if candidate_revision < live_revision and not reset:
-                raise ConfigError(
-                    f"the saved overlay is revision {candidate_revision}, older than the live revision "
-                    f"{live_revision}; not reloading over it"
-                )
-            # Persist the applied marker *before* publishing the candidate: if the write fails the
-            # running configuration is still the old one, and a reader never sees a live revision its
-            # state does not record. Everything after the write is an in-memory assignment.
-            state["settings"] = {
-                "revision": candidate_revision,
-                "applied_at": int(self.clock()),
-                "fingerprint": settings.fingerprint(candidate.overlay["settings"]),
-            }
-            try:
-                save_state(self.cfg.state_path, state)
-            except OSError as exc:
-                raise ConfigError(f"the overlay was not applied: cannot record it in the state: {exc}") from exc
-            self._live = candidate.snapshot()
-            self.overlay = candidate.overlay
-            self.document = candidate.document
-            self.overlay_path = candidate.overlay_path
-            # A pass can hold a snapshot of the old configuration while it waits for the state lock, and it runs
-            # after this swap: the values it may log have to stay filtered. They are merged into one cumulative
-            # filter (longest first, so a short old value cannot hide part of a longer new secret) instead of
-            # leaving two filters to run in sequence, and the candidate's own filter is removed.
-            if self._redactor is None:
-                self._redactor = candidate._redactor
-            else:
-                if candidate._redactor is not None:
-                    self._redactor.add(candidate._redactor.raw)
-                    LOG.removeFilter(candidate._redactor)
-            candidate._redactor = None
-            self.wake.set()  # the scheduler waits on this, so a changed interval applies now
+        store = self.cfg.store()
+        try:
+            with store.lock(blocking=blocking):
+                state = store.load()
+                if state is None:
+                    state = core.new_state()
+                # A candidate is built before the lock, so another reload can publish a newer revision in
+                # between. Publishing this one then would silently roll the configuration back; refuse and
+                # tell the operator, who can reload again to pick up what is on disk now.
+                live_revision = int(self.overlay.get("revision", 0))
+                candidate_revision = int(candidate.overlay["revision"])
+                # A deleted overlay is revision 0 with no settings, and applying it is the documented way back
+                # to the YAML; any other lower revision is a stale candidate and must not roll the live
+                # configuration back under a newer file.
+                reset = candidate_revision == 0 and not candidate.overlay["settings"]
+                if candidate_revision < live_revision and not reset:
+                    raise ConfigError(
+                        f"the saved overlay is revision {candidate_revision}, older than the live revision "
+                        f"{live_revision}; not reloading over it"
+                    )
+                # Persist the applied marker *before* publishing the candidate: if the write fails the
+                # running configuration is still the old one, and a reader never sees a live revision its
+                # state does not record. Everything after the write is an in-memory assignment.
+                state["settings"] = {
+                    "revision": candidate_revision,
+                    "applied_at": int(self.clock()),
+                    "fingerprint": settings.fingerprint(candidate.overlay["settings"]),
+                }
+                store.save(state)
+                self._live = candidate.snapshot()
+                self.overlay = candidate.overlay
+                self.document = candidate.document
+                self.overlay_path = candidate.overlay_path
+                # A pass can hold a snapshot of the old configuration while it waits for the state lock, and it
+                # runs after this swap: the values it may log have to stay filtered. They are merged into one
+                # cumulative filter (longest first, so a short old value cannot hide part of a longer new
+                # secret) instead of leaving two filters to run in sequence, and the candidate's own filter is
+                # removed.
+                if self._redactor is None:
+                    self._redactor = candidate._redactor
+                else:
+                    if candidate._redactor is not None:
+                        self._redactor.add(candidate._redactor.raw)
+                        LOG.removeFilter(candidate._redactor)
+                candidate._redactor = None
+                self.wake.set()  # the scheduler waits on this, so a changed interval applies now
+        except (OSError, StoreUnavailable) as exc:
+            # The lock, the load and the write are one publication: an unreachable store at any of them is a
+            # refused reload, not a live revision whose state does not record it. Both web callers answer a
+            # ``ConfigError`` with the refusal they already show.
+            raise ConfigError(f"the overlay was not applied: cannot record it in the state: {exc}") from exc
 
 
 __all__ = ["Runtime", "read_config"]

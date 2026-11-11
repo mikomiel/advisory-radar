@@ -56,6 +56,7 @@ from .settings import (
 )
 from .sources import build_source
 from .state import LockBusy, SourceError
+from .storage import StoreUnavailable
 
 LOG = logging.getLogger("advisory_radar")
 
@@ -1044,9 +1045,8 @@ def create_app(
 
     def load_state() -> dict:
         from . import core
-        from .state import load_state_document
 
-        return load_state_document(runtime.cfg.state_path, core.STATE_SCHEMA, "advisory state") or core.new_state()
+        return runtime.cfg.store().load() or core.new_state()
 
     @app.get("/login", response_class=HTMLResponse)
     def login_form():
@@ -1363,17 +1363,16 @@ def create_app(
         the row carried is checked under the lock, so a message that moved into that position is not touched.
         """
         from . import core
-        from .state import state_lock
 
         expected = first(form_body(request), "token")
         if not re.fullmatch(r"[0-9a-f]{16}", expected):
             # Fail closed: a form without the row token is not a row this page offered, so there is no
             # message it could be asking about.
             raise HTTPException(status_code=400, detail="missing or malformed row token; reload the parked queue")
-        state_path = runtime.cfg.state_path
+        store = runtime.cfg.store()
         try:
-            with state_lock(state_path, blocking=False):
-                changed = core.manage_parked_entry(state_path, index, release, now=int(time.time()), expected=expected)
+            with store.lock(blocking=False):
+                changed = core.manage_parked_entry(store, index, release, now=int(time.time()), expected=expected)
         except LockBusy:
             return page(
                 "Busy",
@@ -1406,11 +1405,10 @@ def create_app(
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         from . import core
-        from .state import state_lock
 
-        state_path = runtime.cfg.state_path
-        with state_lock(state_path):
-            core.manage_parked(state_path, release=True, now=int(time.time()))
+        store = runtime.cfg.store()
+        with store.lock():
+            core.manage_parked(store, release=True, now=int(time.time()))
         return RedirectResponse("/parked", status_code=303)
 
     @app.post("/parked/drop", dependencies=[Depends(require_csrf)])
@@ -1418,11 +1416,10 @@ def create_app(
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         from . import core
-        from .state import state_lock
 
-        state_path = runtime.cfg.state_path
-        with state_lock(state_path):
-            core.manage_parked(state_path, release=False, now=int(time.time()))
+        store = runtime.cfg.store()
+        with store.lock():
+            core.manage_parked(store, release=False, now=int(time.time()))
         return RedirectResponse("/parked", status_code=303)
 
     # --- the settings overlay: /config and the POSTs that write and apply it ---------------------
@@ -1492,7 +1489,7 @@ def create_app(
     def applied_settings() -> dict:
         try:
             value = load_state().get("settings")
-        except SourceError:
+        except (SourceError, StoreUnavailable):
             return {}
         return value if isinstance(value, dict) else {}
 
@@ -2114,7 +2111,7 @@ def create_app(
             runtime.reload(blocking=False)
         except LockBusy:
             LOG.info("settings revision %d saved; a pass holds the lock, so it is not live yet", stored["revision"])
-        except (ConfigError, SourceError) as exc:
+        except (ConfigError, SourceError, StoreUnavailable) as exc:
             LOG.warning(
                 "settings revision %d saved but not applied: %s",
                 stored["revision"],
@@ -2627,7 +2624,7 @@ def create_app(
                 actions=sign_out_form(request),
                 status_code=409,
             )
-        except (ConfigError, SourceError) as exc:
+        except (ConfigError, SourceError, StoreUnavailable) as exc:
             message = esc(pipeline.redact(str(exc), secret_values(runtime.cfg)))
             return page(
                 "Reload refused",
@@ -3280,7 +3277,7 @@ def create_app(
         """
         try:
             state = load_state()
-        except SourceError as exc:
+        except (SourceError, StoreUnavailable) as exc:
             return PlainTextResponse(f"not ready: {exc}", status_code=503)
         ok, reason = readiness(runtime.cfg, state, int(clock()))
         return PlainTextResponse(reason, status_code=200 if ok else 503)
@@ -3289,7 +3286,7 @@ def create_app(
     def metrics():
         try:
             state = load_state()
-        except SourceError as exc:
+        except (SourceError, StoreUnavailable) as exc:
             # The documented alert is `advisory_radar_ready == 0`, and a failed scrape produces no sample at all:
             # an unreadable state must still answer, with the one thing it can honestly report. Nothing else is
             # fabricated, because without the state every other number is unknown rather than zero.
@@ -3376,7 +3373,6 @@ def create_app(
 
         from . import core as _core
         from .sources import webhook_item_from_payload
-        from .state import load_state_document, save_state, state_lock
 
         secret = env.get("ADVISORY_RADAR_WEBHOOK_SECRET", "")
         if not secret or source_id not in webhook_source_ids():
@@ -3400,21 +3396,21 @@ def create_app(
             return JSONResponse({"error": "payload has no title"}, status_code=422)
         entry.pop("explicit_ids", None)  # ids are re-extracted from text at classify time
 
-        state_path = runtime.cfg.state_path
+        store = runtime.cfg.store()
 
-        def store() -> None:
-            with state_lock(state_path, blocking=False):
-                state = load_state_document(state_path, _core.STATE_SCHEMA, "advisory state") or _core.new_state()
+        def enqueue() -> None:
+            with store.lock(blocking=False):
+                state = store.load() or _core.new_state()
                 inbox = state.setdefault("webhook_inbox", {}).setdefault(source_id, [])
                 # A full inbox refuses the new entry rather than dropping an accepted one: an acknowledged
                 # advisory must never be discarded unprocessed.
                 if len(inbox) >= WEBHOOK_INBOX_LIMIT:
                     raise InboxFull
                 inbox.append(entry)
-                save_state(state_path, state)
+                store.save(state)
 
         try:
-            await run_in_threadpool(store)
+            await run_in_threadpool(enqueue)
         except LockBusy:
             return JSONResponse({"error": "busy, retry"}, status_code=503, headers={"Retry-After": "30"})
         except InboxFull:

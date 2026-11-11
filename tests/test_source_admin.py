@@ -1495,6 +1495,25 @@ def test_a_notifier_header_credential_is_inventoried(tmp_path):
         load_config(path, {"HOOK": "https://hooks.example.net/x", "HOOK_TOKEN": "AbCdEf123456"})
 
 
+def test_a_storage_url_cannot_lend_its_variable_to_an_id(tmp_path):
+    """``storage:`` can embed a password, so it is a credential position like a notifier's url."""
+    path = write_config(
+        tmp_path,
+        sources=[{"id": "feed-${DB_PASSWORD}", "type": "rss", "url": "https://feeds.example.net/security.xml"}],
+        extra="storage: postgresql://radar:${DB_PASSWORD}@db.example/radar\n",
+    )
+    with pytest.raises(ConfigError, match="may not be composed from a variable that supplies a credential"):
+        load_config(path, {"DB_PASSWORD": "AbCdEf123456"})
+    # A variable that supplies no credential anywhere stays usable in an id.
+    path = write_config(
+        tmp_path,
+        sources=[{"id": "feed-${TENANT}", "type": "rss", "url": "https://feeds.example.net/security.xml"}],
+        extra=f"storage: sqlite:///{tmp_path}/state.db\n",
+    )
+    cfg = load_config(path, {"TENANT": "acme"})
+    assert cfg.sources[0]["id"] == "feed-acme"
+
+
 def test_a_token_bearing_url_cannot_lend_its_variable_to_an_id(tmp_path):
     """``?token=${FEED_TOKEN}`` is a documented shape for a private feed, so it is a credential position."""
     path = write_config(

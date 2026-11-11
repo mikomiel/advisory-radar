@@ -21,6 +21,7 @@ import yaml
 
 from .catalogue import SOURCE_SPECS
 from .routing import MATCH_KEYS, SEVERITY_TAGS
+from .storage import Store, store_for
 
 _ENV_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?:_FILE)?\}")
 
@@ -171,6 +172,9 @@ class Config:
     #: keep running for every source every pass, so a slow feed never delays an alert about something else.
     source_intervals: Mapping[str, int] = field(default_factory=dict)
     state_path: Path = Path("data/state.json")
+    #: Where the document lives: empty is the JSON file at ``state_path``, or a ``sqlite:///`` / ``postgresql://``
+    #: URL. YAML-only -- the overlay cannot move the store, exactly as it cannot move ``state_path``.
+    storage: str = ""
     hidden_source_hosts: frozenset[str] = frozenset()
     adobe_commerce: bool = False
     #: A free NVD API key: raises the anonymous 5-per-30 s limit to 50 and shortens the pace in ``core.Intel``.
@@ -206,6 +210,10 @@ class Config:
         all resolve to the global block -- which is what judged every message before overrides existed.
         """
         return self.source_thresholds.get(source_id or "", self.thresholds)
+
+    def store(self) -> Store:
+        """Where this configuration keeps the state document: the JSON file unless ``storage`` says otherwise."""
+        return store_for(self.storage, self.state_path)
 
 
 #: The keys a source entry may carry: the structural ones plus every key the catalogue documents for a
@@ -247,6 +255,7 @@ _TOP_KEYS = {
     "watchlist",
     "poll_interval",
     "state_path",
+    "storage",
     "hidden_source_hosts",
     "adobe_commerce",
     "nvd_api_key",
@@ -331,7 +340,7 @@ def _credential_names(document: dict) -> set[str]:
     publish the key on every page, log line and metric label that shows the id. A variable that only names
     something -- ``id: tenant-${TENANT}`` -- stays usable in an id. The scan is deliberately blind to whether an
     entry is enabled or which kind it is: both are configuration, and both can supply a value an enabled entry's
-    id borrows.
+    id borrows. The store locator counts too: a PostgreSQL URL embeds a password.
     """
     names: set[str] = set()
     for entry in document.get("sources") or []:
@@ -344,6 +353,9 @@ def _credential_names(document: dict) -> set[str]:
         if isinstance(entry, dict):
             for key in (*NOTIFIER_SECRET_KEYS, "headers"):
                 names |= _reference_names(entry.get(key))
+    # The store locator can embed a credential (``postgresql://radar:${DB_PASSWORD}@db.example/radar``), and an
+    # id composed from that variable would publish the password wherever the id is shown.
+    names |= _reference_names(document.get("storage"))
     names |= _reference_names(document.get("nvd_api_key"))
     return names
 
@@ -706,6 +718,15 @@ def config_from_document(
         state_path.name != "settings.json",
         "state_path must not be named settings.json: that is the settings overlay's filename beside the state file",
     )
+    # A malformed value must fail here with every other bad key, not at the first pass: ``store_for`` is the
+    # one parser, and its refusal names the accepted forms without quoting the value (a URL can carry a
+    # password). The store itself is built later, from an already validated value.
+    storage = document.get("storage", "")
+    _require(isinstance(storage, str), "storage must be a string, e.g. sqlite:////data/state.db")
+    try:
+        store_for(storage, state_path)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
     watchlist = document.get("watchlist")
     _require(
         watchlist is None or isinstance(watchlist, str),
@@ -730,6 +751,7 @@ def config_from_document(
         poll_interval_seconds=seconds,
         source_intervals=source_intervals,
         state_path=state_path,
+        storage=storage,
         hidden_source_hosts=hidden,
         adobe_commerce=_bool_option(document.get("adobe_commerce", False), "adobe_commerce"),
         allow_private_sources=_bool_option(document.get("allow_private_sources", False), "allow_private_sources"),

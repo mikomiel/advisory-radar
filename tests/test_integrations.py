@@ -229,7 +229,7 @@ def test_a_delivered_webhook_entry_leaves_the_inbox(tmp_path):
             {"guid": "no-ids", "title": "routine maintenance", "summary": "", "link": "https://v.example/b"},
         ]
     }
-    core.save_state(cfg.state_path, state)
+    cfg.store().save(state)
 
     sent = []
 
@@ -442,7 +442,9 @@ def test_a_webhook_guid_carrying_a_newline_is_released_and_sent_once(tmp_path):
     state["webhook_inbox"] = {
         "wh": [{"guid": "a\nb", "title": "routine maintenance", "summary": "", "link": "https://v.example/b"}]
     }
-    core.save_state(cfg.state_path, state)
+    from advisory_radar.state import save_state
+
+    save_state(cfg.state_path, state)
 
     sent = []
 

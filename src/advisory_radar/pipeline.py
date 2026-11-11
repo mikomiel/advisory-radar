@@ -15,7 +15,8 @@ from .kev import load_kev
 from .notifiers import build_notifier
 from .plugins import Source, SourceWindow
 from .sources import build_source
-from .state import LockBusy, SourceError, load_state_document, save_state, state_lock
+from .state import LockBusy, SourceError
+from .storage import Store, StoreUnavailable
 from .watchlist import load_policy
 
 LOG = logging.getLogger("advisory_radar")
@@ -133,18 +134,25 @@ def run_pass(
     UI's "run now" and a CLI ``once`` can never deliver the same pending message twice or overwrite each
     other's state. ``lock_blocking=False`` returns 1 immediately when another pass holds it.
     """
+    store = cfg.store()
     if dry_run:
-        return _run_pass(cfg, sources, notifiers, http=http, clock=clock, sleep=sleep, dry_run=True)
+        return _run_pass(cfg, store, sources, notifiers, http=http, clock=clock, sleep=sleep, dry_run=True)
     try:
-        with state_lock(cfg.state_path, blocking=lock_blocking):
-            return _run_pass(cfg, sources, notifiers, http=http, clock=clock, sleep=sleep, dry_run=False)
+        with store.lock(blocking=lock_blocking):
+            return _run_pass(cfg, store, sources, notifiers, http=http, clock=clock, sleep=sleep, dry_run=False)
     except LockBusy:
         LOG.warning("another pass holds the state lock; skipped this run")
+        return 1
+    except StoreUnavailable as exc:
+        # A missing driver or an unreachable server is a deployment fault: the pass did not run, and saying so
+        # with the code the caller already reports is better than a traceback out of the scheduler.
+        LOG.error("%s; the pass did not run", exc)
         return 1
 
 
 def _run_pass(
     cfg: Config,
+    store: Store,
     sources: list[Source],
     notifiers: list,
     *,
@@ -156,8 +164,10 @@ def _run_pass(
     """The pass itself; ``run_pass`` owns the state lock around it."""
     now = int(clock())
     try:
-        stored = load_state_document(cfg.state_path, core.STATE_SCHEMA, "advisory state")
-    except SourceError as exc:
+        stored = store.load()
+    except (SourceError, StoreUnavailable) as exc:
+        # An unavailable store reads like an unreadable document here, and for the same reason: treating it
+        # as absent would re-seed the state and replay history the moment the server came back.
         LOG.error("%s; not re-seeding", exc)
         return 1
     policy = load_policy(cfg.watchlist_path) if cfg.watchlist_path else _default_policy()
@@ -359,7 +369,7 @@ def _run_pass(
                 state.get("webhook_inbox", {}).pop(source.id, None)
 
         if not dry_run:
-            save_state(cfg.state_path, state)
+            store.save(state)
 
     if not carried:
         state.pop("carry", None)  # only after every source has written into the attached dict
@@ -370,7 +380,7 @@ def _run_pass(
         # said otherwise. Only health is added to a seeded-empty document: no validator moves and no source is
         # marked seeded, so the first pass that does read a feed still bootstraps that feed's history.
         if not dry_run and state.get("source_health"):
-            save_state(cfg.state_path, state)
+            store.save(state)
         LOG.error("no source could be read on the first pass; only the source health was recorded")
         return 1
 
@@ -399,7 +409,7 @@ def _run_pass(
         LOG.info("dry run: nothing sent, no state written")
         return 0 if source_ok and adobe_ok and not gap else 1
 
-    save_state(cfg.state_path, state)  # pending is durable before the first POST
+    store.save(state)  # pending is durable before the first POST
     queued, parked_before = len(state["pending"]), len(state["parked"])
     if not notifiers and state["pending"]:
         LOG.error(
@@ -413,11 +423,11 @@ def _run_pass(
             notifiers,
             http,
             now,
-            persist=lambda: save_state(cfg.state_path, state),
+            persist=lambda: store.save(state),
             routes=cfg.routes,
             default=cfg.default_notifiers,
         )
-    save_state(cfg.state_path, state)
+    store.save(state)
     newly_parked = len(state["parked"]) - parked_before
     sent = queued - len(state["pending"]) - newly_parked
     LOG.info("pass: %d sent, %d parked, %d pending", sent, newly_parked, len(state["pending"]))
@@ -442,7 +452,7 @@ def _run_pass(
         }
     )
     del runs[:-200]
-    save_state(cfg.state_path, state)  # the run record is part of the state, so it must be saved
+    store.save(state)  # the run record is part of the state, so it must be saved
     return code
 
 

@@ -8,6 +8,21 @@ operator action, and the release workflow then builds and pushes the image to
 ## [Unreleased]
 
 ### Added
+- A `storage:` key moves the state document without changing its model: empty (the default)
+  is the JSON file at `state_path`, `sqlite:///` is one SQLite file on the volume (WAL,
+  `synchronous=FULL`, mode `0600`, with its lock in a sidecar database so a pass can save
+  inside the lock), and `postgresql://` shares one document between instances through an
+  optional driver (`python -m pip install 'psycopg[binary]'`). The pipeline, the queue
+  actions, the webhook intake, the page loader and a reload all read and write through the
+  same store seam, so the JSON file is not touched when the document lives elsewhere. A
+  store that cannot be read fails the pass with the unreadable-document message instead of
+  re-seeding, and an unavailable store is a failed pass rather than a traceback.
+- `advisory-radar migrate --config <path> --to <store url>` copies the document from the
+  configured store to another one. It refuses a target that already holds a document and
+  prints both stores by their redacted names, never the URL; the source is left in place, so
+  moving the store is: migrate, set `storage:`, restart. The key is YAML-only — the overlay
+  cannot move the store, and a reload refuses a changed `storage:` like a changed
+  `state_path`.
 - An `rss` source reads any published feed shape without a new configuration key: RSS 2.0,
   Atom, RSS 1.0 (RDF) and JSON Feed are recognised from the document, and a URL that answers
   an HTML page is followed once through the page's `<link rel="alternate">` autodiscovery
