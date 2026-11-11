@@ -1515,6 +1515,14 @@ def create_app(
         sources = document.get("sources") if isinstance(document, dict) else None
         return [entry for entry in (sources or []) if isinstance(entry, dict) and isinstance(entry.get("id"), str)]
 
+    def page_title(text: str) -> str:
+        """A page title with the configuration's secrets removed; ``page()`` escapes what it is given.
+
+        A title is not exempt from the rule the body follows: on the live path the submitted id is the expanded
+        one, so it can be a value a reference was meant to keep out of sight.
+        """
+        return pipeline.redact(text, secret_values(runtime.cfg))
+
     def safe_text(value: object) -> str:
         """A configuration-derived value rendered as text: redacted against the secrets, then escaped.
 
@@ -1878,7 +1886,7 @@ def create_app(
                 f"<h2>{safe_text(identifier)} <span class='muted'>{safe_text(display_type(entry))}</span> {tone}</h2>"
                 "<p class='muted small'>A configured source; the probe reads it and delivers nothing.</p>"
             )
-            title = f"{identifier} probe"
+            title = page_title(f"{identifier} probe")
         else:
             entry, problem = new_source_from_form(form)
             if entry is None:

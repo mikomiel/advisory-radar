@@ -1276,3 +1276,32 @@ def test_a_bare_config_app_probes_the_url_the_pass_fetches(tmp_path):
     probed = [url for url in seen if "feeds.example.net" in url][-1]
     assert probed == cfg.sources[0]["url"], "the loader expanded this once; the probe must not do it again"
     assert "${CHANNEL}" in probed
+
+
+def test_the_probe_page_title_does_not_print_a_resolved_id(tmp_path):
+    """The title is part of the response: on the live path the id submitted *is* the expanded value."""
+    path = write_config(
+        tmp_path, sources=[{"id": "${SOURCE_ID}", "type": "rss", "url": "https://feeds.example.net/feed.xml"}]
+    )
+    env = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, "SOURCE_ID": "s3cret-token"}
+    runtime = Runtime.build(path, env)
+    assert [source.id for source in runtime.sources] == ["s3cret-token"]
+    # A file-backed runtime's /config renders the reference and looks up a raw id; a bare Config keeps the
+    # expanded document, so the same page looks up the value.
+    cases = (
+        (TestClient(create_app(runtime, env, http=fake_http, resolve=public_resolver)), "${SOURCE_ID}"),
+        (TestClient(create_app(load_config(path, env), env, http=fake_http, resolve=public_resolver)), "s3cret-token"),
+    )
+    for client, config_id in cases:
+        csrf, _ = signed_in(client)
+        for endpoint, identifier in (
+            ("/sources/probe", "s3cret-token"),
+            ("/config/sources/probe", config_id),
+        ):
+            response = client.post(endpoint, data={"csrf": csrf, "id": identifier})
+            assert response.status_code == 200, endpoint
+            assert "s3cret-token" not in response.text, f"{endpoint} printed the resolved id"
+    # the live path submits the value itself, so its title is where the redaction has to show
+    csrf, _ = signed_in(cases[0][0])
+    live = cases[0][0].post("/sources/probe", data={"csrf": csrf, "id": "s3cret-token"})
+    assert "<title>[redacted] probe" in live.text
