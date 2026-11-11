@@ -52,12 +52,13 @@ LOG = logging.getLogger("advisory_radar")
 #: AA (text 4.5:1, control borders 3:1) in both schemes; ``--line`` is a decorative hairline only.
 _STYLE = """<style>
 :root{--bg:#FBFAF8;--surface:#FFFFFF;--ink:#171512;--muted:#6B6660;--line:#E2DDD2;--control:#767065;
---hover:#F1EEE7;--critical:#A3150F;--warning:#7A5200;--ok:#1B6B3D;
+--hover:#F1EEE7;--critical:#A3150F;--on-critical:#FFFFFF;--warning:#7A5200;--ok:#1B6B3D;
 --sans:ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
 --mono:ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;
 color-scheme:light dark}
 @media (prefers-color-scheme:dark){:root{--bg:#12110F;--surface:#1A1916;--ink:#F3F0E8;--muted:#A9A39A;
---line:#2E2C27;--control:#6B665B;--hover:#1E1D19;--critical:#F87171;--warning:#E0A63A;--ok:#6FD08C}}
+--line:#2E2C27;--control:#6B665B;--hover:#1E1D19;--critical:#F87171;--on-critical:#12110F;--warning:#E0A63A;
+--ok:#6FD08C}}
 *,*::before,*::after{box-sizing:border-box}
 body{margin:0 auto;max-width:72rem;padding:0 2rem;background:var(--bg);color:var(--ink);
 font-family:var(--sans);font-size:15px;line-height:1.6;font-variant-numeric:tabular-nums}
@@ -131,7 +132,7 @@ font-family:inherit;font-size:13px;font-weight:500;line-height:1.1;cursor:pointe
 button:hover,.btn:hover{background:var(--hover)}
 .btn-primary,.btn-primary:hover{border-color:var(--ink);background:var(--ink);color:var(--bg)}
 .btn-danger{color:var(--critical);border-color:var(--critical)}
-.btn-danger:hover{background:var(--critical);color:#fff}
+.btn-danger:hover{background:var(--critical);color:var(--on-critical)}
 .btn-quiet{border-color:transparent;color:var(--muted)}
 .btn-quiet:hover{color:var(--ink)}
 label{display:grid;gap:.3rem;color:var(--muted);font-size:12px}
@@ -520,8 +521,11 @@ def _levels_table(levels: object, scores: object) -> str:
             shown = "<span class='muted'>unscored</span>"
         else:
             shown = esc(score)
+        level = _field(levels[cve])
         rows.append(
-            f"<tr><td class='mono'>{esc(cve)}</td><td>{_badge(levels[cve], levels[cve])}</td><td>{shown}</td></tr>"
+            f"<tr><td class='mono'>{esc(cve)}</td>"
+            f"<td>{_badge(level, level) if level else "<span class='muted'>not recorded</span>"}</td>"
+            f"<td>{shown}</td></tr>"
         )
     return (
         "<div class='scroll'><table class='levels'><tr><th scope='col'>CVE</th><th scope='col'>Level</th>"
@@ -540,6 +544,23 @@ def _identifier_list(values: object) -> str:
     if not isinstance(values, (list, tuple)) or not values:
         return "<span class='muted'>(none recorded)</span>"
     return ", ".join(esc(value) for value in values)
+
+
+def _field(value: object) -> str:
+    """A stored scalar as text; a malformed value is shown as the absence it is, never as a Python repr."""
+    return value if isinstance(value, str) else ""
+
+
+def _section(path: str) -> str:
+    """The navigation section a path belongs to, so an error page keeps the reader's place."""
+    if path == "/":
+        return "/"
+    if path.startswith("/advisories/"):
+        return "/alerts"
+    for known, _ in _NAV:
+        if known != "/" and (path == known or path.startswith(f"{known}/")):
+            return known
+    return ""
 
 
 def _badge(text: object, kind: str = "neutral") -> str:
@@ -570,12 +591,14 @@ def _stats(pairs: Sequence[tuple[str, object]]) -> str:
 
 def _outcome_tone(outcome: str) -> str:
     """The tone a recorded outcome carries: an accepted delivery is good, a drop is the loss it is."""
+    if not isinstance(outcome, str):
+        return "neutral"
     return {"delivered": "ok", "dropped": "critical"}.get(outcome, "neutral")
 
 
 def _seen_advisory(record: Mapping, delivery: Mapping | None = None) -> str:
     """The detail page for an identifier the state has seen: the snapshot, or only what an older record held."""
-    outcome = record.get("outcome", "")
+    outcome = _field(record.get("outcome"))
     facts: list[tuple[str, str]] = [
         ("Outcome", _badge(outcome, _outcome_tone(outcome)) if outcome else "<span class='muted'>—</span>"),
         ("Recorded (UTC)", esc(_when(record.get("at"))) or "<span class='muted'>not recorded</span>"),
@@ -596,10 +619,11 @@ def _seen_advisory(record: Mapping, delivery: Mapping | None = None) -> str:
         delivered = "<span class='muted'>none: dropped before any channel accepted it</span>"
     else:
         delivered = "<span class='muted'>not recorded</span>"
+    title = _field(record.get("title"))
     facts += [
-        ("Tag", esc(record.get("tag", "")) or "<span class='muted'>not recorded</span>"),
-        ("Source", esc(record.get("source", "")) or "<span class='muted'>not recorded</span>"),
-        ("Message kind", esc(record.get("kind", "")) or "<span class='muted'>not recorded</span>"),
+        ("Tag", esc(_field(record.get("tag"))) or "<span class='muted'>not recorded</span>"),
+        ("Source", esc(_field(record.get("source"))) or "<span class='muted'>not recorded</span>"),
+        ("Message kind", esc(_field(record.get("kind"))) or "<span class='muted'>not recorded</span>"),
         ("Identifiers", _identifier_list(record.get("ids"))),
         ("CVEs in this message", _identifier_list(record.get("cves"))),
         ("KEV-only (not scored here)", _identifier_list(record.get("kev_only"))),
@@ -608,7 +632,7 @@ def _seen_advisory(record: Mapping, delivery: Mapping | None = None) -> str:
         ("Advisory", _external_link(record.get("link")) or "<span class='muted'>not recorded</span>"),
     ]
     return (
-        (f"<p class='lead'><b>{esc(record.get('title'))}</b></p>" if record.get("title") else "")
+        (f"<p class='lead'><b>{esc(title)}</b></p>" if title else "")
         + _facts(facts)
         + "<h2>CVEs and levels</h2>"
         + _levels_table(record.get("levels"), record.get("scores"))
@@ -626,11 +650,12 @@ def _queued_advisory(state_label: str, entry: Mapping) -> str:
     if not attempts:
         attempts_text = "0 (never attempted)"
     accepted = entry.get("sent_to")
+    title = _field(entry.get("title"))
     facts = [
         ("State", _badge(state_label, "warning" if state_label == "parked" else "neutral")),
-        ("Tag", esc(entry.get("tag", "")) or "<span class='muted'>not recorded</span>"),
-        ("Source", esc(entry.get("source", "")) or "<span class='muted'>not recorded</span>"),
-        ("Message kind", esc(entry.get("kind", "")) or "<span class='muted'>not recorded</span>"),
+        ("Tag", esc(_field(entry.get("tag"))) or "<span class='muted'>not recorded</span>"),
+        ("Source", esc(_field(entry.get("source"))) or "<span class='muted'>not recorded</span>"),
+        ("Message kind", esc(_field(entry.get("kind"))) or "<span class='muted'>not recorded</span>"),
         ("Identifiers", _identifier_list(entry.get("ids"))),
         ("CVEs in this message", _identifier_list(entry.get("cves"))),
         ("KEV-only (not scored here)", _identifier_list(entry.get("kev_only"))),
@@ -643,7 +668,7 @@ def _queued_advisory(state_label: str, entry: Mapping) -> str:
     if parked_at:
         facts.append(("Parked (UTC)", esc(parked_at)))
     return (
-        (f"<p class='lead'><b>{esc(entry.get('title'))}</b></p>" if entry.get("title") else "")
+        (f"<p class='lead'><b>{esc(title)}</b></p>" if title else "")
         + _facts(facts)
         + "<h2>CVEs and levels</h2>"
         + _levels_table(entry.get("levels"), entry.get("scores"))
@@ -871,6 +896,7 @@ def create_app(
             return page(
                 "Error",
                 _notice(esc(exc.detail), "critical"),
+                active=_section(request.url.path),
                 actions=actions,
                 status_code=exc.status_code,
             )
@@ -1125,14 +1151,16 @@ def create_app(
         table_rows = []
         for (_, identifier), record in window:
             path = _advisory_token(identifier)
-            tag = record.get("tag")
-            outcome = record.get("outcome", "")
+            tag = _field(record.get("tag"))
+            outcome = _field(record.get("outcome"))
+            source = _field(record.get("source"))
+            title = _field(record.get("title"))
             tone = {"delivered": " dot-ok", "dropped": " dot-bad"}.get(outcome, "")
             table_rows.append(
                 f"<tr><td><a href='/advisories/{esc(path)}'>{esc(identifier)}</a></td>"
                 f"<td>{_badge(tag, tag) if tag else "<span class='muted'>—</span>"}</td>"
-                f"<td>{esc(record.get('source')) if record.get('source') else '—'}</td>"
-                f"<td>{_short(record.get('title')) if record.get('title') else '—'}</td>"
+                f"<td>{esc(source) if source else '—'}</td>"
+                f"<td>{_short(title) if title else '—'}</td>"
                 f"<td><span class='dot{tone}'></span>{esc(outcome)}</td>"
                 f"<td class='muted nowrap'>{esc(_when(record.get('at')))}</td></tr>"
             )
@@ -1207,10 +1235,10 @@ def create_app(
             shown = ""
             if isinstance(identities, list):
                 shown = ", ".join(value for value in identities if isinstance(value, str))
-            tag = entry.get("tag")
+            tag = _field(entry.get("tag"))
             rows.append(
                 f"<tr><td>{_badge(tag, tag) if tag else '—'}</td>"
-                f"<td>{esc(entry.get('title', ''))}</td><td class='muted'>{esc(shown[:80])}</td>"
+                f"<td>{esc(_field(entry.get('title')))}</td><td class='muted'>{esc(shown[:80])}</td>"
                 f"<td><div class='row-actions'>"
                 f"<form method='post' action='/parked/{index}/release'>{csrf}"
                 f"<input type='hidden' name='token' value='{esc(token)}'>"
@@ -1258,6 +1286,8 @@ def create_app(
                 "Busy",
                 "<p>A pass holds the state lock, so the queue was not changed. Try again shortly.</p>"
                 "<p><a href='/parked'>Back to the parked queue</a></p>",
+                active="/parked",
+                actions=sign_out_form(request),
                 status_code=409,
             )
         if not changed:
@@ -1335,7 +1365,7 @@ def create_app(
         canonical = json.dumps(document, sort_keys=True, separators=(",", ":"), default=str)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    def stale_form(form: dict, document: dict):
+    def stale_form(request: Request, form: dict, document: dict):
         """Refuse a form rendered against a different configuration.
 
         A second tab would rewrite the whole section from its own rows: the fingerprint it carries covers both
@@ -1347,6 +1377,8 @@ def create_app(
             "Not saved",
             "<p>The configuration changed since this page was loaded. Reload "
             "<a href='/config'>the configuration page</a> and make the change again.</p>",
+            active="/config",
+            actions=sign_out_form(request),
             status_code=409,
         )
 
@@ -1501,7 +1533,7 @@ def create_app(
             "enabled notifiers may be selected.</p>"
         )
 
-    def commit_overlay(overlay: dict):
+    def commit_overlay(request: Request, overlay: dict):
         """Validate, build, save and apply one overlay; nothing is written when any step refuses.
 
         Building the plugins here is what makes a saved overlay safe: it is the same build the next
@@ -1509,7 +1541,13 @@ def create_app(
         configuration and the file on disk are still untouched.
         """
         if runtime.config_path is None or runtime.overlay_path is None:
-            return page("Not saved", "<p>This instance has no configuration file to update.</p>", status_code=400)
+            return page(
+                "Not saved",
+                "<p>This instance has no configuration file to update.</p>",
+                active="/config",
+                actions=sign_out_form(request),
+                status_code=400,
+            )
         values = list(secret_values(runtime.cfg))
         candidate = None
         try:
@@ -1523,12 +1561,20 @@ def create_app(
             return page(
                 "Not saved",
                 f"<p>{message}</p><p>The live configuration is unchanged and nothing was written.</p>",
+                active="/config",
+                actions=sign_out_form(request),
                 status_code=400,
             )
         try:
             stored = save_settings(runtime.overlay_path, overlay, now=int(clock()))
         except ConfigError as exc:
-            return page("Not saved", f"<p>{esc(pipeline.redact(str(exc), values))}</p>", status_code=400)
+            return page(
+                "Not saved",
+                f"<p>{esc(pipeline.redact(str(exc), values))}</p>",
+                active="/config",
+                actions=sign_out_form(request),
+                status_code=400,
+            )
         try:
             runtime.reload(blocking=False)
         except LockBusy:
@@ -1549,7 +1595,7 @@ def create_app(
         with SETTINGS_LOCK:
             overlay, revision = saved_overlay()
             base, _ = form_document(overlay)
-            stale = stale_form(form, base)
+            stale = stale_form(request, form, base)
             if stale is not None:
                 return stale
             poll = first(form, "poll_interval").strip()
@@ -1560,7 +1606,7 @@ def create_app(
             overlay["hidden_source_hosts"] = [
                 line.strip() for line in first(form, "hidden_source_hosts").splitlines() if line.strip()
             ]
-            return commit_overlay(overlay)
+            return commit_overlay(request, overlay)
 
     @app.post("/config/sources", dependencies=[Depends(require_csrf)])
     def save_sources_form(request: Request):
@@ -1570,7 +1616,7 @@ def create_app(
         with SETTINGS_LOCK:
             overlay, revision = saved_overlay()
             base, _ = form_document(overlay)
-            stale = stale_form(form, base)
+            stale = stale_form(request, form, base)
             if stale is not None:
                 return stale
             changes = {}
@@ -1583,7 +1629,7 @@ def create_app(
                     "tag": first(form, f"tag:{identifier}").strip(),
                 }
             overlay["sources"] = changes
-            return commit_overlay(overlay)
+            return commit_overlay(request, overlay)
 
     @app.post("/config/notifiers", dependencies=[Depends(require_csrf)])
     def save_notifiers_form(request: Request):
@@ -1593,12 +1639,12 @@ def create_app(
         with SETTINGS_LOCK:
             overlay, revision = saved_overlay()
             base, _ = form_document(overlay)
-            stale = stale_form(form, base)
+            stale = stale_form(request, form, base)
             if stale is not None:
                 return stale
-            return _save_notifiers(overlay, base, form)
+            return _save_notifiers(request, overlay, base, form)
 
-    def _save_notifiers(overlay: dict, base: dict, form: dict):
+    def _save_notifiers(request: Request, overlay: dict, base: dict, form: dict):
         entries = []
         for entry in base.get("notifiers") or []:
             if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
@@ -1626,6 +1672,8 @@ def create_app(
                     "Not saved",
                     f"<p>A {esc(kind)} notifier needs more than one reference; this form collects one. "
                     "Add it by editing the YAML. A secret stays in the environment and is only referenced.</p>",
+                    active="/config",
+                    actions=sign_out_form(request),
                     status_code=400,
                 )
             new = {"id": identifier, "type": kind}
@@ -1635,6 +1683,8 @@ def create_app(
                         "Not saved",
                         f"<p>A {esc(kind)} needs a reference here: enter ${{NAME}} or ${{NAME_FILE}}. "
                         "The secret itself stays in the environment.</p>",
+                        active="/config",
+                        actions=sign_out_form(request),
                         status_code=400,
                     )
                 new[secret_key] = reference
@@ -1644,7 +1694,7 @@ def create_app(
                     new[key] = value
             entries.append(new)
         overlay["notifiers"] = entries
-        return commit_overlay(overlay)
+        return commit_overlay(request, overlay)
 
     @app.post("/config/routes", dependencies=[Depends(require_csrf)])
     def save_routes_form(request: Request):
@@ -1654,12 +1704,12 @@ def create_app(
         with SETTINGS_LOCK:
             overlay, revision = saved_overlay()
             base, _ = form_document(overlay)
-            stale = stale_form(form, base)
+            stale = stale_form(request, form, base)
             if stale is not None:
                 return stale
-            return _save_routes(overlay, base, form)
+            return _save_routes(request, overlay, base, form)
 
-    def _save_routes(overlay: dict, base: dict, form: dict):
+    def _save_routes(request: Request, overlay: dict, base: dict, form: dict):
         """Replace the overlay's ``routes``/``default`` with the form's rows, or remove them when empty.
 
         An empty form means "use the YAML": the overlay keeps no routes block, so the rules written by hand
@@ -1687,6 +1737,8 @@ def create_app(
                 "<p>A default selection needs at least one rule: with no rules every enabled notifier "
                 "receives every message.</p><p>Add a rule, or leave the default empty to keep the YAML "
                 "routing.</p>",
+                active="/config",
+                actions=sign_out_form(request),
                 status_code=400,
             )
         if routes:
@@ -1698,14 +1750,20 @@ def create_app(
         else:
             overlay.pop("routes", None)
             overlay.pop("default", None)
-        return commit_overlay(overlay)
+        return commit_overlay(request, overlay)
 
     @app.post("/reload", dependencies=[Depends(require_csrf)])
     def reload_configuration(request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         if runtime.config_path is None:
-            return page("Not reloaded", "<p>This instance has no configuration file to reload.</p>", status_code=400)
+            return page(
+                "Not reloaded",
+                "<p>This instance has no configuration file to reload.</p>",
+                active="/config",
+                actions=sign_out_form(request),
+                status_code=400,
+            )
         try:
             runtime.reload(blocking=False)
         except LockBusy:
@@ -1713,6 +1771,8 @@ def create_app(
                 "Reload refused",
                 "<p>A pass or another reload is running, so the configuration was not reloaded; try again shortly.</p>"
                 '<p><a href="/config">Back to configuration</a></p>',
+                active="/config",
+                actions=sign_out_form(request),
                 status_code=409,
             )
         except (ConfigError, SourceError) as exc:
@@ -1720,6 +1780,8 @@ def create_app(
             return page(
                 "Reload refused",
                 f"<p>{message}</p><p>The running configuration is unchanged.</p>",
+                active="/config",
+                actions=sign_out_form(request),
                 status_code=400,
             )
         return RedirectResponse("/config", status_code=303)

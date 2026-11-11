@@ -1149,15 +1149,44 @@ def test_the_overlay_routes_replace_the_yaml_block_and_one_validator_checks_memb
         )
 
 
-def test_every_page_carries_the_same_shell(tmp_path):
-    """One shell on every page: a language, a viewport, one title, one h1, one marked section.
+#: The exact policy every page carries. Pinned here so a change to it is a deliberate change, not drift.
+EXPECTED_CSP = (
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+)
 
-    A visual change cannot be unit-tested, but the contract the stylesheet and the navigation depend on can:
-    a page added later must not quietly lose its landmarks, its per-page title or its current-section mark.
+
+def _assert_shell(response, *, active: str, status: int) -> None:
+    """The contract every page shares, whatever its status code, body or session."""
+    assert response.status_code == status
+    assert response.headers["content-security-policy"] == EXPECTED_CSP
+    text = response.text
+    assert "<html lang='en'>" in text
+    assert "<meta name='viewport'" in text
+    assert text.count("<title>") == 1 and text.count("</title>") == 1
+    title = re.search(r"<title>(.*?)</title>", text)
+    assert title is not None and title.group(1).endswith(" · advisory-radar")
+    assert text.count("<h1>") == 1 and text.count("</h1>") == 1
+    assert text.count("<main") == 1 and "<main id='main'>" in text
+    assert "<script" not in text and " onclick=" not in text and " style=" not in text
+    # The stylesheet names the selector too, so the attribute is counted with its leading space.
+    assert text.count(" aria-current='page'") == (1 if active else 0)
+    if active:
+        assert f"<a href='{active}' aria-current='page'>" in text
+
+
+def test_every_page_carries_the_same_shell(tmp_path):
+    """One shell on every page: a language, a viewport, one title, one h1, one current section.
+
+    A rendered page cannot be unit-tested for its look, but the contract the stylesheet, the navigation and
+    the security headers depend on can: an error page and a signed-out page included, so a page added later
+    cannot quietly lose its landmarks, its per-page title or its session chrome.
     """
-    client, token, _ = make_client(tmp_path)
-    assert sign_in(client, token)
-    unknown = advisory_token("CVE-2026-404")
+    state = core.new_state()
+    state["seen"]["CVE-2026-1"] = {"at": NOW, "outcome": "delivered", "tag": "critical", "title": "Seen"}
+    client, token, _ = make_client(tmp_path, state=state)
+    csrf = sign_in(client, token)
+    assert csrf
+    identifier = advisory_token("CVE-2026-1")
     pages = {
         "/": "/",
         "/alerts": "/alerts",
@@ -1165,24 +1194,57 @@ def test_every_page_carries_the_same_shell(tmp_path):
         "/config": "/config",
         "/sources": "/sources",
         "/runs": "/runs",
-        f"/advisories/{unknown}": "",
+        f"/advisories/{identifier}": "/alerts",
     }
     for path, active in pages.items():
         response = client.get(path, headers={"accept": "text/html"})
-        assert response.status_code in (200, 404), path
-        text = response.text
-        assert "<html lang='en'>" in text, path
-        assert "<meta name='viewport'" in text, path
-        assert text.count("<h1>") == 1 and text.count("</h1>") == 1, f"{path} must render exactly one heading"
-        assert "<main id='main'>" in text, path
-        title = re.search(r"<title>(.*?)</title>", text)
-        assert title is not None and title.group(1).endswith(" · advisory-radar"), path
-        assert "<script" not in text and " onclick=" not in text and " style=" not in text, path
-        # The stylesheet names the selector too, so the attribute is counted with its leading space.
-        assert text.count(" aria-current='page'") == (1 if active else 0), path
-        if active:
-            assert f"<a href='{active}' aria-current='page'>" in text, path
-    login = client.get("/login")
-    assert "<html lang='en'>" in login.text
-    assert " aria-current='page'" not in login.text
-    assert "<nav class='links'" not in login.text, "a signed-out page shows the brand alone"
+        _assert_shell(response, active=active, status=200)
+        assert 'action="/logout"' in response.text, f"{path} must offer sign out"
+
+    # An unknown identifier is a 404 of the section it was reached from, chrome included.
+    missing = client.get(f"/advisories/{advisory_token('CVE-2026-404')}", headers={"accept": "text/html"})
+    _assert_shell(missing, active="/alerts", status=404)
+    assert 'action="/logout"' in missing.text
+
+    # A refused save is an authenticated configuration page, not a bare error.
+    stale = client.post(
+        "/config/settings",
+        data={"csrf": csrf, "fingerprint": "0" * 64},
+        headers={"accept": "text/html"},
+    )
+    _assert_shell(stale, active="/config", status=409)
+    assert 'action="/logout"' in stale.text
+
+    # Signed out: the brand alone, and the login page still signs in.
+    client.cookies.clear()
+    login = client.get("/login", headers={"accept": "text/html"})
+    _assert_shell(login, active="", status=200)
+    assert "<nav class='links'" not in login.text
+    wrong = client.post("/login", data={"token": "nope"}, headers={"accept": "text/html"})
+    _assert_shell(wrong, active="", status=200)
+    assert "Wrong token" in wrong.text
+
+
+def test_a_stored_value_is_data_not_a_lookup_key(tmp_path):
+    """A malformed outcome or tag is shown as the absence it is; it used to raise from the colour map.
+
+    The state loader validates the document's shape, not each field's type, so a hand-edited record can hold
+    a list where a string belongs. Nothing on the page may hash that value or render its Python repr.
+    """
+    state = core.new_state()
+    state["seen"]["CVE-2026-1"] = {
+        "at": NOW,
+        "outcome": ["delivered"],
+        "tag": ["critical"],
+        "title": {"unexpected": "mapping"},
+        "levels": {"CVE-2026-1": ["critical"]},
+    }
+    state["parked"] = [{"tag": ["critical"], "title": {"unexpected": "mapping"}, "ids": ["CVE-2026-2"]}]
+    save_state(tmp_path / "state.json", state)
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    for path in ("/alerts", "/parked", f"/advisories/{advisory_token('CVE-2026-1')}"):
+        response = client.get(path)
+        assert response.status_code == 200, path
+        for rendered in ("['delivered']", "['critical']", "{'unexpected'"):
+            assert rendered not in response.text, f"{path} must not render {rendered}"
