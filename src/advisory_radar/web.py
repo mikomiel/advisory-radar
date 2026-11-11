@@ -2480,11 +2480,12 @@ def create_app(
         raw_thresholds = raw_thresholds if isinstance(raw_thresholds, dict) else {}
 
         def threshold_text(key: str) -> str:
-            """The block as written: a ${NAME} reference stays a reference, a number prints without a trailing .0."""
-            value = raw_thresholds.get(key, getattr(cfg.thresholds, key))
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                return f"{value:g}"
-            return esc(value)
+            """The block as written, round-trip safe: a ${NAME} reference stays one, a number keeps every digit.
+
+            ``str`` of a float is what parses back to the same value -- a ``:g`` format would round
+            ``7.500001`` to ``7.5`` and saving another field would silently change this one.
+            """
+            return esc(raw_thresholds.get(key, getattr(cfg.thresholds, key)))
 
         hidden = document.get("hidden_source_hosts")
         hidden_text = "\n".join(str(host) for host in hidden) if isinstance(hidden, list) else ""

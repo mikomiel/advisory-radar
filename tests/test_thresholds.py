@@ -297,8 +297,23 @@ def test_a_stricter_threshold_records_the_downgrade():
     assert state["watch"][cve]["level"] == "critical", "a downgrade is not news either, and the record stays true"
 
 
-def test_evidence_after_a_re_baseline_still_escalates():
-    """A silent re-baseline must not swallow the KEV hit that arrives with the next evaluation."""
+def test_raising_the_floor_silently_rebaselines_a_suppressed_cve():
+    """The other flood: a lower floor must not turn every recorded-low CVE into a warning message."""
+    state = core.new_state()
+    cve = "CVE-2026-7005"
+    state["watch"][cve] = watch_entry(cve, level="suppressed", judged="suppressed", cvss=3.0)
+    intel = Facts(**{cve: facts(3.0)})
+
+    core.reevaluate(state, intel, frozenset(), True, NOW, "", thresholds=Thresholds(suppress_below_cvss=2.0))
+
+    assert state["pending"] == []
+    assert state["watch"][cve]["judged"] == "warning"
+    assert state["watch"][cve]["level"] == "suppressed", "the reader was told nothing, and that stays true"
+
+
+@pytest.mark.parametrize("evidence", ["kev", "ssvc"])
+def test_evidence_after_a_re_baseline_still_escalates(evidence):
+    """A silent re-baseline must not swallow the exploitation signal that arrives with the next evaluation."""
     state = core.new_state()
     cve = "CVE-2026-7004"
     state["watch"][cve] = watch_entry(cve, cvss=8.0)  # sent as a warning under the defaults
@@ -310,11 +325,21 @@ def test_evidence_after_a_re_baseline_still_escalates():
     assert state["watch"][cve]["judged"] == "critical"
     assert state["watch"][cve]["level"] == "warning"
 
-    # The next daily evaluation finds the CVE in KEV: that is evidence, and the reader has never had it.
-    core.reevaluate(state, remote, frozenset({cve}), True, NOW + core.REEVAL_INTERVAL, "", thresholds=looser)
-
+    # The next daily evaluation finds the evidence: the reader has never had it, so it must go out.
+    later = NOW + core.REEVAL_INTERVAL
+    if evidence == "kev":
+        found, kev = remote, frozenset({cve})
+    else:
+        found, kev = Facts(**{cve: facts(8.0, remote=True, ssvc="active")}), frozenset()
+    core.reevaluate(state, found, kev, True, later, "", thresholds=looser)
     queued = [entry for entry in state["pending"] if entry["kind"] == "escalation"]
     assert queued and queued[0]["cves"] == [cve] and queued[0]["tag"] == "critical"
+
+    # Once it is delivered, the same evidence is not a second escalation.
+    core._delivered(state, queued[0], later, "delivered", ("phone",))
+    state["pending"] = [entry for entry in state["pending"] if entry is not queued[0]]
+    core.reevaluate(state, found, kev, True, later + core.REEVAL_INTERVAL, "", thresholds=looser)
+    assert [entry for entry in state["pending"] if entry["kind"] == "escalation"] == []
 
 
 def test_a_kev_hit_still_escalates_across_a_threshold_change():
@@ -359,8 +384,30 @@ def test_the_thresholds_form_saves_them_and_applies_them(tmp_path):
     assert saved.status_code == 303
     assert runtime.cfg.thresholds == Thresholds(7.5, 0.25, 3.0), "with the lock free the save is live at once"
     page = client.get("/config").text
-    assert "value='7.5'" in page and "value='0.25'" in page and "value='3'" in page
+    assert "value='7.5'" in page and "value='0.25'" in page and "value='3.0'" in page
     assert "Risk thresholds" in page
+
+
+def test_saving_the_form_does_not_round_a_precise_threshold(tmp_path):
+    """The rendered value must be the value: a browser resubmits every field, including the untouched ones."""
+    body = "sources: []\nnotifiers: []\nthresholds:\n  critical_cvss: 7.500001\n"
+    client, _, runtime = make_client(tmp_path, body=body)
+    csrf, fingerprint = config_form(client)
+    page = client.get("/config").text
+    rendered = dict(re.findall(r"name='threshold:(\w+)' size='5'[^>]*value='([^']*)'", page))
+    assert rendered["critical_cvss"] == "7.500001", "the form must not round the number it was given"
+
+    saved = save_thresholds(
+        client,
+        csrf,
+        fingerprint,
+        critical_cvss=rendered["critical_cvss"],
+        critical_epss="0.2",
+        suppress_below_cvss=rendered["suppress_below_cvss"],
+    )
+
+    assert saved.status_code == 303
+    assert runtime.cfg.thresholds == Thresholds(7.500001, 0.2, 4.0)
 
 
 def test_an_empty_threshold_field_falls_back_to_the_yaml(tmp_path):
