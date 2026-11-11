@@ -1,11 +1,11 @@
 """Delivery planning: the digest and quiet-hours rules, as pure functions.
 
-A pass renders one queue entry per advisory (``core.classify_new``) and ``core.deliver`` posts each entry to
-the notifiers routing selects. This module decides what a pass sends, before any POST: whether the queued
-advisories travel as one digest, and whether a non-critical message waits in the queue until a local quiet
-window ends. It is pure on purpose -- it imports neither ``core`` nor ``pipeline``, reads no state and
-performs no I/O -- so the rules can be asserted with plain dicts and an epoch, and a scheduling decision can
-never hide inside the retry loop.
+A pass renders one queue entry per advisory (``core.classify_new``), and ``core.deliver`` posts each entry to
+the notifiers routing selects -- or one digest per routing group when digesting is enabled. This module
+decides what a pass sends, before any POST: whether the queued advisories travel as one digest, and whether
+a non-critical message waits in the queue until a local quiet window ends. It is pure on purpose -- it imports
+neither ``core`` nor ``pipeline``, reads no state and performs no I/O -- so the rules can be asserted with
+plain dicts and an epoch, and a scheduling decision can never hide inside the retry loop.
 
 Nothing here invents a delivery state. A held entry is simply absent from every batch, so ``core.deliver``
 leaves it in ``state["pending"]`` exactly as it leaves a message whose notifiers all failed. A digest message
@@ -250,9 +250,9 @@ def plan(
     The function is deterministic and order-preserving: the same entries, epoch and options always produce
     the same batches, and a batch lists its entries in the order it received them. It reads only its
     arguments, so the caller owns the clock and the state: ``core.deliver`` implements the result, and a held
-    entry simply remains in ``state["pending"]``. ``entries`` is the slice this pass may deliver (``core``
-    caps delivery at ``DELIVERY_CAP``), not the whole pending list: the rest waits for a later pass, and
-    digesting it here would send more advisories than a normal pass is allowed to.
+    entry simply remains in ``state["pending"]``. ``entries`` is one routing group from the pass's
+    ``DELIVERY_CAP`` slice, not the whole pending list: the rest waits for a later pass, and digesting beyond
+    the slice would post more advisories than a normal pass is allowed to.
     """
     sendable = [entry for entry in entries if not is_held(epoch, entry, quiet, tz)]
     if not sendable:

@@ -68,6 +68,7 @@ notifiers:
   # - id: hooks
   #   type: webhook
   #   url: https://hooks.example.com/advisory-radar
+  #   secret: ${WEBHOOK_SIGNING_SECRET}   # signs each request (X-ADR-Timestamp, X-ADR-Signature)
   # - id: matrix
   #   type: matrix_webhook
   #   url: ${MATRIX_HOOKSHOT_WEBHOOK}
@@ -84,6 +85,14 @@ notifiers:
   #   to: admin@example.com
   #   username: radar@example.com
   #   password: ${SMTP_PASSWORD}
+
+# Delivery policy. Both keys are editable on /config without a restart.
+# `digest: true` sends one message per routing group instead of one per advisory: the title states
+# the count, the body lists one advisory per line, and the message is capped so every channel accepts
+# it. `quiet_hours` holds non-critical messages until the local-time window ends (it may wrap
+# midnight); a critical message is never held. An empty value means off.
+# digest: true
+# quiet_hours: 22:00-07:00
 
 # Optional routing: rules are checked in order and the first match wins, so the most
 # specific rule goes first. Every key present in one rule must match; a numeric predicate

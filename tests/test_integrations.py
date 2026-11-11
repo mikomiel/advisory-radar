@@ -600,3 +600,34 @@ def test_the_webhook_builder_carries_the_secret():
     notifier = build_notifier({"id": "w", "type": "webhook", "url": "https://hooks.example/x", "secret": "s3cret"}, {})
     assert isinstance(notifier, WebhookNotifier)
     assert notifier.secret == "s3cret"
+
+
+def test_a_webhook_signing_secret_reaches_the_built_notifier(tmp_path):
+    """The YAML key, the builder and the signature are one path.
+
+    A secret that never reaches the notifier would sign nothing, so the test goes through the real builder.
+    """
+    from advisory_radar.config import load_config
+    from advisory_radar.pipeline import build_plugins
+
+    path = tmp_path / "c.yml"
+    path.write_text(
+        "sources: []\n"
+        "notifiers:\n"
+        "  - id: hooks\n"
+        "    type: webhook\n"
+        "    url: ${HOOK}\n"
+        "    secret: ${SIGNING}\n"
+        f"state_path: {tmp_path}/state.json\n"
+    )
+    environment = {"HOOK": "https://hooks.example.net/x", "SIGNING": "s3cret-value"}
+    _, notifiers = build_plugins(load_config(path, environment), environment)
+    notifier = notifiers[0]
+    assert notifier.secret == "s3cret-value"
+    calls: list = []
+    assert notifier.send(webhook_entry(), recording_http(calls)) == 204
+    _, url, headers, body = calls[0]
+    assert url == "https://hooks.example.net/x"
+    timestamp = headers["X-ADR-Timestamp"].encode("ascii")
+    expected = "sha256=" + hmac.new(b"s3cret-value", timestamp + b"." + body, hashlib.sha256).hexdigest()
+    assert hmac.compare_digest(headers["X-ADR-Signature"], expected)

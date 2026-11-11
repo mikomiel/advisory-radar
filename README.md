@@ -181,6 +181,56 @@ rules; a partly filled row is saved as written and the validator reports what is
 notifier membership is judged once, after the merge, so a rule may select a notifier the
 overlay itself adds.
 
+### Delivery: digests, quiet hours and signed webhooks
+
+Two delivery policies live in `config.yml` and on `/config`, and neither changes what a message
+contains while it is off. A digest is one message per routing group: entries are grouped by the
+notifiers `routing.select` chooses, because two advisories that go to different channels cannot
+share a message. The title states how many advisories it covers, the body lists one line per
+advisory (its title, plus up to three short identifiers), and the digest is tagged `critical`
+when any covered advisory is critical. It lists at most 20 advisories and never exceeds the
+character budget one Discord message accepts; anything beyond either cap is counted in a final
+`(+N more not listed)` line rather than dropped. One POST covers the whole group, so a failed
+attempt counts once against every covered advisory, and delivery records each of them
+separately.
+
+```yaml
+digest: true                 # one message per routing group instead of one per advisory
+quiet_hours: 22:00-07:00     # local time, wraps midnight; empty or absent means off
+```
+
+`quiet_hours` holds **non-critical** messages until the window ends: they stay in `pending`,
+are not counted as failed attempts, and go out on the first pass after the window. A critical
+message is never held. The window is half-open, so `07:00` is already outside
+`22:00-07:00`; `00:00-00:00` is an empty window. It is read in the process's local timezone, so
+set `TZ` on the container if the service should not run in UTC. Both keys are overlay-writable,
+so the Settings form on `/config` changes them without a restart.
+
+A generic `webhook` notifier may carry a signing secret, referenced from the environment:
+
+```yaml
+notifiers:
+  - id: hooks
+    type: webhook
+    url: ${WEBHOOK_URL}
+    secret: ${WEBHOOK_SIGNING_SECRET}
+```
+
+With a secret set, every request carries two headers:
+
+| Header | Value |
+|---|---|
+| `X-ADR-Timestamp` | the Unix time the request was signed, in decimal seconds |
+| `X-ADR-Signature` | `sha256=` followed by the lowercase hex HMAC-SHA256 of `timestamp + "." + body`, keyed with the secret |
+
+`body` is the exact byte string posted — the JSON is serialised once — never a re-serialisation
+of it. A receiver verifies a request by parsing the timestamp, refusing one more than 300
+seconds from its own clock, reading the raw body bytes, recomputing
+`hmac.new(secret.encode("utf-8"), timestamp.encode("ascii") + b"." + body, hashlib.sha256).hexdigest()`
+and comparing `"sha256=" + digest` with the header using `hmac.compare_digest`; a plain `==`
+would leak timing information. With no secret, no signature headers are sent and the request is
+byte-for-byte the one earlier versions sent.
+
 ### Advisories, filters and the queue
 
 `/alerts` filters the seen advisories by severity tag, recorded source, outcome, a
@@ -205,16 +255,17 @@ paging.
 
 ### Settings without a restart
 
-The `/config` page changes eight things without editing the YAML or restarting the
+The `/config` page changes ten things without editing the YAML or restarting the
 container: `notifiers`, each source's `enabled` flag, watch `tag`, threshold block and poll
 `interval`, the sources the overlay itself adds, `poll_interval`, `hidden_source_hosts`, the routing
-`routes`/`default` block, and the risk thresholds. The notifier form manages
-the whole list — that is how a channel
-is added, edited or disabled — and while the overlay holds a notifier list, that list
-replaces the YAML's membership and ordinary fields; only a notifier's `headers` stay in
-the YAML and are carried over by id, because the overlay may not store a mapping that can
-carry a credential. A notifier added to the YAML while the overlay holds a list is not
-used until that section is removed from the overlay. Sources work the other way round:
+`routes`/`default` block, the risk thresholds, the delivery `digest` switch and its `quiet_hours`
+window. The notifier form manages the whole list — that is how a channel is added, edited or
+disabled — and while the overlay holds a notifier list, that list
+replaces the YAML's membership and ordinary fields; a notifier's `headers` stay in the YAML
+and a `secret` may stay there too, both carried over by id — the overlay may not store a
+header mapping, and it stores a signing secret only as a reference. A notifier added to the
+YAML while the overlay holds a list is not used until that section is removed from the
+overlay. Sources work the other way round:
 the YAML owns the list and the overlay may only **add** to it, so a source added on
 `/config` needs no edit to a read-only config mount while a YAML edit never loses to an
 older overlay. The two may not share an id — the overlay refuses one the YAML already
@@ -231,9 +282,9 @@ or `SIGHUP`), not a restart — `web.host`, `web.port`, `state_path` and `storag
 process starts, and a change to one of them needs a restart.
 
 Secrets stay in the environment. The overlay stores a notifier's `url`, `key`,
-`password` or `token` only as a `${NAME}` or `${NAME_FILE}` reference, refuses a literal
-value, and does not accept `headers` at all. Changing an environment variable still
-needs a restart, because the process reads the environment when it starts.
+`password`, `token` or signing `secret` only as a `${NAME}` or `${NAME_FILE}` reference,
+refuses a literal value, and does not accept `headers` at all. Changing an environment
+variable still needs a restart, because the process reads the environment when it starts.
 
 A reload builds the new configuration and its plugins before it swaps them in under the
 state lock. A shared configuration value goes through the same validator the YAML does,
@@ -288,7 +339,9 @@ turns critical, and never re-sends what you already received.
 
 - Configurable source plugins: RSS/Atom/JSON Feed, FreshRSS (GReader API), changedetection.io (API poll + inbound webhook), generic inbound webhook; vendor enrichment for Debian DSA, php.net ChangeLog, Node.js security blog, Adobe APSB bulletins
 - Enrichment plugins: CVE.org, NVD, FIRST EPSS, CISA KEV, OSV, Debian security tracker
-- Notifier plugins: Discord webhook, Matrix (Hookshot), ntfy, Gotify, Apprise, generic webhook, SMTP
+- Notifier plugins: Discord webhook, Matrix (Hookshot), ntfy, Gotify, Apprise, generic webhook
+  (optionally signed), SMTP; digests per routing group and local quiet hours for non-critical
+  messages
 - Severity decision per CVE with re-evaluation window and one escalation per level; the
   thresholds are configurable on `/config` globally or per source, and `/thresholds` previews
   what one advisory would be judged as and where its message would go

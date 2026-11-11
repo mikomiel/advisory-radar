@@ -1,7 +1,7 @@
-"""Delivery planning tests: the digest, quiet hours and the plan that combines them.
+"""Delivery tests: the pure planning rules and the delivery step that consumes them.
 
-The whole module under test is pure, so every test here is plain dicts and an explicit epoch: no state file,
-no notifier and no HTTP.
+The planning half of the module under test is pure, so those tests are plain dicts and an explicit epoch: no
+state file, no notifier and no HTTP. The delivery tests below drive ``core.deliver`` with recording notifiers.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import datetime
 
 import pytest
 
-from advisory_radar import delivery
+from advisory_radar import core, delivery
 
 
 def entry(
@@ -268,3 +268,141 @@ class TestPlan:
         second = delivery.plan(entries, at(12), digest=True)
         assert first == second
         assert first[0].message == delivery.digest_message(entries)
+
+
+# --- the delivery step -------------------------------------------------------------------------
+
+
+NOW = 1_792_600_000
+
+
+class Recorder:
+    """Accepts or refuses everything and remembers the messages it was given, with no network."""
+
+    def __init__(self, notifier_id: str = "ops", status: int = 200) -> None:
+        self.id = notifier_id
+        self.status = status
+        self.sent: list[dict] = []
+
+    def send(self, entry: dict, http) -> int:
+        self.sent.append(entry)
+        return self.status
+
+
+def no_http(*args):
+    return 404, {}, b""
+
+
+def queued(cve: str, tag: str = "warning", source_id: str = "vendor") -> dict:
+    """A queue entry shaped like ``core.classify_new`` writes it, complete enough for ``_delivered``."""
+    return {
+        "kind": "new",
+        "tag": tag,
+        "title": f"{tag.upper()}: {cve} in widget",
+        "body": f"\n- **IDs:** {cve}",
+        "ids": [cve],
+        "cves": [cve],
+        "levels": {cve: tag},
+        "kev_only": [],
+        "scores": {cve: 7.5},
+        "thresholds": [9.0, 0.10, 4.0],
+        "source": "Vendor",
+        "link": f"https://vendor.example/{cve}",
+        "source_id": source_id,
+    }
+
+
+def local_at(hour: int, minute: int = 0) -> int:
+    """An epoch whose *local* wall clock is this time: the quiet window is local-time by definition."""
+    return int(datetime.datetime(2026, 11, 11, hour, minute).timestamp())
+
+
+def test_the_features_off_send_one_message_per_entry():
+    """The default path is the message-by-message loop, so an untouched installation is unchanged."""
+    state = core.new_state()
+    state["pending"] = [queued("CVE-2026-1"), queued("CVE-2026-2", "critical"), queued("CVE-2026-3")]
+    ops = Recorder()
+    assert core.deliver(state, [ops], no_http, NOW) is True
+    assert [message["kind"] for message in ops.sent] == ["new", "new", "new"]
+    assert state["pending"] == []
+
+
+def test_three_queued_advisories_become_one_digest_post():
+    state = core.new_state()
+    state["pending"] = [queued("CVE-2026-1"), queued("CVE-2026-2", "critical"), queued("CVE-2026-3")]
+    ops = Recorder()
+    assert core.deliver(state, [ops], no_http, NOW, digest=True) is True
+    assert len(ops.sent) == 1, "one POST for the whole routing group"
+    message = ops.sent[0]
+    assert message["kind"] == "digest"
+    assert message["tag"] == "critical"
+    assert message["title"] == "CRITICAL: digest of 3 advisories"
+    assert message["ids"] == ["CVE-2026-1", "CVE-2026-2", "CVE-2026-3"]
+    assert state["pending"] == []
+    assert set(state["seen"]) == {"CVE-2026-1", "CVE-2026-2", "CVE-2026-3"}
+    assert all(state["seen"][cve]["outcome"] == "delivered" for cve in state["seen"])
+    assert len(state["deliveries"]) == 3, "every covered entry keeps its own delivery record"
+    assert all(snapshot["delivered_to"] == ["ops"] for snapshot in state["deliveries"].values())
+
+
+def test_a_digest_never_mixes_two_routing_groups():
+    state = core.new_state()
+    state["pending"] = [queued("CVE-2026-1", source_id="one"), queued("CVE-2026-2", source_id="two")]
+    routes = [
+        {"match": {"source": "one"}, "notifiers": ["ops"]},
+        {"match": {"source": "two"}, "notifiers": ["phone"]},
+    ]
+    ops, phone = Recorder("ops"), Recorder("phone")
+    assert core.deliver(state, [ops, phone], no_http, NOW, digest=True, routes=routes) is True
+    assert len(ops.sent) == 1 and len(phone.sent) == 1, "two groups are two POSTs"
+    assert ops.sent[0]["ids"] == ["CVE-2026-1"]
+    assert phone.sent[0]["ids"] == ["CVE-2026-2"]
+    assert "CVE-2026-2" not in ops.sent[0]["body"], "an advisory never travels to a channel it did not route to"
+    assert state["pending"] == []
+
+
+def test_quiet_hours_hold_a_warning_while_a_critical_goes_out_then_release_it():
+    window = delivery.parse_quiet_hours("22:00-07:00")
+    state = core.new_state()
+    state["pending"] = [queued("CVE-2026-1"), queued("CVE-2026-2", "critical")]
+    ops = Recorder()
+    assert core.deliver(state, [ops], no_http, local_at(23), quiet_hours=window) is True
+    assert [message["tag"] for message in ops.sent] == ["critical"], "the critical is never held"
+    assert [entry["ids"][0] for entry in state["pending"]] == ["CVE-2026-1"]
+    held = state["pending"][0]
+    assert held.get("attempts", 0) == 0, "a held message is not a failed attempt"
+    assert "first_attempt_at" not in held, "a held message was never attempted"
+    assert core.deliver(state, [ops], no_http, local_at(12), quiet_hours=window) is True
+    assert len(ops.sent) == 2 and ops.sent[1]["tag"] == "warning"
+    assert state["pending"] == []
+
+
+def test_quiet_hours_holding_everything_is_not_a_failed_pass():
+    window = delivery.parse_quiet_hours("22:00-07:00")
+    state = core.new_state()
+    state["pending"] = [queued("CVE-2026-1"), queued("CVE-2026-2")]
+    ops = Recorder()
+    assert core.deliver(state, [ops], no_http, local_at(23), quiet_hours=window) is True
+    assert ops.sent == [] and len(state["pending"]) == 2
+    assert all("attempts" not in entry for entry in state["pending"])
+
+
+def test_a_failed_digest_marks_one_attempt_per_covered_entry_and_retries_only_the_failing_channel():
+    state = core.new_state()
+    state["pending"] = [queued("CVE-2026-1"), queued("CVE-2026-2")]
+    good, bad = Recorder("good"), Recorder("bad", status=500)
+    assert core.deliver(state, [good, bad], no_http, NOW, digest=True) is False
+    assert [entry["attempts"] for entry in state["pending"]] == [1, 1], "one POST is one attempt for each entry"
+    assert [entry["last_status"] for entry in state["pending"]] == [500, 500]
+    assert [entry["sent_to"] for entry in state["pending"]] == [["good"], ["good"]]
+    assert len(good.sent) == 1 and len(bad.sent) == 1, "the digest was posted once, not once per advisory"
+    assert good.sent[0]["ids"] == ["CVE-2026-1", "CVE-2026-2"]
+
+    assert core.deliver(state, [good, bad], no_http, NOW + 1, digest=True) is False
+    assert len(good.sent) == 1, "a channel that accepted the digest is not sent it twice"
+    assert len(bad.sent) == 2
+    assert [entry["attempts"] for entry in state["pending"]] == [2, 2]
+
+    # The third failed attempt parks every covered entry, and the pass then continues rather than stopping.
+    assert core.deliver(state, [good, bad], no_http, NOW + 2, digest=True) is True
+    assert state["pending"] == [] and len(state["parked"]) == 2
