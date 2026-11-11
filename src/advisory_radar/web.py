@@ -16,6 +16,7 @@ import hmac
 import html
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -30,7 +31,15 @@ from itsdangerous import BadSignature, URLSafeSerializer
 
 from . import __version__, pipeline
 from .catalogue import SOURCE_SPECS
-from .config import Config, ConfigError, config_from_document, expand_entry, load_document, secret_values
+from .config import (
+    THRESHOLD_KEYS,
+    Config,
+    ConfigError,
+    config_from_document,
+    expand_entry,
+    load_document,
+    secret_values,
+)
 from .http import Http, private_destination, resolve_host, urllib_http
 from .notifiers import NOTIFIER_BUILDERS
 from .runtime import Runtime
@@ -590,6 +599,9 @@ def _section(path: str) -> str:
     if path == "/run":
         return "/"
     if path == "/reload":
+        return "/config"
+    if path.startswith("/thresholds"):
+        # The preview is reached from the configuration page and changes nothing, so it belongs to that section.
         return "/config"
     for known, _ in _NAV:
         if known != "/" and (path == known or path.startswith(f"{known}/")):
@@ -2067,6 +2079,42 @@ def create_app(
             ]
             return commit_overlay(request, overlay)
 
+    @app.post("/config/thresholds", dependencies=[Depends(require_csrf)])
+    def save_thresholds_form(request: Request):
+        """Store the risk thresholds the form carries; an empty field falls back to the YAML value.
+
+        A value that parses as a number is stored as one; anything else is stored as typed and judged by the
+        merged validator like every other overlay value, so a typo is refused with ``thresholds.critical_cvss
+        must be a number`` and nothing is written.
+        """
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        form = form_body(request)
+        with SETTINGS_LOCK:
+            overlay, revision = saved_overlay()
+            base, _ = form_document(overlay)
+            stale = stale_form(request, form, base)
+            if stale is not None:
+                return stale
+            changes = {}
+            for key in THRESHOLD_KEYS:
+                value = first(form, f"threshold:{key}").strip()
+                if not value:
+                    continue
+                try:
+                    changes[key] = float(value)
+                except ValueError:
+                    # Stored as typed, so the merged validator refuses it with the message the YAML would give
+                    # (``thresholds.critical_cvss must be a number``) and nothing is written.
+                    changes[key] = value
+            if changes:
+                # The block is rebuilt whole, so a field cleared here stops overriding the YAML for that key
+                # instead of keeping the previous save.
+                overlay["thresholds"] = changes
+            else:
+                overlay.pop("thresholds", None)
+            return commit_overlay(request, overlay)
+
     @app.post("/config/sources", dependencies=[Depends(require_csrf)])
     def save_sources_form(request: Request):
         if not require_auth(request):
@@ -2428,6 +2476,16 @@ def create_app(
         status_tone = "ok" if live_now and saved_revision else ("warning" if saved_revision else "neutral")
         poll_text = document.get("poll_interval")
         poll_text = poll_text if isinstance(poll_text, str) else f"{cfg.poll_interval_seconds}s"
+        raw_thresholds = document.get("thresholds")
+        raw_thresholds = raw_thresholds if isinstance(raw_thresholds, dict) else {}
+
+        def threshold_text(key: str) -> str:
+            """The block as written: a ${NAME} reference stays a reference, a number prints without a trailing .0."""
+            value = raw_thresholds.get(key, getattr(cfg.thresholds, key))
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return f"{value:g}"
+            return esc(value)
+
         hidden = document.get("hidden_source_hosts")
         hidden_text = "\n".join(str(host) for host in hidden) if isinstance(hidden, list) else ""
         type_options = "".join(
@@ -2454,7 +2512,28 @@ def create_app(
             "</div>"
             "<p class='muted small'>Poll interval: 15m, 30s or 12h.</p>"
             "<button class='btn btn-primary'>Save settings</button></form>"
-            "<h2><span class='sec-num'>02</span>Sources</h2>"
+            "<h2><span class='sec-num'>02</span>Risk thresholds</h2>"
+            f'<form method="post" action="/config/thresholds">{csrf}{fingerprint_field}'
+            "<div class='fields'>"
+            "<label>Critical at CVSS"
+            f"<input type='text' name='threshold:critical_cvss' size='5' value='{threshold_text('critical_cvss')}'>"
+            "</label>"
+            "<label>Critical at EPSS"
+            f"<input type='text' name='threshold:critical_epss' size='5' value='{threshold_text('critical_epss')}'>"
+            "</label>"
+            "<label>Suppress below CVSS"
+            "<input type='text' name='threshold:suppress_below_cvss' size='5' "
+            f"value='{threshold_text('suppress_below_cvss')}'></label>"
+            "</div>"
+            "<p class='muted small'>A CVE is <b>critical</b> when it is in KEV, when CISA records active "
+            "exploitation, or when its CVSS is at or above the first number with a remote, unauthenticated, "
+            "no-interaction vector, or an EPSS score at or above the second. A completely measured CVE below the "
+            "third is recorded and watched but never sent. An empty field uses the YAML value. A change applies "
+            "to the next pass, and it re-baselines what is already watched instead of sending the backlog out."
+            "</p>"
+            "<button class='btn btn-primary'>Save thresholds</button> "
+            "<a class='btn btn-quiet' href='/thresholds'>Preview a decision</a></form>"
+            "<h2><span class='sec-num'>03</span>Sources</h2>"
             "<p class='muted small'>A source defined in the YAML keeps its keys there: this page edits its enable "
             "flag and its watch tag, and can test it. A source added here is stored whole in the settings overlay, "
             "so it needs no edit to a read-only config mount. The watch tag scopes a changedetection.io poll and "
@@ -2478,7 +2557,7 @@ def create_app(
             "<button class='btn btn-primary'>Save sources</button> "
             "<button class='btn' type='submit' formaction='/config/sources/probe'>Test the new source</button>"
             "</form>"
-            "<h2><span class='sec-num'>03</span>Notifiers</h2>"
+            "<h2><span class='sec-num'>04</span>Notifiers</h2>"
             f'<form method="post" action="/config/notifiers">{csrf}{fingerprint_field}'
             f"{notifier_form_entries(notifiers)}"
             "<h3>New notifier</h3>"
@@ -2491,7 +2570,7 @@ def create_app(
             "<label>reference <input type='text' name='new:reference' placeholder='${NAME}'></label>"
             f"{new_fields}</div>"
             "<button class='btn btn-primary'>Save notifiers</button></form>"
-            "<h2><span class='sec-num'>04</span>Routes</h2>"
+            "<h2><span class='sec-num'>05</span>Routes</h2>"
             f'<form method="post" action="/config/routes">{csrf}{fingerprint_field}'
             f"{route_form_entries(routes, defaults, notifier_choices(notifiers))}"
             "<button class='btn btn-primary'>Save routes</button></form>"
@@ -2500,6 +2579,151 @@ def create_app(
             "still need a restart.</p>"
         )
         return page("Configuration", body, active="/config", actions=sign_out_form(request))
+
+    #: The preview's numeric fields and the range each accepts, so a hand-written URL cannot raise a 500.
+    PREVIEW_RANGES = {"cvss": (0.0, 10.0), "epss": (0.0, 1.0)}
+
+    @app.get("/thresholds", response_class=HTMLResponse)
+    def threshold_preview(request: Request):
+        """What one advisory would be judged as, and where it would go, under the thresholds in force.
+
+        A read: it renders the numbers the running configuration loaded and calls the same ``core.level_of`` and
+        ``routing.select`` the pass calls, so the answer cannot drift from the decision it describes. Nothing is
+        written and no state is read, so the link can be shared and repeated.
+        """
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        from . import core, routing  # lazy, like the other core use here: this module is imported before both
+
+        cfg = runtime.cfg
+
+        def number(name: str) -> float | None:
+            raw = (request.query_params.get(name) or "").strip()
+            if not raw:
+                return None
+            low, high = PREVIEW_RANGES[name]
+            try:
+                value = float(raw)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"{name} must be a number") from None
+            if not math.isfinite(value) or not low <= value <= high:
+                raise HTTPException(status_code=400, detail=f"{name} must be between {low:g} and {high:g}")
+            return value
+
+        cvss = number("cvss")
+        epss = number("epss")
+        kev_choice = (request.query_params.get("kev") or "").strip()
+        if kev_choice not in ("", "yes", "unknown"):
+            raise HTTPException(status_code=400, detail="kev must be empty, yes or unknown")
+        ssvc = (request.query_params.get("ssvc") or "").strip()
+        if ssvc not in ("", "active"):
+            raise HTTPException(status_code=400, detail="ssvc must be empty or active")
+        remote = request.query_params.get("remote") == "1"
+        source = (request.query_params.get("source") or "").strip()
+        product = (request.query_params.get("product") or "").strip()
+
+        def choice(value: str, label: str, current: str) -> str:
+            return f"<option value='{esc(value)}'{' selected' if value == current else ''}>{esc(label)}</option>"
+
+        configured = [str(entry.get("id", "")) for entry in cfg.sources if isinstance(entry, dict)]
+        source_options = choice("", "(none)", source) + "".join(
+            choice(identifier, identifier, source) for identifier in configured
+        )
+        if source and source not in configured:
+            # A shared link can outlive the source it names. Keep the value, marked, so the routing answer stays
+            # true to what was asked instead of silently previewing a message from no source at all.
+            source_options += choice(source, f"{source} (not configured)", source)
+        result = ""
+        if "preview" in request.query_params:
+            thresholds = cfg.thresholds
+            facts = core.CveFacts(cvss, ssvc or None, epss, None, True, remote_unauth=remote)
+            level, reason = core.level_of(facts, kev_choice == "yes", kev_choice != "unknown", thresholds=thresholds)
+            line = core.metrics_line(cvss, epss, None, ssvc or None, kev_choice == "yes")
+            note = core.reason_note(reason, thresholds)
+            why = {
+                "kev": "the CVE is in the CISA KEV catalog: exploitation observed in the wild.",
+                "ssvc": "CISA records active exploitation (SSVC).",
+                "remote": f"CVSS is at or above {thresholds.critical_cvss:g} with a remote, unauthenticated, "
+                "no-interaction vector.",
+                "epss": f"CVSS is at or above {thresholds.critical_cvss:g} and EPSS is at or above "
+                f"{thresholds.critical_epss:g}.",
+            }.get(
+                reason or "",
+                "no CVE, score or exploitation signal reaches the critical rules, and the item is "
+                + (
+                    "below the suppression floor, so it is recorded and watched and no message is sent."
+                    if level == "suppressed"
+                    else "at or above the suppression floor, so it is sent as a warning."
+                ),
+            )
+            tone = {"critical": "critical", "warning": "warning", "suppressed": "ok"}[level]
+            label = {"critical": "Critical", "warning": "Warning", "suppressed": "Suppressed"}[level]
+            if level == "suppressed":
+                # Nothing is sent, so naming a route would describe a message that never exists.
+                destination = "<p class='muted'>No message is sent, so nothing is routed.</p>"
+            else:
+                selected, where = routing.select(
+                    {
+                        "tag": level,
+                        "source_id": source,
+                        "products": [product] if product else [],
+                        "ids": ["CVE-0000-0000"],
+                    },
+                    cfg.routes,
+                    cfg.default_notifiers,
+                    [str(entry.get("id", "")) for entry in cfg.notifiers],
+                )
+                destination = (
+                    f"<p>Routing: <b>{esc(where)}</b> · "
+                    + (f"notifiers <b>{esc(', '.join(selected))}</b>" if selected else "no notifier")
+                    + "</p>"
+                )
+                if not selected:
+                    destination += _notice(
+                        "No rule names a notifier for this message and the configuration has no default: the "
+                        "pass would fail on it rather than drop it.",
+                        "warning",
+                    )
+            carries = "Recorded with" if level == "suppressed" else "The message would carry"
+            result = (
+                "<h2>Result</h2>"
+                f"<p>{_badge(label, tone)} {esc(why)}</p>"
+                f"<p class='muted small'>{carries}: <code>{esc(line)}</code>"
+                + (f" · <b>{esc(note)}</b>" if note else "")
+                + "</p>"
+                + destination
+            )
+        form = (
+            "<form method='get' action='/thresholds'>"
+            "<div class='fields'>"
+            f"<label>CVSS<input type='text' name='cvss' size='4' value='{esc('' if cvss is None else cvss)}'></label>"
+            f"<label>EPSS<input type='text' name='epss' size='4' value='{esc('' if epss is None else epss)}'></label>"
+            f"<label>KEV<select name='kev'>{choice('', 'not in KEV', kev_choice)}"
+            f"{choice('yes', 'in KEV', kev_choice)}{choice('unknown', 'catalog unknown', kev_choice)}</select></label>"
+            f"<label>SSVC<select name='ssvc'>{choice('', 'none', ssvc)}{choice('active', 'active', ssvc)}"
+            "</select></label>"
+            "<label class='check'><input type='checkbox' name='remote' value='1'"
+            f"{' checked' if remote else ''}> remote, unauthenticated, no interaction</label>"
+            "</div>"
+            "<div class='fields'>"
+            f"<label>Source<select name='source'>{source_options}</select></label>"
+            f"<label>Product id<input type='text' name='product' value='{esc(product)}'></label>"
+            "</div>"
+            "<button class='btn btn-primary' name='preview' value='1'>Preview</button>"
+            f" <a class='btn btn-quiet' href='/config'>Change the thresholds</a>"
+            "</form>"
+        )
+        thresholds_now = (
+            f"critical at CVSS <b>{cfg.thresholds.critical_cvss:g}</b> or EPSS "
+            f"<b>{cfg.thresholds.critical_epss:g}</b>, suppressed below CVSS "
+            f"<b>{cfg.thresholds.suppress_below_cvss:g}</b>"
+        )
+        body = (
+            "<p class='muted'>What one advisory would be classified as, and where the message would go, under "
+            f"the live thresholds: {thresholds_now}. Nothing is delivered and nothing is written.</p>"
+            f"{form}{result}"
+        )
+        return page("Threshold preview", body, active="/config", actions=sign_out_form(request))
 
     @app.get("/sources", response_class=HTMLResponse)
     def sources_page(request: Request):

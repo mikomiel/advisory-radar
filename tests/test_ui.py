@@ -1197,6 +1197,7 @@ def test_every_page_carries_the_same_shell(tmp_path):
         "/config": "/config",
         "/sources": "/sources",
         "/runs": "/runs",
+        "/thresholds": "/config",
         f"/advisories/{advisory_token('CVE-2026-1')}": "/alerts",
     }
     # A page route added later must join this test instead of silently going unchecked.
