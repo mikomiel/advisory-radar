@@ -771,6 +771,12 @@ def config_from_document(
         watchlist is None or isinstance(watchlist, str),
         f"watchlist must be a path to a watchlist file, got {type(watchlist).__name__}",
     )
+    # An embedded NUL is not a path any call can take: refusing it here fails at start with a message, instead of
+    # a ValueError from the first inspection.
+    _require(
+        not isinstance(watchlist, str) or "\x00" not in watchlist,
+        "watchlist must not contain a NUL byte",
+    )
     watchlist_path = Path(watchlist) if isinstance(watchlist, str) else None
     raw_hidden = document.get("hidden_source_hosts")
     if raw_hidden is not None:

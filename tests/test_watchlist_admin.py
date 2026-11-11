@@ -672,7 +672,7 @@ BROKEN_EXACT = (
     {"product:nodejs:aliases": None, "product:nodejs:aliases_json": "[7]"},  # a row's exact list
     {"excluded_products": "legacy", "excluded_products_json": '["legacy"]'},  # two representations at once
     {"excluded_products": None, "excluded_products_json": ""},  # the page never renders an empty exact field
-    {"excluded_products": None, "excluded_products_json": "[" * 2000 + "]" * 2000},  # decoder recursion
+    {"excluded_products": None, "excluded_products_json": "[" * 10_000 + "]" * 10_000},  # decoder recursion
 )
 
 
@@ -852,3 +852,31 @@ def test_a_read_only_exclusion_list_cannot_be_replaced_through_its_hidden_field(
     )
     assert response.status_code == 303
     assert json.loads(watch.read_text())["excluded_products"] == ["Example\nServer"]
+
+
+def test_a_document_nested_too_deeply_is_reported_and_not_saved_over(tmp_path):
+    """A hand edit can leave a document the decoder gives up on: the page and a save must say so, not crash."""
+    watch = tmp_path / "scope.json"
+    watch.write_text("[" * 10_000 + "]" * 10_000)
+    before = watch.read_text()
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    page = client.get("/watchlist")
+    assert page.status_code == 200
+    assert "cannot be read" in page.text and "name='fingerprint'" not in page.text
+    csrf = CSRF_RE.search(client.get("/").text).group(1)
+    response = client.post(
+        "/watchlist",
+        data={
+            "csrf": csrf,
+            "fingerprint": "",
+            "debian_packages": "*",
+            "excluded_products": "",
+            "new:id": "",
+            "new:aliases": "",
+            "new:domains": "",
+        },
+    )
+    assert response.status_code == 200
+    assert "cannot be read" in response.text
+    assert watch.read_text() == before

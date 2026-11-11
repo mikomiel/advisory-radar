@@ -996,3 +996,13 @@ def test_a_scope_that_cannot_be_inspected_fails_the_pass(tmp_path, monkeypatch):
 
     monkeypatch.setattr(pipeline.watchlist, "os", types.SimpleNamespace(lstat=denied))
     assert pipeline.run_pass(cfg, [], [], http=fake_http, clock=lambda: float(NOW), sleep=lambda s: None) == 1
+
+
+def test_a_scope_nested_too_deeply_fails_the_pass(tmp_path):
+    """A decoder that gives up is an unreadable document, not an exception out of the scheduler."""
+    scope = tmp_path / "scope.json"
+    scope.write_text("[" * 10_000 + "]" * 10_000)
+    path = tmp_path / "deep.yml"
+    path.write_text(f"sources: []\nnotifiers: []\nstate_path: {tmp_path}/state.json\nwatchlist: {scope}\n")
+    cfg = load_config(path, {})
+    assert pipeline.run_pass(cfg, [], [], http=fake_http, clock=lambda: float(NOW), sleep=lambda s: None) == 1

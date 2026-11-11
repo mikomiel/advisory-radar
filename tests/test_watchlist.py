@@ -439,3 +439,27 @@ def test_a_link_retargeted_while_the_save_waits_is_refused(tmp_path, monkeypatch
         _save(link, document(products=[]), expected=digest(document()))
     assert first.read_text() == before_first
     assert second.read_text() == before_second
+
+
+def test_a_document_nested_too_deeply_is_unreadable_not_a_crash(tmp_path):
+    """A hand edit can leave a document the decoder gives up on; the pass and the page must say so."""
+    deep = tmp_path / "deep.json"
+    deep.write_text("[" * 10_000 + "]" * 10_000)
+    with pytest.raises(SourceError, match="cannot be read"):
+        read_watchlist(deep)
+
+
+def test_a_path_with_an_embedded_nul_is_refused_not_a_crash(tmp_path):
+    """``os.lstat`` raises ValueError for a NUL, which is not the OSError the inspection guard expects."""
+    broken = Path("scope\x00.json")
+    with pytest.raises(SourceError, match="not a usable path"):
+        watchlist.present(broken)
+    with pytest.raises(SourceError, match="not a usable path"):
+        save_watchlist(broken, lambda current: document(), expected="")
+
+
+def test_the_configuration_refuses_a_watchlist_path_with_a_nul(tmp_path):
+    path = tmp_path / "config.yml"
+    path.write_text('sources: []\nnotifiers: []\nstate_path: state.json\nwatchlist: "scope\\u0000.json"\n')
+    with pytest.raises(ConfigError, match="NUL"):
+        load_config(path, {})

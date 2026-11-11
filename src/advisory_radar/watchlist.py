@@ -109,10 +109,15 @@ def parse_policy(document: object) -> Policy:
 
 
 def read_watchlist(path: Path = WATCHLIST) -> dict:
-    """The document as written, once it is known to be a valid watchlist."""
+    """The document as written, once it is known to be a valid watchlist.
+
+    A file that cannot be read or decoded is never treated as absent or empty: the answer here is the same one the
+    pass and the page report, whatever the fault -- including a nesting deep enough that the decoder gives up
+    before it has a value, which a hand edit can leave behind and a form payload cannot (that is ``_json_list``).
+    """
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         raise SourceError("watchlist cannot be read") from exc
     parse_policy(document)
     return document
@@ -135,9 +140,9 @@ def present(path: Path) -> bool:
     """Whether the directory entry exists, including a symlink that points at nothing.
 
     Only a missing entry is ``False``. A path that cannot be inspected -- a parent directory without the search
-    bit, a link loop, an I/O error -- raises instead of answering "absent", because that answer falls back to the
-    packaged default, which judges every advisory. A present-but-unreadable document must fail the pass, both
-    when it is the configured path and when it is the one beside the state file.
+    bit, a link loop, an I/O error, an embedded NUL -- raises instead of answering "absent", because that answer
+    falls back to the packaged default, which judges every advisory. A present-but-unreadable document must fail
+    the pass, both when it is the configured path and when it is the one beside the state file.
     """
     try:
         os.lstat(path)
@@ -145,6 +150,8 @@ def present(path: Path) -> bool:
         return False  # no entry, or a component that is not a directory: nothing can be there
     except OSError as exc:
         raise SourceError(f"watchlist {path} cannot be inspected: {exc}") from exc
+    except ValueError as exc:  # an embedded NUL: the path cannot be inspected at all
+        raise SourceError(f"watchlist {path} is not a usable path: {exc}") from exc
     return True
 
 
@@ -192,7 +199,10 @@ def save_watchlist(path: Path, build: Callable[[dict | None], dict], *, expected
     operator's own document untouched and every later edit of it silently ignored. The lock is taken on the same
     resolved path, so two names for one document cannot save past each other.
     """
-    target = path.resolve()
+    try:
+        target = path.resolve()
+    except ValueError as exc:  # an embedded NUL: no lock, no read and no replacement can name this path
+        raise SourceError(f"watchlist {path} is not a usable path: {exc}") from exc
     if path.is_symlink() and not present(target):
         # The link names a file that is not there. Creating it would leave the operator editing a document they
         # did not name, with whatever the link pointed at before gone from their point of view.
