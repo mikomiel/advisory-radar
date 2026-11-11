@@ -19,6 +19,7 @@ import re
 import threading
 from pathlib import Path
 
+from .catalogue import SOURCE_SPECS
 from .config import ConfigError
 from .state import save_json, serialize_json
 
@@ -33,7 +34,9 @@ SETTINGS_NAME = "settings.json"
 #: A file larger than this is refused before it is parsed.
 MAX_SETTINGS_BYTES = 64 * 1024
 #: The only keys the overlay may carry. Everything else stays in the YAML.
-OVERLAY_KEYS = frozenset({"notifiers", "sources", "poll_interval", "hidden_source_hosts", "routes", "default"})
+OVERLAY_KEYS = frozenset(
+    {"notifiers", "sources", "sources_added", "poll_interval", "hidden_source_hosts", "routes", "default"}
+)
 #: Notifier keys that carry a credential: only a whole-value environment reference is accepted.
 SECRET_KEYS = ("url", "key", "password", "token")
 #: Exactly one ``${NAME}`` (optionally ``${NAME_FILE}``), with no surrounding text: a value with
@@ -49,11 +52,11 @@ def is_reference(value: object) -> bool:
 def validate_settings(settings: object) -> dict:
     """Refuse an overlay the runtime could not apply, without repeating the config validator.
 
-    Only rules specific to the overlay live here: the six-key allowlist, the reference-only secret
-    rule, and the two-key source edit. Values the YAML validator checks -- a poll interval, a
-    hidden-host list, a notifier's keys and its ``enabled`` boolean, a route's match keys and whether
-    a selected notifier is enabled -- are merged and left to it, so both sources of truth fail with
-    one message.
+    Only rules specific to the overlay live here: the seven-key allowlist, the reference-only secret
+    rule, the two-key edit of a YAML source, and the shape of a complete source the overlay adds. Values
+    the YAML validator checks -- a poll interval, a hidden-host list, a notifier's keys and its ``enabled``
+    boolean, a source's remaining keys, a route's match keys and whether a selected notifier is enabled --
+    are merged and left to it, so both sources of truth fail with one message.
     """
     if not isinstance(settings, dict):
         raise ConfigError("settings: the overlay must be a mapping")
@@ -96,7 +99,40 @@ def validate_settings(settings: object) -> dict:
                 raise ConfigError(f"settings: source {identifier!r}: unknown keys {sorted(extra)}")
             if "tag" in changes and not isinstance(changes["tag"], str):
                 raise ConfigError(f"settings: source {identifier!r}: tag must be a string")
+    if "sources_added" in settings:
+        _validate_added_sources(settings["sources_added"])
     return settings
+
+
+def _validate_added_sources(added: object) -> None:
+    """A complete source the overlay adds: a mapping with an id and a built-in type, no literal secret.
+
+    A non-mapping is refused rather than skipped: ``config._merge_added_sources`` skips one it cannot read, so
+    the entry would vanish between the two owners and the operator would see a saved source that never ran.
+    """
+    if not isinstance(added, list):
+        raise ConfigError("settings: sources_added must be a list of complete source entries")
+    seen: set[str] = set()
+    for entry in added:
+        if not isinstance(entry, dict):
+            raise ConfigError("settings: every added source must be a mapping")
+        identifier = entry.get("id")
+        if not isinstance(identifier, str) or not identifier:
+            raise ConfigError("settings: every added source needs a string id")
+        if identifier in seen:
+            raise ConfigError(f"settings: added source {identifier!r} is defined twice")
+        seen.add(identifier)
+        kind = entry.get("type")
+        if not isinstance(kind, str) or kind not in SOURCE_SPECS:
+            raise ConfigError(
+                f"settings: added source {identifier!r} has no built-in type (want one of {sorted(SOURCE_SPECS)})"
+            )
+        for key in SOURCE_SPECS[kind].secret_keys:
+            if key in entry and not is_reference(entry[key]):
+                raise ConfigError(
+                    f"settings: added source {identifier!r}: {key} must be a ${{NAME}} or ${{NAME_FILE}} "
+                    "reference; a literal secret is never stored"
+                )
 
 
 def fingerprint(settings: dict) -> str:

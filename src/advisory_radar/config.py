@@ -12,12 +12,14 @@ from __future__ import annotations
 import copy
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 
 from .catalogue import SOURCE_SPECS
+from .routing import MATCH_KEYS, SEVERITY_TAGS
 
 _ENV_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?:_FILE)?\}")
 
@@ -58,6 +60,20 @@ def _expand(value: object, env: dict[str, str], resolved: list[str] | None = Non
     if isinstance(value, dict):
         return {key: _expand(item, env, resolved, lenient=lenient) for key, item in value.items()}
     return value
+
+
+def expand_entry(entry: dict, env: Mapping[str, str], resolved: list[str] | None = None) -> dict:
+    """One plugin entry with its ``${NAME}``/``${NAME_FILE}`` references resolved.
+
+    A form or a probe holds an entry as it is written -- a ``${FRESHRSS_TOKEN}`` reference rather than a token --
+    while a builder needs the value. A missing variable raises the ``ConfigError`` a configuration load would,
+    naming the variable and never its value: the message is rendered before any redaction exists. A caller that
+    may show an error adds the values it just resolved to ``resolved`` so they can be redacted.
+    """
+    expanded = _expand(copy.deepcopy(entry), dict(env), resolved)
+    if not isinstance(expanded, dict):  # unreachable for a mapping input; keeps the return type honest
+        raise ConfigError("a plugin entry must be a mapping")
+    return expanded
 
 
 @dataclass(frozen=True)
@@ -126,8 +142,7 @@ _TOP_KEYS = {
     "default",
     "web",
 }
-#: The keys a routing rule's ``match`` mapping may carry (see ``routing.py``).
-_MATCH_KEYS = frozenset({"source", "tag", "product", "ids"})
+#: The keys a routing rule itself may carry; the match keys and the tag set are ``routing.py``'s.
 _ROUTE_KEYS = frozenset({"match", "notifiers"})
 
 
@@ -181,7 +196,7 @@ def load_document(path: Path, *, settings: dict | None = None) -> dict:
 
 
 def _merge_settings(document: dict, settings: dict) -> None:
-    """Overlay the six writable keys onto the raw YAML document, in place."""
+    """Overlay the seven writable keys onto the raw YAML document, in place."""
     from .settings import validate_settings  # lazy: settings.py imports ConfigError from this module
 
     validate_settings(settings)
@@ -203,6 +218,8 @@ def _merge_settings(document: dict, settings: dict) -> None:
         document["notifiers"] = merged
     if "sources" in settings:
         document["sources"] = _merge_sources(document.get("sources"), settings["sources"])
+    if "sources_added" in settings:
+        document["sources"] = _merge_added_sources(document.get("sources"), settings["sources_added"])
     if "poll_interval" in settings:
         document["poll_interval"] = settings["poll_interval"]
     if "hidden_source_hosts" in settings:
@@ -228,6 +245,32 @@ def _merge_sources(raw: object, overlay: dict) -> object:
         if entry is None:
             raise ConfigError(f"settings: no source with id {identifier!r} is defined in the YAML config")
         entry.update(changes)
+    return merged
+
+
+def _merge_added_sources(raw: object, added: object) -> object:
+    """Append the overlay's own source entries to the YAML list; a duplicate id is refused.
+
+    The YAML owns membership: the overlay may add a source the file does not define, never redefine one it does.
+    Two owners for one id would leave which URL is polled to the merge order, so the collision fails the load.
+    """
+    if not isinstance(added, list):
+        return raw  # ``validate_settings`` already refused a shape that is not a list
+    if raw is None:
+        raw = []
+    if not isinstance(raw, list):
+        return raw  # the validator refuses the YAML shape, which an overlay cannot repair
+    merged = [dict(entry) if isinstance(entry, dict) else entry for entry in raw]
+    known = {entry.get("id") for entry in merged if isinstance(entry, dict)}
+    for entry in added:
+        if not isinstance(entry, dict):
+            continue  # the config validator refuses a non-mapping entry with its own message
+        identifier = entry.get("id")
+        if identifier in known:
+            # The id was checked as a string by ``validate_settings``; it carries no secret, so it may be named.
+            raise ConfigError(f"settings: source id {identifier!r} is already defined in the YAML config")
+        known.add(identifier)
+        merged.append(dict(entry))
     return merged
 
 
@@ -283,10 +326,14 @@ def _routing(document: dict, notifiers: list[dict], *, strict: bool = True) -> t
         _require(not unknown, f"{where}: unknown keys {sorted(unknown)}")
         match = route.get("match")
         _require(isinstance(match, dict) and bool(match), f"{where}: match must be a non-empty mapping")
-        unknown_match = set(match) - _MATCH_KEYS
+        unknown_match = set(match) - MATCH_KEYS
         _require(not unknown_match, f"{where}: unknown match keys {sorted(unknown_match)}")
         for key, value in match.items():
             _require(isinstance(value, str) and bool(value), f"{where}: match.{key} must be a non-empty string")
+            if key == "tag":
+                # A message's tag is its severity word, so any other value is a rule that can never fire. Refuse
+                # it here: a route that silently delivers nothing is worse than a configuration error.
+                _require(value in SEVERITY_TAGS, f"{where}: match.tag must be one of {sorted(SEVERITY_TAGS)}")
         routes.append(
             {
                 "match": dict(match),

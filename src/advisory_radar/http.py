@@ -42,6 +42,16 @@ def urllib_http(
     method: str, url: str, headers: Mapping[str, str], body: bytes | None
 ) -> tuple[int, dict[str, str], bytes]:
     try:
+        scheme = urllib.parse.urlsplit(url).scheme
+    except ValueError:
+        # A malformed URL (an unclosed IPv6 bracket) is a refused request, exactly as it was when the
+        # ``Request`` built it and raised inside the guard below.
+        return 0, {}, b""
+    if scheme not in ("http", "https"):
+        # ``urllib`` opens its other handlers too -- ``file://`` would read a local file as a feed. Every source
+        # and notifier this program talks to is HTTP(S), so any other scheme is a refused request, not a fetch.
+        return 0, {}, b""
+    try:
         # Built inside the guard: a malformed URL raises a ValueError whose text carries the URL, and a URL
         # can carry a token.
         request = urllib.request.Request(url, data=body, headers={"User-Agent": USER_AGENT, **headers}, method=method)

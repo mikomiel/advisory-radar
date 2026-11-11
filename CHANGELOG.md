@@ -8,6 +8,27 @@ operator action, and the release workflow then builds and pushes the image to
 ## [Unreleased]
 
 ### Added
+- Sources can be added, edited and removed on `/config` without touching the read-only
+  config mount. The settings overlay gained `sources_added`: a source the YAML does not
+  define is stored whole in the overlay, while the YAML keeps owning the entries the file
+  defines. The two may not share an id (a collision fails the load instead of letting the
+  merge order decide which URL is polled), and a secret key (`token`, `api_key`) may only be
+  stored as a `${NAME}`/`${NAME_FILE}` reference. `SourceSpec.secret_keys` in the catalogue
+  is the one owner of which keys those are, so the config key allowlist, the form and the
+  overlay's rule are derived rather than repeated.
+- A source probe in the browser: **Test the new source** on `/config` and a **Test** button
+  on every row of `/config` and `/sources` perform the same fetch a pass performs, show the
+  entry count, the first entries or the error, and write nothing. A probe of an unsaved
+  source resolves its `${NAME}` references (reporting a missing variable by name, never its
+  value) and offers a form that saves exactly what it fetched. `create_app` takes an
+  injectable transport for it, so the tests answer without a network.
+- Per-source health: each pass records `source_health` (last attempt, last success, entries,
+  redacted error) in the same write as that source's validators, pruned to the configured
+  ids. `/sources` is now the operational page — one line per enabled source with its state,
+  timestamps, entries and error beside the probe button — and `/metrics` exports
+  `advisory_radar_source_up`, `_source_last_success_timestamp_seconds` and `_source_items`,
+  labelled by source id, so one broken feed is visible while every pass-level number is
+  green.
 - A source catalogue (`advisory_radar/catalogue.py`): one `SourceSpec` per
   built-in kind with its summary, required and optional keys, a tested example
   and a docs anchor. The config key allowlist is derived from it instead of
@@ -77,6 +98,13 @@ operator action, and the release workflow then builds and pushes the image to
   Playwright is not a project dependency, and no CI job runs it.
 
 ### Fixed
+- A routing rule matching a `tag` outside `critical` and `warning` was accepted and could
+  never fire: `routing.SEVERITY_TAGS` is now the closed set the validator uses, and a rule
+  naming an unconfigured source id is reported on `/config` as inert (staging a rule before
+  its source is legitimate, so that one warns rather than fails).
+- `http.urllib_http` accepted any URL scheme, so a `file://` source would have been read as a
+  local file. A source or notifier URL is HTTP(S); every other scheme is now a refused
+  request, and the probe says so in words.
 - An automerge left its head branch behind: the repository's *automatically delete head branches*
   setting did not delete the branch of a merge made through the API (the branches of #36 and #43
   survived with the setting on). The workflow now deletes the merged head ref through
@@ -100,6 +128,11 @@ operator action, and the release workflow then builds and pushes the image to
   waiting for a sweep. The schedules stay as the backstop.
 
 ### Changed
+- `/sources` leads with what this instance monitors: each enabled source's state, last
+  attempt, last success, entries and error, with a probe per row. The built-in catalogue
+  stays on the page, below the configured sources it documents. The `/config` source table
+  gained the added-keys, remove and test columns, and the watch-tag column now says what it
+  is: a changedetection.io watch tag the other kinds ignore.
 - The web UI has one design: a shared shell with a brand, a marked current section and a footer
   (version and the probe links), design tokens measured for WCAG AA contrast in light and dark,
   hairline tables, severity and outcome badges, stat tiles on the dashboard, numbered

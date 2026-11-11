@@ -12,6 +12,9 @@ from collections.abc import Sequence
 
 #: The keys a route's ``match`` mapping may carry; ``config`` refuses any other.
 MATCH_KEYS = frozenset({"source", "tag", "product", "ids"})
+#: The only tags a queued message can carry: they are its severity word (``core.LEVEL_LABEL``). A rule matching
+#: any other value could never fire, so ``config`` refuses it instead of accepting a rule that delivers nothing.
+SEVERITY_TAGS = frozenset({"critical", "warning"})
 
 
 def _strings(value: object) -> tuple[str, ...]:

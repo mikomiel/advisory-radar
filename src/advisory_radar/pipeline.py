@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from . import core
-from .config import Config
+from .config import Config, secret_values
 from .http import Http, RedactFilter, urllib_http
 from .kev import load_kev
 from .notifiers import build_notifier
@@ -24,11 +24,12 @@ KEV_CACHE_NAME = "kev.json"
 
 
 def _drop_disabled_sources(state: dict, enabled_ids: set[str]) -> None:
-    """Discard a removed source's unclassified work *and* its stored validators.
+    """Discard a removed source's unclassified work, its stored validators and its health record.
 
-    The two have to go together. Dropping the carry while keeping the validators lets a re-enabled source with
-    an unchanged feed answer ``304`` on its next read, so the candidates just discarded could not be recovered
-    from the feed at all. ``carry`` is the source of truth for what is still owed.
+    The first two have to go together. Dropping the carry while keeping the validators lets a re-enabled source
+    with an unchanged feed answer ``304`` on its next read, so the candidates just discarded could not be
+    recovered from the feed at all. ``carry`` is the source of truth for what is still owed. Health is kept for
+    a configured source only: a record for a source nobody configured would outlive the reason it existed.
     """
     carried = state.setdefault("carry", {})
     feeds = state.get("feeds")
@@ -36,6 +37,30 @@ def _drop_disabled_sources(state: dict, enabled_ids: set[str]) -> None:
         carried.pop(stale, None)
         if isinstance(feeds, dict):
             feeds.pop(stale, None)
+    health = state.get("source_health")
+    if isinstance(health, dict):
+        for stale in [source_id for source_id in health if source_id not in enabled_ids]:
+            health.pop(stale, None)
+
+
+def _record_health(state: dict, source_id: str, now: int, *, ok: bool, items: int = 0, error: str = "") -> None:
+    """Record this window's outcome for one source; the last success survives a later failure.
+
+    This answers the question the run history cannot: *which* feed is broken right now. ``ok_at`` is preserved
+    so a source that answered an hour ago and fails now shows both facts rather than looking dead since boot.
+    The error text is the message a human needs, and the caller redacts it before it is stored.
+    """
+    health = state.setdefault("source_health", {})
+    previous = health.get(source_id)
+    previous = previous if isinstance(previous, dict) else {}
+    ok_at = now if ok else previous.get("ok_at", 0)
+    health[source_id] = {
+        "at": now,
+        "ok": ok,
+        "ok_at": ok_at if isinstance(ok_at, int) and not isinstance(ok_at, bool) else 0,
+        "items": items,
+        "error": error,
+    }
 
 
 def _reset_validators_on_policy_change(state: dict, policy: object) -> None:
@@ -143,6 +168,13 @@ def _run_pass(
         except Exception as exc:  # a source fault fails the pass but keeps state
             LOG.error("source %s: %s: %s; state kept", source.id, type(exc).__name__, exc)
             source_ok = False
+            _record_health(
+                state,
+                source.id,
+                now,
+                ok=False,
+                error=redact(f"{type(exc).__name__}: {exc}", secret_values(cfg)),
+            )
             continue  # other sources still bootstrap; this one is seeded when it first answers
         window = SourceWindow(
             source.id,
@@ -166,6 +198,16 @@ def _run_pass(
             # Fail closed: do not adopt a window we cannot trust. The next pass compares against the same
             # trusted window, so a genuinely recovered export clears the gap and a damaged one keeps failing.
             gap = True
+            _record_health(
+                state,
+                source.id,
+                now,
+                ok=False,
+                error=(
+                    "window gap: the window is full and shares no entry with the previous pass; "
+                    "the source is deferred until it answers a complete window"
+                ),
+            )
             continue
         fetched_ids.add(source.id)
         live_guids.update(item.guid for item in window.items)
@@ -244,6 +286,10 @@ def _run_pass(
             carried[source.id] = [core.item_to_state(item) for item in left]
         if window is not None:
             windows[source.id] = [item.guid for item in window.items]
+            # Health follows the same rule as the validators: recorded only once this window's candidates are
+            # durable, so a crash between fetch and classification cannot report a source healthy for work it
+            # never queued.
+            _record_health(state, source.id, now, ok=True, items=len(window.items))
         # A source that tracks a cursor advances it only now: the same write carries the candidates, so a crash
         # between fetch and classification cannot skip an advisory forever.
         commit = getattr(source, "commit", None)

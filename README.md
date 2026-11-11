@@ -68,6 +68,11 @@ wins**, so the most specific rule goes first. A rule matches on one or more of:
 | `product` | the item matched that watchlist product id; a message without a product match never matches a product rule |
 | `ids` | any id in the message matches the pattern, case-insensitively (`CVE-2026-*`, `GHSA-*`) |
 
+A `match.tag` outside `critical` and `warning` is refused when the configuration loads: a
+message can carry no other tag, so such a rule could never fire. A rule naming a source id
+that no source defines still loads — a rule may be staged before its source — and `/config`
+reports it as inert until that source exists.
+
 Every key present in one rule must match. `notifiers` names the enabled channels the
 message goes to, and `default` is used when no rule matches. Every id must name an
 **enabled** notifier in the effective configuration — one the settings overlay adds counts,
@@ -120,15 +125,21 @@ paging.
 
 ### Settings without a restart
 
-The `/config` page changes six things without editing the YAML or restarting the
-container: `notifiers`, each source's `enabled` flag and `tag`, `poll_interval`,
-`hidden_source_hosts`, and the routing `routes`/`default` block. The notifier form manages
+The `/config` page changes seven things without editing the YAML or restarting the
+container: `notifiers`, each source's `enabled` flag and watch `tag`, the sources the
+overlay itself adds, `poll_interval`, `hidden_source_hosts`, and the routing
+`routes`/`default` block. The notifier form manages
 the whole list — that is how a channel
 is added, edited or disabled — and while the overlay holds a notifier list, that list
 replaces the YAML's membership and ordinary fields; only a notifier's `headers` stay in
 the YAML and are carried over by id, because the overlay may not store a mapping that can
 carry a credential. A notifier added to the YAML while the overlay holds a list is not
-used until that section is removed from the overlay. A save writes `settings.json` next to the state file (on the `/data`
+used until that section is removed from the overlay. Sources work the other way round:
+the YAML owns the list and the overlay may only **add** to it, so a source added on
+`/config` needs no edit to a read-only config mount while a YAML edit never loses to an
+older overlay. The two may not share an id — the overlay refuses one the YAML already
+defines, so which URL is polled is never decided by merge order. A save writes
+`settings.json` next to the state file (on the `/data`
 volume) and applies immediately when the state lock is free; if a pass holds the lock, the
 page says the revision is not live yet, and Reload applies it when the pass finishes. Each
 form carries a fingerprint of the configuration it was rendered from, so a second tab —
@@ -146,8 +157,10 @@ needs a restart, because the process reads the environment when it starts.
 
 A reload builds the new configuration and its plugins before it swaps them in under the
 state lock. A shared configuration value goes through the same validator the YAML does,
-and the overlay adds its own restrictions (a secret must be a reference, a source edit is
-`enabled`/`tag` only, `headers` may not be written), so a refused overlay is reported with
+and the overlay adds its own restrictions (a notifier's secret must be a reference, a
+source the YAML defines may only be re-flagged and re-tagged there, a source the overlay
+adds must be a complete entry and may carry a secret only as a reference, `headers` may
+not be written), so a refused overlay is reported with
 the validator's message; the running configuration stays; a pass that already started finishes with the
 configuration it started with, and the next pass uses the reloaded one. The wait between
 passes follows the live interval, so shortening `poll_interval` takes effect without sleeping
@@ -221,6 +234,16 @@ when the fetch failed. It sends no notification and writes no state, so it is
 safe to run while the service is polling. A `webhook` source is read from an
 empty inbox, so it prints no items: the command checks configuration, not intake.
 
+The same probe is a button. `/config` can add a source without touching the file:
+pick a type, fill the keys it declares, and press **Test the new source** — the
+probe performs the fetch a pass performs, shows the entry count, the first entries
+or the error, and writes nothing. A probe of an unsaved source reports a missing
+`${NAME}` by name, never its value, and offers to save the source it just fetched.
+Every configured row has its own **Test** button, and `/sources` shows one health
+line per enabled source — the last attempt, the last success, the entries in that
+window and the error that attempt reported — with the same numbers exported as
+metrics (see `docs/deployment.md`).
+
 | Kind | Summary | Required keys | Optional keys |
 |---|---|---|---|
 | `rss` | Any RSS 2.0 or Atom feed URL, read in one conditional GET. | `url` | `tag`, `enabled` |
@@ -229,7 +252,8 @@ empty inbox, so it prints no items: the command checks configuration, not intake
 | `webhook` | Items pushed to this instance's `/webhooks/<id>` endpoint, read from the state inbox. | — | `tag`, `enabled` |
 
 An accepted key is not always read by every kind: `tag` scopes a
-changedetection.io poll to one watch tag, `user` names the FreshRSS account, and
+changedetection.io poll to one watch tag and the other kinds ignore it, so the
+column is only meaningful there; `user` names the FreshRSS account; and
 `enabled: false` keeps an entry in the file without building it. An RSS/Atom feed
 and a changedetection.io poll return the whole response, so the FreshRSS GReader
 export is the only built-in that reports a truncated window.
