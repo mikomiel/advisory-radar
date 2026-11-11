@@ -716,6 +716,10 @@ def _webhook_config(tmp_path: Path, watchlist: dict | None = None):
     path.write_text(
         f"sources:\n  - id: wh\n    type: webhook\nnotifiers:\n  - id: fake\n    type: webhook\n"
         f"    url: https://hooks.example.com/x\nstate_path: {tmp_path}/state.json\n{watch}"
+    )
+    return load_config(path, {})
+
+
 # --- delivery policy wired from the configuration ----------------------------------------------
 
 
@@ -877,6 +881,8 @@ def test_two_webhook_guids_that_differ_only_by_a_control_character_both_arrive(t
     stored = json.loads((tmp_path / "state.json").read_text())
     assert {"src:wh:wh:a\x7fb", "src:wh:wh:ab"} <= set(stored["seen"])
     assert not (stored.get("webhook_inbox") or {}).get("wh"), "both accepted entries must leave the inbox"
+
+
 def local_epoch(hour: int, minute: int = 0) -> int:
     """An epoch whose *local* wall clock is this time, which is what a quiet-hours window reads."""
     import datetime

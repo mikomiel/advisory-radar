@@ -469,6 +469,8 @@ def test_a_webhook_guid_carrying_a_newline_is_released_and_sent_once(tmp_path):
         )
     assert not (load_state_document(cfg.state_path, core.STATE_SCHEMA, "state").get("webhook_inbox") or {}).get("wh")
     assert len(sent) == 1, "the same inbox entry must not be classified and sent on every pass"
+
+
 # --- the signed generic webhook ------------------------------------------------------------------
 
 
