@@ -37,6 +37,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from . import adobe, routing
+from .config import DEFAULT_THRESHOLDS, Thresholds
 from .feeds import FeedExport
 from .feeds import parse_feed as parse_greader
 from .http import MESSAGE_LIMIT, Http, inert, parse_json
@@ -133,9 +134,6 @@ ENRICH_RETRY_SECONDS = 2 * 3600
 #: (``state["enrich_pending"]``, apart from the ``enrich_retry`` clock so that a later page fault cannot shorten it),
 #: before it is sent as unknown severity: Node.js may publish the post a little before it fills in the CVE list.
 NODEJS_PENDING_SECONDS = 24 * 3600
-CRITICAL_CVSS = 9.0
-CRITICAL_EPSS = 0.10
-LOW_BELOW = 4.0
 #: A vendor-neutral approximation of OSV's `database_specific.severity` label: the upper edge of the
 #: CVSS v3 band. Used only when OSV is the sole source of a score; a CVSS vector is not computed.
 OSV_SEVERITY_SCORE = {"LOW": 3.9, "MODERATE": 6.9, "HIGH": 8.9, "CRITICAL": 9.0}
@@ -145,7 +143,6 @@ RANK = {"suppressed": 0, "warning": 1, "critical": 2}
 #: in state stay English.
 LEVEL_LABEL = {"critical": "CRITICAL", "warning": "WARNING"}
 EPSS_NOTE = "Likely exploitation (EPSS), unconfirmed."
-REMOTE_NOTE = "CVSS >= 9.0, remote attack, no privileges, no user interaction (CVSS vector)."
 ENRICH_FAILED_NOTE = "The CVE list could not be read from the source; severity unknown."
 ACTION = "**Action:** check whether the vulnerable version is deployed."
 #: An escalation reaches readers who already acted on the first message.
@@ -972,38 +969,72 @@ class Intel:
 # Routing
 
 
-def critical_reason(facts: CveFacts, kev: bool) -> str | None:
+def critical_reason(facts: CveFacts, kev: bool, *, thresholds: Thresholds) -> str | None:
     """``kev`` | ``ssvc`` | ``remote`` | ``epss`` (first match wins), else None."""
     if kev:
         return "kev"
     if facts.ssvc == "active":
         return "ssvc"
-    if facts.cvss is not None and facts.cvss >= CRITICAL_CVSS:
+    if facts.cvss is not None and facts.cvss >= thresholds.critical_cvss:
         if facts.remote_unauth:
             return "remote"
-        if facts.epss is not None and facts.epss >= CRITICAL_EPSS:
+        if facts.epss is not None and facts.epss >= thresholds.critical_epss:
             return "epss"
     return None
 
 
-#: The note a critical verdict carries for a reason that is a forecast rather than an observed exploitation.
-REASON_NOTE = {"remote": REMOTE_NOTE, "epss": EPSS_NOTE}
-#: The note an escalation carries: what changed since the first message, not why the CVE is critical.
-CHANGE_NOTE = {
-    "kev": "Change: CVE added to the CISA KEV catalog (exploited in the wild).",
-    "ssvc": "Change: CISA recorded active exploitation (SSVC).",
-    "epss": "Change: exploitation likelihood (EPSS) above threshold; unconfirmed.",
-    "remote": "Change: a CVSS >= 9.0 score appeared for a remote, unauthenticated, no-interaction attack.",
-}
+def remote_note(thresholds: Thresholds = DEFAULT_THRESHOLDS) -> str:
+    """The note the remote rule carries, naming the CVSS bar actually configured.
+
+    A literal "CVSS >= 9.0" would be a lie the moment the threshold is saved as anything else, and the note is
+    the only place a reader learns which rule decided.
+    """
+    return f"CVSS >= {thresholds.critical_cvss:g}, remote attack, no privileges, no user interaction (CVSS vector)."
 
 
-def level_of(facts: CveFacts, kev: bool, kev_known: bool, fallback_cvss: float | None = None) -> tuple[str, str | None]:
+def reason_note(reason: str | None, thresholds: Thresholds = DEFAULT_THRESHOLDS) -> str:
+    """The note a critical verdict carries, or the empty string for a reason that needs none.
+
+    ``kev`` and ``ssvc`` are observed exploitation and speak for themselves; ``remote`` and ``epss`` are forecasts
+    and name the configured bar, because the same advisory is a warning under a stricter threshold.
+    """
+    if reason == "remote":
+        return remote_note(thresholds)
+    if reason == "epss":
+        return EPSS_NOTE
+    return ""
+
+
+def change_note(reason: str | None, thresholds: Thresholds = DEFAULT_THRESHOLDS) -> str:
+    """The note an escalation carries: what changed since the first message, not why the CVE is critical."""
+    if reason == "kev":
+        return "Change: CVE added to the CISA KEV catalog (exploited in the wild)."
+    if reason == "ssvc":
+        return "Change: CISA recorded active exploitation (SSVC)."
+    if reason == "epss":
+        return f"Change: exploitation likelihood (EPSS) at or above {thresholds.critical_epss:g}; unconfirmed."
+    if reason == "remote":
+        return (
+            f"Change: a CVSS >= {thresholds.critical_cvss:g} score appeared for a remote, unauthenticated, "
+            "no-interaction attack."
+        )
+    return ""
+
+
+def level_of(
+    facts: CveFacts,
+    kev: bool,
+    kev_known: bool,
+    fallback_cvss: float | None = None,
+    *,
+    thresholds: Thresholds,
+) -> tuple[str, str | None]:
     """(``critical`` | ``warning`` | ``suppressed``, why critical). Unknown is a warning."""
-    reason = critical_reason(facts, kev)
+    reason = critical_reason(facts, kev, thresholds=thresholds)
     if reason:
         return "critical", reason
     cvss = facts.cvss if facts.cvss is not None else fallback_cvss
-    if facts.complete and kev_known and cvss is not None and cvss < LOW_BELOW:
+    if facts.complete and kev_known and cvss is not None and cvss < thresholds.suppress_below_cvss:
         return "suppressed", None
     return "warning", None
 
@@ -1056,6 +1087,8 @@ def judge(
     osv_fallbacks: Mapping[str, float] | None = None,
     independent_ghsa_cvss: float | None = None,
     osv_scores_are_aliased: bool = False,
+    *,
+    thresholds: Thresholds,
 ) -> Verdict:
     """Item verdict from the CVEs it names; the CVE that decides is the one shown.
 
@@ -1067,11 +1100,11 @@ def judge(
         if independent_ghsa_cvss is not None:
             # An alias-free advisory carries its own severity, whatever else the item mentions. Once it
             # exists, the aggregate score is not used: part of it may belong to an already-claimed CVE.
-            if independent_ghsa_cvss >= CRITICAL_CVSS:
+            if independent_ghsa_cvss >= thresholds.critical_cvss:
                 return Verdict(
                     "critical", (), metrics_line(independent_ghsa_cvss, None, None, None, False, approximate=True), ""
                 )
-            if osv_complete and independent_ghsa_cvss < LOW_BELOW:
+            if osv_complete and independent_ghsa_cvss < thresholds.suppress_below_cvss:
                 return Verdict(
                     "suppressed", (), metrics_line(independent_ghsa_cvss, None, None, None, False, approximate=True), ""
                 )
@@ -1088,9 +1121,9 @@ def judge(
             return Verdict("warning", (), line, incomplete_note)
         # With no CVE named, every OSV score here belongs to an advisory that has no CVE alias, so its
         # severity decides on its own: a CRITICAL label is critical, not merely a warning.
-        if osv_cvss is not None and osv_cvss >= CRITICAL_CVSS:
+        if osv_cvss is not None and osv_cvss >= thresholds.critical_cvss:
             return Verdict("critical", (), metrics_line(osv_cvss, None, None, None, False, approximate=True), "")
-        if osv_complete and osv_cvss is not None and osv_cvss < LOW_BELOW:
+        if osv_complete and osv_cvss is not None and osv_cvss < thresholds.suppress_below_cvss:
             return Verdict("suppressed", (), metrics_line(osv_cvss, None, None, None, False, approximate=True), "")
         line = (
             "unknown (no CVE id and no OSV score)"
@@ -1105,6 +1138,7 @@ def judge(
             cve in kev,
             kev_known,
             fallbacks.get(cve),
+            thresholds=thresholds,
         )
         for cve in cves
     }
@@ -1129,10 +1163,10 @@ def judge(
     if independent_ghsa_cvss is not None:
         # An alias-free GHSA carries its own severity: a LOW CVE beside it must not hide it, and an aliased
         # GHSA (whose score is already represented by its CVE) must not override the CVE's own score.
-        if independent_ghsa_cvss >= CRITICAL_CVSS:
+        if independent_ghsa_cvss >= thresholds.critical_cvss:
             tag = "critical"
             ghsa_decides = True
-        elif tag == "suppressed" and independent_ghsa_cvss >= LOW_BELOW:
+        elif tag == "suppressed" and independent_ghsa_cvss >= thresholds.suppress_below_cvss:
             # Both components are measured and both are LOW: keep the suppression. Only a second advisory
             # above the LOW floor is news.
             tag = "warning"
@@ -1158,7 +1192,7 @@ def judge(
     unscored = sum(1 for cve in cves if not facts[cve].complete)
     if unscored:
         line += f" (+{unscored} CVEs unscored)"
-    note = REASON_NOTE.get(judged[shown][1] or "", "")
+    note = reason_note(judged[shown][1], thresholds)
     if ghsa_decides:
         note = "An advisory in this item without a CVE id decides the severity."
     if tag == "warning" and (not osv_complete or any(not facts[cve].complete for cve in cves)):
@@ -1395,6 +1429,9 @@ def _delivered(
                 # message about the same advisory is dropped or delivered again from another source.
                 state["seen"][identifier] = {"at": now, "outcome": outcome, "delivery": snapshot_id}
         kev_only = set(entry.get("kev_only") or ())
+        # The rules that judged this message travel with it: a queue entry written before thresholds were
+        # configurable carries none, and then the defaults are what judged it.
+        judged_by = Thresholds.from_snapshot(entry.get("thresholds")).snapshot()
         for cve, level in entry["levels"].items() if outcome == "delivered" else ():
             # A message the operator dropped was never sent, so no later escalation may refer to it as sent.
             state["watch"][cve] = {
@@ -1404,6 +1441,7 @@ def _delivered(
                 "kev_only": cve in kev_only,
                 "title": entry["source"],
                 "link": entry["link"],
+                "thresholds": judged_by,
             }
             if "scores" in entry:  # A message queued before the key existed has no score on record: legacy.
                 state["watch"][cve]["cvss"] = entry["scores"].get(cve)
@@ -1411,11 +1449,18 @@ def _delivered(
         watch = state["watch"].get(entry["cves"][0])
         if watch is not None:
             watch["level"] = entry["tag"]
+            watch["thresholds"] = Thresholds.from_snapshot(entry.get("thresholds")).snapshot()
     # An Adobe message was recorded in state["adobe"] when it was queued; delivering or dropping it changes nothing.
 
 
 def _suppressed(
-    state: dict, ids: Sequence[str], verdict: Verdict, item: Item, scores: Mapping[str, float | None], now: int
+    state: dict,
+    ids: Sequence[str],
+    verdict: Verdict,
+    item: Item,
+    scores: Mapping[str, float | None],
+    now: int,
+    thresholds: Thresholds,
 ) -> None:
     for identifier in ids:
         # An identifier that was already notified keeps its history: this message is about the new CVEs.
@@ -1428,6 +1473,7 @@ def _suppressed(
             "title": headline(item.title, item.summary)[0],
             "link": item.link,
             "cvss": scores.get(cve),
+            "thresholds": thresholds.snapshot(),
         }
 
 
@@ -1451,6 +1497,7 @@ def classify_new(
     share: int | None = None,
     trusted: Collection[str] = (),
     source_id: str = "",
+    thresholds: Thresholds,
 ) -> list[Item]:
     """Queue the items nobody has seen, oldest first, until the delivery cap or the lookup budget is reached.
 
@@ -1643,13 +1690,14 @@ def classify_new(
             osv_fallbacks=osv_fallbacks,
             independent_ghsa_cvss=independent_ghsa_cvss,
             osv_scores_are_aliased=aliased_scored and not independent_scored,
+            thresholds=thresholds,
         )
         if unenriched and verdict.tag == "warning":
             verdict = replace(verdict, note=ENRICH_FAILED_NOTE)
         # The CVSS each watched CVE had when its message was queued: a later escalation by the remote rule needs it.
         scores = {cve: facts[cve].cvss for cve, _ in verdict.levels}
         if verdict.tag == "suppressed":
-            _suppressed(state, ids, verdict, item, scores, now)
+            _suppressed(state, ids, verdict, item, scores, now, thresholds)
         else:
             shown_ids = [i for i in ids if i not in claimed and not i.startswith("src:")]
             heading, excerpt = headline(item.title, item.summary)
@@ -1681,6 +1729,7 @@ def classify_new(
                     "levels": dict(verdict.levels),
                     "kev_only": list(verdict.skipped),
                     "scores": scores,
+                    "thresholds": thresholds.snapshot(),
                     "source": heading,
                     "link": item.link,
                     "source_id": source_id,
@@ -1736,19 +1785,33 @@ def _prune_enrich_clock(state: dict, key: str, guids: set[str]) -> None:
         state.pop(key, None)
 
 
-def _score_is_new(entry: dict) -> bool:
-    """True when the CVSS now on record is news to a reader: the CVE was unscored or below 9.0 when it was queued.
+def _score_is_new(entry: dict, thresholds: Thresholds) -> bool:
+    """True when the CVSS now on record is news to a reader: the CVE was unscored or below the bar when queued.
 
     A watch entry without the ``cvss`` key was written before the score was recorded; its score counts as known.
     """
-    return "cvss" in entry and (entry["cvss"] is None or entry["cvss"] < CRITICAL_CVSS)
+    return "cvss" in entry and (entry["cvss"] is None or entry["cvss"] < thresholds.critical_cvss)
 
 
-def reevaluate(state: dict, intel: Intel, kev: frozenset[str], kev_known: bool, now: int, feed_host: str) -> None:
+def reevaluate(
+    state: dict,
+    intel: Intel,
+    kev: frozenset[str],
+    kev_known: bool,
+    now: int,
+    feed_host: str,
+    *,
+    thresholds: Thresholds,
+) -> None:
     """Re-score due CVEs once a day; queue one escalation per level a CVE newly reaches.
 
     The remote-and-unauthenticated rule alone escalates only a CVE whose score was new (``_score_is_new``): a rule
     that changed since the first message is not a change in the world. KEV, SSVC and EPSS escalate as before.
+
+    A *threshold* change is the same kind of rule change, so an entry judged under other numbers is re-baselined
+    once (``entry["thresholds"]``) instead of being escalated: otherwise lowering the floor would send the whole
+    watch list out at once. Observed exploitation is the exception -- a KEV hit or CISA's active flag that a
+    reader was never told about is a miss, whatever the thresholds say.
     """
     watch: dict = state["watch"]
     due = sorted(
@@ -1773,7 +1836,7 @@ def reevaluate(state: dict, intel: Intel, kev: frozenset[str], kev_known: bool, 
         current = facts[cve]
         entry = watch[cve]
         # Membership is positive evidence on its own; kev_known only gates the *absence*-based suppression.
-        deciding = critical_reason(current, cve in kev)
+        deciding = critical_reason(current, cve in kev, thresholds=thresholds)
         if cve in deferred and not deciding:
             # No request was made and nothing independently decisive is known: try again next pass rather
             # than waiting a whole day. KEV or SSVC evidence still escalates now.
@@ -1787,11 +1850,21 @@ def reevaluate(state: dict, intel: Intel, kev: frozenset[str], kev_known: bool, 
             entry["last_eval"] = now
             continue
         entry["last_eval"] = now
-        level, reason = level_of(current, cve in kev, kev_known)
-        held = reason == "remote" and not _score_is_new(entry)
+        level, reason = level_of(current, cve in kev, kev_known, thresholds=thresholds)
+        judged_by = Thresholds.from_snapshot(entry.get("thresholds"))
+        entry["thresholds"] = thresholds.snapshot()
+        if judged_by != thresholds and not (reason in ("kev", "ssvc") and level == "critical"):
+            # Re-baseline: record what this CVE is under the new numbers, send nothing. A settings edit is not
+            # a change in the world, so it must not look like one.
+            entry["level"] = level
+            LOG.info("reevaluate: %s recorded as %s under changed thresholds; nothing sent", cve, level)
+            continue
+        held = reason == "remote" and not _score_is_new(entry, thresholds)
         if held:  # Judge again without the remote rule, so EPSS can still escalate.
-            level, reason = level_of(replace(current, remote_unauth=False), cve in kev, kev_known)
-        if level == "warning" and not (current.cvss is not None and current.cvss >= LOW_BELOW):
+            level, reason = level_of(
+                replace(current, remote_unauth=False), cve in kev, kev_known, thresholds=thresholds
+            )
+        if level == "warning" and not (current.cvss is not None and current.cvss >= thresholds.suppress_below_cvss):
             continue  # Still unscored or LOW: not an escalation.
         if RANK[level] <= RANK[entry["level"]]:
             if held and entry["level"] != "critical":
@@ -1808,7 +1881,7 @@ def reevaluate(state: dict, intel: Intel, kev: frozenset[str], kev_known: bool, 
             continue
         before = "recorded as LOW and not sent" if entry["level"] == "suppressed" else "sent as a warning"
         line = metrics_line(current.cvss, current.epss, current.percentile, current.ssvc, cve in kev)
-        note = CHANGE_NOTE.get(reason or "", "")
+        note = change_note(reason, thresholds)
         title, body = render(
             level,
             f"{cve} now {LEVEL_LABEL[level]}",
@@ -1834,6 +1907,7 @@ def reevaluate(state: dict, intel: Intel, kev: frozenset[str], kev_known: bool, 
                 "levels": {},
                 "source": entry["title"],
                 "link": entry["link"],
+                "thresholds": thresholds.snapshot(),
             }
         )
 

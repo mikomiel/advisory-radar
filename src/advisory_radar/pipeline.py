@@ -158,7 +158,7 @@ def _run_pass(
     intel = core.Intel(http, cache, clock, sleep, nvd_key=cfg.nvd_api_key)
     # Re-evaluate before classification: both share one NVD budget, and a busy news day must not starve a due
     # watch of the measurement that could escalate it. A watch created later this pass is evaluated next pass.
-    core.reevaluate(state, intel, kev, kev_known, now, "")
+    core.reevaluate(state, intel, kev, kev_known, now, "", thresholds=cfg.thresholds)
 
     fetched_ids: set[str] = set()
     answered: list[tuple[object, object]] = []
@@ -281,6 +281,7 @@ def _run_pass(
             trusted=trusted,
             # Recorded on every queued message so routing can match on the source and its products.
             source_id=source.id,
+            thresholds=cfg.thresholds,
         )
         if left:
             carried[source.id] = [core.item_to_state(item) for item in left]

@@ -10,6 +10,7 @@ doing nothing.
 from __future__ import annotations
 
 import copy
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -76,6 +77,82 @@ def expand_entry(entry: dict, env: Mapping[str, str], resolved: list[str] | None
     return expanded
 
 
+#: The names the ``thresholds`` block may carry, in the order its documentation lists them.
+THRESHOLD_KEYS = ("critical_cvss", "critical_epss", "suppress_below_cvss")
+
+
+@dataclass(frozen=True)
+class Thresholds:
+    """The three numbers the severity decision reads.
+
+    Owned by the configuration because they *are* configuration: ``core`` takes them as an argument instead of
+    reading a module constant, so a value saved from the browser applies to the next pass instead of the next
+    release. The defaults are the numbers the code hardcoded before this block existed, so an installation that
+    never writes it keeps its behaviour exactly.
+    """
+
+    #: At or above this CVSS a CVE can be critical: with a remote, unauthenticated, no-interaction vector, or
+    #: with an EPSS score at or above ``critical_epss``.
+    critical_cvss: float = 9.0
+    #: At or above this exploitation probability a CVE with a CVSS at or above ``critical_cvss`` is critical.
+    critical_epss: float = 0.10
+    #: Below this CVSS a completely measured CVE is recorded and watched, but never sent.
+    suppress_below_cvss: float = 4.0
+
+    def snapshot(self) -> list[float]:
+        """The three numbers as a JSON list, so a watch entry can record which rules judged it."""
+        return [self.critical_cvss, self.critical_epss, self.suppress_below_cvss]
+
+    @classmethod
+    def from_snapshot(cls, value: object) -> Thresholds:
+        """The thresholds a watch entry recorded; a damaged or missing record means the defaults.
+
+        The state is JSON a person can edit by hand, and entries written before thresholds were configurable
+        carry no record at all: both have to judge instead of raising.
+        """
+        members = value if isinstance(value, (list, tuple)) else ()
+        usable = len(members) == 3 and all(
+            isinstance(member, (int, float)) and not isinstance(member, bool) and math.isfinite(member)
+            for member in members
+        )
+        return cls(*(float(member) for member in members)) if usable else DEFAULT_THRESHOLDS
+
+
+DEFAULT_THRESHOLDS = Thresholds()
+
+
+def _threshold_number(raw: object, where: str) -> float:
+    """One number from the ``thresholds`` block; the value itself never reaches the message.
+
+    A block can be written with a ``${NAME}`` reference, which expands to a string of unknown content, and these
+    messages are logged before any redaction exists.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw):
+        raise ConfigError(f"{where} must be a number")
+    return float(raw)
+
+
+def _thresholds(raw: object) -> Thresholds:
+    """The validated ``thresholds`` block; an absent one is the defaults, never an error."""
+    if raw is None:
+        return DEFAULT_THRESHOLDS
+    _require(isinstance(raw, dict), "thresholds must be a mapping")
+    unknown = set(raw) - set(THRESHOLD_KEYS)
+    _require(not unknown, f"thresholds: unknown keys {sorted(unknown)}")
+    values = {key: getattr(DEFAULT_THRESHOLDS, key) for key in THRESHOLD_KEYS}
+    for key in THRESHOLD_KEYS:
+        if key in raw:
+            values[key] = _threshold_number(raw[key], f"thresholds.{key}")
+    thresholds = Thresholds(**values)
+    _require(0 < thresholds.critical_cvss <= 10, "thresholds.critical_cvss must be above 0 and at most 10")
+    _require(0 < thresholds.critical_epss <= 1, "thresholds.critical_epss must be above 0 and at most 1")
+    _require(
+        0 <= thresholds.suppress_below_cvss <= thresholds.critical_cvss,
+        "thresholds.suppress_below_cvss must be between 0 and thresholds.critical_cvss",
+    )
+    return thresholds
+
+
 @dataclass(frozen=True)
 class Config:
     sources: tuple[dict, ...]
@@ -92,6 +169,9 @@ class Config:
     #: turned off for an installation whose sources live on the LAN. It is not an isolation boundary -- see
     #: :func:`advisory_radar.http.private_destination` for what it does and does not cover.
     allow_private_sources: bool = False
+    #: The severity thresholds in force; see :class:`Thresholds`. Never read from a module constant in ``core``,
+    #: or a saved overlay could not change the next pass.
+    thresholds: Thresholds = DEFAULT_THRESHOLDS
     #: Ordered routing rules, first match wins. Empty means every message goes to every enabled notifier,
     #: exactly as it did before routing existed.
     routes: tuple[dict, ...] = ()
@@ -150,6 +230,7 @@ _TOP_KEYS = {
     "default",
     "web",
     "allow_private_sources",
+    "thresholds",
 }
 #: The keys a routing rule itself may carry; the match keys and the tag set are ``routing.py``'s.
 _ROUTE_KEYS = frozenset({"match", "notifiers"})
@@ -285,7 +366,7 @@ def load_document(path: Path, *, settings: dict | None = None) -> dict:
 
 
 def _merge_settings(document: dict, settings: dict) -> None:
-    """Overlay the seven writable keys onto the raw YAML document, in place."""
+    """Overlay the eight writable keys onto the raw YAML document, in place."""
     from .settings import validate_settings  # lazy: settings.py imports ConfigError from this module
 
     validate_settings(settings)
@@ -319,6 +400,15 @@ def _merge_settings(document: dict, settings: dict) -> None:
         document["routes"] = settings["routes"]
     if "default" in settings:
         document["default"] = settings["default"]
+    if "thresholds" in settings:
+        # Merged key by key, unlike ``routes``: the numbers are independent, so an overlay that carries one of
+        # them leaves the YAML's other two in force, and clearing one field falls back to the YAML value.
+        raw_thresholds = document.get("thresholds")
+        if isinstance(raw_thresholds, dict):
+            document["thresholds"] = {**raw_thresholds, **settings["thresholds"]}
+        elif raw_thresholds is None:
+            document["thresholds"] = dict(settings["thresholds"])
+        # A block that is not a mapping is refused by the validator; an overlay cannot repair it.
 
 
 def _merge_sources(raw: object, overlay: dict) -> object:
@@ -514,6 +604,8 @@ def config_from_document(
     # Routing is validated here, after expansion and after the disabled entries were dropped, so a route names
     # a notifier that will actually be built. An absent or empty block keeps the pre-routing behaviour.
     routes, default_notifiers = _routing(document, notifiers, strict=not lenient)
+    # After expansion: a block can carry a reference, which arrives as a string and is refused as "not a number".
+    thresholds = _thresholds(document.get("thresholds"))
 
     poll = document.get("poll_interval", "15m")
     match = re.fullmatch(r"(\d+)([smh])", str(poll))
@@ -566,6 +658,7 @@ def config_from_document(
         adobe_commerce=_bool_option(document.get("adobe_commerce", False), "adobe_commerce"),
         allow_private_sources=_bool_option(document.get("allow_private_sources", False), "allow_private_sources"),
         nvd_api_key=raw_nvd_key.strip(),
+        thresholds=thresholds,
         routes=routes,
         default_notifiers=default_notifiers,
         web_host=web_host,

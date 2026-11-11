@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from advisory_radar import core, pipeline
-from advisory_radar.config import collect_secrets, load_config
+from advisory_radar.config import DEFAULT_THRESHOLDS, collect_secrets, load_config
 from advisory_radar.notifiers import AppriseNotifier, DiscordWebhookNotifier, build_notifier
 from advisory_radar.sources import RssSource
 from advisory_radar.state import state_lock
@@ -528,8 +528,8 @@ def test_a_failing_watch_does_not_starve_the_next_one():
                 facts[healthy] = core.CveFacts(None, None, None, None, True)
             return facts
 
-    core.reevaluate(state, Intel(), frozenset(), True, now, "")
-    core.reevaluate(state, Intel(), frozenset(), True, now, "")
+    core.reevaluate(state, Intel(), frozenset(), True, now, "", thresholds=DEFAULT_THRESHOLDS)
+    core.reevaluate(state, Intel(), frozenset(), True, now, "", thresholds=DEFAULT_THRESHOLDS)
     assert state["watch"][healthy]["last_eval"] == now, "a failing batch must not block a healthy watch"
 
 
@@ -664,7 +664,7 @@ def test_a_kev_hit_escalates_even_when_the_scored_lookups_fail():
         def cves(self, cves, force=False, deferred=None):
             return {name: core.CveFacts(None, None, None, None, False) for name in cves}
 
-    core.reevaluate(state, Intel(), frozenset({cve}), True, now, "")
+    core.reevaluate(state, Intel(), frozenset({cve}), True, now, "", thresholds=DEFAULT_THRESHOLDS)
     queued = [entry for entry in state["pending"] if entry["kind"] == "escalation"]
     assert queued and queued[0]["cves"] == [cve], "a known KEV hit must escalate"
     assert queued[0]["tag"] == "critical"
@@ -754,9 +754,9 @@ def test_an_overflowing_metric_is_unknown_not_fatal(tmp_path):
 
 def test_low_ghsa_does_not_suppress_an_unmeasured_one():
     facts = {"CVE-2026-1": core.CveFacts(None, None, None, None, True)}
-    verdict = core.judge([], facts, frozenset(), True, 3.9, osv_complete=False)
+    verdict = core.judge([], facts, frozenset(), True, 3.9, osv_complete=False, thresholds=DEFAULT_THRESHOLDS)
     assert verdict.tag != "suppressed", "an unmeasured advisory must keep the item visible"
-    verdict_measured = core.judge([], facts, frozenset(), True, 3.9, osv_complete=True)
+    verdict_measured = core.judge([], facts, frozenset(), True, 3.9, osv_complete=True, thresholds=DEFAULT_THRESHOLDS)
     assert verdict_measured.tag == "suppressed"
 
 
@@ -905,9 +905,19 @@ def test_an_osv_score_never_judges_an_unrelated_cve():
         3.9,
         True,
         osv_fallbacks={"CVE-2026-8888": 3.9},
+        thresholds=DEFAULT_THRESHOLDS,
     )
     assert verdict.tag == "warning", "an unrelated LOW score must not suppress this CVE"
-    aliased = core.judge(["CVE-2026-7777"], facts, frozenset(), True, 3.9, True, osv_fallbacks={"CVE-2026-7777": 3.9})
+    aliased = core.judge(
+        ["CVE-2026-7777"],
+        facts,
+        frozenset(),
+        True,
+        3.9,
+        True,
+        osv_fallbacks={"CVE-2026-7777": 3.9},
+        thresholds=DEFAULT_THRESHOLDS,
+    )
     assert aliased.tag == "suppressed"
 
 
@@ -960,7 +970,9 @@ def test_a_damaged_kev_cache_is_not_a_known_catalog(tmp_path):
 
 def test_a_two_ghsa_item_does_not_lend_one_score_to_the_others_cve():
     facts = {"CVE-2026-7777": core.CveFacts(None, None, None, None, True)}
-    verdict = core.judge(["CVE-2026-7777"], facts, frozenset(), True, 3.9, True, osv_fallbacks={})
+    verdict = core.judge(
+        ["CVE-2026-7777"], facts, frozenset(), True, 3.9, True, osv_fallbacks={}, thresholds=DEFAULT_THRESHOLDS
+    )
     assert verdict.tag == "warning", "no GHSA aliases this CVE, so no OSV score judges it"
 
 
@@ -1159,19 +1171,30 @@ def test_an_aliased_ghsa_does_not_override_its_cve(monkeypatch):
         True,
         osv_fallbacks={"CVE-2026-1111": 9.8},
         independent_ghsa_cvss=None,
+        thresholds=DEFAULT_THRESHOLDS,
     )
     assert verdict.tag == "warning", "an aliased GHSA must not force critical"
 
 
 def test_an_alias_free_critical_ghsa_alone_is_critical():
-    verdict = core.judge([], {}, frozenset(), True, 9.8, True, osv_fallbacks={}, independent_ghsa_cvss=9.8)
+    verdict = core.judge(
+        [], {}, frozenset(), True, 9.8, True, osv_fallbacks={}, independent_ghsa_cvss=9.8, thresholds=DEFAULT_THRESHOLDS
+    )
     assert verdict.tag == "critical", "a CRITICAL advisory with no CVE alias is critical by itself"
 
 
 def test_an_alias_free_ghsa_cannot_be_hidden_by_a_low_cve():
     facts = {"CVE-2026-2222": core.CveFacts(2.0, None, 0.001, 0.1, True)}
     verdict = core.judge(
-        ["CVE-2026-2222"], facts, frozenset(), True, 9.8, True, osv_fallbacks={}, independent_ghsa_cvss=9.8
+        ["CVE-2026-2222"],
+        facts,
+        frozenset(),
+        True,
+        9.8,
+        True,
+        osv_fallbacks={},
+        independent_ghsa_cvss=9.8,
+        thresholds=DEFAULT_THRESHOLDS,
     )
     assert verdict.tag == "critical"
 
@@ -1229,7 +1252,9 @@ def test_an_item_with_many_ghsas_cannot_monopolise_the_pass(monkeypatch):
         tuple(f"GHSA-aaaa-bbbb-{index:04d}" for index in range(200)),
     )
     policy = core.Policy(("curl",), (), ())
-    core.classify_new(state, [many], Intel(), frozenset(), True, NOW, "vendor.example.com", policy)
+    core.classify_new(
+        state, [many], Intel(), frozenset(), True, NOW, "vendor.example.com", policy, thresholds=DEFAULT_THRESHOLDS
+    )
     assert len(looked) <= core.MAX_ITEM_GHSA_LOOKUPS, "OSV lookups per item are bounded"
     # the unmeasured remainder keeps the item out of the suppressed bucket
     assert all(entry["tag"] != "suppressed" for entry in state["pending"])
@@ -1238,11 +1263,27 @@ def test_an_item_with_many_ghsas_cannot_monopolise_the_pass(monkeypatch):
 def test_two_measured_low_advisories_stay_suppressed():
     facts = {"CVE-2026-3333": core.CveFacts(2.0, None, 0.001, 0.1, True)}
     verdict = core.judge(
-        ["CVE-2026-3333"], facts, frozenset(), True, 3.9, True, osv_fallbacks={}, independent_ghsa_cvss=3.9
+        ["CVE-2026-3333"],
+        facts,
+        frozenset(),
+        True,
+        3.9,
+        True,
+        osv_fallbacks={},
+        independent_ghsa_cvss=3.9,
+        thresholds=DEFAULT_THRESHOLDS,
     )
     assert verdict.tag == "suppressed", "LOW + LOW is not news"
     high = core.judge(
-        ["CVE-2026-3333"], facts, frozenset(), True, 7.5, True, osv_fallbacks={}, independent_ghsa_cvss=7.5
+        ["CVE-2026-3333"],
+        facts,
+        frozenset(),
+        True,
+        7.5,
+        True,
+        osv_fallbacks={},
+        independent_ghsa_cvss=7.5,
+        thresholds=DEFAULT_THRESHOLDS,
     )
     assert high.tag == "warning"
 
@@ -1285,6 +1326,7 @@ def test_a_claimed_cve_beside_a_new_ghsa_does_not_let_the_ghsa_speak_for_it():
         osv_fallbacks={},
         independent_ghsa_cvss=None,
         osv_scores_are_aliased=True,
+        thresholds=DEFAULT_THRESHOLDS,
     )
     assert verdict.tag == "warning", "an aliased advisory must not escalate on its own label"
 
@@ -1305,6 +1347,7 @@ def test_an_independent_critical_ghsa_wins_regardless_of_identifier_order():
             osv_fallbacks={},
             independent_ghsa_cvss=9.8 if independent_first else None,
             osv_scores_are_aliased=not independent_first,
+            thresholds=DEFAULT_THRESHOLDS,
         )
         expected = "critical" if independent_first else "warning"
         assert verdict.tag == expected
@@ -1398,7 +1441,15 @@ def test_a_state_file_named_kev_json_is_refused(tmp_path):
 def test_a_ghsa_decided_verdict_renders_the_ghsa_evidence():
     facts = {"CVE-2026-4444": core.CveFacts(2.0, None, 0.001, 0.1, True)}
     verdict = core.judge(
-        ["CVE-2026-4444"], facts, frozenset(), True, 9.8, True, osv_fallbacks={}, independent_ghsa_cvss=9.8
+        ["CVE-2026-4444"],
+        facts,
+        frozenset(),
+        True,
+        9.8,
+        True,
+        osv_fallbacks={},
+        independent_ghsa_cvss=9.8,
+        thresholds=DEFAULT_THRESHOLDS,
     )
     assert verdict.tag == "critical"
     assert "OSV GHSA severity" in verdict.line, "the deciding evidence must be shown, not the unrelated CVE score"
@@ -1443,7 +1494,7 @@ def test_confirmed_ssvc_active_escalates_through_an_epss_outage():
         def cves(self, cves, force=False, deferred=None):
             return {name: core.CveFacts(None, "active", None, None, False) for name in cves}
 
-    core.reevaluate(state, Intel(), frozenset(), True, NOW, "")
+    core.reevaluate(state, Intel(), frozenset(), True, NOW, "", thresholds=DEFAULT_THRESHOLDS)
     queued = [entry for entry in state["pending"] if entry["kind"] == "escalation"]
     assert queued and queued[0]["tag"] == "critical", "SSVC active decides without EPSS"
 
@@ -1551,7 +1602,9 @@ def test_a_deferred_enrichment_item_is_carried(tmp_path, monkeypatch):
 
     state = core.new_state()
     policy = core.Policy(("curl",), (), ())
-    left = core.classify_new(state, [dsa], Intel(), frozenset(), True, NOW, "lists.debian.org", policy)
+    left = core.classify_new(
+        state, [dsa], Intel(), frozenset(), True, NOW, "lists.debian.org", policy, thresholds=DEFAULT_THRESHOLDS
+    )
     assert [entry.guid for entry in left] == ["g1"], "a deferred item is returned for the next pass"
     assert state["enrich_retry"]["g1"] == NOW
 
@@ -1940,6 +1993,7 @@ def test_the_rendered_score_belongs_to_the_shown_cve():
         3.9,
         True,
         osv_fallbacks={"CVE-2026-2222": 3.9},
+        thresholds=DEFAULT_THRESHOLDS,
     )
     assert verdict.tag == "warning"
     assert "CVE-2026-1111" in verdict.line and "3.9" not in verdict.line, (
@@ -2097,7 +2151,9 @@ def test_php_enrichment_keeps_both_cves_and_ghsas():
         return core.OsvFacts((), 9.8, True)
 
     FakeIntel.ghsa = ghsa
-    core.classify_new(state, [release_item], FakeIntel(), frozenset(), True, NOW, "www.php.net", policy)
+    core.classify_new(
+        state, [release_item], FakeIntel(), frozenset(), True, NOW, "www.php.net", policy, thresholds=DEFAULT_THRESHOLDS
+    )
     assert "GHSA-aaaa-bbbb-cccc" in looked, "a PHP release names both ids and both must be used"
     assert any(entry["tag"] == "critical" for entry in state["pending"]), "the alias-free CRITICAL GHSA decides"
 
@@ -2110,7 +2166,9 @@ def test_a_capped_out_cve_is_still_watched():
     facts = {
         f"CVE-2026-{1000 + index}": core.CveFacts(None, None, None, None, False, skipped=True) for index in range(12)
     }
-    verdict = core.judge(list(facts), facts, frozenset(), True, None, True, osv_fallbacks={})
+    verdict = core.judge(
+        list(facts), facts, frozenset(), True, None, True, osv_fallbacks={}, thresholds=DEFAULT_THRESHOLDS
+    )
     watched = dict(verdict.levels)
     assert len(watched) <= core.MAX_ITEM_CVE_LOOKUPS + 12, "watching skipped CVEs stays bounded"
     assert any(level == "warning" for level in watched.values()), (
@@ -2168,7 +2226,9 @@ def test_every_cve_in_a_large_advisory_is_watched():
     facts = {
         f"CVE-2026-{2000 + index}": core.CveFacts(None, None, None, None, False, skipped=True) for index in range(25)
     }
-    verdict = core.judge(list(facts), facts, frozenset(), True, None, True, osv_fallbacks={})
+    verdict = core.judge(
+        list(facts), facts, frozenset(), True, None, True, osv_fallbacks={}, thresholds=DEFAULT_THRESHOLDS
+    )
     assert len(verdict.levels) == 25, "every claimed CVE needs a watch entry"
     assert set(verdict.skipped) == set(facts), "the unmeasured ones are flagged KEV-only"
 
@@ -2196,7 +2256,7 @@ def test_a_kev_addition_escalates_a_capped_out_cve(tmp_path):
         def cves(self, cves, force=False, deferred=None):
             raise AssertionError("a KEV-only watch must not spend an enrichment request")
 
-    core.reevaluate(state, Intel(), frozenset({later}), True, NOW, "")
+    core.reevaluate(state, Intel(), frozenset({later}), True, NOW, "", thresholds=DEFAULT_THRESHOLDS)
     queued = [entry for entry in state["pending"] if entry["kind"] == "escalation"]
     assert queued and queued[0]["cves"] == [later], "a KEV addition escalates a watch that was never enriched"
 
@@ -2232,7 +2292,7 @@ def test_a_deferred_nvd_lookup_does_not_advance_the_daily_clock():
             (deferred if deferred is not None else set()).update(cves)  # budget ran out: no request made
             return {name: core.CveFacts(None, None, None, None, False) for name in cves}
 
-    core.reevaluate(state, Intel(), frozenset(), True, NOW, "")
+    core.reevaluate(state, Intel(), frozenset(), True, NOW, "", thresholds=DEFAULT_THRESHOLDS)
     assert state["watch"][cve]["last_eval"] == NOW - 2 * 86400, "a deferred lookup is not an attempt"
 
 
@@ -2249,9 +2309,11 @@ def test_suppressing_a_new_cve_keeps_an_earlier_record():
         ("CVE-2026-1111", "CVE-2026-2222"),
     )
     facts = {"CVE-2026-2222": core.CveFacts(2.0, None, 0.001, 0.1, True)}
-    verdict = core.judge(["CVE-2026-2222"], facts, frozenset(), True, None, True, osv_fallbacks={})
+    verdict = core.judge(
+        ["CVE-2026-2222"], facts, frozenset(), True, None, True, osv_fallbacks={}, thresholds=DEFAULT_THRESHOLDS
+    )
     assert verdict.tag == "suppressed"
-    core._suppressed(state, ["CVE-2026-1111", "CVE-2026-2222"], verdict, item, {}, NOW)
+    core._suppressed(state, ["CVE-2026-1111", "CVE-2026-2222"], verdict, item, {}, NOW, DEFAULT_THRESHOLDS)
     assert state["seen"]["CVE-2026-1111"] == {"at": NOW - 7200, "outcome": "delivered"}
     assert state["seen"]["CVE-2026-2222"]["outcome"] == "suppressed"
 
@@ -2276,7 +2338,7 @@ def test_a_confirmed_kev_hit_escalates_even_when_the_lookup_was_deferred():
             (deferred if deferred is not None else set()).update(cves)  # budget ran out
             return {name: core.CveFacts(None, None, None, None, False) for name in cves}
 
-    core.reevaluate(state, Intel(), frozenset({cve}), True, NOW, "")
+    core.reevaluate(state, Intel(), frozenset({cve}), True, NOW, "", thresholds=DEFAULT_THRESHOLDS)
     queued = [entry for entry in state["pending"] if entry["kind"] == "escalation"]
     assert queued and queued[0]["tag"] == "critical", "a confirmed KEV hit must not wait for the budget"
 
@@ -2320,6 +2382,7 @@ def test_independent_low_evidence_wins_over_a_mixed_aggregate():
         osv_fallbacks={},
         independent_ghsa_cvss=8.9,
         osv_scores_are_aliased=False,
+        thresholds=DEFAULT_THRESHOLDS,
     )
     assert verdict.tag == "warning", "the independent score decides, and HIGH is not critical"
 
@@ -2404,7 +2467,7 @@ def test_a_cached_kev_hit_escalates_without_a_fresh_catalog():
         def cves(self, cves, force=False, deferred=None):
             return {name: core.CveFacts(None, None, None, None, False) for name in cves}
 
-    core.reevaluate(state, Intel(), frozenset({cve}), False, NOW, "")
+    core.reevaluate(state, Intel(), frozenset({cve}), False, NOW, "", thresholds=DEFAULT_THRESHOLDS)
     queued = [entry for entry in state["pending"] if entry["kind"] == "escalation"]
     assert queued and queued[0]["tag"] == "critical"
 
@@ -2457,6 +2520,7 @@ def test_a_claimed_ghsa_does_not_promote_a_new_low_finding():
         NOW,
         "vendor.example.com",
         policy,
+        thresholds=DEFAULT_THRESHOLDS,
     )
     tags = [entry["tag"] for entry in state["pending"]]
     assert "critical" not in tags, "a claimed advisory must not promote the new finding"
@@ -2529,7 +2593,9 @@ def test_a_claimed_alias_free_ghsa_does_not_set_the_item_aggregate():
             return core.OsvFacts((), None, False)  # the new one is unmeasured
 
     policy = core.Policy(("curl",), (), ())
-    core.classify_new(state, [item], Intel(), frozenset(), True, NOW, "vendor.example.com", policy)
+    core.classify_new(
+        state, [item], Intel(), frozenset(), True, NOW, "vendor.example.com", policy, thresholds=DEFAULT_THRESHOLDS
+    )
     assert all(entry["tag"] != "critical" for entry in state["pending"]), (
         "a delivered advisory must not promote an unmeasured new one"
     )

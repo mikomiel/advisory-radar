@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from advisory_radar import core, pipeline, routing
-from advisory_radar.config import ConfigError, load_config
+from advisory_radar.config import DEFAULT_THRESHOLDS, ConfigError, load_config
 from advisory_radar.sources import RssSource
 from advisory_radar.watchlist import load_policy
 
@@ -275,6 +275,7 @@ def test_classify_new_records_the_source_id_and_matched_products(tmp_path):
         "vendor.example.com",
         policy,
         source_id="php-releases",
+        thresholds=DEFAULT_THRESHOLDS,
     )
     queued = state["pending"][0]
     assert queued["source_id"] == "php-releases"
