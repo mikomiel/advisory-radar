@@ -1429,3 +1429,73 @@ def test_both_reference_spellings_are_the_same_variable(tmp_path):
     )
     with pytest.raises(ConfigError, match="may not be composed from a variable that supplies a credential"):
         load_config(path, {})
+
+
+def test_a_repeated_file_suffix_cannot_dodge_the_inventory(tmp_path):
+    """``${X_FILE}``, ``${X_FILE_FILE}`` and ``${X}`` all read through one chain, so they are one variable."""
+    path = write_config(
+        tmp_path,
+        sources=[
+            {
+                "id": "feed-${CD_TOKEN_FILE}",
+                "type": "changedetection",
+                "url": "https://changes.example.net",
+                "api_key": "${CD_TOKEN_FILE_FILE}",
+            }
+        ],
+    )
+    with pytest.raises(ConfigError, match="may not be composed from a variable that supplies a credential") as raised:
+        load_config(path, {})
+    # The message names the id as written; no value exists yet, and none is printed.
+    assert "feed-${CD_TOKEN_FILE}" in str(raised.value)
+
+
+def test_a_non_scalar_credential_position_is_inventoried(tmp_path):
+    # ``_expand`` resolves the strings inside a list, so a shape the scanner skipped would still supply the value.
+    path = write_config(
+        tmp_path,
+        sources=[
+            {
+                "id": "feed-${TOKEN}",
+                "type": "rss",
+                "url": "https://feeds.example.net/security.xml",
+                "token": ["${TOKEN}"],
+            }
+        ],
+    )
+    with pytest.raises(ConfigError, match="may not be composed from a variable that supplies a credential"):
+        load_config(path, {})
+
+
+def test_a_genuinely_disabled_carrier_is_inventoried(tmp_path):
+    path = write_config(
+        tmp_path,
+        sources=[
+            {
+                "id": "changes",
+                "type": "changedetection",
+                "enabled": False,
+                "url": "https://changes.example.net",
+                "api_key": "${CD_TOKEN}",
+            },
+            {"id": "feed-${CD_TOKEN}", "type": "rss", "url": "https://feeds.example.net/x.xml"},
+        ],
+    )
+    with pytest.raises(ConfigError, match="may not be composed from a variable that supplies a credential"):
+        load_config(path, {"CD_TOKEN": "AbCdEf123456"})
+
+
+def test_a_notifier_header_credential_is_inventoried(tmp_path):
+    path = write_config(tmp_path, sources=[{"id": "feed-${HOOK_TOKEN}", "type": "rss", "url": "https://a.example.net"}])
+    document = yaml.safe_load(path.read_text())
+    document["notifiers"] = [
+        {
+            "id": "chat",
+            "type": "webhook",
+            "url": "${HOOK}",
+            "headers": {"Authorization": "Bearer ${HOOK_TOKEN}"},
+        }
+    ]
+    path.write_text(yaml.safe_dump(document))
+    with pytest.raises(ConfigError, match="may not be composed from a variable that supplies a credential"):
+        load_config(path, {"HOOK": "https://hooks.example.net/x", "HOOK_TOKEN": "AbCdEf123456"})

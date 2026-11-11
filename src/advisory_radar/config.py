@@ -160,15 +160,31 @@ _TRUE_WORDS = frozenset({"true", "yes", "on", "1"})
 _FALSE_WORDS = frozenset({"false", "no", "off", "0", ""})
 
 
-def _reference_names(value: object) -> set[str]:
-    """The environment variable names a value references, with the ``_FILE`` suffix normalised away.
+def _base_name(name: str) -> str:
+    """The variable family a reference belongs to: ``X``, ``X_FILE`` and ``X_FILE_FILE`` share an ``X`` chain.
 
-    ``${TOKEN}`` and ``${TOKEN_FILE}`` are the same variable's two spellings, so an id composed from one must
-    meet a credential supplied by the other.
+    ``_expand`` reads ``${X_FILE}`` from ``X_FILE`` or ``X``, and ``${X_FILE_FILE}`` from ``X_FILE_FILE`` or
+    ``X_FILE`` -- so a spelling with more suffixes still reaches the same secret, and stripping one suffix would
+    let it slip past the id check.
     """
-    if not isinstance(value, str):
-        return set()
-    return {name.removesuffix("_FILE") for name in _ENV_RE.findall(value)}
+    while name.endswith("_FILE") and len(name) > len("_FILE"):
+        name = name[: -len("_FILE")]
+    return name
+
+
+def _reference_names(value: object) -> set[str]:
+    """Every environment reference a value carries, at any depth, as family names.
+
+    It walks lists and mappings: a credential position can hold either, and ``_expand`` resolves the strings
+    inside one, so a shape the scanner skipped would still supply the value an id borrows.
+    """
+    if isinstance(value, str):
+        return {_base_name(name) for name in _ENV_RE.findall(value)}
+    if isinstance(value, list):
+        return set().union(*(_reference_names(item) for item in value)) if value else set()
+    if isinstance(value, dict):
+        return set().union(*(_reference_names(item) for item in value.values())) if value else set()
+    return set()
 
 
 #: Every key any built-in source kind declares as a credential. The collector uses the union rather than the
@@ -192,15 +208,9 @@ def _credential_names(document: dict) -> set[str]:
             for key in SOURCE_SECRET_KEYS:
                 names |= _reference_names(entry.get(key))
     for entry in document.get("notifiers") or []:
-        if not isinstance(entry, dict):
-            continue
-        for key in (*NOTIFIER_SECRET_KEYS, "headers"):
-            value = entry.get(key)
-            if isinstance(value, dict):
-                for item in value.values():
-                    names |= _reference_names(item)
-            else:
-                names |= _reference_names(value)
+        if isinstance(entry, dict):
+            for key in (*NOTIFIER_SECRET_KEYS, "headers"):
+                names |= _reference_names(entry.get(key))
     names |= _reference_names(document.get("nvd_api_key"))
     return names
 
