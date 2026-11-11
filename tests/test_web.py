@@ -93,7 +93,7 @@ def test_login_and_dashboard(tmp_path):
     client.cookies.set("advisory_radar_session", cookie)
     dashboard = client.get("/")
     assert dashboard.status_code == 200
-    assert "Pending: <b>1</b>" in dashboard.text
+    assert "<span class='stat-label'>Pending</span><span class='stat-value'>1</span>" in dashboard.text
     assert client.get("/alerts").status_code == 200
     assert "CVE-2026-1" in client.get("/alerts").text
     assert client.get("/runs").status_code == 200
@@ -149,7 +149,7 @@ def test_pages_tolerate_records_that_are_not_objects_or_not_times(tmp_path):
     dashboard = client.get("/")
     assert dashboard.status_code == 200
     assert "Last pass: 2026-10-21 16:26" in dashboard.text
-    assert "Seen in last 24h: <b>1</b>" in dashboard.text
+    assert "<span class='stat-label'>Seen in last 24h</span><span class='stat-value'>1</span>" in dashboard.text
 
     alerts = client.get("/alerts")
     assert alerts.status_code == 200

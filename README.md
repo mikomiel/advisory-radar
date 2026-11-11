@@ -189,18 +189,20 @@ turns critical, and never re-sends what you already received.
 
 ## Screenshots
 
-The UI is server-rendered: there is no JavaScript build step. These are from a
-local run with demo data, so the advisories in them are not real findings. The set is
+The UI is server-rendered: there is no JavaScript build step. Its pages share one
+hand-written stylesheet with no script, no web font and no external origin, and it follows
+the reader's light or dark preference. These are from a local run with demo data, so the
+advisories in them are not real findings. The set is
 reproducible: `uv run --with playwright python scripts/capture_screenshots.py` builds the
 demo config and state in a temporary directory, serves the app on loopback and writes the
 five PNGs (Playwright is opt-in and not a project dependency; see
 `docs/deployment.md`).
 
-![Dashboard: pending, parked and recently seen counts with the last pass result](docs/screenshots/dashboard.png)
+![Dashboard: pending, parked, seen-today and total counts above the last pass's sent, parked and exit result](docs/screenshots/dashboard.png)
 
 | Alerts | Configuration |
 |---|---|
-| ![Alert history: URL filters for tag, source, outcome, text and date, with the advisory rows linked to their detail page](docs/screenshots/alerts.png) | ![Configuration: sources, notifiers, routes, the poll interval and the settings overlay status](docs/screenshots/config.png) |
+| ![Alert history: URL filters for tag, source, outcome, text and date, with severity badges and the advisory rows linked to their detail page](docs/screenshots/alerts.png) | ![Configuration: numbered sections for settings, sources, notifiers and routes, with the poll interval and the settings overlay status](docs/screenshots/config.png) |
 
 | Parked messages | Runs |
 |---|---|

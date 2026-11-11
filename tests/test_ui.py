@@ -1147,3 +1147,42 @@ def test_the_overlay_routes_replace_the_yaml_block_and_one_validator_checks_memb
             {},
             settings={"routes": [{"match": {"tag": "critical"}, "notifiers": ["ghost"]}]},
         )
+
+
+def test_every_page_carries_the_same_shell(tmp_path):
+    """One shell on every page: a language, a viewport, one title, one h1, one marked section.
+
+    A visual change cannot be unit-tested, but the contract the stylesheet and the navigation depend on can:
+    a page added later must not quietly lose its landmarks, its per-page title or its current-section mark.
+    """
+    client, token, _ = make_client(tmp_path)
+    assert sign_in(client, token)
+    unknown = advisory_token("CVE-2026-404")
+    pages = {
+        "/": "/",
+        "/alerts": "/alerts",
+        "/parked": "/parked",
+        "/config": "/config",
+        "/sources": "/sources",
+        "/runs": "/runs",
+        f"/advisories/{unknown}": "",
+    }
+    for path, active in pages.items():
+        response = client.get(path, headers={"accept": "text/html"})
+        assert response.status_code in (200, 404), path
+        text = response.text
+        assert "<html lang='en'>" in text, path
+        assert "<meta name='viewport'" in text, path
+        assert text.count("<h1>") == 1 and text.count("</h1>") == 1, f"{path} must render exactly one heading"
+        assert "<main id='main'>" in text, path
+        title = re.search(r"<title>(.*?)</title>", text)
+        assert title is not None and title.group(1).endswith(" · advisory-radar"), path
+        assert "<script" not in text and " onclick=" not in text and " style=" not in text, path
+        # The stylesheet names the selector too, so the attribute is counted with its leading space.
+        assert text.count(" aria-current='page'") == (1 if active else 0), path
+        if active:
+            assert f"<a href='{active}' aria-current='page'>" in text, path
+    login = client.get("/login")
+    assert "<html lang='en'>" in login.text
+    assert " aria-current='page'" not in login.text
+    assert "<nav class='links'" not in login.text, "a signed-out page shows the brand alone"

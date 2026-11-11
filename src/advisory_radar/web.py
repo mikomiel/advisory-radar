@@ -28,7 +28,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from itsdangerous import BadSignature, URLSafeSerializer
 
-from . import pipeline
+from . import __version__, pipeline
 from .catalogue import SOURCE_SPECS
 from .config import Config, ConfigError, config_from_document, load_document, secret_values
 from .notifiers import NOTIFIER_BUILDERS
@@ -47,27 +47,219 @@ from .state import LockBusy, SourceError
 
 LOG = logging.getLogger("advisory_radar")
 
-PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>advisory-radar</title>
-<style>
-body{{font-family:system-ui,sans-serif;margin:2rem;max-width:60rem;color:#1a1a1a}}
-nav a{{margin-right:1rem}} table{{border-collapse:collapse}} td,th{{border:1px solid #ccc;padding:.25rem .6rem}}
-.tag-critical{{color:#b00020;font-weight:bold}} .tag-warning{{color:#9a6700}} .muted{{color:#666}}
-form{{display:inline}} button{{cursor:pointer}}
-</style></head><body><nav><a href="/">Dashboard</a><a href="/alerts">Alerts</a>
-<a href="/parked">Parked</a><a href="/config">Config</a><a href="/sources">Sources</a><a href="/runs">Runs</a>
-<a href="/healthz">healthz</a>{nav_extra}</nav><h1>{title}</h1>{body}</body></html>"""
+#: The page's one inline stylesheet. A plain string, not an f-string: its braces stay single because
+#: ``page`` interpolates the value instead of formatting it. Every colour pair was measured against WCAG
+#: AA (text 4.5:1, control borders 3:1) in both schemes; ``--line`` is a decorative hairline only.
+_STYLE = """<style>
+:root{--bg:#FBFAF8;--surface:#FFFFFF;--ink:#171512;--muted:#6B6660;--line:#E2DDD2;--control:#767065;
+--hover:#F1EEE7;--critical:#A3150F;--warning:#7A5200;--ok:#1B6B3D;
+--sans:ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
+--mono:ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,'Liberation Mono',monospace;
+color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--bg:#12110F;--surface:#1A1916;--ink:#F3F0E8;--muted:#A9A39A;
+--line:#2E2C27;--control:#6B665B;--hover:#1E1D19;--critical:#F87171;--warning:#E0A63A;--ok:#6FD08C}}
+*,*::before,*::after{box-sizing:border-box}
+body{margin:0 auto;max-width:72rem;padding:0 2rem;background:var(--bg);color:var(--ink);
+font-family:var(--sans);font-size:15px;line-height:1.6;font-variant-numeric:tabular-nums}
+a{color:inherit;text-underline-offset:2px;text-decoration-thickness:1px}
+a:hover{text-decoration-thickness:2px}
+:focus-visible{outline:2px solid var(--ink);outline-offset:2px;border-radius:1px}
+::selection{background:var(--ink);color:var(--bg)}
+p{margin:.6rem 0}
+code,pre{font-family:var(--mono);font-size:.9em}
+pre{margin:.3rem 0;padding:.6rem .7rem;background:var(--surface);border:1px solid var(--line);overflow-x:auto}
+ul{margin:.6rem 0 1rem;padding-left:1.15rem}
+.skip{position:absolute;left:-9999px}
+.skip:focus{left:1rem;top:.6rem;z-index:20;padding:.4rem .7rem;background:var(--ink);
+color:var(--bg);text-decoration:none}
+header.top{display:flex;align-items:center;gap:1.25rem;flex-wrap:wrap;padding:1rem 0;
+border-bottom:1px solid var(--ink);position:sticky;top:0;z-index:10;background:var(--bg)}
+.brand{display:inline-flex;align-items:center;gap:.55rem;margin-right:auto;font-weight:600;
+letter-spacing:-.01em;text-decoration:none}
+.mark{position:relative;width:11px;height:11px;border:1.5px solid currentColor;border-radius:50%}
+.mark::after{content:'';position:absolute;inset:2.5px;border-radius:50%;background:currentColor}
+nav.links{display:flex;gap:1.1rem;font-size:13px}
+nav.links a{color:var(--muted);text-decoration:none;padding:.15rem 0;border-bottom:2px solid transparent}
+nav.links a:hover{color:var(--ink)}
+nav.links a[aria-current='page']{color:var(--ink);border-bottom-color:var(--ink)}
+.session{font-size:13px}
+.session form{display:inline;margin:0}
+main{width:100%;padding-bottom:2rem}
+.page-head{padding:1.9rem 0 .75rem}
+h1{margin:0;font-size:clamp(1.6rem,1.2rem + 1.4vw,2rem);line-height:1.12;font-weight:600;
+letter-spacing:-.02em;overflow-wrap:anywhere}
+h2{margin:2.4rem 0 .5rem;padding-top:1.2rem;border-top:1px solid var(--line);font-size:1.05rem;
+font-weight:600;letter-spacing:-.01em}
+h3{margin:1.8rem 0 .4rem;color:var(--muted);font-size:12px;font-weight:600;letter-spacing:.08em;
+text-transform:uppercase}
+.muted{color:var(--muted)}
+.small{font-size:13px}
+.sec-num{margin-right:.55rem;color:var(--muted);font-family:var(--mono);font-size:12px;letter-spacing:0}
+table{width:100%;border-collapse:collapse;margin:.5rem 0 1rem;font-size:14px}
+table.levels{max-width:34rem}
+th{padding:.5rem .55rem;border-bottom:1px solid var(--ink);color:var(--muted);font-size:11px;
+font-weight:600;letter-spacing:.09em;text-transform:uppercase;text-align:left;white-space:nowrap}
+td{padding:.55rem;border-bottom:1px solid var(--line);vertical-align:top}
+td.nowrap,th.nowrap{white-space:nowrap}
+th.narrow{width:5rem}
+th.tag-col{width:15rem}
+tr:hover td{background:var(--hover)}
+td.num,th.num{text-align:right}
+.scroll{overflow-x:auto}
+.scroll table{min-width:40rem}
+table.compact{width:auto;min-width:32rem}
+.scroll table.compact{min-width:32rem}
+.badge{display:inline-block;padding:0 .38rem;border:1px solid currentColor;border-radius:2px;
+font-family:var(--mono);font-size:11px;font-weight:600;line-height:1.7;letter-spacing:.05em;
+text-transform:uppercase;white-space:nowrap}
+.badge-critical{color:var(--critical)}
+.badge-warning{color:var(--warning)}
+.badge-ok{color:var(--ok)}
+.badge-neutral{color:var(--muted)}
+.dot{display:inline-block;width:8px;height:8px;margin-right:.45rem;border-radius:50%;
+background:var(--muted);vertical-align:baseline}
+.dot-ok{background:var(--ok)}
+.dot-bad{background:var(--critical)}
+.notice{margin:.8rem 0;padding:.6rem .8rem;border:1px solid var(--line);border-left:3px solid var(--muted);
+background:var(--surface);font-size:13.5px}
+.notice-ok{border-left-color:var(--ok)}
+.notice-warning{border-left-color:var(--warning)}
+.notice-critical{border-left-color:var(--critical)}
+button,.btn{display:inline-flex;align-items:center;gap:.4rem;margin:0;padding:.5rem .75rem;
+border:1px solid var(--control);border-radius:2px;background:transparent;color:var(--ink);
+font-family:inherit;font-size:13px;font-weight:500;line-height:1.1;cursor:pointer;text-decoration:none}
+button:hover,.btn:hover{background:var(--hover)}
+.btn-primary,.btn-primary:hover{border-color:var(--ink);background:var(--ink);color:var(--bg)}
+.btn-danger{color:var(--critical);border-color:var(--critical)}
+.btn-danger:hover{background:var(--critical);color:#fff}
+.btn-quiet{border-color:transparent;color:var(--muted)}
+.btn-quiet:hover{color:var(--ink)}
+label{display:grid;gap:.3rem;color:var(--muted);font-size:12px}
+label>input:not([type='checkbox']),label>select,label>textarea{width:100%}
+input,select,textarea{max-width:100%;padding:.35rem .5rem;border:1px solid var(--control);border-radius:2px;
+background:var(--surface);color:var(--ink);font-family:inherit;font-size:14px}
+input[type='checkbox']{width:1rem;height:1rem;padding:0;accent-color:var(--ink)}
+textarea{width:100%;min-height:5rem}
+input:focus-visible,select:focus-visible,textarea:focus-visible{outline:2px solid var(--ink);outline-offset:1px}
+form.toolbar{display:flex;flex-wrap:wrap;align-items:flex-end;gap:.85rem 1rem;padding:1rem 0 1.1rem;
+border-bottom:1px solid var(--line)}
+form.toolbar input,form.toolbar select{min-width:7.5rem}
+form.toolbar input[type='date']{min-width:9rem}
+.toolbar-actions{display:flex;gap:.5rem;margin-left:auto}
+.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(16rem,1fr));gap:1rem;margin:.8rem 0 1.1rem}
+label.poll{max-width:18rem}
+.field-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));gap:.5rem .9rem}
+.notifier{padding:1.1rem 0;border-bottom:1px solid var(--line)}
+.notifier-head{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem;margin-bottom:.7rem}
+.notifier-head b{font-size:15px}
+label.check{display:inline-flex;align-items:center;gap:.4rem;margin-left:auto;color:var(--muted);font-size:12px}
+.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));margin:.5rem 0 .75rem;
+border-top:1px solid var(--ink);border-bottom:1px solid var(--line)}
+.stat{padding:.9rem 1rem .9rem 0;border-right:1px solid var(--line)}
+.stat:last-child{border-right:0}
+.stat-label{display:block;color:var(--muted);font-size:11px;letter-spacing:.09em;text-transform:uppercase}
+.stat-value{display:block;font-family:var(--mono);font-size:1.9rem;line-height:1.25;letter-spacing:-.02em}
+.pass{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem 1.25rem;padding:1rem 0 1.1rem;
+border-bottom:1px solid var(--line)}
+.pass .grow{margin-right:auto}
+.pass p{margin:0}
+.bulk{display:flex;flex-wrap:wrap;gap:.5rem;padding:1rem 0;border-bottom:1px solid var(--line)}
+.row-actions{display:flex;flex-wrap:wrap;gap:.4rem}
+.row-actions form{display:inline}
+nav.pager{display:flex;justify-content:space-between;gap:.6rem;margin:1rem 0 0}
+.empty{margin:1.25rem 0;padding:1.25rem;border:1px dashed var(--control);color:var(--muted)}
+.empty p:first-child{margin-top:0}
+.empty p:last-child{margin-bottom:0}
+dl.facts{display:grid;grid-template-columns:minmax(9rem,13rem) 1fr;gap:.15rem 1.25rem;margin:1.1rem 0 0}
+dl.facts div{display:contents}
+dt{padding:.25rem 0;color:var(--muted);font-size:11px;letter-spacing:.07em;text-transform:uppercase}
+dd{margin:0;padding:.25rem 0;overflow-wrap:anywhere}
+.strip{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.75rem 1.5rem;
+padding:.9rem 0;border-bottom:1px solid var(--line)}
+.strip p{margin:0}
+.login{max-width:24rem;margin:1.25rem 0 0;padding:1.5rem;background:var(--surface);border:1px solid var(--line)}
+.login form{display:grid;gap:.6rem;margin-top:1rem}
+.login button{justify-content:center}
+.back{margin:1.75rem 0 0;font-size:13px}
+footer.bottom{display:flex;flex-wrap:wrap;justify-content:space-between;gap:.4rem 1.5rem;
+padding:1.1rem 0;border-top:1px solid var(--line);color:var(--muted);font-size:12px}
+footer.bottom a{color:var(--muted);text-decoration:none}
+footer.bottom a:hover{color:var(--ink);text-decoration:underline}
+.probes{display:flex;gap:1rem}
+@media (max-width:48rem){
+body{padding:0 1.1rem}
+header.top{position:static;gap:.6rem;padding:.85rem 0}
+.brand{order:1}
+.session{order:2;margin-left:auto}
+nav.links{order:3;width:100%;flex-wrap:nowrap;overflow-x:auto;gap:.9rem;padding-bottom:.15rem}
+.stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+.stat{padding:.8rem 0;border-right:0;border-bottom:1px solid var(--line)}
+.stat:nth-child(2n){padding-left:1rem;border-left:1px solid var(--line)}
+dl.facts{grid-template-columns:1fr;gap:0}
+dt{margin-top:.55rem}
+}
+@media print{
+header.top,footer.bottom,.session,form.toolbar,nav.pager,.bulk,.row-actions{display:none}
+body{max-width:none;background:#fff;color:#000}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>"""
+
+#: The authenticated navigation, in reading order: (path, label).
+_NAV = (
+    ("/", "Dashboard"),
+    ("/alerts", "Alerts"),
+    ("/parked", "Parked"),
+    ("/config", "Config"),
+    ("/sources", "Sources"),
+    ("/runs", "Runs"),
+)
 
 
 def esc(value: object) -> str:
     return html.escape(str(value))
 
 
+def _nav(active: str) -> str:
+    """The section links, with the current page marked for assistive technology and for the stylesheet."""
+    links = []
+    for path, label in _NAV:
+        current = " aria-current='page'" if path == active else ""
+        links.append(f"<a href='{path}'{current}>{label}</a>")
+    return f"<nav class='links' aria-label='Main'>{''.join(links)}</nav>"
+
+
 def page(
-    title: str, body: str, *, nav_extra: str = "", status_code: int = 200, headers: Mapping[str, str] | None = None
+    title: str,
+    body: str,
+    *,
+    active: str = "",
+    actions: str = "",
+    minimal: bool = False,
+    status_code: int = 200,
+    headers: Mapping[str, str] | None = None,
 ) -> HTMLResponse:
-    return HTMLResponse(
-        PAGE.format(title=esc(title), nav_extra=nav_extra, body=body), status_code=status_code, headers=headers
+    """One page: the shared shell (head, navigation, title, footer) around a page's body.
+
+    ``actions`` is the sign-out form, and is what makes the navigation authenticated; ``minimal`` keeps the
+    brand alone, for the pages a signed-out visitor sees. ``active`` is the path the navigation marks as the
+    current section, so an advisory page keeps "Alerts" marked.
+    """
+    brand = "<a class='brand' href='/'><span class='mark' aria-hidden='true'></span>advisory-radar</a>"
+    header = brand if minimal else f"{brand}{_nav(active)}<div class='session'>{actions}</div>"
+    document = (
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<meta name='color-scheme' content='light dark'>"
+        f"<title>{esc(title)} · advisory-radar</title>{_STYLE}</head><body>"
+        "<a class='skip' href='#main'>Skip to content</a>"
+        f"<header class='top'>{header}</header>"
+        f"<main id='main'><div class='page-head'><h1>{esc(title)}</h1></div>{body}</main>"
+        f"<footer class='bottom'><span>advisory-radar {esc(__version__)}</span>"
+        "<span class='probes'><a href='/healthz'>healthz</a><a href='/readyz'>readyz</a>"
+        "<a href='/metrics'>metrics</a></span></footer></body></html>"
     )
+    return HTMLResponse(document, status_code=status_code, headers=headers)
 
 
 class Auth:
@@ -329,15 +521,18 @@ def _levels_table(levels: object, scores: object) -> str:
         else:
             shown = esc(score)
         rows.append(
-            f"<tr><td>{esc(cve)}</td><td class='tag-{esc(levels[cve])}'>{esc(levels[cve])}</td><td>{shown}</td></tr>"
+            f"<tr><td class='mono'>{esc(cve)}</td><td>{_badge(levels[cve], levels[cve])}</td><td>{shown}</td></tr>"
         )
-    return "<table><tr><th>CVE</th><th>Level</th><th>CVSS</th></tr>" + "".join(rows) + "</table>"
+    return (
+        "<div class='scroll'><table class='levels'><tr><th scope='col'>CVE</th><th scope='col'>Level</th>"
+        "<th scope='col'>CVSS</th></tr>" + "".join(rows) + "</table></div>"
+    )
 
 
 def _facts(facts: Sequence[tuple[str, str]]) -> str:
-    """A two-column table of already-escaped/rendered values."""
-    rows = "".join(f"<tr><th>{esc(name)}</th><td>{value}</td></tr>" for name, value in facts)
-    return f"<table>{rows}</table>"
+    """A two-column definition list of already-escaped/rendered values."""
+    rows = "".join(f"<div><dt>{esc(name)}</dt><dd>{value}</dd></div>" for name, value in facts)
+    return f"<dl class='facts'>{rows}</dl>"
 
 
 def _identifier_list(values: object) -> str:
@@ -347,20 +542,52 @@ def _identifier_list(values: object) -> str:
     return ", ".join(esc(value) for value in values)
 
 
+def _badge(text: object, kind: str = "neutral") -> str:
+    """A small uppercase chip; ``kind`` is one of neutral, ok, warning or critical."""
+    return f"<span class='badge badge-{esc(kind)}'>{esc(text)}</span>"
+
+
+def _notice(rendered: str, kind: str = "neutral") -> str:
+    """A tone-marked block around already-rendered HTML (never an unescaped value from the caller)."""
+    return f"<p class='notice notice-{esc(kind)}'>{rendered}</p>"
+
+
+def _empty(message: str, hint: str = "") -> str:
+    """The answer when a list has no rows: one sentence instead of an empty table."""
+    tail = f"<p>{hint}</p>" if hint else ""
+    return f"<div class='empty'><p>{message}</p>{tail}</div>"
+
+
+def _stats(pairs: Sequence[tuple[str, object]]) -> str:
+    """The dashboard's headline numbers: one label above one value per tile."""
+    tiles = "".join(
+        f"<div class='stat'><span class='stat-label'>{esc(label)}</span>"
+        f"<span class='stat-value'>{esc(value)}</span></div>"
+        for label, value in pairs
+    )
+    return f"<section class='stats'>{tiles}</section>"
+
+
+def _outcome_tone(outcome: str) -> str:
+    """The tone a recorded outcome carries: an accepted delivery is good, a drop is the loss it is."""
+    return {"delivered": "ok", "dropped": "critical"}.get(outcome, "neutral")
+
+
 def _seen_advisory(record: Mapping, delivery: Mapping | None = None) -> str:
     """The detail page for an identifier the state has seen: the snapshot, or only what an older record held."""
     outcome = record.get("outcome", "")
     facts: list[tuple[str, str]] = [
-        ("Outcome", esc(outcome)),
+        ("Outcome", _badge(outcome, _outcome_tone(outcome)) if outcome else "<span class='muted'>—</span>"),
         ("Recorded (UTC)", esc(_when(record.get("at"))) or "<span class='muted'>not recorded</span>"),
     ]
     record = delivery if isinstance(delivery, Mapping) else record
+    back = "<p class='back'><a href='/alerts'>← Back to alerts</a></p>"
     if not any(key in record for key in ("tag", "source", "title", "levels", "scores", "delivered_to")):
         return (
             "<p>The state holds this identifier, but only its outcome and when it was recorded.</p>"
             "<p class='muted'>The delivered message's details were not recorded: this record was written by an "
             "older version of advisory-radar, or no message was delivered for this identifier. Nothing is "
-            "reconstructed here, and the message body is not retained.</p>" + _facts(facts)
+            "reconstructed here, and the message body is not retained.</p>" + _facts(facts) + back
         )
     accepted = record.get("delivered_to")
     if isinstance(accepted, list) and accepted:
@@ -381,10 +608,11 @@ def _seen_advisory(record: Mapping, delivery: Mapping | None = None) -> str:
         ("Advisory", _external_link(record.get("link")) or "<span class='muted'>not recorded</span>"),
     ]
     return (
-        (f"<p><b>{esc(record.get('title'))}</b></p>" if record.get("title") else "")
+        (f"<p class='lead'><b>{esc(record.get('title'))}</b></p>" if record.get("title") else "")
         + _facts(facts)
         + "<h2>CVEs and levels</h2>"
         + _levels_table(record.get("levels"), record.get("scores"))
+        + back
     )
 
 
@@ -399,7 +627,7 @@ def _queued_advisory(state_label: str, entry: Mapping) -> str:
         attempts_text = "0 (never attempted)"
     accepted = entry.get("sent_to")
     facts = [
-        ("State", esc(state_label)),
+        ("State", _badge(state_label, "warning" if state_label == "parked" else "neutral")),
         ("Tag", esc(entry.get("tag", "")) or "<span class='muted'>not recorded</span>"),
         ("Source", esc(entry.get("source", "")) or "<span class='muted'>not recorded</span>"),
         ("Message kind", esc(entry.get("kind", "")) or "<span class='muted'>not recorded</span>"),
@@ -415,10 +643,11 @@ def _queued_advisory(state_label: str, entry: Mapping) -> str:
     if parked_at:
         facts.append(("Parked (UTC)", esc(parked_at)))
     return (
-        (f"<p><b>{esc(entry.get('title'))}</b></p>" if entry.get("title") else "")
+        (f"<p class='lead'><b>{esc(entry.get('title'))}</b></p>" if entry.get("title") else "")
         + _facts(facts)
         + "<h2>CVEs and levels</h2>"
         + _levels_table(entry.get("levels"), entry.get("scores"))
+        + "<p class='back'><a href='/parked'>← Back to the parked queue</a></p>"
     )
 
 
@@ -638,7 +867,13 @@ def create_app(
     async def http_error(request: Request, exc: HTTPException):
         """A browser gets a page, a script gets JSON; neither leaks why a token was refused."""
         if "text/html" in request.headers.get("accept", ""):
-            return page("Error", f"<p>{esc(exc.detail)}</p>", status_code=exc.status_code)
+            actions = sign_out_form(request) if auth.valid(request) else ""
+            return page(
+                "Error",
+                _notice(esc(exc.detail), "critical"),
+                actions=actions,
+                status_code=exc.status_code,
+            )
         return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
 
     def csrf_token(request: Request) -> str:
@@ -694,9 +929,13 @@ def create_app(
     @app.get("/login", response_class=HTMLResponse)
     def login_form():
         return page(
-            "Login",
+            "Sign in",
+            "<div class='login'><p class='muted small'>Enter the token this instance runs with: "
+            "<code>ADVISORY_RADAR_AUTH_TOKEN</code>.</p>"
             '<form method="post" action="/login"><input type="password" name="token" '
-            'placeholder="auth token"><button>Sign in</button></form>',
+            'placeholder="auth token" aria-label="Auth token" autofocus>'
+            '<button class="btn btn-primary">Sign in</button></form></div>',
+            minimal=True,
         )
 
     @app.post("/login")
@@ -706,7 +945,8 @@ def create_app(
         def throttled(wait: int):
             return page(
                 "Too many attempts",
-                "<p>Too many failed sign-in attempts. Try again shortly.</p>",
+                _notice("Too many failed sign-in attempts. Try again shortly.", "warning"),
+                minimal=True,
                 status_code=429,
                 headers={"Retry-After": str(wait)},
             )
@@ -744,9 +984,12 @@ def create_app(
             return response
         throttle.failed(peer)
         return page(
-            "Login",
-            '<p>Wrong token.</p><form method="post" action="/login">'
-            '<input type="password" name="token"><button>Sign in</button></form>',
+            "Sign in",
+            "<div class='login'>"
+            + _notice("Wrong token.", "critical")
+            + '<form method="post" action="/login"><input type="password" name="token" '
+            'aria-label="Auth token" autofocus><button class="btn btn-primary">Sign in</button></form></div>',
+            minimal=True,
         )
 
     @app.post("/logout", dependencies=[Depends(require_csrf)])
@@ -780,14 +1023,33 @@ def create_app(
             stamp = _epoch(record.get("at")) if isinstance(record, dict) else None
             if stamp is not None and stamp >= today:
                 today_seen += 1
+        when = _when(last.get("at"))
+        code = last.get("code", "?")
+        ok = _number(code, -1) == 0
+        if not when:
+            dot, exit_badge = "dot", _badge(code, "neutral")
+        elif ok:
+            dot, exit_badge = "dot dot-ok", _badge(code, "ok")
+        else:
+            dot, exit_badge = "dot dot-bad", _badge(code, "critical")
         body = (
-            f"<p>Pending: <b>{len(pending)}</b> · Parked: <b>{len(parked)}</b> · "
-            f"Seen in last 24h: <b>{today_seen}</b> · Total seen: <b>{len(seen)}</b></p>"
-            f"<p class='muted'>Last pass: {esc(_when(last.get('at')) or 'never')} — sent {last.get('sent', 0)}, "
-            f"parked {last.get('parked', 0)}, exit {last.get('code', '?')}</p>"
-            f'<form method="post" action="/run">{csrf_field(request)}<button>Run a pass now</button></form>'
+            _stats(
+                [
+                    ("Pending", len(pending)),
+                    ("Parked", len(parked)),
+                    ("Seen in last 24h", today_seen),
+                    ("Total seen", len(seen)),
+                ]
+            )
+            + "<div class='pass'>"
+            f"<p class='grow'><span class='{dot}'></span>Last pass: {esc(when or 'never')}</p>"
+            f"<p class='muted small'>sent {esc(last.get('sent', 0))} · parked {esc(last.get('parked', 0))} · "
+            f"exit {exit_badge}</p>"
+            f'<form method="post" action="/run">{csrf_field(request)}'
+            "<button class='btn btn-primary'>Run a pass now</button></form>"
+            "</div>"
         )
-        return page("Dashboard", body, nav_extra=sign_out_form(request))
+        return page("Dashboard", body, active="/", actions=sign_out_form(request))
 
     @app.post("/run", dependencies=[Depends(require_csrf)])
     def run_now(request: Request):
@@ -848,46 +1110,59 @@ def create_app(
         if filters["outcome"] and filters["outcome"] not in SEEN_OUTCOMES:
             outcome_values = (*SEEN_OUTCOMES, filters["outcome"])
         filter_form = (
-            "<form method='get' action='/alerts'><p>"
-            f"<label>Tag <select name='tag'>{''.join(option(value, filters['tag']) for value in ('', *TAGS))}"
-            "</select></label> "
-            f"<label>Source <input type='text' name='source' value='{esc(filters['source'])}'></label> "
-            f"<label>Outcome <select name='outcome'>"
-            f"{''.join(option(value, filters['outcome']) for value in ('', *outcome_values))}</select></label> "
-            f"<label>Text <input type='text' name='q' value='{esc(filters['q'])}'></label> "
-            f"<label>Since <input type='date' name='since' value='{esc(filters['since'])}'></label> "
-            f"<label>Until <input type='date' name='until' value='{esc(filters['until'])}'></label> "
-            "<button>Filter</button></p></form>"
+            "<form class='toolbar' method='get' action='/alerts'>"
+            f"<label>Tag<select name='tag'>{''.join(option(value, filters['tag']) for value in ('', *TAGS))}"
+            "</select></label>"
+            f"<label>Source<input type='text' name='source' value='{esc(filters['source'])}'></label>"
+            f"<label>Outcome<select name='outcome'>"
+            f"{''.join(option(value, filters['outcome']) for value in ('', *outcome_values))}</select></label>"
+            f"<label>Text<input type='text' name='q' value='{esc(filters['q'])}'></label>"
+            f"<label>Since<input type='date' name='since' value='{esc(filters['since'])}'></label>"
+            f"<label>Until<input type='date' name='until' value='{esc(filters['until'])}'></label>"
+            "<div class='toolbar-actions'><button class='btn btn-primary'>Filter</button>"
+            "<a class='btn btn-quiet' href='/alerts'>Reset</a></div></form>"
         )
         table_rows = []
         for (_, identifier), record in window:
             path = _advisory_token(identifier)
             tag = record.get("tag")
+            outcome = record.get("outcome", "")
+            tone = {"delivered": " dot-ok", "dropped": " dot-bad"}.get(outcome, "")
             table_rows.append(
                 f"<tr><td><a href='/advisories/{esc(path)}'>{esc(identifier)}</a></td>"
-                f"<td class='tag-{esc(tag or '')}'>{esc(tag) if tag else '—'}</td>"
+                f"<td>{_badge(tag, tag) if tag else "<span class='muted'>—</span>"}</td>"
                 f"<td>{esc(record.get('source')) if record.get('source') else '—'}</td>"
                 f"<td>{_short(record.get('title')) if record.get('title') else '—'}</td>"
-                f"<td>{esc(record.get('outcome', ''))}</td>"
-                f"<td class='muted'>{esc(_when(record.get('at')))}</td></tr>"
+                f"<td><span class='dot{tone}'></span>{esc(outcome)}</td>"
+                f"<td class='muted nowrap'>{esc(_when(record.get('at')))}</td></tr>"
             )
+        if table_rows:
+            table = (
+                "<div class='scroll'><table><tr><th scope='col'>ID</th><th scope='col'>Tag</th>"
+                "<th scope='col'>Source</th><th scope='col'>Title</th><th scope='col'>Outcome</th>"
+                "<th scope='col'>First seen (UTC)</th></tr>" + "".join(table_rows) + "</table></div>"
+            )
+        elif any(filters.values()):
+            table = _empty("No records match these filters.", "<a href='/alerts'>Clear the filters</a>")
+        else:
+            table = _empty("No advisory has been recorded yet: the first pass fills this list.")
         pager = []
         if previous is not None:
-            pager.append(f"<a href='{esc(link(before=_cursor_encode(*previous)))}'>← Newer</a>")
+            pager.append(f"<a class='btn' href='{esc(link(before=_cursor_encode(*previous)))}'>← Newer</a>")
         if following is not None:
-            pager.append(f"<a href='{esc(link(cursor=_cursor_encode(*following)))}'>Older →</a>")
+            pager.append(f"<a class='btn' href='{esc(link(cursor=_cursor_encode(*following)))}'>Older →</a>")
         body = (
             filter_form
-            + f"<p class='muted'>{len(rows)} matching record(s). A dash means the record predates the delivery "
-            "snapshot, so it carries no tag, source or title.</p>"
-            "<table><tr><th>ID</th><th>Tag</th><th>Source</th><th>Title</th><th>Outcome</th>"
-            "<th>First seen (UTC)</th></tr>" + "".join(table_rows) + "</table>"
+            + f"<p class='muted small'>{len(rows)} matching record(s). A dash means the record predates the "
+            "delivery snapshot, so it carries no tag, source or title.</p>" + table
         )
         if pager:
-            body += "<p>" + " · ".join(pager) + "</p>"
+            body += f"<nav class='pager' aria-label='Pages'>{''.join(pager)}</nav>"
         elif cursor is not None or before is not None:
-            body += f"<p class='muted'>No records on this page. <a href='{esc(link())}'>Newest alerts</a>.</p>"
-        return page("Alerts", body, nav_extra=sign_out_form(request))
+            body += _empty(
+                f"No records on this page. <a href='{esc(link())}'>Newest alerts</a>.",
+            )
+        return page("Alerts", body, active="/alerts", actions=sign_out_form(request))
 
     @app.get("/advisories/{token}", response_class=HTMLResponse)
     def advisory_page(token: str, request: Request):
@@ -905,12 +1180,12 @@ def create_app(
                 deliveries.get(reference) if isinstance(deliveries, dict) and isinstance(reference, str) else None
             )
             body = _seen_advisory(record, snapshot if isinstance(snapshot, dict) else None)
-            return page(f"Advisory {identifier}", body, nav_extra=sign_out_form(request))
+            return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
         for label, queue in (("pending", state.get("pending")), ("parked", state.get("parked"))):
             for entry in queue if isinstance(queue, list) else ():
                 if isinstance(entry, dict) and identifier in (entry.get("ids") or ()):
                     body = _queued_advisory(label, entry)
-                    return page(f"Advisory {identifier}", body, nav_extra=sign_out_form(request))
+                    return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
         raise HTTPException(status_code=404, detail=f"no advisory {identifier} is recorded")
 
     @app.get("/parked", response_class=HTMLResponse)
@@ -932,20 +1207,32 @@ def create_app(
             shown = ""
             if isinstance(identities, list):
                 shown = ", ".join(value for value in identities if isinstance(value, str))
+            tag = entry.get("tag")
             rows.append(
-                f"<tr><td class='tag-{esc(entry.get('tag', ''))}'>{esc(entry.get('tag', ''))}</td>"
-                f"<td>{esc(entry.get('title', ''))}</td><td>{esc(shown[:80])}</td>"
-                f"<td><form method='post' action='/parked/{index}/release'>{csrf}"
-                f"<input type='hidden' name='token' value='{esc(token)}'><button>Release</button></form> "
+                f"<tr><td>{_badge(tag, tag) if tag else '—'}</td>"
+                f"<td>{esc(entry.get('title', ''))}</td><td class='muted'>{esc(shown[:80])}</td>"
+                f"<td><div class='row-actions'>"
+                f"<form method='post' action='/parked/{index}/release'>{csrf}"
+                f"<input type='hidden' name='token' value='{esc(token)}'>"
+                "<button class='btn btn-primary'>Release</button></form>"
                 f"<form method='post' action='/parked/{index}/drop'>{csrf}"
-                f"<input type='hidden' name='token' value='{esc(token)}'><button>Drop</button></form></td></tr>"
+                f"<input type='hidden' name='token' value='{esc(token)}'>"
+                "<button class='btn btn-danger'>Drop</button></form></div></td></tr>"
             )
-        body = (
-            "<table><tr><th>Tag</th><th>Title</th><th>IDs</th><th>Actions</th></tr>" + "".join(rows) + "</table>"
-            f'<form method="post" action="/parked/release">{csrf}<button>Release all</button></form> '
-            f'<form method="post" action="/parked/drop">{csrf}<button>Drop all</button></form>'
-        )
-        return page("Parked messages", body, nav_extra=sign_out_form(request))
+        if rows:
+            body = (
+                "<div class='scroll'><table class='compact'><tr><th scope='col'>Tag</th>"
+                "<th scope='col'>Title</th><th scope='col'>IDs</th><th scope='col'>Actions</th></tr>"
+                + "".join(rows)
+                + "</table></div>"
+                f'<div class="bulk"><form method="post" action="/parked/release">{csrf}'
+                '<button class="btn">Release all</button></form>'
+                f'<form method="post" action="/parked/drop">{csrf}'
+                '<button class="btn btn-danger">Drop all</button></form></div>'
+            )
+        else:
+            body = _empty("Nothing is parked: no message is waiting for a decision.")
+        return page("Parked messages", body, active="/parked", actions=sign_out_form(request))
 
     def parked_decision(index: int, release: bool, request: Request):
         """Release or drop one parked message under the state lock; a stale row is a 404.
@@ -1096,7 +1383,7 @@ def create_app(
         return esc(", ".join(notes))
 
     def notifier_form_entries(entries) -> str:
-        """One row per configured notifier: enabled, its non-secret keys, and its secret references."""
+        """One block per configured notifier: enabled, its non-secret keys, and its secret references."""
         rows = []
         for entry in entries:
             if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
@@ -1106,14 +1393,18 @@ def create_app(
             # Every optional field is rendered, not only those the entry already carries: a defaulted value
             # must be settable, and a value cleared in one save must be settable again in the next.
             fields = " ".join(
-                f"<label>{key} <input type='text' name='field:{esc(identifier)}:{key}' "
-                f"value='{esc(entry.get(key, ''))}'></label>"
+                f"<label>{key}<input type='text' name='field:{esc(identifier)}:{key}' "
+                f"value='{esc(entry.get(key, ''))}' "
+                f"aria-label='{esc(key)} for {esc(identifier)}'></label>"
                 for key in NOTIFIER_FORM_KEYS
             )
             rows.append(
-                f"<tr><td><b>{esc(identifier)}</b><br><span class='muted'>{esc(entry.get('type', ''))}</span></td>"
-                f"<td><input type='checkbox' name='enabled:{esc(identifier)}' value='1'{checked}></td>"
-                f"<td>{fields}</td><td class='muted'>{notifier_notes(entry)}</td></tr>"
+                "<div class='notifier'><div class='notifier-head'>"
+                f"<b>{esc(identifier)}</b><span class='muted'>{esc(entry.get('type', ''))}</span>"
+                f"<label class='check'><input type='checkbox' name='enabled:{esc(identifier)}' value='1'{checked} "
+                f"aria-label='Enabled {esc(identifier)}'>enabled</label>"
+                f"</div><div class='field-grid'>{fields}</div>"
+                f"<p class='muted small'>{notifier_notes(entry) or 'no secret reference recorded'}</p></div>"
             )
         return "".join(rows)
 
@@ -1129,9 +1420,11 @@ def create_app(
             public = _public_url(str(entry.get("url", "")))
             rows.append(
                 f"<tr><td><b>{esc(identifier)}</b> <span class='muted'>{esc(entry.get('type', ''))}</span>"
-                + (f"<br><span class='muted'>{esc(public)}</span>" if public else "")
-                + f"</td><td><input type='checkbox' name='enabled:{esc(identifier)}' value='1'{checked}></td>"
-                f"<td><input type='text' name='tag:{esc(identifier)}' value='{esc(entry.get('tag', ''))}'></td></tr>"
+                + (f"<br><span class='muted small'>{esc(public)}</span>" if public else "")
+                + f"</td><td><input type='checkbox' name='enabled:{esc(identifier)}' value='1'{checked} "
+                f"aria-label='Enabled {esc(identifier)}'></td>"
+                f"<td><input type='text' name='tag:{esc(identifier)}' value='{esc(entry.get('tag', ''))}' "
+                f"aria-label='Tag for {esc(identifier)}'></td></tr>"
             )
         return "".join(rows)
 
@@ -1175,13 +1468,17 @@ def create_app(
             ) + "".join(f"<option value='{esc(value)}' selected>{esc(value)} (reference)</option>" for value in extra)
             rows.append(
                 f"<tr><td><input type='text' name='route:{index}:source' "
-                f"value='{esc(match.get('source', ''))}' placeholder='source id'></td>"
-                f"<td><select name='route:{index}:tag'>{tag_options}</select></td>"
+                f"value='{esc(match.get('source', ''))}' placeholder='source id' "
+                f"aria-label='Rule {index} source id'></td>"
+                f"<td><select name='route:{index}:tag' aria-label='Rule {index} tag'>{tag_options}</select></td>"
                 f"<td><input type='text' name='route:{index}:product' "
-                f"value='{esc(match.get('product', ''))}' placeholder='product id'></td>"
+                f"value='{esc(match.get('product', ''))}' placeholder='product id' "
+                f"aria-label='Rule {index} product id'></td>"
                 f"<td><input type='text' name='route:{index}:ids' "
-                f"value='{esc(match.get('ids', ''))}' placeholder='CVE-2026-*'></td>"
-                f"<td><select name='route:{index}:notifiers' multiple size='2'>{options}</select></td></tr>"
+                f"value='{esc(match.get('ids', ''))}' placeholder='CVE-2026-*' "
+                f"aria-label='Rule {index} ids pattern'></td>"
+                f"<td><select name='route:{index}:notifiers' multiple size='2' "
+                f"aria-label='Rule {index} notifiers'>{options}</select></td></tr>"
             )
         default_ids = {value for value in defaults if isinstance(value, str)}
         known = {identifier for identifier, _ in choices}
@@ -1194,9 +1491,10 @@ def create_app(
             f"<option value='{esc(value)}' selected>{esc(value)} (reference)</option>" for value in extra_defaults
         )
         return (
-            "<table><tr><th>Source id</th><th>Tag</th><th>Product id</th><th>IDs pattern</th>"
-            f"<th>Notifiers</th></tr>{''.join(rows)}</table>"
-            f"<p><label>Default notifiers (when no rule matches)<br>"
+            "<div class='scroll'><table><tr><th scope='col'>Source id</th><th scope='col'>Tag</th>"
+            "<th scope='col'>Product id</th><th scope='col'>IDs pattern</th>"
+            f"<th scope='col'>Notifiers</th></tr>{''.join(rows)}</table></div>"
+            "<p><label>Default notifiers (when no rule matches)"
             f"<select name='default' multiple size='3'>{default_options}</select></label></p>"
             "<p class='muted'>Rules are checked in order and the first match wins. An entirely empty row is "
             "ignored; a partly filled one is saved as written and the validator reports what is wrong. Only "
@@ -1482,14 +1780,16 @@ def create_app(
         banner = ""
         if saved is not None:
             if live_now and saved == live_revision:
-                banner += f"<p class='tag-warning'>Revision {saved} saved and live.</p>"
+                banner += _notice(f"Revision {saved} saved and live.", "ok")
             else:
-                banner += (
-                    f"<p class='tag-warning'>Revision {saved} saved but not live yet (live revision {live_revision}); "
-                    "press Reload once the running pass finishes.</p>"
+                banner += _notice(
+                    f"Revision {saved} saved but not live yet (live revision {live_revision}); "
+                    "press Reload once the running pass finishes.",
+                    "warning",
                 )
         if overlay_error:
-            banner += f"<p class='tag-critical'>The overlay cannot be read: {overlay_error}</p>"
+            banner += _notice(f"The overlay cannot be read: {overlay_error}", "critical")
+        status_tone = "ok" if live_now and saved_revision else ("warning" if saved_revision else "neutral")
         poll_text = document.get("poll_interval")
         poll_text = poll_text if isinstance(poll_text, str) else f"{cfg.poll_interval_seconds}s"
         hidden = document.get("hidden_source_hosts")
@@ -1497,48 +1797,54 @@ def create_app(
         type_options = "".join(
             f"<option value='{esc(kind)}'>{esc(kind)}</option>" for kind in sorted(NOTIFIER_BUILDERS)
         )
-        new_fields = " ".join(
-            f"<label>{key} <input type='text' name='new:{key}'></label>" for key in NOTIFIER_FORM_KEYS
-        )
+        new_fields = " ".join(f"<label>{key}<input type='text' name='new:{key}'></label>" for key in NOTIFIER_FORM_KEYS)
         csrf = csrf_field(request)
         fingerprint = form_fingerprint(document)
         fingerprint_field = f"<input type='hidden' name='fingerprint' value='{fingerprint}'>"
         body = (
-            f"<p>Live poll interval <b>{cfg.poll_interval_seconds}s</b> · state {esc(cfg.state_path)} · "
-            f"watchlist {esc(cfg.watchlist_path or 'built-in default')}</p>"
-            f"<p class='muted'>Settings overlay: {status}</p>{banner}"
-            f'<form method="post" action="/reload">{csrf}<button>Reload configuration</button></form>'
-            "<h2>Settings</h2>"
+            f"<div class='strip'><p class='muted small'>Live poll interval <b>{cfg.poll_interval_seconds}s</b> · "
+            f"state <code>{esc(cfg.state_path)}</code> · "
+            f"watchlist <code>{esc(cfg.watchlist_path or 'built-in default')}</code></p>"
+            f'<form method="post" action="/reload">{csrf}<button class="btn">Reload configuration</button></form>'
+            "</div>"
+            f"<p class='notice notice-{status_tone}'>Settings overlay: {status}</p>{banner}"
+            "<h2><span class='sec-num'>01</span>Settings</h2>"
             f'<form method="post" action="/config/settings">{csrf}{fingerprint_field}'
-            f"<p><label>Poll interval <input type='text' name='poll_interval' value='{esc(poll_text)}'></label> "
-            "(15m, 30s or 12h)</p>"
-            "<p><label>Hidden source hosts (one per line)<br>"
-            f"<textarea name='hidden_source_hosts' rows='4' cols='40'>{esc(hidden_text)}</textarea></label></p>"
-            "<button>Save settings</button></form>"
-            "<h2>Sources</h2>"
+            "<div class='fields'>"
+            "<label class='poll'>Poll interval"
+            f"<input type='text' name='poll_interval' value='{esc(poll_text)}'></label>"
+            "<label>Hidden source hosts (one per line)"
+            f"<textarea name='hidden_source_hosts' rows='3'>{esc(hidden_text)}</textarea></label>"
+            "</div>"
+            "<p class='muted small'>Poll interval: 15m, 30s or 12h.</p>"
+            "<button class='btn btn-primary'>Save settings</button></form>"
+            "<h2><span class='sec-num'>02</span>Sources</h2>"
             f'<form method="post" action="/config/sources">{csrf}{fingerprint_field}'
-            "<table><tr><th>Source</th><th>Enabled</th><th>Tag</th></tr>"
-            f"{source_form_entries(sources)}</table><button>Save sources</button></form>"
-            "<h2>Notifiers</h2>"
+            "<div class='scroll'><table><tr><th scope='col'>Source</th>"
+            "<th scope='col' class='narrow'>Enabled</th>"
+            f"<th scope='col' class='tag-col'>Tag</th></tr>{source_form_entries(sources)}</table></div>"
+            "<button class='btn btn-primary'>Save sources</button></form>"
+            "<h2><span class='sec-num'>03</span>Notifiers</h2>"
             f'<form method="post" action="/config/notifiers">{csrf}{fingerprint_field}'
-            "<table><tr><th>Notifier</th><th>Enabled</th><th>Non-secret fields</th><th>Secrets</th></tr>"
-            f"{notifier_form_entries(notifiers)}</table>"
+            f"{notifier_form_entries(notifiers)}"
             "<h3>New notifier</h3>"
-            "<p class='muted'>Secrets stay in the environment: the reference field takes ${NAME} or ${NAME_FILE} "
-            "and is stored instead of the value. A type that needs two references, or a header, is added by "
-            "editing the YAML.</p>"
-            "<p><label>id <input type='text' name='new:id'></label> "
-            f"<label>type <select name='new:type'>{type_options}</select></label> "
-            "<label>reference <input type='text' name='new:reference' placeholder='${NAME}'></label></p>"
-            f"<p>{new_fields}</p><button>Save notifiers</button></form>"
-            "<h2>Routes</h2>"
+            "<p class='muted small'>Secrets stay in the environment: the reference field takes ${NAME} or "
+            "${NAME_FILE} and is stored instead of the value. A type that needs two references, or a header, "
+            "is added by editing the YAML.</p>"
+            "<div class='fields'>"
+            "<label>id<input type='text' name='new:id'></label>"
+            f"<label>type<select name='new:type'>{type_options}</select></label>"
+            "<label>reference <input type='text' name='new:reference' placeholder='${NAME}'></label>"
+            f"{new_fields}</div>"
+            "<button class='btn btn-primary'>Save notifiers</button></form>"
+            "<h2><span class='sec-num'>04</span>Routes</h2>"
             f'<form method="post" action="/config/routes">{csrf}{fingerprint_field}'
             f"{route_form_entries(routes, defaults, notifier_choices(notifiers))}"
-            "<button>Save routes</button></form>"
-            "<p class='muted'>The YAML file stays the source of every other setting; environment changes still "
-            "need a restart.</p>"
+            "<button class='btn btn-primary'>Save routes</button></form>"
+            "<p class='muted small'>The YAML file stays the source of every other setting; environment changes "
+            "still need a restart.</p>"
         )
-        return page("Configuration", body, nav_extra=sign_out_form(request))
+        return page("Configuration", body, active="/config", actions=sign_out_form(request))
 
     @app.get("/sources", response_class=HTMLResponse)
     def sources_page(request: Request):
@@ -1558,14 +1864,15 @@ def create_app(
             f"<li><b>{esc(source['id'])}</b> ({esc(source.get('type', ''))})</li>" for source in runtime.cfg.sources
         )
         body = (
-            "<p>Every built-in source type, its keys and an example. Required keys have no default.</p>"
-            "<table><tr><th>Kind</th><th>Summary</th><th>Required</th><th>Optional</th>"
-            f"<th>Example</th><th>Docs</th></tr>{''.join(rows)}</table>"
+            "<p class='muted'>Every built-in source type, its keys and an example. Required keys have no default.</p>"
+            "<div class='scroll'><table><tr><th scope='col'>Kind</th><th scope='col'>Summary</th>"
+            "<th scope='col'>Required</th><th scope='col'>Optional</th><th scope='col'>Example</th>"
+            f"<th scope='col'>Docs</th></tr>{''.join(rows)}</table></div>"
             f"<h2>Configured sources</h2><ul>{configured or '<li>(none)</li>'}</ul>"
-            "<p class='muted'>Try one without delivering anything: "
+            "<p class='muted small'>Try one without delivering anything: "
             "<code>advisory-radar sources test &lt;id&gt;</code>.</p>"
         )
-        return page("Sources", body, nav_extra=sign_out_form(request))
+        return page("Sources", body, active="/sources", actions=sign_out_form(request))
 
     @app.get("/runs", response_class=HTMLResponse)
     def runs_page(request: Request):
@@ -1596,24 +1903,37 @@ def create_app(
                 continue
             shown.append(run)
         rows = "".join(
-            f"<tr><td>{esc(_when(run.get('at')))}</td><td>{esc(run.get('sent', 0))}</td>"
-            f"<td>{esc(run.get('parked', 0))}</td><td>{esc(run.get('pending', 0))}</td>"
-            f"<td>{esc(run.get('code', ''))}</td></tr>"
+            f"<tr><td class='nowrap'>{esc(_when(run.get('at')))}</td><td class='num'>{esc(run.get('sent', 0))}</td>"
+            f"<td class='num'>{esc(run.get('parked', 0))}</td><td class='num'>{esc(run.get('pending', 0))}</td>"
+            f"<td>{_badge(run.get('code', ''), 'ok' if _number(run.get('code'), -1) == 0 else 'critical')}</td>"
+            "</tr>"
             for run in shown
         )
-        body = (
-            "<form method='get' action='/runs'><p>"
-            f"<label>Exit code <input type='text' name='code' size='3' value='{esc(filters['code'])}'></label> "
-            f"<label>Since <input type='date' name='since' value='{esc(filters['since'])}'></label> "
-            f"<label>Until <input type='date' name='until' value='{esc(filters['until'])}'></label> "
-            "<button>Filter</button></p></form>"
-            "<p class='muted'>The writer keeps only the last 200 passes in the state, so this page has no "
-            "pagination: older rows are not stored.</p>"
-            "<table><tr><th>At (UTC)</th><th>Sent</th><th>Parked</th><th>Pending</th><th>Exit</th></tr>"
-            + rows
-            + "</table>"
+        filter_form = (
+            "<form class='toolbar' method='get' action='/runs'>"
+            f"<label>Exit code<input type='text' name='code' size='3' value='{esc(filters['code'])}'></label>"
+            f"<label>Since<input type='date' name='since' value='{esc(filters['since'])}'></label>"
+            f"<label>Until<input type='date' name='until' value='{esc(filters['until'])}'></label>"
+            "<div class='toolbar-actions'><button class='btn btn-primary'>Filter</button>"
+            "<a class='btn btn-quiet' href='/runs'>Reset</a></div></form>"
         )
-        return page("Runs", nav_extra=sign_out_form(request), body=body)
+        if shown:
+            table = (
+                "<div class='scroll'><table class='compact'><tr><th scope='col'>At (UTC)</th>"
+                "<th scope='col' class='num'>Sent</th><th scope='col' class='num'>Parked</th>"
+                "<th scope='col' class='num'>Pending</th><th scope='col'>Exit</th></tr>"
+                f"{rows}</table></div>"
+            )
+        elif any(filters.values()):
+            table = _empty("No pass matches these filters.", "<a href='/runs'>Clear the filters</a>")
+        else:
+            table = _empty("No pass has been recorded yet: the first run fills this list.")
+        body = (
+            filter_form
+            + "<p class='muted small'>The writer keeps only the last 200 passes in the state, so this page has no "
+            "pagination: older rows are not stored.</p>" + table
+        )
+        return page("Runs", body, active="/runs", actions=sign_out_form(request))
 
     @app.get("/healthz", response_class=PlainTextResponse)
     def healthz():

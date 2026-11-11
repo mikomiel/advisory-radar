@@ -346,7 +346,7 @@ def test_sources_page_lists_the_catalogue_for_a_signed_in_user(tmp_path):
     for spec in SOURCE_SPECS.values():
         example = html.escape(yaml.safe_dump(spec.example, sort_keys=False))
         assert example in page.text, "the page must show each example as YAML"
-    assert '<a href="/sources">Sources</a>' in page.text, "the nav must link the page"
+    assert "<a href='/sources' aria-current='page'>Sources</a>" in page.text, "the nav links the page, marked current"
     assert "<li><b>vendor</b> (rss)</li>" in page.text, "configured source ids and types are listed"
 
 

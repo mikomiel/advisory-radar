@@ -100,6 +100,13 @@ operator action, and the release workflow then builds and pushes the image to
   waiting for a sweep. The schedules stay as the backstop.
 
 ### Changed
+- The web UI has one design: a shared shell with a brand, a marked current section and a footer
+  (version and the probe links), design tokens measured for WCAG AA contrast in light and dark,
+  hairline tables, severity and outcome badges, stat tiles on the dashboard, numbered
+  configuration sections, a notifier laid out as a block instead of a table row, and an empty
+  state instead of a bare table. It is still one inline stylesheet with no script, no web font
+  and no external origin, and it follows `prefers-color-scheme` without a toggle. Every page now
+  carries a language, a viewport, a per-page title, one `h1`, a `main` landmark and a skip link.
 - The sensitive-path guard also covers `uv.lock`, `.python-version` and
   `.dockerignore`: the lock decides what `uv sync --frozen` installs in CI, and
   the pin and the ignore list change the runtime and the image.
