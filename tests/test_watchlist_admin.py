@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import types
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -532,3 +533,18 @@ def test_a_metadata_only_flag_survives_an_unchanged_save(tmp_path):
     )
     assert response.status_code == 303
     assert json.loads(watch.read_text())["products"][0]["metadata_only"] is True
+
+
+def test_a_path_that_cannot_be_inspected_is_reported_by_the_page(tmp_path, monkeypatch):
+    """The page must not show the permissive default while the pass fails on the same unreadable path."""
+    client, _ = make_client(tmp_path)
+    sign_in(client)
+
+    def denied(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(watchlist, "os", types.SimpleNamespace(lstat=denied))
+    page = client.get("/watchlist")
+    assert page.status_code == 200
+    assert "cannot be inspected" in page.text
+    assert "name='fingerprint'" not in page.text, "there is nothing safe to edit against"

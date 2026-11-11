@@ -3161,6 +3161,7 @@ def create_app(
         request: Request,
         target: Path,
         *,
+        exists: bool,
         rows: Sequence[Mapping[str, object]] | None = None,
         packages: str = "",
         excluded: str = "",
@@ -3173,12 +3174,14 @@ def create_app(
 
         Shared by the read and by a refused save, so a refusal shows the rows exactly as they were submitted
         instead of the file they were edited from. ``rows=None`` is the unreadable-document answer: the strip
-        and the reason, and no form, because there is nothing to edit against.
+        and the reason, and no form, because there is nothing to edit against. ``exists`` is the caller's answer
+        from :func:`watchlist.present`, so a path that cannot be inspected is decided once, where it can become a
+        message, instead of inside a renderer.
         """
         strip = (
             "<div class='strip'><p class='muted small'>"
             f"Document <code>{esc(target)}</code>"
-            + ("" if watchlist.present(target) else " (not created yet)")
+            + ("" if exists else " (not created yet)")
             + f" · {len(rows or ())} product{'s' if len(rows or ()) != 1 else ''} · read at the start of every "
             "pass, so a save applies to the next one</p>"
             "<a class='btn' href='/config'>Configuration</a></div>"
@@ -3239,7 +3242,18 @@ def create_app(
         notices = ""
         if saved is not None:
             notices += _notice(f"Scope <code>{esc(saved)}</code> saved. The next pass reads it.", "ok")
-        if watchlist.present(target):
+        try:
+            exists = watchlist.present(target)
+        except SourceError as exc:
+            # The path cannot even be inspected (a directory without the search bit, an I/O error). Answering
+            # "absent" here would show the permissive default while the pass failed on the same path.
+            notices += _notice(
+                f"The scope cannot be inspected: {esc(exc)}. Nothing is judged by it and every pass fails until "
+                "the path is readable; no document is created over it.",
+                "critical",
+            )
+            return watchlist_scope_page(request, target, exists=True, notices=notices)
+        if exists:
             try:
                 document = watchlist.read_watchlist(target)
             except SourceError as exc:
@@ -3250,7 +3264,7 @@ def create_app(
                     "every pass fails; correct it by hand, or point <code>watchlist:</code> at another document.",
                     "critical",
                 )
-                return watchlist_scope_page(request, target, notices=notices)
+                return watchlist_scope_page(request, target, exists=exists, notices=notices)
             expected = watchlist.digest(document)
         else:
             expected = ""
@@ -3270,13 +3284,14 @@ def create_app(
                     "Nothing is judged until it is fixed.",
                     "critical",
                 )
-                return watchlist_scope_page(request, target, notices=notices)
+                return watchlist_scope_page(request, target, exists=exists, notices=notices)
         extra = watchlist_preview_form(values)
         if "preview" in params:
             extra += watchlist_preview_verdict(document, values)
         return watchlist_scope_page(
             request,
             target,
+            exists=exists,
             rows=list(document["products"]),
             packages="\n".join(document["debian_source_packages"]),
             excluded="\n".join(document["excluded_products"]),
@@ -3297,6 +3312,12 @@ def create_app(
             return RedirectResponse("/login", status_code=303)
         cfg = runtime.cfg
         target = watchlist.editable_path(cfg.watchlist_path, cfg.state_path)
+        try:
+            exists = watchlist.present(target)
+        except SourceError:
+            # Uninspectable: the save below answers with the same message, and this page must not also claim the
+            # document is missing.
+            exists = True
         form = form_body(request)
         expected = first(form, "fingerprint")
         submitted = _submitted_products(form)
@@ -3349,6 +3370,7 @@ def create_app(
         return watchlist_scope_page(
             request,
             target,
+            exists=exists,
             rows=submitted,
             packages=first(form, "debian_packages"),
             excluded=first(form, "excluded_products"),

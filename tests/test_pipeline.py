@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -982,4 +983,16 @@ def test_a_broken_link_to_the_scope_fails_the_pass(tmp_path):
     """A scope that is present but unreadable must not fall back to the default, which judges every advisory."""
     cfg = _webhook_config(tmp_path)  # no ``watchlist:`` key, so the document is read beside the state file
     (tmp_path / "watchlist.json").symlink_to(tmp_path / "gone.json")
+    assert pipeline.run_pass(cfg, [], [], http=fake_http, clock=lambda: float(NOW), sleep=lambda s: None) == 1
+
+
+def test_a_scope_that_cannot_be_inspected_fails_the_pass(tmp_path, monkeypatch):
+    """A permission error is not evidence of absence: falling back to the default would judge everything."""
+    cfg = _webhook_config(tmp_path)
+    (tmp_path / "watchlist.json").write_text(json.dumps({"schema": "security-watchlist.v1"}))
+
+    def denied(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(pipeline.watchlist, "os", types.SimpleNamespace(lstat=denied))
     assert pipeline.run_pass(cfg, [], [], http=fake_http, clock=lambda: float(NOW), sleep=lambda s: None) == 1

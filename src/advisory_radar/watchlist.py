@@ -133,11 +133,18 @@ def editable_path(configured: Path | None, state_path: Path) -> Path:
 def present(path: Path) -> bool:
     """Whether the directory entry exists, including a symlink that points at nothing.
 
-    ``Path.exists()`` is false for a broken link, and a scope that is present but unreadable must fail the pass
-    instead of falling back to the packaged default: the fallback judges every advisory. It is also what stops a
-    save from replacing the link with a regular file, which would leave the operator's own document ignored.
+    Only a missing entry is ``False``. A path that cannot be inspected -- a parent directory without the search
+    bit, a link loop, an I/O error -- raises instead of answering "absent", because that answer falls back to the
+    packaged default, which judges every advisory. A present-but-unreadable document must fail the pass, both
+    when it is the configured path and when it is the one beside the state file.
     """
-    return os.path.lexists(path)
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False  # no entry, or a component that is not a directory: nothing can be there
+    except OSError as exc:
+        raise SourceError(f"watchlist {path} cannot be inspected: {exc}") from exc
+    return True
 
 
 def active_path(configured: Path | None, state_path: Path) -> Path:

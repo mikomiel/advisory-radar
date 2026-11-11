@@ -11,6 +11,10 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import subprocess
+import sys
+import threading
+import types
 from pathlib import Path
 
 import pytest
@@ -320,3 +324,59 @@ def test_a_save_does_not_replace_a_broken_link_with_a_file(tmp_path):
     with pytest.raises(SourceError, match="cannot be read"):
         save_watchlist(target, document(), expected="")
     assert target.is_symlink(), "the link is the operator's, not this program's"
+
+
+def test_a_path_that_cannot_be_inspected_is_not_an_absent_document(tmp_path, monkeypatch):
+    """``lexists`` answers False for a permission error, and "absent" falls back to judging everything."""
+
+    def denied(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(watchlist, "os", types.SimpleNamespace(lstat=denied))
+    with pytest.raises(SourceError, match="cannot be inspected"):
+        watchlist.present(tmp_path / "watchlist.json")
+    with pytest.raises(SourceError, match="cannot be inspected"):
+        active_path(None, tmp_path / "state.json")
+    # A configured document is named outright: the sibling being uninspectable cannot change which one is read.
+    assert active_path(tmp_path / "scope.json", tmp_path / "state.json") == tmp_path / "scope.json"
+
+
+RACE_CHILD = """
+import sys
+from pathlib import Path
+from advisory_radar.watchlist import StaleDocument, save_watchlist
+
+target, expected = Path(sys.argv[1]), sys.argv[2]
+document = {"schema": "security-watchlist.v1", "debian_source_packages": ["*"], "excluded_products": [],
+            "products": []}
+try:
+    save_watchlist(target, document, expected=expected)
+except StaleDocument:
+    raise SystemExit(3)
+raise SystemExit(0)
+"""
+
+
+def test_a_second_process_saving_the_same_page_is_refused(tmp_path, monkeypatch):
+    """The sidecar lock is what makes the digest check mean something between processes, not only threads."""
+    target = write(tmp_path / "watchlist.json", document())
+    stale = digest(document())
+    writing = threading.Event()
+    release = threading.Event()
+    original = watchlist.save_json
+
+    def slow_save(path, value):
+        writing.set()
+        assert release.wait(20)
+        return original(path, value)
+
+    monkeypatch.setattr(watchlist, "save_json", slow_save)
+    first = threading.Thread(target=lambda: save_watchlist(target, document(products=[]), expected=stale))
+    first.start()
+    assert writing.wait(20), "the first save must reach the write while holding the lock"
+    child = subprocess.Popen([sys.executable, "-c", RACE_CHILD, str(target), stale])
+    release.set()
+    first.join(20)
+    child.wait(timeout=30)
+    assert child.returncode == 3, "the second process reads the first one's document and refuses"
+    assert read_watchlist(target)["products"] == []

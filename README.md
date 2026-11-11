@@ -68,6 +68,8 @@ Where the document lives, in order: the path `watchlist:` names; otherwise
 read-only); otherwise the built-in default, which judges everything. `watchlist:` naming a
 file that does not exist yet is a configuration error that fails every pass, so a typo can
 never silently mean "judge everything"; the page names it and creates it when you save. A
+document that is there but cannot be read or even inspected — a broken link, a directory
+without the search bit — fails the pass the same way, and the page refuses to edit it. A
 save writes nothing when the page is stale (the file changed under it), when a value is
 invalid (the rows you typed are re-rendered), or when the destination cannot be written. The
 read, the check and the write happen under one lock on the document, so two tabs — or two

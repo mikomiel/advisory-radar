@@ -14,13 +14,17 @@ operator action, and the release workflow then builds and pushes the image to
   `watchlist.json` beside `state_path`, else the built-in default — so a hand edit and the page
   cannot disagree, and a save applies to the next pass because a pass reads the policy every run.
   A scope change makes each source be read in full once, so nothing newly in scope stays hidden
-  behind a conditional request. A save writes nothing and re-renders the rows as they were typed
-  when a value is invalid, when the file changed under the page, or when the destination cannot
-  be written. A read-only form checks one advisory against the saved document and explains the
-  verdict with the same reason the pass uses. A configured `watchlist:` that does not exist still
-  fails every pass — the page names it and creates it on save — and `state_path` may no longer be
-  named `watchlist.json`, which is the default document's filename. An unreadable watchlist now
-  reports a failed pass instead of raising out of the scheduler.
+  behind a conditional request. A save holds a lock on `watchlist.json.lock` around reading,
+  checking and replacing the document, so two tabs or two processes cannot silently replace each
+  other's edit; a page rendered against another document is refused with a reload link, and a save
+  writes nothing and re-renders the rows as they were typed when a value is invalid or the
+  destination cannot be written. A row whose alias contains a comma is read-only in the form — the
+  document keeps it exactly, and it is edited in the file. A read-only form checks one advisory
+  against the saved document and explains the verdict with the same reason the pass uses. A
+  configured `watchlist:` that does not exist still fails every pass — the page names it and
+  creates it on save — and `state_path` may no longer be named `watchlist.json`, which is the
+  default document's filename. A watchlist that cannot be read, or even inspected, now reports a
+  failed pass instead of raising out of the scheduler.
 - Delivery can be scheduled instead of sent one advisory at a time. `digest: true` posts one
   message per routing group, because entries that reach different channels cannot share one:
   the title states the count, the body lists one advisory per line (title plus up to three
