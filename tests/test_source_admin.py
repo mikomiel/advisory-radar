@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from advisory_radar import core, pipeline
 from advisory_radar.config import ConfigError, load_config, load_document
-from advisory_radar.http import urllib_http
+from advisory_radar.http import private_destination, urllib_http
 from advisory_radar.runtime import Runtime
 from advisory_radar.settings import validate_settings
 from advisory_radar.state import save_state
@@ -62,23 +62,32 @@ def write_config(tmp_path: Path, sources: list[dict] | None = None, extra: str =
     return path
 
 
+#: A public unicast address: what a name resolves to when a test does not care where it points.
+PUBLIC_ADDRESS = "93.184.216.34"
+
+
+def public_resolver(host: str) -> tuple[str, ...]:
+    """The default resolver for a test: every name answers one public address, and no DNS is consulted."""
+    return (PUBLIC_ADDRESS,)
+
+
 def make_client(
     tmp_path: Path,
     sources: list[dict] | None = None,
     environment: dict[str, str] | None = None,
     transport=None,
-    resolve: tuple[str, ...] = ("93.184.216.34",),
+    resolve=public_resolver,
     extra: str = "",
 ):
     """A signed-out client, the runtime it serves and the config file behind it.
 
-    The resolver is injected so no test depends on DNS: the default is a public unicast address, and a test
-    that needs a private destination passes ``172.16.0.9`` instead.
+    The resolver is injected so no test depends on DNS. A test that needs an internal destination passes
+    ``lambda host: ("172.16.0.9",)``; one that needs the *name* to decide passes its own function.
     """
     path = write_config(tmp_path, sources, extra)
     env = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, **(environment or {})}
     runtime = Runtime.build(path, env)
-    app = create_app(runtime, env, http=transport or fake_http, resolve=lambda host: resolve)
+    app = create_app(runtime, env, http=transport or fake_http, resolve=resolve)
     return TestClient(app), runtime, path
 
 
@@ -480,7 +489,7 @@ def test_adding_from_a_probe_keeps_the_sources_already_added(tmp_path):
 
 
 def test_a_source_that_points_into_a_private_network_is_refused(tmp_path):
-    client, _, _ = make_client(tmp_path, resolve=("172.16.0.9",))
+    client, _, _ = make_client(tmp_path, resolve=lambda host: ("172.16.0.9",))
     response = new_source(client, **{"new:type": "rss", "new:url": "https://nas.example.net/feed.xml"})
     assert response.status_code == 400
     assert "private network" in response.text
@@ -488,7 +497,9 @@ def test_a_source_that_points_into_a_private_network_is_refused(tmp_path):
 
 
 def test_a_private_destination_is_allowed_when_the_yaml_allows_it(tmp_path):
-    client, runtime, _ = make_client(tmp_path, resolve=("172.16.0.9",), extra="allow_private_sources: true\n")
+    client, runtime, _ = make_client(
+        tmp_path, resolve=lambda host: ("172.16.0.9",), extra="allow_private_sources: true\n"
+    )
     response = new_source(client, **{"new:type": "rss", "new:url": "https://nas.example.net/feed.xml"})
     assert response.status_code == 303
     runtime.reload(blocking=True)
@@ -496,7 +507,7 @@ def test_a_private_destination_is_allowed_when_the_yaml_allows_it(tmp_path):
 
 
 def test_a_probe_of_a_new_source_refuses_a_private_destination(tmp_path):
-    client, _, _ = make_client(tmp_path, resolve=("172.20.5.7",))
+    client, _, _ = make_client(tmp_path, resolve=lambda host: ("172.20.5.7",))
     csrf, fingerprint = signed_in(client)
     response = client.post(
         "/config/sources/probe",
@@ -516,7 +527,7 @@ def test_a_configured_source_may_still_point_into_a_private_network(tmp_path):
     client, _, _ = make_client(
         tmp_path,
         sources=[{"id": "freshrss", "type": "rss", "url": "https://rss.example.net/feed.xml"}],
-        resolve=("172.16.0.9",),
+        resolve=lambda host: ("172.16.0.9",),
     )
     csrf, fingerprint = signed_in(client)
     response = client.post("/config/sources/probe", data={"csrf": csrf, "fingerprint": fingerprint, "id": "freshrss"})
@@ -615,3 +626,130 @@ def test_a_pass_that_dies_before_classifying_records_no_health(tmp_path, monkeyp
     with pytest.raises(RuntimeError):
         pipeline.run_pass(runtime.cfg, runtime.sources, runtime.notifiers, http=fake_http)
     assert not runtime.cfg.state_path.exists(), "health is written only after this window's work is durable"
+
+
+def test_the_destination_check_reads_the_host_the_transport_reads(tmp_path):
+    # ``urllib.request.Request`` unquotes the authority before it dials, so ``%31%32%37.0.0.1`` reaches
+    # 127.0.0.1. A resolver that only knows the decoded name is what proves the check normalises the same way.
+    def resolver(host: str) -> tuple[str, ...]:
+        return ("127.0.0.1",) if host == "127.0.0.1" else (PUBLIC_ADDRESS,)
+
+    client, _, _ = make_client(tmp_path, resolve=resolver)
+    assert private_destination("http://%31%32%37.0.0.1/feed.xml", resolve=resolver)
+    response = new_source(client, **{"new:type": "rss", "new:url": "http://%31%32%37.0.0.1/feed.xml"})
+    assert response.status_code == 400
+    assert "private network" in response.text
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "127.0.0.1",  # loopback
+        "::1",  # loopback, IPv6
+        "172.16.0.9",  # private, IPv4
+        "fd00::1",  # unique local, IPv6
+        "169.254.169.254",  # link-local, the metadata service
+        "100.64.0.1",  # shared address space: neither private nor global
+        "fec0::1",  # site-local, deprecated, and it reports is_global
+        "224.0.0.1",  # multicast, which also reports is_global
+    ],
+)
+def test_internal_address_classes_are_refused(address):
+    assert private_destination("https://internal.example/feed.xml", resolve=lambda host: (address,))
+
+
+def test_a_public_address_is_allowed():
+    assert not private_destination("https://feeds.example.net/feed.xml", resolve=lambda host: (PUBLIC_ADDRESS,))
+
+
+def test_a_reference_cannot_smuggle_a_private_destination_past_the_check(tmp_path):
+    def resolver(host: str) -> tuple[str, ...]:
+        return ("127.0.0.1",) if host == "127.0.0.1" else (PUBLIC_ADDRESS,)
+
+    client, _, _ = make_client(tmp_path, environment={"INTERNAL_HOST": "127.0.0.1"}, resolve=resolver)
+    response = new_source(client, **{"new:type": "rss", "new:url": "http://${INTERNAL_HOST}/feed.xml"})
+    assert response.status_code == 400
+    assert "private network" in response.text
+    assert not (tmp_path / "data" / "settings.json").exists()
+
+
+def test_a_whole_url_reference_can_be_saved(tmp_path):
+    client, runtime, _ = make_client(tmp_path, environment={"FEED_URL": "https://feeds.example.net/feed.xml"})
+    response = new_source(client, **{"new:type": "rss", "new:url": "${FEED_URL}"})
+    assert response.status_code == 303
+    assert overlay(tmp_path)["sources_added"][0]["url"] == "${FEED_URL}"
+    runtime.reload(blocking=True)
+    assert "rss" in [source.id for source in runtime.sources]
+
+
+def test_a_webhook_source_can_be_added_without_a_url(tmp_path):
+    client, runtime, _ = make_client(tmp_path)
+    response = new_source(client, **{"new:id": "vendor-hook", "new:type": "webhook"})
+    assert response.status_code == 303
+    runtime.reload(blocking=True)
+    assert "vendor-hook" in [source.id for source in runtime.sources]
+
+
+def test_a_credential_echoed_in_a_link_is_redacted(tmp_path):
+    watches = json.dumps(
+        {
+            "abc": {
+                "last_changed": 1792600000,
+                "title": "a watch",
+                "link": "https://s3cret-token.example.net/w/abc",
+            }
+        }
+    ).encode()
+
+    def echoing(method, url, headers, body):
+        if "changes.example.net" in url:
+            return 200, {}, watches
+        return 200, {}, RSS
+
+    client, _, _ = make_client(
+        tmp_path,
+        sources=[
+            {
+                "id": "changes",
+                "type": "changedetection",
+                "url": "https://changes.example.net",
+                "api_key": "${CHANGEDETECTION_API_KEY}",
+            }
+        ],
+        environment={"CHANGEDETECTION_API_KEY": "s3cret-token"},
+        transport=echoing,
+    )
+    csrf, fingerprint = signed_in(client)
+    response = client.post("/config/sources/probe", data={"csrf": csrf, "fingerprint": fingerprint, "id": "changes"})
+    assert response.status_code == 200
+    assert "s3cret-token" not in response.text, "a link's origin is source-supplied text too"
+    assert "[redacted]" in response.text
+
+
+def test_a_failed_first_pass_still_bootstraps_when_a_source_answers(tmp_path):
+    failing = {"on": True}
+
+    def toggling(method, url, headers, body):
+        if failing["on"]:
+            return 0, {}, b""
+        return 200, {"ETag": '"v1"'}, RSS
+
+    _, runtime, _ = make_client(tmp_path, transport=toggling)
+    assert pipeline.run_pass(runtime.cfg, runtime.sources, runtime.notifiers, http=toggling) == 1
+    assert json.loads((tmp_path / "data" / "state.json").read_text())["source_health"]["vendor"]["ok"] is False
+    failing["on"] = False
+    assert pipeline.run_pass(runtime.cfg, runtime.sources, runtime.notifiers, http=toggling) == 0
+    state = json.loads((tmp_path / "data" / "state.json").read_text())
+    assert state["source_health"]["vendor"]["ok"] is True
+    # The failed first pass marked nothing as seeded, so the first answer bootstraps instead of alerting history.
+    assert state["seen"], "the first successful pass seeds the feed's history"
+    assert state["pending"] == []
+
+
+def test_a_dry_run_writes_nothing_even_when_every_source_fails(tmp_path):
+    _, runtime, _ = make_client(tmp_path, transport=lambda *args: (0, {}, b""))
+    code = pipeline.run_pass(
+        runtime.cfg, runtime.sources, runtime.notifiers, http=lambda *args: (0, {}, b""), dry_run=True
+    )
+    assert code == 1
+    assert not (tmp_path / "data" / "state.json").exists()

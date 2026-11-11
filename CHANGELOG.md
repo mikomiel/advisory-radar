@@ -161,11 +161,13 @@ operator action, and the release workflow then builds and pushes the image to
 - A source added from `/config` may not point into a private network unless the YAML sets
   `allow_private_sources: true`: the settings overlay is reachable with the UI token alone,
   and only whoever writes the YAML should be able to aim the fetcher at an internal address.
-  A configured YAML source is unaffected, so a LAN FreshRSS or changedetection.io target
-  behaves as before.
+  The check reads the host the way the transport does -- a percent-encoded authority is
+  unquoted first -- and refuses loopback, private, shared, link-local, site-local and
+  multicast addresses. A configured YAML source is unaffected, so a LAN FreshRSS or
+  changedetection.io target behaves as before.
 - A probe's answer is redacted against every secret the entry resolved, not only its error:
-  a source can echo a request token back in a feed title, and the probe page must not become
-  a way to read a `${NAME}` out.
+  a source can echo a request token back in a feed title or in a link's host, and the probe
+  page must not become a way to read a `${NAME}` out.
 - Every workflow action is pinned to a full commit SHA, with its version in a
   trailing comment so Dependabot keeps it current, and every job runs on
   `ubuntu-24.04` instead of the moving `ubuntu-latest`.

@@ -1659,7 +1659,9 @@ def create_app(
         rows = "".join(
             f"<tr><td>{esc(_short(pipeline.redact(item.title, secrets), 80))}</td>"
             f"<td class='mono nowrap'>{esc(_when(item.published))}</td>"
-            f"<td>{esc(_public_url(item.link))}</td></tr>"
+            # The origin is source-supplied too: a watch can name its own host, so the redaction covers what
+            # the origin extraction leaves rather than the raw link alone.
+            f"<td>{esc(pipeline.redact(_public_url(item.link), secrets))}</td></tr>"
             for item in items[:5]
         )
         table = (
@@ -1675,14 +1677,20 @@ def create_app(
         )
         return _notice(f"Answered with {len(items)} entr{'y' if len(items) == 1 else 'ies'}.", "ok") + truncated + table
 
-    def added_source_error(url: str) -> str:
-        """Why a source added on this page may not point at this URL, or "" when it may.
+    def added_source_error(entry: dict) -> str:
+        """Why a source added on this page may not be used, or "" when it may.
 
-        Two rules meet here. The address must be one this program can fetch at all, and -- unless the YAML says
-        otherwise -- a source added with the UI token alone may not aim the fetcher at a private network.
+        The check runs on the *expanded* entry: ``${INTERNAL_HOST}`` is not a hostname, and the address it
+        resolves to is the one the fetcher would contact. The stored entry keeps its references. A kind with no
+        remote side (``webhook``) has no destination to judge.
         """
-        if not url:
-            return "that source has no url"
+        try:
+            expanded = expand_entry(entry, runtime.environment)
+        except ConfigError as exc:
+            return str(exc)  # a missing variable is named by name, never by value
+        url = expanded.get("url")
+        if not isinstance(url, str) or not url:
+            return ""
         if _url_scheme(url) not in ("http", "https"):
             return "that source url is not an http or https url"
         if runtime.cfg.allow_private_sources or not private_destination(url, resolve):
@@ -2005,11 +2013,10 @@ def create_app(
                             # Refused here, in words: letting the builder raise would report a bare KeyError.
                             error = f"{identifier}: {spec.kind} needs {', '.join(missing)}"
                             break
-                        if updated.get("url") != entry.get("url"):
-                            problem = added_source_error(str(updated.get("url") or ""))
-                            if problem:
-                                error = f"{identifier}: {problem}"
-                                break
+                        problem = added_source_error(updated)
+                        if problem:
+                            error = f"{identifier}: {problem}"
+                            break
                     added.append(updated)
             if not whole and not new_source_used(form):
                 error = "this form carried no source to save"
@@ -2020,7 +2027,7 @@ def create_app(
                     if candidate["id"] in {entry.get("id") for entry in (base.get("sources") or [])}:
                         error = f"source id {candidate['id']!r} is already configured; pick another id"
                     else:
-                        error = added_source_error(str(candidate.get("url") or ""))
+                        error = added_source_error(candidate)
                     if not error:
                         added.append(candidate)
             if error:

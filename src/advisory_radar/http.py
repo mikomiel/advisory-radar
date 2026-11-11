@@ -38,7 +38,9 @@ def private_destination(url: str, resolve: Callable[[str], Iterable[str]] = reso
     internal address", and the YAML -- written by whoever runs the host -- is never subject to it.
     """
     try:
-        host = urllib.parse.urlsplit(url).hostname
+        # Unquoted exactly as ``urllib.request.Request`` unquotes it before it dials: ``%31%32%37.0.0.1`` is
+        # ``127.0.0.1`` to the transport, so it has to be to this check too.
+        host = urllib.parse.unquote(urllib.parse.urlsplit(url).hostname or "")
     except ValueError:
         return True  # a URL nobody can parse must not be fetched either
     if not host:
@@ -53,7 +55,10 @@ def private_destination(url: str, resolve: Callable[[str], Iterable[str]] = reso
             parsed = ipaddress.ip_address(address.split("%", 1)[0])  # an IPv6 zone id is not part of the address
         except ValueError:
             continue
-        if parsed.is_private or parsed.is_loopback or parsed.is_link_local or parsed.is_reserved or parsed.is_multicast:
+        # ``is_global`` is the shortest statement of "routable on the public internet", and it is not enough on
+        # its own: IPv6 site-local ``fec0::/10`` and IPv4 multicast both report ``is_global`` true, and only an
+        # ``IPv6Address`` has ``is_site_local`` at all.
+        if not parsed.is_global or parsed.is_multicast or getattr(parsed, "is_site_local", False):
             return True
     return False
 
