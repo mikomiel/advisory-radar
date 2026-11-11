@@ -1,21 +1,72 @@
-"""Built-in notifier plugins: Apprise gateway, Discord webhook, generic webhook."""
+"""Built-in notifier plugins: Apprise gateway, Discord webhook, generic webhook.
+
+A generic ``webhook`` notifier may carry a ``secret``. With one set, every request is signed so a receiver
+can tell a message this instance sent from one an attacker composed against the same URL:
+
+``X-ADR-Timestamp``
+    The Unix time the request was signed, as decimal seconds (the integer part of the clock).
+``X-ADR-Signature``
+    ``sha256=`` followed by the lowercase hex HMAC-SHA256 of ``timestamp + "." + body``, keyed with the
+    secret. ``body`` is the exact byte string POSTed, never a re-serialisation of it.
+
+The body is serialised once, signed, and sent as that same byte string. JSON has more than one spelling of
+the same document (spacing, escaping, key order), so signing a second serialisation would produce a signature
+the receiver could not reproduce from the bytes it received.
+
+Verification recipe for a receiver:
+
+1. Read ``X-ADR-Timestamp`` and ``X-ADR-Signature`` and refuse the request when either is missing.
+2. Parse the timestamp as decimal integer seconds and refuse it when ``abs(now - timestamp) > 300`` (five
+   minutes). The signature itself stays valid forever, so the timestamp is the replay bound; a receiver may
+   use a smaller window, but it must allow enough for network and queueing delay.
+3. Read the raw request body as bytes, exactly as received. Do not parse and re-encode it, and do not sign a
+   field parsed out of it: either would compare over different bytes.
+4. Compute ``hmac.new(secret.encode("utf-8"), timestamp.encode("ascii") + b"." + body,
+   hashlib.sha256).hexdigest()`` and compare ``"sha256=" + digest`` with the header using
+   ``hmac.compare_digest``. Never compare with ``==``: a byte-by-byte comparison leaks timing information.
+5. Refuse the request when the comparison fails.
+
+With no secret nothing above applies: no signature headers are sent, and the request is the same bytes and
+headers as before signing existed.
+"""
 
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import logging
+import time
 import urllib.parse
+from collections.abc import Callable
 
 from .http import Http
 
 LOG = logging.getLogger(__name__)
 
+#: The request headers a configured ``headers`` mapping may not spoof: the notifier writes them after merging
+#: that mapping, case-insensitively, so a receiver can rely on the one value the code computed.
+_SIGNATURE_HEADERS = frozenset({"x-adr-timestamp", "x-adr-signature"})
 
-def _post_json(http: Http, url: str, headers: dict[str, str], payload: dict) -> int:
-    body = json.dumps(payload).encode()
+
+def _post(http: Http, url: str, headers: dict[str, str], body: bytes) -> int:
     status, _, _ = http("POST", url, {"Content-Type": "application/json", **headers}, body)
     return status
+
+
+def _post_json(http: Http, url: str, headers: dict[str, str], payload: dict) -> int:
+    return _post(http, url, headers, json.dumps(payload).encode())
+
+
+def _signature(secret: str, timestamp: str, body: bytes) -> str:
+    """``sha256=`` and the lowercase hex HMAC of ``timestamp + "." + body`` over the exact bytes sent.
+
+    The secret is UTF-8 and the timestamp ASCII, which is the encoding the module docstring's recipe names:
+    a receiver written in another language must be able to reproduce this byte for byte.
+    """
+    material = timestamp.encode("ascii") + b"." + body
+    return "sha256=" + hmac.new(secret.encode("utf-8"), material, hashlib.sha256).hexdigest()
 
 
 class AppriseNotifier:
@@ -51,12 +102,26 @@ class DiscordWebhookNotifier:
 
 
 class WebhookNotifier:
-    """Any JSON webhook: the full structured message is POSTed."""
+    """Any JSON webhook: the full structured message is POSTed, signed when a secret is configured.
 
-    def __init__(self, notifier_id: str, url: str, headers: dict[str, str] | None = None) -> None:
+    ``clock`` is injectable so a test can pin the timestamp header; a deployment keeps the system clock. The
+    body is encoded once here -- not by ``_post_json`` -- because the signature and the request must cover the
+    very same bytes.
+    """
+
+    def __init__(
+        self,
+        notifier_id: str,
+        url: str,
+        headers: dict[str, str] | None = None,
+        secret: str | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         self.id = notifier_id
         self.url = url
         self.headers = headers or {}
+        self.secret = secret or None
+        self.clock = clock
 
     def send(self, entry: dict, http: Http) -> int:
         payload = {
@@ -68,7 +133,16 @@ class WebhookNotifier:
             "link": entry.get("link", ""),
             "source": entry.get("source", ""),
         }
-        return _post_json(http, self.url, self.headers, payload)
+        body = json.dumps(payload).encode()
+        headers = self.headers
+        if self.secret:
+            timestamp = str(int(self.clock()))
+            # A configured header cannot shadow the computed pair: two spellings of one header would leave
+            # which value the receiver reads to the HTTP stack.
+            headers = {name: value for name, value in self.headers.items() if name.lower() not in _SIGNATURE_HEADERS}
+            headers["X-ADR-Timestamp"] = timestamp
+            headers["X-ADR-Signature"] = _signature(self.secret, timestamp, body)
+        return _post(http, self.url, headers, body)
 
 
 class MatrixWebhookNotifier:
@@ -221,7 +295,7 @@ def _bool(value: object, name: str) -> bool:
 NOTIFIER_BUILDERS = {
     "apprise": lambda cfg, env: AppriseNotifier(cfg["id"], cfg["url"], cfg.get("key", "alerts"), cfg["password"]),
     "discord_webhook": lambda cfg, env: DiscordWebhookNotifier(cfg["id"], cfg["url"]),
-    "webhook": lambda cfg, env: WebhookNotifier(cfg["id"], cfg["url"], cfg.get("headers") or {}),
+    "webhook": lambda cfg, env: WebhookNotifier(cfg["id"], cfg["url"], cfg.get("headers") or {}, cfg.get("secret")),
     "matrix_webhook": lambda cfg, env: MatrixWebhookNotifier(cfg["id"], cfg["url"]),
     "ntfy": lambda cfg, env: NtfyNotifier(cfg["id"], cfg["url"], cfg["topic"], int(cfg.get("priority", 3))),
     "gotify": lambda cfg, env: GotifyNotifier(cfg["id"], cfg["url"], cfg["token"], int(cfg.get("priority", 5))),
