@@ -1012,3 +1012,33 @@ def test_a_scope_path_that_is_a_directory_fails_the_pass(tmp_path):
     cfg = _webhook_config(tmp_path)
     (tmp_path / "watchlist.json").mkdir()
     assert pipeline.run_pass(cfg, [], [], http=fake_http, clock=lambda: float(NOW), sleep=lambda s: None) == 1
+
+
+def test_the_default_scope_is_in_force_beside_a_state_path_that_cannot_be_walked(tmp_path):
+    """A `..` through a missing directory must not hide a saved scope behind the packaged default."""
+    state_path = tmp_path / "missing" / ".." / "state.json"
+    (tmp_path / "watchlist.json").write_text(
+        json.dumps(
+            {
+                "schema": "security-watchlist.v1",
+                "debian_source_packages": ["curl"],
+                "excluded_products": [],
+                "products": [{"id": "libfoo", "aliases": ["libfoo"], "domains": []}],
+            }
+        )
+    )
+    path = tmp_path / "walkless.yml"
+    path.write_text(
+        f"sources:\n  - id: wh\n    type: webhook\nstorage: sqlite:///{tmp_path}/store.db\nstate_path: {state_path}\n"
+    )
+    cfg = load_config(path, {})
+    store = cfg.store()
+    state = core.new_state()
+    state["seeded"] = {"wh": True}
+    state["webhook_inbox"] = {"wh": [{"guid": "noise", "title": "garden notes", "link": "", "summary": ""}]}
+    store.save(state)
+    code = pipeline.run_pass(
+        cfg, [WebhookSource("wh")], [], http=fake_http, clock=lambda: float(NOW), sleep=lambda s: None
+    )
+    assert code == 0
+    assert store.load()["seen"]["src:wh:noise"]["outcome"] == "filtered", "the saved scope was in force"

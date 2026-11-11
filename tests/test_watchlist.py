@@ -492,3 +492,23 @@ def test_a_document_root_is_not_a_document(tmp_path):
     assert watchlist.present(root) is True
     with pytest.raises(SourceError, match="does not name a document"):
         save_watchlist(root, lambda current: document(), expected="")
+
+
+def test_the_default_document_is_found_beside_a_state_path_the_filesystem_cannot_walk(tmp_path):
+    """The sibling is looked for at its resolved entry: otherwise a `..` hides a saved scope behind the default."""
+    state_path = tmp_path / "missing" / ".." / "state.json"
+    saved = write(tmp_path / "watchlist.json", document())
+    assert active_path(None, state_path) == saved.resolve()
+
+
+def test_a_link_behind_an_unwalkable_spelling_is_still_a_document(tmp_path):
+    """The dangling-link rule must survive the spelling the filesystem cannot traverse."""
+    link = tmp_path / "scope.json"
+    link.symlink_to(tmp_path / "gone.json")
+    configured = tmp_path / "missing" / ".." / "scope.json"
+    resolved, there = watchlist.resolve_document(configured)
+    assert resolved == (tmp_path / "gone.json").resolve()
+    assert there is True, "the entry is a link, so it is a document that cannot be read, not an empty slot"
+    with pytest.raises(SourceError, match="refusing to create it"):
+        save_watchlist(configured, lambda current: document(), expected="")
+    assert not (tmp_path / "gone.json").exists()

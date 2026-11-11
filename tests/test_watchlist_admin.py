@@ -940,20 +940,45 @@ def test_a_save_creates_the_file_the_pass_will_read(tmp_path):
 
 
 def test_the_preview_matches_what_a_webhook_entry_is_judged_on(tmp_path):
-    """A webhook entry keeps its text, so the preview and that ingestion path must reach the same verdict."""
+    """The preview stands in for the fields a pass sees after ingestion: same fields, same verdict.
+
+    A webhook entry keeps its own text, and the match reads the title, the summary and the feed title, so both of
+    the latter are compared here rather than only the package rule.
+    """
     from advisory_radar.sources import webhook_item_from_payload
 
-    watch = write_scope(tmp_path / "scope.json", products=[], debian_source_packages=["openssl"])
+    watch = write_scope(
+        tmp_path / "scope.json",
+        products=[
+            {"id": "acme", "aliases": ["acme"], "domains": []},
+            {"id": "vendor", "aliases": ["vendor feed"], "domains": []},
+        ],
+    )
     client, _ = make_client(tmp_path, watch)
     sign_in(client)
-    title = " DSA-6104-1 openssl - security update"
-    entry = webhook_item_from_payload({"title": title, "link": "https://lists.debian.org/x", "guid": "g"})
+    policy = watchlist.load_policy(watch)
+    entry = webhook_item_from_payload(
+        {"title": "nightly notes", "summary": "acme shipped a fix", "link": "https://vendor.example.net/a", "guid": "g"}
+    )
     assert entry is not None
     item = core.Item(
         entry["guid"], entry["title"], entry["link"], entry["summary"], None, (), source_title=entry["source_title"]
     )
-    policy = watchlist.load_policy(watch)
-    page = client.get("/watchlist", params={"preview": "1", "title": title, "link": item.link})
-    reason = core.filter_reason(item, policy)
-    assert ("Out of scope" in page.text) is bool(reason), "the page and the entry agree on the verdict"
-    assert "judged exactly as typed" in page.text, "the page says what its input stands for"
+    page = client.get(
+        "/watchlist",
+        params={
+            "preview": "1",
+            "title": item.title,
+            "link": item.link,
+            "summary": item.summary,
+            "source_title": item.source_title,
+        },
+    )
+    assert core.filter_reason(item, policy) == "", "this entry is in scope through its summary"
+    assert "In scope" in page.text and "matched <code>acme</code>" in page.text
+
+    # The feed title is part of the text a product matches, so it reaches the preview as well.
+    feed_item = core.Item("h", "notes", "", "", None, (), source_title="Vendor Feed")
+    page = client.get("/watchlist", params={"preview": "1", "title": "notes", "source_title": "Vendor Feed"})
+    assert core.filter_reason(feed_item, policy) == ""
+    assert "In scope" in page.text and "judged exactly as typed" in page.text

@@ -169,6 +169,19 @@ def document_path(path: Path) -> Path:
         raise SourceError(f"watchlist {path} is not a usable path: {exc}") from exc
 
 
+def entry_path(path: Path) -> Path:
+    """The operator's own last name with its parents resolved: the entry the filesystem would find there.
+
+    Resolving the parents first is what makes the answer right for a spelling the filesystem cannot walk
+    (``/data/missing/../scope.json``): the final name is then inspected where it really is, instead of being asked
+    about through a directory that does not exist. This is the entry, not the file it may name: a link is a link.
+    """
+    try:
+        return path.parent.resolve() / path.name
+    except (OSError, ValueError) as exc:
+        raise SourceError(f"watchlist {path} is not a usable path: {exc}") from exc
+
+
 def resolve_document(path: Path) -> tuple[Path, bool]:
     """The file a name points at, and whether that is a document rather than an entry with nothing behind it.
 
@@ -178,19 +191,21 @@ def resolve_document(path: Path) -> tuple[Path, bool]:
     resolved = document_path(path)
     if present(resolved):
         return resolved, True
-    return resolved, path.is_symlink()
+    return resolved, present(entry_path(path))
 
 
 def active_path(configured: Path | None, state_path: Path) -> Path:
     """The document a pass reads: the configured one, the saved one beside the state, else the packaged default.
 
     A configured path is never replaced by a fallback: a document the operator named but has not created yet
-    must fail the pass, because reading the packaged default instead would silently judge every advisory.
+    must fail the pass, because reading the packaged default instead would silently judge every advisory. The
+    document beside the state file is looked for at its resolved entry, so a state path the filesystem cannot walk
+    cannot hide a saved scope behind the packaged default.
     """
     if configured is not None:
         return document_path(configured)
-    beside = state_path.with_name(WATCHLIST_NAME)
-    return document_path(beside) if present(beside) else document_path(DEFAULT_DOCUMENT)
+    beside, there = resolve_document(state_path.with_name(WATCHLIST_NAME))
+    return beside if there else document_path(DEFAULT_DOCUMENT)
 
 
 def display_path(configured: Path | None, state_path: Path) -> Path:
@@ -244,7 +259,8 @@ def save_watchlist(path: Path, build: Callable[[dict | None], dict], *, expected
         # A directory root (``watchlist: /``) is a path, not a document, and it has no name for the sidecar lock:
         # refusing it here is the difference between a refusal and a crash.
         raise SourceError(f"watchlist {path} does not name a document; point watchlist: at a file")
-    if path.is_symlink() and not present(target):
+    entry = entry_path(path)
+    if present(entry) and entry.is_symlink() and not present(target):
         # The link names a file that is not there. Creating it would leave the operator editing a document they
         # did not name, with whatever the link pointed at before gone from their point of view.
         raise SourceError(f"{path} is a link to {target}, which does not exist; refusing to create it")
