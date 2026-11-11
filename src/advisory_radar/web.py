@@ -1650,14 +1650,18 @@ def create_app(
         )
 
     def redacted_origin(link: object, secrets: Sequence[str]) -> str:
-        """A link's origin with every secret removed.
+        """A link's origin with every secret removed, or a marker when removing one left nothing showable.
 
-        The origin is source-supplied text too -- a watch can name its own host -- and the extraction lowercases
-        a hostname, so the lowercase form of a secret is redacted as well: otherwise a credential reflected in
-        upper case would be rendered in the one form the redactor no longer matches.
+        The redaction runs on the whole value *before* the origin is extracted: extracting lowercases a
+        hostname and would transform a reflected credential into a string the redactor no longer matches. A
+        redacted host is left bracketed (``[redacted].example.net``), which is not a URL any more, so the
+        fallback is the marker alone rather than a fabricated origin.
         """
-        origin = _public_url(str(link or ""))
-        return pipeline.redact(origin, [*secrets, *(secret.lower() for secret in secrets)])
+        text = str(link or "")
+        redacted = pipeline.redact(text, secrets)
+        if redacted == text:
+            return _public_url(text)
+        return _public_url(redacted) or "[redacted]"
 
     def probe_window(window, secrets: Sequence[str]) -> str:
         """What one probe answered: the entry count, the truncation flag and the first few items.
@@ -1758,8 +1762,10 @@ def create_app(
         identifier = first(form, "id").strip()
         add_form = ""
         if identifier:
+            settings = saved_overlay()[0]
+            owned = added_source_ids(settings)
             entry = next(
-                (candidate for candidate in saved_source_entries(saved_overlay()[0]) if candidate["id"] == identifier),
+                (candidate for candidate in saved_source_entries(settings) if candidate["id"] == identifier),
                 None,
             )
             if entry is None:
@@ -1771,7 +1777,9 @@ def create_app(
                     actions=sign_out_form(request),
                     status_code=404,
                 )
-            ok, detail = probe_source(entry, adding=False)
+            # Ownership, not "already saved": a disabled overlay source is still a source this page added, and
+            # probing it must not become the way around the destination rule.
+            ok, detail = probe_source(entry, adding=identifier in owned)
             tone = _badge("answered", "ok") if ok else _badge("failed", "critical")
             heading = (
                 f"<h2>{esc(identifier)} <span class='muted'>{esc(str(entry.get('type', '')))}</span> {tone}</h2>"
@@ -2408,7 +2416,7 @@ def create_app(
             record = health.get(identifier)
             record = record if isinstance(record, dict) else {}
             kind = str(source.get("type", ""))
-            origin = _public_url(str(source.get("url", "")))
+            origin = redacted_origin(source.get("url", ""), secret_values(runtime.cfg))
             badge = f" {_badge('added', 'neutral')}" if identifier in added_ids else ""
             tone = (
                 "<span class='muted small'>not polled yet</span>"

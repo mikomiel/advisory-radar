@@ -29,6 +29,13 @@ def resolve_host(host: str) -> tuple[str, ...]:
     return tuple(info[4][0] for info in socket.getaddrinfo(host, None))
 
 
+#: IPv6 ranges that are a wrapper around an IPv4 address: the address the connection finally reaches is the
+#: embedded one, so the embedded one is what the rule has to judge. ``::/96`` is the deprecated IPv4-compatible
+#: form, ``64:ff9b::/96`` the well-known NAT64 prefix, ``2002::/16`` 6to4. IPv4-mapped ``::ffff:0:0/96``
+#: already reports the embedded address's own class.
+_EMBEDDED_IPV4 = tuple(ipaddress.ip_network(prefix) for prefix in ("::/96", "64:ff9b::/96", "2002::/16"))
+
+
 def _host_of(url: str) -> str | None:
     """The host the transport will dial: the authority is unquoted, then userinfo and port are removed.
 
@@ -73,6 +80,8 @@ def private_destination(url: str, resolve: Callable[[str], Iterable[str]] = reso
         # its own: IPv6 site-local ``fec0::/10`` and IPv4 multicast both report ``is_global`` true, and only an
         # ``IPv6Address`` has ``is_site_local`` at all.
         if not parsed.is_global or parsed.is_multicast or getattr(parsed, "is_site_local", False):
+            return True
+        if parsed.version == 6 and any(parsed in network for network in _EMBEDDED_IPV4):
             return True
     return False
 

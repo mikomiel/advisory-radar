@@ -163,14 +163,18 @@ operator action, and the release workflow then builds and pushes the image to
   and only whoever writes the YAML should be able to aim the fetcher at an internal address.
   The check reads the destination the way the transport does -- the authority is unquoted
   before the host is separated from the port, so `%3A8080` is a port and not part of a name --
-  and refuses loopback, private, shared, link-local, site-local and multicast addresses. A
-  disabled source is not checked, so one whose host later resolves internally can still be
-  switched off. A configured YAML source is unaffected, so a LAN FreshRSS or
+  and refuses loopback, private, shared, link-local, site-local and multicast addresses and
+  the IPv6 ranges that wrap an IPv4 one (`::/96`, `64:ff9b::/96`, `2002::/16`). A disabled
+  source is not checked, so one whose host later resolves internally can still be switched
+  off; probing is judged by ownership instead, so a probe of a source the overlay added is
+  checked even while that source is disabled. A configured YAML source is unaffected, so a LAN FreshRSS or
   changedetection.io target behaves as before.
 - A probe's answer is redacted against every secret the entry resolved, not only its error:
   a source can echo a request token back in a feed title or in a link's host, and the probe
-  page must not become a way to read a `${NAME}` out. A link's origin is redacted against the
-  lowercase form too, because extracting the origin lowercases the hostname.
+  page must not become a way to read a `${NAME}` out. The origin is redacted before it is
+  extracted -- extraction lowercases a hostname, which would transform the value being matched
+  -- and `/sources` redacts the origin it shows for the same reason, because it reads the
+  expanded configuration rather than the references.
 - Every workflow action is pinned to a full commit SHA, with its version in a
   trailing comment so Dependabot keeps it current, and every job runs on
   `ubuntu-24.04` instead of the moving `ubuntu-latest`.

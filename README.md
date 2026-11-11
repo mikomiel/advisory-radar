@@ -249,8 +249,11 @@ reachable with the UI token alone, and aiming this process at an internal addres
 is a decision for whoever runs the host. A configured YAML source is never subject
 to the rule — a FreshRSS or changedetection.io instance on the LAN stays a supported
 target — and `allow_private_sources: true` in the YAML lifts it for added sources
-too. Both a URL and the titles it answers are redacted against every secret the
-configuration resolved, so a probe cannot be used to read a `${NAME}` back out.
+too. A probe of a source the page added is judged whether or not that source is
+enabled: switching it off is allowed without the check, probing it is not. Every
+origin either page shows — a probe's answer and a configured source on `/sources` —
+and every title a probe shows is redacted against the secrets the configuration
+resolved, so neither page can be used to read a `${NAME}` back out.
 
 | Kind | Summary | Required keys | Optional keys |
 |---|---|---|---|

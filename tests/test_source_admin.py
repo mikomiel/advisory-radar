@@ -801,3 +801,102 @@ def test_a_source_whose_host_becomes_internal_can_still_be_disabled(tmp_path):
     )
     assert refused.status_code == 400
     assert "private network" in refused.text
+
+
+def test_a_probe_of_a_disabled_overlay_source_is_still_judged(tmp_path):
+    """Disabling a source the page added must not become the way to aim its probe at an internal address."""
+    addresses = {"value": PUBLIC_ADDRESS}
+
+    def resolver(host: str) -> tuple[str, ...]:
+        return (addresses["value"],)
+
+    client, _, _ = make_client(tmp_path, resolve=resolver)
+    assert new_source(client, **{"new:type": "rss", "new:url": "https://nas.example.net/feed.xml"}).status_code == 303
+    addresses["value"] = "172.16.0.9"
+    csrf, fingerprint = signed_in(client)
+    # Switching it off while pointing it at loopback is allowed: a disabled source is not fetched.
+    saved = client.post(
+        "/config/sources",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "enabled:vendor": "1",
+            "tag:vendor": "",
+            "added_url:nas-example-net": "http://127.0.0.1:8080/feed.xml",
+        },
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303
+    csrf, fingerprint = signed_in(client)
+    probed = client.post("/sources/probe", data={"csrf": csrf, "id": "nas-example-net"})
+    assert probed.status_code == 200
+    assert "private network" in probed.text
+
+
+def test_the_sources_page_redacts_a_secret_in_a_configured_url(tmp_path):
+    client, _, _ = make_client(
+        tmp_path,
+        sources=[{"id": "vendor", "type": "rss", "url": "https://${FEED_TOKEN}.feeds.example.net/security.xml"}],
+        environment={"FEED_TOKEN": "AbCdEf123456"},
+    )
+    signed_in(client)
+    page = client.get("/sources").text
+    assert "abcdef123456" not in page.lower(), "the table shows an expanded configuration, so it must redact it"
+    assert "redacted" in page.lower()
+
+
+def test_a_percent_encoded_credential_in_a_link_is_redacted(tmp_path):
+    # The redaction covers the encoded form of a secret, which is how it reaches a hostname.
+    watches = json.dumps(
+        {
+            "abc": {
+                "last_changed": 1792600000,
+                "title": "a watch",
+                "link": "https://Ab%2FCd.example.net/w/abc",
+            }
+        }
+    ).encode()
+
+    def echoing(method, url, headers, body):
+        if "changes.example.net" in url:
+            return 200, {}, watches
+        return 200, {}, RSS
+
+    client, _, _ = make_client(
+        tmp_path,
+        sources=[
+            {
+                "id": "changes",
+                "type": "changedetection",
+                "url": "https://changes.example.net",
+                "api_key": "${CHANGEDETECTION_API_KEY}",
+            }
+        ],
+        environment={"CHANGEDETECTION_API_KEY": "Ab/Cd"},
+        transport=echoing,
+    )
+    csrf, fingerprint = signed_in(client)
+    response = client.post("/config/sources/probe", data={"csrf": csrf, "fingerprint": fingerprint, "id": "changes"})
+    assert response.status_code == 200
+    assert "ab%2fcd" not in response.text.lower()
+    assert "ab/cd" not in response.text.lower()
+    assert "[redacted]" in response.text
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "::ffff:127.0.0.1",  # IPv4-mapped loopback
+        "::ffff:100.64.0.1",  # IPv4-mapped shared space
+        "::ffff:224.0.0.1",  # IPv4-mapped multicast
+        "64:ff9b::7f00:1",  # NAT64 wrapper around 127.0.0.1
+        "2002:7f00:1::1",  # 6to4 wrapper around 127.0.0.1
+        "fe80::1%eth0",  # link-local with a zone id
+    ],
+)
+def test_a_wrapped_or_zoned_literal_is_refused(address):
+    assert private_destination("https://internal.example/feed.xml", resolve=lambda host: (address,))
+
+
+def test_a_public_ipv6_address_is_allowed():
+    assert not private_destination("https://feeds.example.net/", resolve=lambda host: ("2001:4860:4860::8888",))
