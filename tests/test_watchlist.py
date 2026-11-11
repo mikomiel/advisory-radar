@@ -55,6 +55,11 @@ def write(path: Path, value: dict) -> Path:
     return path
 
 
+def _save(path: Path, document: dict, *, expected: str = "") -> str:
+    """Save one document the way the editor does: the build returns it whatever the file holds."""
+    return save_watchlist(path, lambda current: document, expected=expected)
+
+
 def item(title: str, link: str = "https://vendor.example.com/a", summary: str = "notes", source_title: str = ""):
     return core.Item("g1", title, link, summary, None, (), source_title=source_title)
 
@@ -167,7 +172,7 @@ def test_the_digest_covers_values_not_formatting():
 
 def test_a_save_creates_the_document(tmp_path):
     target = tmp_path / "data" / "watchlist.json"
-    written = save_watchlist(target, document(), expected="")
+    written = _save(target, document(), expected="")
     assert written == digest(document())
     assert read_watchlist(target) == document()
     assert oct(target.stat().st_mode & 0o777) == "0o600", "the scope is a document on the data volume"
@@ -175,7 +180,7 @@ def test_a_save_creates_the_document(tmp_path):
 
 def test_a_save_replaces_the_document_it_was_rendered_from(tmp_path):
     target = write(tmp_path / "watchlist.json", document())
-    written = save_watchlist(target, document(products=[]), expected=digest(document()))
+    written = _save(target, document(products=[]), expected=digest(document()))
     assert read_watchlist(target)["products"] == []
     assert written == digest(document(products=[]))
 
@@ -184,14 +189,14 @@ def test_a_stale_page_cannot_replace_a_newer_edit(tmp_path):
     target = write(tmp_path / "watchlist.json", document())
     before = target.read_text()
     with pytest.raises(StaleDocument):
-        save_watchlist(target, document(products=[]), expected="0" * 64)
+        _save(target, document(products=[]), expected="0" * 64)
     assert target.read_text() == before, "a refused save writes nothing"
 
 
 def test_a_page_that_thinks_there_is_no_document_cannot_create_one_over_an_edit(tmp_path):
     target = write(tmp_path / "watchlist.json", document())
     with pytest.raises(StaleDocument):
-        save_watchlist(target, document(), expected="")
+        _save(target, document(), expected="")
     assert read_watchlist(target) == document()
 
 
@@ -200,7 +205,7 @@ def test_an_invalid_document_is_refused_before_the_file_is_touched(tmp_path):
     before = target.read_text()
     broken = document(products=[{"id": "nodejs", "aliases": ["x"], "domains": ["not a domain"]}])
     with pytest.raises(SourceError, match="domain is invalid"):
-        save_watchlist(target, broken, expected=digest(document()))
+        _save(target, broken, expected=digest(document()))
     assert target.read_text() == before
 
 
@@ -210,7 +215,7 @@ def test_a_target_that_is_not_a_watchlist_is_not_overwritten(tmp_path):
     target.write_text(json.dumps({"schema": "advisory-radar-state.v1", "seen": {}}))
     before = target.read_text()
     with pytest.raises(SourceError, match="schema is invalid"):
-        save_watchlist(target, document(), expected="")
+        _save(target, document(), expected="")
     assert target.read_text() == before
 
 
@@ -218,7 +223,7 @@ def test_a_document_over_the_save_limit_is_refused(tmp_path):
     target = tmp_path / "watchlist.json"
     large = document(products=[{"id": f"p{index}", "aliases": ["x" * 200], "domains": []} for index in range(100)])
     with pytest.raises(SourceError, match="more than the"):
-        save_watchlist(target, large, expected="")
+        _save(target, large, expected="")
     assert not target.exists(), "a document too large to save from the page is refused, never half-written"
 
 
@@ -298,13 +303,13 @@ def test_a_save_holds_the_lock_across_the_read_the_check_and_the_write(tmp_path,
 
     monkeypatch.setattr(watchlist, "read_watchlist", probe_read)
     monkeypatch.setattr(watchlist, "save_json", probe_save)
-    save_watchlist(target, document(products=[]), expected=digest(document()))
+    _save(target, document(products=[]), expected=digest(document()))
     assert observed == [("read", True), ("write", True)]
 
 
 def test_the_lock_is_not_held_once_the_save_returns(tmp_path):
     target = write(tmp_path / "watchlist.json", document())
-    save_watchlist(target, document(), expected=digest(document()))
+    _save(target, document(), expected=digest(document()))
     assert _sidecar_is_locked(target) is False, "the lock is released, so the next save is not blocked"
 
 
@@ -324,7 +329,7 @@ def test_a_save_does_not_replace_a_broken_link_with_a_file(tmp_path):
     target = tmp_path / "watchlist.json"
     target.symlink_to(tmp_path / "gone.json")
     with pytest.raises(SourceError, match="refusing to create it"):
-        save_watchlist(target, document(), expected="")
+        _save(target, document(), expected="")
     assert target.is_symlink(), "the link is the operator's, not this program's"
     assert not (tmp_path / "gone.json").exists(), "the link's target is not created behind the operator's back"
 
@@ -334,7 +339,7 @@ def test_a_save_through_a_link_updates_the_file_it_names(tmp_path):
     real = write(tmp_path / "scope.json", document())
     link = tmp_path / "watchlist.json"
     link.symlink_to(real)
-    save_watchlist(link, document(products=[]), expected=digest(document()))
+    _save(link, document(products=[]), expected=digest(document()))
     assert link.is_symlink(), "the link is not replaced by a regular file"
     assert read_watchlist(real)["products"] == []
     assert (tmp_path / "scope.json.lock").exists(), "the lock is taken on the document, not on the link"
@@ -367,7 +372,7 @@ document = {"schema": "security-watchlist.v1", "debian_source_packages": ["*"], 
 print("ready", flush=True)
 started = time.monotonic()
 try:
-    save_watchlist(target, document, expected=expected)
+    save_watchlist(target, lambda current: document, expected=expected)
 except StaleDocument:
     print(f"stale {time.monotonic() - started:.3f}", flush=True)
     raise SystemExit(3)
@@ -394,7 +399,7 @@ def test_a_second_process_saving_the_same_page_is_refused(tmp_path, monkeypatch)
         return original(path, value)
 
     monkeypatch.setattr(watchlist, "save_json", slow_save)
-    first = threading.Thread(target=lambda: save_watchlist(target, document(products=[]), expected=stale))
+    first = threading.Thread(target=lambda: _save(target, document(products=[]), expected=stale))
     first.start()
     assert writing.wait(20), "the first save must reach the write while holding the lock"
     child = subprocess.Popen([sys.executable, "-c", RACE_CHILD, str(target), stale], stdout=subprocess.PIPE, text=True)
@@ -431,6 +436,6 @@ def test_a_link_retargeted_while_the_save_waits_is_refused(tmp_path, monkeypatch
     monkeypatch.setattr(watchlist, "state_lock", retarget_then_lock)
     before_first, before_second = first.read_text(), second.read_text()
     with pytest.raises(StaleDocument, match="now names another document"):
-        save_watchlist(link, document(products=[]), expected=digest(document()))
+        _save(link, document(products=[]), expected=digest(document()))
     assert first.read_text() == before_first
     assert second.read_text() == before_second

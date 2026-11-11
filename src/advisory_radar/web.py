@@ -1014,18 +1014,15 @@ def _product_rows(products: Sequence[Mapping[str, object]]) -> str:
     The id is rendered as text, not as an editable field: it is what a routing rule and an exclusion name, so
     a rename would silently change both. Renaming is a remove and an add.
 
-    A row holding an alias its field cannot carry (see :func:`_alias_holds`) is rendered read-only with the exact
-    list in a hidden field, because the field would otherwise split or rewrite it on an unchanged save. The
-    document is the place to edit it.
+    A row holding an alias its field cannot carry (see :func:`_alias_holds`) is rendered read-only, with the exact
+    list in a hidden field so the row still submits as one row; the save keeps the value from the document
+    (``metadata_only`` too, which has no control here), because a hidden field is not a promise the page keeps.
     """
     rows = []
     for product in products:
         identifier = str(product.get("id", ""))
         aliases = [str(alias) for alias in product.get("aliases") or ()]
         domains = ", ".join(str(domain) for domain in product.get("domains") or ())
-        # ``metadata_only`` is read and validated by the document but consumed by nothing yet; the row carries
-        # it through every save rather than dropping a key this page does not understand.
-        metadata = "1" if product.get("metadata_only") is True else "0"
         removed = " checked" if product.get("remove") is True else ""
         if all(_alias_holds(alias) for alias in aliases):
             aliases_cell = (
@@ -1041,8 +1038,7 @@ def _product_rows(products: Sequence[Mapping[str, object]]) -> str:
                 "<br><span class='muted small'>kept exactly: this field cannot hold an alias here</span></td>"
             )
         rows.append(
-            f"<tr><td><b>{esc(identifier)}</b>"
-            f"<input type='hidden' name='metadata_only:{esc(identifier)}' value='{metadata}'></td>"
+            f"<tr><td><b>{esc(identifier)}</b></td>"
             f"{aliases_cell}"
             f"<td><input type='text' size='{_DOMAINS_SIZE}' name='product:{esc(identifier)}:domains' "
             f"value='{esc(domains)}' aria-label='domains for {esc(identifier)}'></td>"
@@ -1115,7 +1111,7 @@ def _row_field(name: str) -> tuple[str, str] | None:
     if prefix == "product":
         identifier, _, leaf = rest.rpartition(":")
         return (identifier, leaf) if leaf in {"aliases", "aliases_json", "domains"} else None
-    if prefix in {"metadata_only", "remove"}:
+    if prefix == "remove":
         return (rest, prefix) if rest and ":" not in rest else None
     return None
 
@@ -1126,7 +1122,7 @@ def _parse_watchlist_form(
     """The rows, the two lists and the pending new row one submission carries, or a refusal.
 
     The shape is checked whole before any of it is interpreted. An unknown field, a repeated field, a row field
-    whose row is missing its aliases or its metadata flag, a flag that is not the value the page sends, an id the
+    whose row is missing its aliases or its domains, a flag that is not the value the page sends, an id the
     document could not hold, or two representations of one list are all payloads this page never emits -- and
     guessing at one is how a malformed request clears a scope instead of being refused.
     """
@@ -1147,15 +1143,9 @@ def _parse_watchlist_form(
     rows = []
     for identifier in identifiers:
         aliases = _lists(form, f"product:{identifier}:aliases", _form_words)
-        domains, metadata, remove = (
-            _one(form, f"product:{identifier}:domains"),
-            _one(form, f"metadata_only:{identifier}"),
-            _one(form, f"remove:{identifier}"),
-        )
-        if domains is None or metadata is None:
+        domains, remove = _one(form, f"product:{identifier}:domains"), _one(form, f"remove:{identifier}")
+        if domains is None:
             raise _BadForm(f"the row {identifier!r} is incomplete")
-        if metadata not in {"0", "1"}:
-            raise _BadForm(f"metadata_only:{identifier} is not a flag: {metadata!r}")
         if remove not in (None, "1"):
             raise _BadForm(f"remove:{identifier} is not a flag: {remove!r}")
         rows.append(
@@ -1163,7 +1153,6 @@ def _parse_watchlist_form(
                 "id": identifier,
                 "aliases": aliases,
                 "domains": _form_words(domains),
-                "metadata_only": metadata == "1",
                 "remove": remove == "1",
             }
         )
@@ -1181,16 +1170,49 @@ def _watchlist_document(
     packages: Sequence[str],
     excluded: Sequence[str],
     new_row: Mapping[str, str],
+    base: Mapping[str, object] | None,
 ) -> dict:
-    """The document a submitted form describes, before it is validated or written.
+    """The document a submission describes, merged with the document the page was rendered from.
+
+    ``base`` is that document (``None`` before the first save). It is what makes the submission speak about the
+    document it saw rather than about whatever a request claims: the rows it rendered are the only rows a save may
+    touch, so omitting one can no longer delete a product, and the values the page does not offer for editing --
+    ``metadata_only``, and a control it rendered read-only -- come from it rather than from the form.
 
     Every list field is a set: a blank entry is dropped and a repeated one keeps its first place, so a pasted list
     saves once instead of being refused. The shape -- which ids, domains and package patterns are acceptable --
-    stays ``watchlist.parse_policy``'s answer, the same one a pass gets from the file. The caller parses the form
-    once and passes the same rows and lists here and to the page a refusal re-renders, so the refusal cannot show
-    a different edit from the one it refused.
+    stays ``watchlist.parse_policy``'s answer, the same one a pass gets from the file.
     """
-    products = [{key: value for key, value in row.items() if key != "remove"} for row in rows if not row["remove"]]
+    previous = {
+        str(product["id"]): product
+        for product in (base or {}).get("products", [])
+        if isinstance(product, dict) and isinstance(product.get("id"), str)
+    }
+    submitted = [str(row["id"]) for row in rows]
+    missing = sorted(set(previous) - set(submitted))
+    unknown = sorted(set(submitted) - set(previous))
+    if missing or unknown:
+        raise _BadForm(
+            "the rows do not match the document this page was loaded from"
+            + (f"; missing {', '.join(missing)}" if missing else "")
+            + (f"; unknown {', '.join(unknown)}" if unknown else "")
+        )
+    products = []
+    for row in rows:
+        if row["remove"]:
+            continue
+        was = previous[str(row["id"])]
+        kept = [str(alias) for alias in was.get("aliases") or ()]
+        # A row the page rendered read-only holds the document's aliases, not the submission's; an editable row is
+        # the edit the operator made.
+        products.append(
+            {
+                "id": row["id"],
+                "aliases": [str(alias) for alias in row["aliases"]] if all(map(_alias_holds, kept)) else kept,
+                "domains": row["domains"],
+                "metadata_only": was.get("metadata_only") is True,
+            }
+        )
     identifier = new_row.get("id", "")
     if identifier:
         products.append(
@@ -1203,10 +1225,22 @@ def _watchlist_document(
         )
     return {
         "schema": watchlist.SCHEMA,
-        "debian_source_packages": list(packages),
-        "excluded_products": list(excluded),
+        "debian_source_packages": _kept_or_submitted(packages, (base or {}).get("debian_source_packages"), _line_holds),
+        "excluded_products": _kept_or_submitted(excluded, (base or {}).get("excluded_products"), _line_holds),
         "products": products,
     }
+
+
+def _kept_or_submitted(submitted: Sequence[str], kept: object, holds: Callable[[str], bool]) -> list[str]:
+    """A list field: the document's entries when the page rendered them read-only, else the submission's.
+
+    The page renders a whole field read-only when one of its entries cannot survive the control, so the field's
+    value is then the document's, and a hidden field that disagrees with it changes nothing.
+    """
+    entries = [entry for entry in kept if isinstance(entry, str)] if isinstance(kept, list) else None
+    if entries is not None and not all(holds(entry) for entry in entries):
+        return entries
+    return list(submitted)
 
 
 def _insecure_cookies(env: Mapping[str, str]) -> bool:
@@ -3495,9 +3529,24 @@ def create_app(
                 "critical",
             )
         else:
+
+            def build(current: dict | None) -> dict:
+                """Merge the submission with the document it was rendered from, inside the save's lock."""
+                base = current if current is not None else watchlist.read_watchlist(watchlist.DEFAULT_DOCUMENT)
+                return _watchlist_document(submitted, packages, excluded, new_row, base)
+
             try:
-                document = _watchlist_document(submitted, packages, excluded, new_row)
-                written = watchlist.save_watchlist(target, document, expected=expected)
+                written = watchlist.save_watchlist(target, build, expected=expected)
+            except _BadForm as exc:
+                # The rows do not match the document this page was loaded from: the page rendered other rows, so
+                # the submission is not an edit of it.
+                return page(
+                    "Not saved",
+                    f"<p>{esc(exc)}; reload <a href='/watchlist'>the watchlist</a> and make the change again.</p>",
+                    active="/watchlist",
+                    actions=sign_out_form(request),
+                    status_code=400,
+                )
             except watchlist.StaleDocument:
                 return page(
                     "Not saved",

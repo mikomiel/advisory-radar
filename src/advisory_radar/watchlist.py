@@ -13,6 +13,7 @@ import json
 import os
 import re
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -170,8 +171,13 @@ def digest(document: object) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def save_watchlist(path: Path, document: dict, *, expected: str) -> str:
+def save_watchlist(path: Path, build: Callable[[dict | None], dict], *, expected: str) -> str:
     """Validate, then atomically replace the document; returns the digest of what was written.
+
+    ``build`` turns the document this save replaces (``None`` when there is none) into the one to write. It runs
+    under the lock and after the digest check, which is what lets an editor keep the values a page does not offer
+    for editing -- the rows it rendered, a control it showed read-only -- from the document it started from,
+    instead of trusting the submission for them. It may raise to refuse the save.
 
     ``expected`` is the digest the form was rendered from, or ``""`` when there was no file: a page that would
     replace an edit it never saw is refused instead of overwriting it. The target is read before it is
@@ -186,7 +192,6 @@ def save_watchlist(path: Path, document: dict, *, expected: str) -> str:
     operator's own document untouched and every later edit of it silently ignored. The lock is taken on the same
     resolved path, so two names for one document cannot save past each other.
     """
-    parse_policy(document)
     target = path.resolve()
     if path.is_symlink() and not present(target):
         # The link names a file that is not there. Creating it would leave the operator editing a document they
@@ -197,13 +202,15 @@ def save_watchlist(path: Path, document: dict, *, expected: str) -> str:
             # The link moved while this save waited for the lock. Replacing the old target would report success
             # for a document a pass no longer reads, so the retargeted save is the one that has to retry.
             raise StaleDocument(f"{path} now names another document; reload and make the change again")
-        current = ""
+        current: dict | None = None
         if present(target):
             # Reading first is what stops a misconfigured path from being overwritten: only a document this
             # module can read as a watchlist is a document it may replace.
-            current = digest(read_watchlist(target))
-        if current != expected:
+            current = read_watchlist(target)
+        if (digest(current) if current is not None else "") != expected:
             raise StaleDocument(f"{path} changed since this page was loaded")
+        document = build(current)
+        parse_policy(document)
         payload = serialize_json(document)
         if len(payload.encode("utf-8")) > MAX_WATCHLIST_BYTES:
             raise SourceError(

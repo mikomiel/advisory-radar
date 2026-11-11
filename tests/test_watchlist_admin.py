@@ -183,7 +183,6 @@ def test_a_product_can_be_added_edited_and_removed(tmp_path):
         **{
             "product:nodejs:aliases": "node.js, nodejs",
             "product:nodejs:domains": "nodejs.org",
-            "metadata_only:nodejs": "0",
             "debian_packages": "*",
             "excluded_products": "",
             "new:id": "php",
@@ -205,10 +204,8 @@ def test_a_product_can_be_added_edited_and_removed(tmp_path):
         **{
             "product:nodejs:aliases": "node.js",
             "product:nodejs:domains": "nodejs.org",
-            "metadata_only:nodejs": "0",
             "product:php:aliases": "php",
             "product:php:domains": "php.net",
-            "metadata_only:php": "0",
             "remove:php": "1",
             "debian_packages": "curl",
             "excluded_products": "legacy",
@@ -236,7 +233,6 @@ def test_a_refused_save_keeps_the_edit_and_writes_nothing(tmp_path):
         **{
             "product:nodejs:aliases": "node.js",
             "product:nodejs:domains": "not a domain",
-            "metadata_only:nodejs": "0",
             "debian_packages": "*",
             "new:id": "php",
             "new:aliases": "php",
@@ -262,7 +258,6 @@ def test_a_stale_page_cannot_replace_a_newer_edit(tmp_path):
         **{
             "product:nodejs:aliases": "changed",
             "product:nodejs:domains": "nodejs.org",
-            "metadata_only:nodejs": "0",
             "debian_packages": "*",
         },
     )
@@ -285,7 +280,6 @@ def test_adding_a_product_that_already_has_a_row_is_named_as_such(tmp_path):
         **{
             "product:nodejs:aliases": "node.js",
             "product:nodejs:domains": "nodejs.org",
-            "metadata_only:nodejs": "0",
             "debian_packages": "*",
             "new:id": "nodejs",
             "new:aliases": "node.js",
@@ -427,7 +421,6 @@ def test_an_id_being_removed_in_the_same_save_can_be_added_again(tmp_path):
         **{
             "product:nodejs:aliases": "node.js",
             "product:nodejs:domains": "nodejs.org",
-            "metadata_only:nodejs": "0",
             "remove:nodejs": "1",
             "debian_packages": "*",
             "new:id": "nodejs",
@@ -471,7 +464,6 @@ def test_an_alias_its_field_cannot_hold_is_kept_exactly(tmp_path, alias):
         **{
             "product:acme:aliases_json": html.unescape(rendered.group(1)),
             "product:acme:domains": "",
-            "metadata_only:acme": "0",
             "debian_packages": "*",
         },
     )
@@ -499,7 +491,6 @@ def test_an_exclusion_its_field_cannot_hold_is_kept_exactly(tmp_path, entry):
             "excluded_products_json": html.unescape(rendered.group(1)),
             "product:nodejs:aliases": "node.js",
             "product:nodejs:domains": "nodejs.org",
-            "metadata_only:nodejs": "0",
             "debian_packages": "*",
         },
     )
@@ -521,7 +512,6 @@ def test_a_new_row_without_an_id_is_refused_and_kept(tmp_path):
         **{
             "product:nodejs:aliases": "node.js",
             "product:nodejs:domains": "nodejs.org",
-            "metadata_only:nodejs": "0",
             "debian_packages": "*",
             "new:aliases": "php",
             "new:domains": "php.net",
@@ -562,7 +552,7 @@ def test_a_document_value_is_escaped_everywhere_it_is_rendered(tmp_path):
 
 
 def test_a_metadata_only_flag_survives_an_unchanged_save(tmp_path):
-    """The flag has no consumer yet; the page still may not drop a key it does not understand."""
+    """The flag has no consumer and no control here; it is not part of the form at all, so a save keeps it."""
     watch = write_scope(
         tmp_path / "scope.json",
         products=[{"id": "nodejs", "aliases": ["node.js"], "domains": [], "metadata_only": True}],
@@ -570,7 +560,7 @@ def test_a_metadata_only_flag_survives_an_unchanged_save(tmp_path):
     client, _ = make_client(tmp_path, watch)
     sign_in(client)
     csrf, fingerprint, text = scope_form(client)
-    assert "name='metadata_only:nodejs' value='1'" in text
+    assert "metadata_only:" not in text, "the page offers no control for it, and submits no field for it"
     response = submit(
         client,
         csrf,
@@ -578,7 +568,6 @@ def test_a_metadata_only_flag_survives_an_unchanged_save(tmp_path):
         **{
             "product:nodejs:aliases": "node.js",
             "product:nodejs:domains": "",
-            "metadata_only:nodejs": "1",
             "debian_packages": "*",
         },
     )
@@ -627,7 +616,6 @@ def test_a_symlinked_document_is_saved_through_its_link(tmp_path):
         **{
             "product:nodejs:aliases": "node.js, nodejs",
             "product:nodejs:domains": "nodejs.org",
-            "metadata_only:nodejs": "0",
             "debian_packages": "*",
         },
     )
@@ -697,7 +685,6 @@ def _valid_payload(csrf: str, fingerprint: str) -> dict:
         "excluded_products": "",
         "product:nodejs:aliases": "node.js",
         "product:nodejs:domains": "nodejs.org",
-        "metadata_only:nodejs": "0",
         "new:id": "",
         "new:aliases": "",
         "new:domains": "",
@@ -748,13 +735,11 @@ def test_a_repeated_field_is_refused(tmp_path, fields):
     [
         {"product:nodejs:aliases": None},  # a row with no aliases: it would vanish and leave no scope
         {"product:nodejs:domains": None},
-        {"metadata_only:nodejs": None},
         {"product:nodejs:bogus": "x"},  # not a field of this form
         {"unexpected": "x"},
-        {"product:Bad_Id:aliases": "x", "product:Bad_Id:domains": "", "metadata_only:Bad_Id": "0"},
+        {"product:Bad_Id:aliases": "x", "product:Bad_Id:domains": ""},
         {"remove:nodejs": "false"},  # the page sends 1 or nothing
-        {"metadata_only:nodejs": "true"},
-        {"metadata_only:nodejs": "garbage"},
+        {"metadata_only:nodejs": "true"},  # not a control this page offers
     ],
 )
 def test_a_shape_the_page_never_sends_is_refused(tmp_path, fields):
@@ -769,3 +754,101 @@ def test_a_shape_the_page_never_sends_is_refused(tmp_path, fields):
     response = client.post("/watchlist", data={k: v for k, v in data.items() if v is not None})
     assert response.status_code == 400
     assert watch.read_text() == before
+
+
+def test_omitting_a_row_is_refused(tmp_path):
+    """A row the page rendered is a row the submission must speak about: omitting it would delete a product."""
+    watch = write_scope(
+        tmp_path / "scope.json",
+        products=[
+            {"id": "nodejs", "aliases": ["node.js"], "domains": []},
+            {"id": "php", "aliases": ["php"], "domains": []},
+        ],
+    )
+    before = watch.read_text()
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    csrf, fingerprint, _ = scope_form(client)
+    response = submit(
+        client,
+        csrf,
+        fingerprint,
+        **{
+            "product:nodejs:aliases": "node.js",
+            "product:nodejs:domains": "",
+            "debian_packages": "*",
+        },
+    )
+    assert response.status_code == 400
+    assert "missing php" in response.text
+    assert watch.read_text() == before
+
+
+def test_an_invented_row_is_refused(tmp_path):
+    """Additions belong in the new row: a row for an id the page never rendered is not an edit."""
+    watch = write_scope(tmp_path / "scope.json")
+    before = watch.read_text()
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    csrf, fingerprint, _ = scope_form(client)
+    response = submit(
+        client,
+        csrf,
+        fingerprint,
+        **{
+            "product:nodejs:aliases": "node.js",
+            "product:nodejs:domains": "nodejs.org",
+            "product:php:aliases": "php",
+            "product:php:domains": "php.net",
+            "debian_packages": "*",
+        },
+    )
+    assert response.status_code == 400
+    assert "unknown php" in response.text
+    assert watch.read_text() == before
+
+
+def test_a_read_only_alias_list_cannot_be_replaced_through_its_hidden_field(tmp_path):
+    """The page shows that row read-only, so a hidden field that disagrees with the document changes nothing."""
+    watch = write_scope(
+        tmp_path / "scope.json",
+        products=[{"id": "acme", "aliases": ["Example, Inc."], "domains": []}],
+    )
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    csrf, fingerprint, _ = scope_form(client)
+    response = submit(
+        client,
+        csrf,
+        fingerprint,
+        **{
+            "product:acme:aliases": None,
+            "product:acme:aliases_json": json.dumps(["something else"]),
+            "product:acme:domains": "",
+            "debian_packages": "*",
+        },
+    )
+    assert response.status_code == 303
+    assert json.loads(watch.read_text())["products"][0]["aliases"] == ["Example, Inc."]
+
+
+def test_a_read_only_exclusion_list_cannot_be_replaced_through_its_hidden_field(tmp_path):
+    """Same rule for a whole field: the document keeps a list its control cannot carry."""
+    watch = write_scope(tmp_path / "scope.json", excluded_products=["Example\nServer"])
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    csrf, fingerprint, _ = scope_form(client)
+    response = submit(
+        client,
+        csrf,
+        fingerprint,
+        **{
+            "excluded_products": None,
+            "excluded_products_json": json.dumps([]),
+            "product:nodejs:aliases": "node.js",
+            "product:nodejs:domains": "nodejs.org",
+            "debian_packages": "*",
+        },
+    )
+    assert response.status_code == 303
+    assert json.loads(watch.read_text())["excluded_products"] == ["Example\nServer"]
