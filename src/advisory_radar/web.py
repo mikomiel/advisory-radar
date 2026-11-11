@@ -417,19 +417,22 @@ def _day_start(value: str, where: str) -> int:
 
 
 def _cursor_encode(at: int, identifier: str) -> str:
-    """A page position as URL-safe base64 of ``at:identifier``, without padding.
+    """A page position as URL-safe base64 of ``[at, identifier]``, without padding.
 
-    The identifier may be a legacy state key that is not a Unicode scalar value, so it is encoded
-    defensively: a page whose cursor cannot name that one record must still render the rest.
+    JSON with ``ensure_ascii`` escapes a legacy identifier that is not a Unicode scalar value instead of
+    replacing it, because the cursor must name the exact record it stopped after: a substituted character
+    would sort before the original and the next page would repeat the same rows forever.
     """
-    return base64.urlsafe_b64encode(f"{at}:{identifier}".encode("utf-8", "replace")).decode("ascii").rstrip("=")
+    payload = json.dumps([at, identifier], ensure_ascii=True).encode("ascii")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
 
 
 def _cursor_decode(value: str) -> tuple[int, str]:
     """The position a ``cursor``/``before`` parameter names; a 400 page when it is not one.
 
-    ``identifier`` is split off at the first colon, because a stored identifier may contain one
-    (``src:<guid>``). Nothing else about the value is trusted: it comes from the URL.
+    The value is the JSON pair :func:`_cursor_encode` produced, decoded losslessly: an identifier may contain
+    a colon (``src:<guid>``) or a character that is not a Unicode scalar value. Nothing about it is trusted:
+    it comes from the URL, and anything that is not that pair is refused.
     """
     malformed = HTTPException(status_code=400, detail="malformed page cursor; open /alerts again")
     try:
@@ -438,12 +441,10 @@ def _cursor_decode(value: str) -> tuple[int, str]:
         raw = base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True).decode("utf-8")
     except (binascii.Error, ValueError):
         raise malformed from None
-    at, separator, identifier = raw.partition(":")
-    if not separator or not identifier:
-        raise malformed
     try:
-        return int(at), identifier
-    except ValueError:
+        at, identifier = json.loads(raw)
+        return int(at), str(identifier)
+    except (ValueError, TypeError):
         raise malformed from None
 
 

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from . import core
 from .config import Config, secret_values
+from .feeds import normalise_identity
 from .http import Http, RedactFilter, urllib_http
 from .kev import load_kev
 from .notifiers import build_notifier
@@ -94,9 +95,13 @@ def _reset_validators_on_policy_change(state: dict, policy: object) -> None:
 
 
 def _namespaced(item: core.Item, source_id: str) -> core.Item:
-    """Give an item a source-scoped guid: two feeds may both publish guid ``1`` for unrelated advisories."""
+    """Give an item a source-scoped guid: two feeds may both publish guid ``1`` for unrelated advisories.
+
+    The guid is normalised here, at the one door every source's items pass through, so a webhook payload or a
+    carried candidate cannot insert an identity in a spelling classification never compares against.
+    """
     return core.Item(
-        f"{source_id}:{item.guid}",
+        f"{source_id}:{normalise_identity(item.guid)}",
         item.title,
         item.link,
         item.summary,
@@ -215,7 +220,12 @@ def _run_pass(
         # there is undetectable; see README, "Sources".
         # An empty previous window proves nothing: the source had no entries, so "no overlap" is expected and a
         # gap there would reject every later full window forever.
-        if window.truncated and previous and not set(previous) & {item.guid for item in window.items}:
+        if (
+            window.truncated
+            and previous
+            and not {normalise_identity(guid) for guid in previous}
+            & {normalise_identity(item.guid) for item in window.items}
+        ):
             LOG.error(
                 "source %s: window gap: the window is full (%d entries) and shares none with the previous "
                 "pass; items may have been missed. Keeping the last trusted window and deferring this source",
@@ -336,8 +346,8 @@ def _run_pass(
                 # so the claim is `src:{source}:{guid}`.
                 identities = core.extract_ids(
                     str(entry.get("title", "")), str(entry.get("summary", "")), str(entry.get("link", ""))
-                ) or (f"src:{source.id}:{entry.get('guid', '')}",)
-                if not all(identifier in claimed for identifier in identities):
+                ) or (f"src:{source.id}:{normalise_identity(entry.get('guid', ''))}",)
+                if not all(core.claim_key(identifier) in claimed for identifier in identities):
                     kept.append(entry)
             if kept:
                 state.setdefault("webhook_inbox", {})[source.id] = kept

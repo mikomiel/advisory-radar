@@ -1512,11 +1512,11 @@ def _claimed(state: dict) -> set[str]:
     stored = set(state["seen"]) | {
         identifier for entry in (*state["pending"], *state.get("parked", ())) for identifier in entry["ids"]
     }
-    return {_identity_key(value) for value in stored if isinstance(value, str)}
+    return {claim_key(value) for value in stored if isinstance(value, str)}
 
 
-def _identity_key(value: str) -> str:
-    """One stored identifier in the form a reader produces: ``src:<source>:<guid>`` keeps its prefix."""
+def claim_key(value: str) -> str:
+    """One identifier in the form a reader produces: ``src:<source>:<guid>`` keeps its prefix."""
     if value.startswith("src:"):
         body = value[len("src:") :]
         source, separator, guid = body.partition(":")
@@ -1527,12 +1527,14 @@ def _identity_key(value: str) -> str:
 
 
 def _log_id(value: str) -> str:
-    """An untrusted identifier made safe for one log record: single line, bounded.
+    """An untrusted identifier made safe for one log record: single line, never truncated.
 
     Identities come from a feed, and a control character in one would otherwise end the record and let a
-    publisher write what looks like an application log line.
+    publisher write what looks like an application log line. The value is not shortened: redaction runs on the
+    finished record and replaces a whole configured credential, so a truncated value would leave its prefix in
+    the log where the redactor can no longer recognise it.
     """
-    return " ".join(value.split())[:200]
+    return " ".join(value.split())
 
 
 def classify_new(
@@ -2323,7 +2325,9 @@ def item_from_state(row: object) -> Item:
     published = data.get("published")
     explicit = data.get("explicit")
     return Item(
-        str(data.get("guid", "")),
+        # A carried guid is already source-namespaced; normalising it here keeps it comparable with the claim
+        # classification records, which is the only spelling it will ever be checked against.
+        normalise_identity(str(data.get("guid", ""))),
         str(data.get("title", "")),
         str(data.get("link", "")),
         str(data.get("summary", "")),

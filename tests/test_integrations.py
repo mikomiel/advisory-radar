@@ -379,3 +379,42 @@ def test_a_partial_smtp_refusal_is_not_a_delivery():
         )
     finally:
         smtplib.SMTP = original
+
+
+def test_a_webhook_guid_carrying_a_newline_is_released_and_sent_once(tmp_path):
+    """The inbox is released on the identity classification records, so the same entry is not re-sent."""
+    from advisory_radar import core, pipeline
+    from advisory_radar.config import load_config
+    from advisory_radar.sources import WebhookSource
+    from advisory_radar.state import load_state_document
+
+    path = tmp_path / "c.yml"
+    path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
+    cfg = load_config(path, {})
+    state = core.new_state()
+    state["webhook_inbox"] = {
+        "wh": [{"guid": "a\nb", "title": "routine maintenance", "summary": "", "link": "https://v.example/b"}]
+    }
+    core.save_state(cfg.state_path, state)
+
+    sent = []
+
+    class Recorder:
+        id = "rec"
+
+        def send(self, entry, http):
+            sent.append(entry)
+            return 200
+
+    # Two passes: a second delivery would mean the inbox never recognised the claim it recorded.
+    for _ in range(2):
+        pipeline.run_pass(
+            cfg,
+            [WebhookSource("wh")],
+            [Recorder()],
+            http=lambda *a: (404, {}, b""),
+            clock=lambda: 1_700_000_000.0,
+            sleep=lambda s: None,
+        )
+    assert not (load_state_document(cfg.state_path, core.STATE_SCHEMA, "state").get("webhook_inbox") or {}).get("wh")
+    assert len(sent) == 1, "the same inbox entry must not be classified and sent on every pass"
