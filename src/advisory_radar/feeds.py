@@ -1,4 +1,9 @@
-"""Feed readers: the GReader (FreshRSS) JSON export and generic RSS/Atom XML."""
+"""Feed readers for every shape this program reads, and the sniffing that chooses one.
+
+Every reader returns the frozen ``FeedExport``/``FeedEntry`` contract, so a new format adds a parser and a
+dispatch branch, never a new field. An empty export is a claim that the publisher said nothing changed, so a
+document this module cannot read raises instead: a silent empty export would mark an unread source healthy.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +21,8 @@ from .http import header, parse_json
 Http = Callable[[str, str, Mapping[str, str], bytes | None], tuple[int, dict[str, str], bytes]]
 FEED_ITEMS = 100
 GREADER_ID = re.compile(r"^tag:google\.com,2005:reader/item/([0-9a-fA-F]+)$")
+#: A JSON Feed names itself in ``version`` (``https://jsonfeed.org/version/1.1``); no other JSON export does.
+JSON_FEED_VERSION = "jsonfeed.org"
 
 
 class FeedError(Exception):
@@ -98,6 +105,24 @@ def _text(value: object) -> str:
     return clean_text(value) if isinstance(value, str) else ""
 
 
+def _plain(value: object) -> str:
+    """Whitespace-normalised plain text, without HTML parsing.
+
+    ``content_text`` is already text, so running it through the HTML parser would eat a legitimate ``<`` --
+    "fixed in <2.0" would lose the version, and with it the shard of evidence the source was added for.
+    """
+    return " ".join(value.split()) if isinstance(value, str) else ""
+
+
+def _string(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _local(tag: object) -> str:
+    """An ElementTree tag without its namespace, lowercased for HTML/OPML name comparisons."""
+    return tag.rsplit("}", 1)[-1].lower() if isinstance(tag, str) else ""
+
+
 def _first_href(links: object) -> str:
     for entry in links if isinstance(links, list) else []:
         href = entry.get("href") if isinstance(entry, dict) else None
@@ -106,10 +131,53 @@ def _first_href(links: object) -> str:
     return ""
 
 
+#: A feed date outside this window is treated as absent: a stray huge integer must not survive to
+#: rendering, where ``datetime.fromtimestamp`` would raise.
+EARLIEST_EPOCH = 631152000  # 1990-01-01
+LATEST_EPOCH = 4102444800  # 2100-01-01
+
+
+def _plausible(epoch: int) -> bool:
+    return EARLIEST_EPOCH <= epoch <= LATEST_EPOCH
+
+
+def _epoch_of(value: object) -> int | None:
+    """A date string as an epoch inside the plausibility window, or None.
+
+    RFC 3339 and RFC 822 both occur in the wild across the formats this module reads, so both parsers are
+    tried. A value the window rejects is returned as absent rather than as a year-10000 timestamp.
+    """
+    raw = value.strip() if isinstance(value, str) else ""
+    if not raw:
+        return None
+    for parse in (parsedate_to_datetime, datetime.datetime.fromisoformat):
+        try:
+            epoch = int(parse(raw).timestamp())
+        except (TypeError, ValueError, OverflowError):
+            continue
+        return epoch if _plausible(epoch) else None
+    return None
+
+
+def _is_json_feed(document: object) -> bool:
+    if not isinstance(document, dict):
+        return False
+    version = document.get("version")
+    return isinstance(version, str) and JSON_FEED_VERSION in version.lower()
+
+
 def parse_feed(body: bytes) -> FeedExport:
-    document = parse_json(body)
+    """The FreshRSS GReader JSON export."""
+    return _greader_export(parse_json(body))
+
+
+def _greader_export(document: object) -> FeedExport:
     if not isinstance(document, dict):
         raise FeedError("feed is not a JSON object")
+    if _is_json_feed(document):
+        # The two JSON shapes share an ``items`` list. Reading a JSON Feed here would find no GReader id and
+        # call a healthy feed broken, so the version is checked before the items are touched.
+        raise FeedError("feed is JSON Feed, not a GReader export")
     entries = document.get("items")
     if not isinstance(entries, list):
         raise FeedError("feed has no items list")
@@ -164,7 +232,57 @@ def fetch_feed(http: Http, base_url: str, token: str, user: str = "admin") -> Fe
 
 
 # --------------------------------------------------------------------------
-# Generic RSS 2.0 / Atom feeds
+# JSON Feed 1.0 / 1.1
+
+
+def parse_json_feed(body: bytes) -> FeedExport:
+    """JSON Feed 1.0 and 1.1, which is JSON but not the GReader export.
+
+    ``items`` is required by the specification but may legitimately be empty: a feed publishing nothing yet
+    is not the same as a document that cannot be read, and the latter raises. There is no continuation
+    token in this format, so the whole feed is always read and ``truncated`` is always false.
+    """
+    return _json_feed_export(parse_json(body))
+
+
+def _json_feed_export(document: object) -> FeedExport:
+    if not isinstance(document, dict):
+        raise FeedError("feed is not a JSON object")
+    if not _is_json_feed(document):
+        raise FeedError("feed is not JSON Feed")
+    entries = document.get("items")
+    if not isinstance(entries, list):
+        raise FeedError("feed has no items list")
+    feed_title = _text(document.get("title"))
+    feed_link = _string(document.get("home_page_url"))
+    items = []
+    for node in entries:
+        if not isinstance(node, dict):
+            raise FeedError("feed entry is not an object")
+        # ``url`` is the item's public page; ``external_url`` is used when the item has no page on this
+        # site, and either is a better link than none. The id is the stable identity and wins outright.
+        link = _string(node.get("url")) or _string(node.get("external_url"))
+        guid = _string(node.get("id")) or link
+        title = _text(node.get("title"))
+        if not guid or not title:
+            raise FeedError("feed entry has no usable id or title")
+        # Both content fields are read, because some publishers put the advisory identifier in only one.
+        # An exact duplicate is kept once: JSON Feed requires the two renderings to say the same thing, so
+        # joining both unconditionally would repeat every advisory in the evidence and in the notification.
+        summary = " ".join(
+            dict.fromkeys(part for part in (_plain(node.get("content_text")), _text(node.get("content_html"))) if part)
+        )
+        if not summary:
+            # The item ``summary`` is a rendering of the content, so it is only a fallback; JSON Feed
+            # without either content field is technically invalid but does occur.
+            summary = _plain(node.get("summary"))
+        published = _epoch_of(node.get("date_published")) or _epoch_of(node.get("date_modified"))
+        items.append(FeedEntry(guid, title, link, summary, published, feed_title, feed_link))
+    return FeedExport(tuple(items), False)
+
+
+# --------------------------------------------------------------------------
+# Generic RSS 2.0 / Atom / RSS 1.0 (RDF) feeds
 
 
 class RssError(Exception):
@@ -173,6 +291,9 @@ class RssError(Exception):
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
 _RSS = "{http://purl.org/rss/1.0/}"
+_RDF = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}"
+_DC = "{http://purl.org/dc/elements/1.1/}"
+_CONTENT = "{http://purl.org/rss/1.0/modules/content/}"
 
 
 #: XHTML elements that end a run of text. Inline elements (``<span>``, ``<b>``, ``<a>``) must stay adjacent,
@@ -229,94 +350,125 @@ def _text_of(node: ET.Element | None) -> str:
     return clean_text("".join(parts))
 
 
-#: A feed date outside this window is treated as absent: a stray huge integer must not survive to
-#: rendering, where ``datetime.fromtimestamp`` would raise.
-EARLIEST_EPOCH = 631152000  # 1990-01-01
-LATEST_EPOCH = 4102444800  # 2100-01-01
-
-
-def _plausible(epoch: int) -> bool:
-    return EARLIEST_EPOCH <= epoch <= LATEST_EPOCH
-
-
 def _published_of(node: ET.Element | None) -> int | None:
-    if node is None:
-        return None
-    raw = (node.text or "").strip()
-    if not raw:
-        return None
-    for parse in (parsedate_to_datetime, datetime.datetime.fromisoformat):
-        try:
-            epoch = int(parse(raw).timestamp())
-        except (TypeError, ValueError, OverflowError):
-            continue
-        return epoch if _plausible(epoch) else None  # a year-10000 date must not reach the renderer
-    return None
+    return _epoch_of(node.text) if node is not None else None
 
 
 def parse_rss(body: bytes) -> FeedExport:
-    """RSS 2.0 and Atom feeds; the whole feed is read, so the window is never truncated."""
+    """RSS 2.0, Atom and RSS 1.0 (RDF) feeds; the whole feed is read, so the window is never truncated.
+
+    The three shapes share a vocabulary but not a structure. RSS 1.0 in particular is not RSS 2.0 under
+    another name: its ``item`` elements are siblings of the ``channel`` under an RDF root, and its dates
+    come from Dublin Core. Reading such a document with the RSS 2.0 rules finds no items at all, which
+    would look exactly like a feed whose publisher said nothing changed.
+    """
     try:
         root = ET.fromstring(body)
     except ET.ParseError as exc:
         raise RssError(f"feed is not XML: {exc}") from exc
-    items: list[FeedEntry] = []
-    channel_title = ""
-    channel_link = ""
-    entries: list[ET.Element] = []
     if root.tag == "rss" or root.tag.endswith("}rss"):
-        channel = root.find("channel")
-        if channel is None:
-            raise RssError("RSS has no channel")
-        channel_title = _text_of(channel.find("title"))
-        channel_link = _text_of(channel.find("link"))
-        entries = list(channel.findall("item"))
-        for node in entries:
-            link = _text_of(node.find("link"))
-            guid = _text_of(node.find("guid")) or link
-            title = _text_of(node.find("title"))
-            if not guid or not title:
-                raise RssError("feed entry has no usable id or title")
-            summary = " ".join(
-                text
-                for text in (
-                    _text_of(node.find("description")),
-                    _text_of(node.find("{http://purl.org/rss/1.0/modules/content/}encoded")),
-                )
-                if text
-            )
-            items.append(
-                FeedEntry(guid, title, link, summary, _published_of(node.find("pubDate")), channel_title, channel_link)
-            )
-    elif root.tag == f"{_ATOM}feed":
-        channel_title = _text_of(root.find(f"{_ATOM}title"))
-        # Only an alternate link is a public site. A rel="self" link is the subscription URL and can carry a
-        # feed credential, which must never reach a notification.
-        channel_link = ""
-        for candidate in root.findall(f"{_ATOM}link"):
-            if candidate.get("rel") in (None, "alternate") and candidate.get("href"):
-                channel_link = candidate.get("href", "")
-                break
-        for node in root.findall(f"{_ATOM}entry"):
-            link = ""
-            for candidate in node.findall(f"{_ATOM}link"):
-                if candidate.get("rel") in (None, "alternate") and candidate.get("href"):
-                    link = candidate.get("href", "")
-                    break
-            guid = _text_of(node.find(f"{_ATOM}id")) or link
-            title = _text_of(node.find(f"{_ATOM}title"))
-            if not guid or not title:
-                raise RssError("feed entry has no usable id or title")
-            summary = " ".join(
-                text
-                for text in (_text_of(node.find(f"{_ATOM}summary")), _text_of(node.find(f"{_ATOM}content")))
-                if text
-            )
-            published = _published_of(node.find(f"{_ATOM}published")) or _published_of(node.find(f"{_ATOM}updated"))
-            items.append(FeedEntry(guid, title, link, summary, published, channel_title, channel_link))
-    else:
-        raise RssError("feed is neither RSS nor Atom")
+        return _rss_2_export(root)
+    if root.tag == f"{_ATOM}feed":
+        return _atom_export(root)
+    if root.tag == f"{_RDF}RDF":
+        return _rdf_export(root)
+    raise RssError("feed is neither RSS, Atom nor RDF")
+
+
+def _rss_2_export(root: ET.Element) -> FeedExport:
+    channel = root.find("channel")
+    if channel is None:
+        raise RssError("RSS has no channel")
+    channel_title = _text_of(channel.find("title"))
+    channel_link = _text_of(channel.find("link"))
+    items = []
+    for node in channel.findall("item"):
+        link = _text_of(node.find("link"))
+        guid = _text_of(node.find("guid")) or link
+        title = _text_of(node.find("title"))
+        if not guid or not title:
+            raise RssError("feed entry has no usable id or title")
+        summary = " ".join(
+            text for text in (_text_of(node.find("description")), _text_of(node.find(_CONTENT + "encoded"))) if text
+        )
+        items.append(
+            FeedEntry(guid, title, link, summary, _published_of(node.find("pubDate")), channel_title, channel_link)
+        )
     return FeedExport(tuple(items), False)
+
+
+def _atom_export(root: ET.Element) -> FeedExport:
+    channel_title = _text_of(root.find(f"{_ATOM}title"))
+    # Only an alternate link is a public site. A rel="self" link is the subscription URL and can carry a
+    # feed credential, which must never reach a notification.
+    channel_link = ""
+    for candidate in root.findall(f"{_ATOM}link"):
+        if candidate.get("rel") in (None, "alternate") and candidate.get("href"):
+            channel_link = candidate.get("href", "")
+            break
+    items = []
+    for node in root.findall(f"{_ATOM}entry"):
+        link = ""
+        for candidate in node.findall(f"{_ATOM}link"):
+            if candidate.get("rel") in (None, "alternate") and candidate.get("href"):
+                link = candidate.get("href", "")
+                break
+        guid = _text_of(node.find(f"{_ATOM}id")) or link
+        title = _text_of(node.find(f"{_ATOM}title"))
+        if not guid or not title:
+            raise RssError("feed entry has no usable id or title")
+        summary = " ".join(
+            text for text in (_text_of(node.find(f"{_ATOM}summary")), _text_of(node.find(f"{_ATOM}content"))) if text
+        )
+        published = _published_of(node.find(f"{_ATOM}published")) or _published_of(node.find(f"{_ATOM}updated"))
+        items.append(FeedEntry(guid, title, link, summary, published, channel_title, channel_link))
+    return FeedExport(tuple(items), False)
+
+
+def _rdf_export(root: ET.Element) -> FeedExport:
+    """RSS 1.0: the channel and the items are siblings under the RDF root.
+
+    An RDF root with a channel but no item is refused rather than read as an empty feed. The reader cannot
+    tell it apart from a malformed document, and an empty export would tell the pipeline the source is
+    healthy and unchanged on every poll.
+    """
+    channel = root.find(f"{_RSS}channel")
+    if channel is None:
+        raise RssError("RDF has no RSS 1.0 channel")
+    channel_title = _text_of(channel.find(f"{_RSS}title"))
+    channel_link = _text_of(channel.find(f"{_RSS}link"))
+    entries = root.findall(f"{_RSS}item")
+    if not entries:
+        raise RssError("RDF feed has no items")
+    items = []
+    for node in entries:
+        link = _text_of(node.find(f"{_RSS}link"))
+        # rdf:about is the item's identity and survives a link change; the link is the fallback.
+        guid = (node.get(f"{_RDF}about") or "").strip() or link
+        title = _text_of(node.find(f"{_RSS}title"))
+        if not guid or not title:
+            raise RssError("feed entry has no usable id or title")
+        summary = " ".join(
+            text
+            for text in (_text_of(node.find(f"{_RSS}description")), _text_of(node.find(_CONTENT + "encoded")))
+            if text
+        )
+        items.append(
+            FeedEntry(guid, title, link, summary, _published_of(node.find(f"{_DC}date")), channel_title, channel_link)
+        )
+    return FeedExport(tuple(items), False)
+
+
+def _validators_of(response_headers: Mapping[str, str]) -> dict[str, str]:
+    """The caching validators to send on the next poll; an absent header is simply not stored."""
+    stored: dict[str, str] = {}
+    etag = header(response_headers, "ETag")
+    if etag:
+        stored["etag"] = etag
+    modified = header(response_headers, "Last-Modified")
+    if modified:
+        stored["last_modified"] = modified
+    return stored
 
 
 def fetch_rss(
@@ -342,11 +494,166 @@ def fetch_rss(
         return FeedExport((), False), None
     if status != 200:
         raise RssError(f"feed answered HTTP {status}" if status else "feed is unreachable")
-    stored: dict[str, str] = {}
-    etag = header(response_headers, "ETag")
-    if etag:
-        stored["etag"] = etag
-    modified = header(response_headers, "Last-Modified")
-    if modified:
-        stored["last_modified"] = modified
-    return parse_rss(body), stored
+    return parse_rss(body), _validators_of(response_headers)
+
+
+# --------------------------------------------------------------------------
+# OPML import
+
+
+def parse_opml(body: bytes) -> tuple[tuple[str, str, str], ...]:
+    """Flatten an OPML 2.0 subscription list into ``(title, xml_url, html_url)`` feeds.
+
+    A folder is an outline without an ``xmlUrl``, and an export usually puts every feed inside one, so the
+    walk descends into an outline that names no feed instead of skipping its children. Document order is
+    kept because it is the only ordering signal OPML carries.
+    """
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError as exc:
+        raise FeedError(f"OPML is not XML: {exc}") from exc
+    if _local(root.tag) != "opml":
+        raise FeedError("document is not OPML")
+    feeds: list[tuple[str, str, str]] = []
+
+    def walk(element: ET.Element) -> None:
+        for child in list(element):
+            if _local(child.tag) == "outline":
+                xml_url = (child.get("xmlUrl") or "").strip()
+                if xml_url:
+                    # ``text`` is the required OPML label and ``title`` the optional prettier one; a
+                    # folder without a feed is skipped, so only a real subscription reaches this branch.
+                    title = (child.get("title") or child.get("text") or "").strip()
+                    feeds.append((title, xml_url, (child.get("htmlUrl") or "").strip()))
+            walk(child)
+
+    walk(root)
+    return tuple(feeds)
+
+
+# --------------------------------------------------------------------------
+# HTML autodiscovery
+
+
+#: Link types a page may use to advertise a feed. ``application/json`` is included because some publishers
+#: serve JSON Feed under it; ``text/html`` and ``application/xhtml+xml`` are deliberately absent.
+_FEED_TYPES = frozenset(
+    {
+        "application/rss+xml",
+        "application/atom+xml",
+        "application/feed+json",
+        "application/json",
+    }
+)
+
+
+class _AlternateLinks(html.parser.HTMLParser):
+    """Collect the ``href`` of every ``<link rel="alternate">`` whose type is a feed type."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.hrefs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag.lower() != "link":
+            return
+        values = {name.lower(): value or "" for name, value in attrs}
+        rel = values.get("rel", "").lower().split()
+        # A link type may carry a charset parameter; only the media type takes part in the decision.
+        mime = values.get("type", "").split(";", 1)[0].strip().lower()
+        href = values.get("href", "").strip()
+        if href and "alternate" in rel and mime in _FEED_TYPES:
+            self.hrefs.append(href)
+
+
+def discover_feed(body: bytes, page_url: str) -> str | None:
+    """The first feed an HTML page advertises, as an absolute URL, or None.
+
+    Only ``rel="alternate"`` counts: a stylesheet or a preload can carry a feed MIME type by accident, and
+    following one would fetch a resource that is not a subscription. Relative ``href`` values are resolved
+    here because they are only meaningful against the page that carried them; this function fetches nothing.
+    """
+    finder = _AlternateLinks()
+    finder.feed(body.decode("utf-8", "replace"))
+    finder.close()
+    if not finder.hrefs:
+        return None
+    return urllib.parse.urljoin(page_url, finder.hrefs[0])
+
+
+# --------------------------------------------------------------------------
+# Format dispatch
+
+
+#: A page that is not well-formed XML still declares itself in its first bytes, sometimes after a comment.
+#: A well-formed page is recognised by its root element instead, so a feed whose CDATA contains "<html>"
+#: is not mistaken for one; a malformed feed that is mistaken for a page still raises, it just raises the
+#: other error, which is why this fallback may be generous.
+_HTML_HEAD_BYTES = 1024
+
+
+def _looks_like_html(body: bytes) -> bool:
+    try:
+        return _local(ET.fromstring(body).tag) == "html"
+    except (ET.ParseError, ValueError):
+        head = body.lstrip(b"\xef\xbb\xbf")[:_HTML_HEAD_BYTES].lower()
+        return b"<!doctype html" in head or b"<html" in head
+
+
+def parse_any(body: bytes) -> FeedExport:
+    """Parse whichever feed format these bytes are, deciding from what the document says about itself.
+
+    A caller's guess is not evidence: sniffing on the presence of an ``items`` key would read a JSON Feed
+    with the GReader rules and a GReader export with the JSON Feed rules. An HTML page is refused here
+    because autodiscovery needs the page URL, which only ``fetch_any`` has.
+    """
+    head = body.lstrip(b"\xef\xbb\xbf \t\r\n")
+    if head[:1] in (b"{", b"["):
+        document = parse_json(body)
+        if isinstance(document, dict) and _is_json_feed(document):
+            return _json_feed_export(document)
+        return _greader_export(document)
+    if _looks_like_html(body):
+        raise FeedError("page is not a feed")
+    return parse_rss(body)
+
+
+_FEED_ACCEPT = (
+    "application/rss+xml, application/atom+xml, application/feed+json, application/json, application/xml, text/xml"
+)
+
+
+def fetch_any(
+    http: Http, url: str, validators: Mapping[str, str] | None = None
+) -> tuple[FeedExport, dict[str, str] | None]:
+    """One GET for any supported feed format, plus the caching validators to keep for the next one.
+
+    A source may be configured with the page that advertises a feed rather than the feed itself, so an HTML
+    answer is followed through exactly one autodiscovery hop. A page that advertises another page is refused
+    instead of followed again: the source is a subscription, not a crawl.
+
+    Conditional requests behave exactly as ``fetch_rss`` does. A 304 is an empty export only when this
+    call asked conditionally, because otherwise nothing has said the feed is unchanged.
+    """
+    headers = {"Accept": f"{_FEED_ACCEPT}, text/html"}
+    if validators:
+        headers.update(validators)
+    status, response_headers, body = http("GET", url, headers, None)
+    if status == 304:
+        if not validators:
+            raise RssError("feed answered 304 to an unconditional request")
+        return FeedExport((), False), None
+    if status != 200:
+        raise RssError(f"feed answered HTTP {status}" if status else "feed is unreachable")
+    if _looks_like_html(body):
+        target = discover_feed(body, url)
+        if target is None:
+            raise FeedError("page offers no feed link")
+        status, _, body = http("GET", target, {"Accept": _FEED_ACCEPT}, None)
+        if status != 200:
+            raise RssError(f"feed answered HTTP {status}" if status else "feed is unreachable")
+        # No validators are stored for a page. They describe the page, and a 304 on it would say nothing
+        # about the feed it advertises; storing the feed's own ETag instead would send it to the wrong
+        # resource. Polling the page unconditionally costs one extra GET and cannot hide a changed feed.
+        return parse_any(body), {}
+    return parse_any(body), _validators_of(response_headers)
