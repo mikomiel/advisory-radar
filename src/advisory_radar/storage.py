@@ -201,6 +201,10 @@ class SqliteStore:
         except sqlite3.DatabaseError as exc:
             # The file store's rule, kept: unreadable is not absent, because re-seeding would replay history.
             raise SourceError(f"{self._owner} {self._path} cannot be read: {exc}") from exc
+        except OSError as exc:
+            # A directory that cannot be created or a database this process may open but not chmod is the
+            # store being unavailable, not an escaping filesystem error: the probes and the CLI answer this.
+            raise _sqlite_unavailable(self._path, exc) from exc
         finally:
             if connection is not None:
                 connection.close()
@@ -268,11 +272,17 @@ class SqliteStore:
     def _connect(self) -> sqlite3.Connection:
         self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         connection = sqlite3.connect(self._path, timeout=self._timeout, isolation_level=None)
-        # SQLite applies the process umask, which would leave the document world-readable; ``state.save_json``
-        # earns the same protection with an explicit chmod on the temporary file.
-        os.chmod(self._path, 0o600)
-        # Per connection, not per database: only journal_mode is stored in the file header.
-        connection.execute("PRAGMA synchronous = FULL")
+        try:
+            # SQLite applies the process umask, which would leave the document world-readable;
+            # ``state.save_json`` earns the same protection with an explicit chmod on the temporary file.
+            os.chmod(self._path, 0o600)
+            # Per connection, not per database: only journal_mode is stored in the file header.
+            connection.execute("PRAGMA synchronous = FULL")
+        except BaseException:
+            # A handle opened before its setup failed must not outlive the refusal: the caller translates the
+            # fault into a store that cannot be used, and a leaked handle would keep the database open.
+            connection.close()
+            raise
         return connection
 
     def _prepare(self, connection: sqlite3.Connection) -> None:
@@ -318,6 +328,37 @@ def _malformed_percent_escape(userinfo: str) -> bool:
     return False
 
 
+#: libpq options whose value is a credential. A password belongs in the userinfo or the environment: this
+#: program does not parse libpq's option set, so it refuses these rather than accepting a value it can neither
+#: validate nor scrub from a driver message.
+_QUERY_CREDENTIALS = ("passfile", "password", "sslcert", "sslkey", "sslpassword")
+
+#: The refusal names the option and nothing else: the value may be the only copy of a password, and a
+#: ``migrate`` target's credentials are in no configuration this process redacts.
+_QUERY_CREDENTIAL_REFUSAL = (
+    "unsupported state store: the PostgreSQL URL supplies {name} as a query parameter; a credential belongs "
+    "in the userinfo or the environment, not in the query string"
+)
+
+
+def _query_credential(url: str) -> str:
+    """The credential-bearing libpq option a PostgreSQL URL names in its query string, or "".
+
+    libpq percent-decodes an option name before matching it and matches it case-sensitively (``?pass%77ord=``
+    is ``password``, ``?PASSWORD=`` is an unknown option), so the check does the same and returns the canonical
+    name -- never the text from the URL, which a refusal must not echo.
+    """
+    for field in urllib.parse.urlsplit(url).query.split("&"):
+        name = field.partition("=")[0]
+        try:
+            decoded = urllib.parse.unquote(name, errors="strict")
+        except UnicodeDecodeError:
+            continue  # not a resolvable option name; the driver's own parse is not this check's business
+        if decoded in _QUERY_CREDENTIALS:
+            return decoded
+    return ""
+
+
 def _password_tokens(password: str) -> set[str]:
     """Every spelling of a password a driver message can repeat: as written, decoded, and fully encoded.
 
@@ -335,6 +376,11 @@ def _postgres_target(url: str) -> tuple[str, str]:
 
     Parsing here is a credential control as much as a validation: a refusal that quoted the URL would put its
     password into a log line. The password is never returned from this function or stored on its own.
+
+    A password belongs in the userinfo or the environment. libpq also accepts credentials as query parameters,
+    but this program does not parse libpq's option set: a query string that names one is refused here, so a
+    value this code can neither validate nor scrub never reaches the driver. What remains -- the userinfo -- is
+    the only credential position the scrubber has to cover.
     """
     try:
         parts = urllib.parse.urlsplit(url)
@@ -345,6 +391,9 @@ def _postgres_target(url: str) -> tuple[str, str]:
         raise ValueError(_UNSUPPORTED_STORE)
     if _malformed_percent_escape(_userinfo(url)):
         raise ValueError(_MALFORMED_USERINFO)
+    supplied = _query_credential(url)
+    if supplied:
+        raise ValueError(_QUERY_CREDENTIAL_REFUSAL.format(name=supplied))
     return host, parts.path.lstrip("/")
 
 

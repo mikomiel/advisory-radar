@@ -161,6 +161,35 @@ def test_a_lock_fault_that_is_not_contention_is_a_store_error(tmp_path):
         pass
 
 
+def test_a_filesystem_failure_reading_the_store_is_a_store_error(tmp_path, monkeypatch):
+    """A database it can open but not chmod is a store that cannot be used -- and the refusal must close it.
+
+    ``load`` only translated SQLite errors, so the ``PermissionError`` from the setup that runs after the handle
+    is opened escaped: a probe became a 500 and a migration a traceback. The half-set-up handle leaked too.
+    """
+    path = tmp_path / "state.db"
+    storage.SqliteStore(path).save(DOCUMENT)
+    opened: list[sqlite3.Connection] = []
+    real_connect = sqlite3.connect
+
+    def tracking_connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    def denied(path, mode):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(storage.sqlite3, "connect", tracking_connect)
+    monkeypatch.setattr(storage.os, "chmod", denied)
+    with pytest.raises(storage.StoreUnavailable) as caught:
+        storage.SqliteStore(path).load()
+    assert not isinstance(caught.value, OSError)
+    assert opened, "the database was opened before the failure"
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[-1].execute("SELECT 1")  # a closed handle: the refusal must not leak the connection
+
+
 def test_a_pass_over_a_read_only_sqlite_store_fails_instead_of_raising(tmp_path, read_only_sqlite, caplog):
     path = tmp_path / "state.db"
     document = core.new_state()
@@ -447,3 +476,50 @@ def test_a_driver_message_that_names_the_token_alone_is_scrubbed(monkeypatch):
     assert "s3cr3t" not in message
     assert "[redacted]" in message
     assert "db.example/radar" in message, "the reason stays useful"
+
+
+@pytest.mark.parametrize(
+    ("url", "name", "value"),
+    [
+        ("postgresql://db.example/radar?password=bad%password", "password", "bad%password"),
+        ("postgresql://db.example/radar?passfile=/run/secrets/pgpass", "passfile", "/run/secrets/pgpass"),
+        ("postgresql://db.example/radar?sslpassword=s3cr3t-ssl", "sslpassword", "s3cr3t-ssl"),
+        ("postgresql://db.example/radar?sslcert=/run/secrets/client.crt", "sslcert", "/run/secrets/client.crt"),
+        ("postgresql://db.example/radar?sslkey=/run/secrets/client.key", "sslkey", "/run/secrets/client.key"),
+        # libpq percent-decodes an option name before matching it, so this spelling is the same option.
+        ("postgresql://db.example/radar?pass%77ord=s3cr3t-encoded", "password", "s3cr3t-encoded"),
+    ],
+)
+def test_a_credential_in_the_postgres_query_string_is_refused_before_the_driver(
+    url, name, value, tmp_path, monkeypatch
+):
+    """This program does not parse libpq options, so a credential in the query string is refused, not used.
+
+    A ``migrate`` target's credentials are in no configuration this process redacts, and libpq can quote the
+    value alone; the refusal is therefore checked before a driver exists to build such a message.
+    """
+    driver_calls: list[str] = []
+
+    class _Driver:
+        @staticmethod
+        def connect(url: str):
+            driver_calls.append(url)
+            raise AssertionError("the driver must not be reached")
+
+    monkeypatch.setitem(sys.modules, "psycopg", _Driver)
+    with pytest.raises(ValueError) as caught:
+        storage.PostgreSqlStore(url)
+    message = str(caught.value)
+    assert name in message, "the refusal names the parameter, so an operator can act on it"
+    assert value not in message, "the refusal must never carry the credential"
+    assert driver_calls == []
+    # A configuration reaches the same refusal through the one parser, so `migrate --to` cannot skip it.
+    with pytest.raises(ValueError):
+        storage.store_for(url, tmp_path / "state.json")
+    assert driver_calls == []
+
+
+def test_a_non_credential_query_parameter_is_not_refused():
+    # The check is a fixed credential vocabulary, not a ban on the libpq options this program does not read.
+    store = storage.PostgreSqlStore("postgresql://db.example/radar?sslmode=require")
+    assert repr(store) == "PostgreSqlStore(host='db.example', database='radar')"

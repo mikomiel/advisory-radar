@@ -98,6 +98,35 @@ def test_migrate_refuses_an_unusable_target_without_echoing_it(tmp_path, monkeyp
     assert "s3cr3t-pass" not in caplog.text
 
 
+def test_migrate_refuses_a_target_credential_in_the_query_string(tmp_path, monkeypatch, caplog):
+    """A ``--to`` credential is in no configuration this process redacts, so the target is refused first.
+
+    libpq can quote the value alone in its parse error; the URL must never reach it, and the log line an
+    operator pastes into an issue must carry the parameter name rather than the credential.
+    """
+    driver_calls: list[str] = []
+
+    class _Driver:
+        @staticmethod
+        def connect(url: str):
+            driver_calls.append(url)
+            raise RuntimeError('invalid percent-encoded token: "bad%password"')
+
+    monkeypatch.setitem(sys.modules, "psycopg", _Driver)
+    config = make_config(tmp_path)
+    save_state(tmp_path / "state.json", make_document())
+    with caplog.at_level(logging.ERROR):
+        code = cli.main(
+            ["migrate", "--config", str(config), "--to", "postgresql://db.example/radar?password=bad%password"],
+            env={},
+        )
+    assert code == 1
+    assert driver_calls == [], "the URL must be refused before the driver can quote it"
+    assert "bad%password" not in caplog.text
+    assert "%password" not in caplog.text
+    assert "password" in caplog.text, "the parameter is named, so the operator can act on it"
+
+
 def test_the_document_is_the_same_after_a_round_trip_through_sqlite(tmp_path):
     """A migration is a byte-for-byte move of the text, so a document can come back unchanged."""
     document = make_document()
