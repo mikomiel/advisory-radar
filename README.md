@@ -100,7 +100,8 @@ change of rules, not of the world, so it does not send the backlog out: each wat
 records the numbers it was judged under — its source's block when it has one — and the first
 evaluation after a change records the new verdict without telling anyone. A change to a
 source's block re-baselines only the CVEs that source queued, and a change to the global block
-leaves a source with a block of its own alone. The entry keeps what you were actually told
+reaches a source only through the numbers that source does not state itself. The entry keeps
+what you were actually told
 apart from what the numbers now say, so a KEV hit or a CISA active flag that arrives later
 still escalates — that is evidence, not a rule.
 

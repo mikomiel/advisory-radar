@@ -192,7 +192,8 @@ Changing a threshold changes the rules, so it does not send the watch list out: 
 watched CVE records the numbers it was judged under — its source's own block when it has one
 — and the first evaluation after a change records the new verdict without telling anyone. A
 source's block moving re-baselines only the CVEs that source queued, and the global block
-moving leaves a source with its own block alone. The entry keeps the level the reader was told
+moving reaches a source only through the numbers that source does not state itself. The entry
+keeps the level the reader was told
 (`level`) apart from the level the numbers in force make of it (`judged`), so a KEV hit or a
 CISA active flag that arrives later still escalates against what was actually sent. State
 written before the source was recorded, and a hand-edited record whose source or numbers
