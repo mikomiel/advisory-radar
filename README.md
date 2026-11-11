@@ -254,7 +254,7 @@ returns to the YAML: the empty overlay is applied as revision 0.
 ### Storage
 
 `state_path` is a single JSON document by default, and the `storage:` key moves those bytes
-without changing the document model, the pages or the commands. `sqlite:///data/state.db`
+without changing the document model, the pages or the commands. `sqlite:////data/state.db`
 keeps one file for one host (WAL, `synchronous=FULL`, mode `0600`); `postgresql://` shares
 one document between instances and needs the optional driver
 (`python -m pip install 'psycopg[binary]'`). The YAML owns the key: the overlay cannot move
@@ -262,7 +262,7 @@ the store, and a reload refuses a changed `storage:` exactly as it refuses a cha
 `state_path`. `settings.json` and the KEV cache stay beside `state_path`; neither is part of
 the document.
 
-`advisory-radar migrate --config config/config.yml --to sqlite:///data/state.db` copies the
+`advisory-radar migrate --config config/config.yml --to sqlite:////data/state.db` copies the
 document read through the configured store into another one, and prints both stores — never
 the URL, which can carry a password. It refuses a target that already holds a document, so a
 wrong `--to` cannot overwrite a live state, and it leaves the source in place: set `storage:`

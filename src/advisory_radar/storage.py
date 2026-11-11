@@ -58,6 +58,33 @@ _MALFORMED_USERINFO = (
     "(for example %40 for @)"
 )
 
+#: A SQLite document must not be written at the path of a file that lives beside ``state_path``: the KEV cache
+#: and the settings overlay are replaced atomically by their own writers, so the first pass would destroy one.
+#: The refusal names the file's role, never the path, so a log line and the message cannot disagree about it.
+_RESERVED_NEIGHBOUR_REFUSAL = (
+    "unsupported state store: the SQLite file is the {role} beside state_path, which this program replaces; "
+    "choose another path for the state document"
+)
+
+
+def _refuse_reserved_neighbour(path: Path, state_path: Path) -> None:
+    """Refuse a SQLite document at the KEV cache or the settings overlay beside ``state_path``.
+
+    The comparison is on resolved absolute paths, because ``sqlite:///data/kev.json`` is relative to the
+    working directory while ``sqlite:////data/kev.json`` is absolute and both can name the same file. The
+    neighbour names come from the owners that write those files, so a rename cannot leave this check behind;
+    they are imported here because both modules reach ``storage`` through ``config``.
+    """
+    from . import pipeline, settings  # lazy: pipeline and settings import storage (through config)
+
+    resolved = path.resolve()
+    for role, neighbour in (
+        ("KEV cache", state_path.with_name(pipeline.KEV_CACHE_NAME)),
+        ("settings overlay", settings.settings_path(state_path)),
+    ):
+        if resolved == neighbour.resolve():
+            raise ValueError(_RESERVED_NEIGHBOUR_REFUSAL.format(role=role))
+
 
 class StoreUnavailable(RuntimeError):
     """A store cannot be opened or used at all: no driver, an unreachable server, a refused connection.
@@ -618,7 +645,9 @@ def store_for(value: str | None, state_path: Path) -> Store:
     """The store a configured value names, refusing an unknown shape without quoting the value back.
 
     A value is a store locator and the PostgreSQL form carries a password, so a refusal names the forms that
-    are accepted and never the text it rejected: a mistyped URL must not leak through an error message.
+    are accepted and never the text it rejected: a mistyped URL must not leak through an error message. A
+    SQLite path that resolves to one of the auxiliary files beside ``state_path`` is refused too: those files
+    are replaced by their own writers, so the state document there would destroy one.
     """
     if not value:
         return JsonStore(state_path)
@@ -626,6 +655,7 @@ def store_for(value: str | None, state_path: Path) -> Store:
         path = Path(value[len(_SQLITE_PREFIX) :])
         if str(path) == ".":
             raise ValueError(_UNSUPPORTED_STORE)
+        _refuse_reserved_neighbour(path, state_path)
         return SqliteStore(path)
     if value.startswith(("postgresql://", "postgres://")):
         return PostgreSqlStore(value)

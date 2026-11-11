@@ -10,11 +10,11 @@ poll_interval: 15m
 state_path: /data/state.json
 
 # Where the state document lives. Empty (the default) is the JSON file at state_path.
-#   storage: sqlite:///data/state.db            # one host, one file
+#   storage: sqlite:////data/state.db           # one host, one file
 #   storage: postgresql://radar:${POSTGRES_PASSWORD}@db/radar   # shared between instances;
 #                                               # needs python -m pip install 'psycopg[binary]'
 # YAML-only: the /config overlay cannot move the store, and moving it needs a restart.
-# `advisory-radar migrate --config config/config.yml --to sqlite:///data/state.db` copies
+# `advisory-radar migrate --config config/config.yml --to sqlite:////data/state.db` copies
 # an existing document; it refuses a target that already holds one.
 
 # Optional: a free NVD API key. NVD admits 5 requests per 30 s anonymously and

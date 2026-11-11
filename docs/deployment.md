@@ -113,7 +113,7 @@ a TLS-terminating reverse proxy; the session cookie is only sent over HTTPS unle
 ### Storage
 
 `storage:` in `config.yml` moves the state document without changing its model. Empty is
-the default and means the JSON file at `state_path`; `sqlite:///data/state.db` keeps one
+the default and means the JSON file at `state_path`; `sqlite:////data/state.db` keeps one
 file on the volume for one host; `postgresql://user:password@host/database` shares one
 document between instances and needs the optional driver:
 
@@ -121,12 +121,17 @@ document between instances and needs the optional driver:
 python -m pip install 'psycopg[binary]'
 ```
 
+Three slashes make a SQLite path relative to the working directory; four make it absolute.
+`sqlite:////data/state.db` is `/data/state.db` in the container, while
+`sqlite:///data/state.db` is `data/state.db` under the image's working directory (`/data`) —
+that is, `/data/data/state.db`.
+
 The key is YAML-only. The overlay cannot move the store, and a reload refuses a changed
 `storage:` as it refuses a changed `state_path`, so moving it is a restart.
 `settings.json` and the KEV cache stay beside `state_path` and are not part of the
 document, which is why `state_path` is still required when the document lives elsewhere.
 
-`advisory-radar migrate --config /config/config.yml --to sqlite:///data/state.db` copies
+`advisory-radar migrate --config /config/config.yml --to sqlite:////data/state.db` copies
 the document read through the configured store into another one. It refuses a target that
 already holds a document and prints both stores, never the URL, which can carry a password.
 The source is left in place: set `storage:` and restart once the copy looks right. Run it

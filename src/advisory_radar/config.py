@@ -722,7 +722,7 @@ def config_from_document(
     # one parser, and its refusal names the accepted forms without quoting the value (a URL can carry a
     # password). The store itself is built later, from an already validated value.
     storage = document.get("storage", "")
-    _require(isinstance(storage, str), "storage must be a string, e.g. sqlite:///data/state.db")
+    _require(isinstance(storage, str), "storage must be a string, e.g. sqlite:////data/state.db")
     try:
         store_for(storage, state_path)
     except ValueError as exc:

@@ -286,6 +286,25 @@ def test_a_write_between_the_check_and_the_save_cannot_overwrite_the_document(tm
     assert SqliteStore(tmp_path / "state.db").load() == outer_document
 
 
+def test_migrate_refuses_a_target_at_an_auxiliary_file(tmp_path, caplog):
+    """``--to`` a path beside ``state_path`` is refused before the KEV cache or the settings overlay is touched."""
+    config = make_config(tmp_path)
+    save_state(tmp_path / "state.json", make_document())
+    kev, overlay = tmp_path / "kev.json", tmp_path / "settings.json"
+    kev.write_text('{"schema": "advisory-radar-kev.v1", "cves": ["CVE-2026-1"]}', encoding="utf-8")
+    overlay.write_text('{"schema": "advisory-radar-settings.v1", "settings": {}}', encoding="utf-8")
+    before = (kev.read_bytes(), overlay.read_bytes())
+
+    for target, role in ((kev, "KEV cache"), (overlay, "settings overlay")):
+        with caplog.at_level(logging.ERROR):
+            caplog.clear()
+            code = cli.main(["migrate", "--config", str(config), "--to", f"sqlite:///{target}"], env={})
+        assert code == 1
+        assert role in caplog.text, "the refusal names the file's role"
+        assert str(target) not in caplog.text, "the log never names the path"
+    assert (kev.read_bytes(), overlay.read_bytes()) == before, "a refused migration must not touch either file"
+
+
 def test_migrate_refuses_a_read_only_target_without_writing(tmp_path, read_only_sqlite, caplog):
     """A target that cannot be written is the store refusal, not a traceback and not a half-migration."""
     config = make_config(tmp_path)

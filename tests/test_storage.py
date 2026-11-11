@@ -19,7 +19,7 @@ import time
 import pytest
 
 from advisory_radar import core, pipeline, storage
-from advisory_radar.config import load_config
+from advisory_radar.config import ConfigError, load_config
 from advisory_radar.state import LockBusy, SourceError, serialize_json
 
 DOCUMENT = {
@@ -316,6 +316,53 @@ def test_an_unknown_store_is_refused_without_echoing_it(tmp_path):
     assert "mysql" not in message
     with pytest.raises(ValueError):
         storage.store_for("sqlite:///", tmp_path / "state.json")
+
+
+def test_a_sqlite_target_at_an_auxiliary_file_beside_state_path_is_refused(tmp_path, monkeypatch):
+    """The KEV cache and the settings overlay are replaced by their own writers; a document there destroys one."""
+    data = tmp_path / "data"
+    data.mkdir()
+    state_path = data / "state.json"
+    kev, overlay = data / "kev.json", data / "settings.json"
+    kev.write_text('{"schema": "advisory-radar-kev.v1", "cves": ["CVE-2026-1"]}', encoding="utf-8")
+    overlay.write_text('{"schema": "advisory-radar-settings.v1", "settings": {}}', encoding="utf-8")
+    before = (kev.read_bytes(), overlay.read_bytes())
+
+    for target, role in ((kev, "KEV cache"), (overlay, "settings overlay")):
+        with pytest.raises(ValueError) as caught:
+            storage.store_for(f"sqlite:///{target}", state_path)
+        message = str(caught.value)
+        assert role in message, "the refusal names the file's role"
+        assert str(target) not in message, "the refusal never names the path"
+
+    # Three slashes are relative to the working directory: this spelling is the same file as the absolute one.
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match="KEV cache"):
+        storage.store_for("sqlite:///data/kev.json", state_path)
+
+    # A SQLite document beside those files is exactly what a store is for.
+    assert isinstance(storage.store_for(f"sqlite:///{data}/state.db", state_path), storage.SqliteStore)
+    assert (kev.read_bytes(), overlay.read_bytes()) == before, "a refused target must not touch either file"
+
+
+def test_a_configured_sqlite_store_at_an_auxiliary_file_is_refused(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    kev, overlay = data / "kev.json", data / "settings.json"
+    kev.write_text('{"schema": "advisory-radar-kev.v1", "cves": ["CVE-2026-1"]}', encoding="utf-8")
+    overlay.write_text('{"schema": "advisory-radar-settings.v1", "settings": {}}', encoding="utf-8")
+    before = (kev.read_bytes(), overlay.read_bytes())
+    config_path = tmp_path / "config.yml"
+
+    for target, role in ((kev, "KEV cache"), (overlay, "settings overlay")):
+        config_path.write_text(
+            f"sources: []\nnotifiers: []\nstate_path: {data}/state.json\nstorage: sqlite:///{target}\n"
+        )
+        with pytest.raises(ConfigError) as caught:
+            load_config(config_path, {})
+        assert role in str(caught.value)
+        assert str(target) not in str(caught.value)
+    assert (kev.read_bytes(), overlay.read_bytes()) == before, "a refused configuration must not touch either file"
 
 
 # --------------------------------------------------------------------------
