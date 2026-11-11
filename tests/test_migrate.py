@@ -239,8 +239,12 @@ def test_two_migrations_against_the_same_target_cannot_both_write(tmp_path):
     assert SqliteStore(tmp_path / "state.db").load() == first_document
 
 
-def test_a_write_injected_between_the_check_and_the_save_is_refused(tmp_path, caplog):
-    """A writer that appears after the check must not be overwritten: the target lock excludes it."""
+def test_a_write_between_the_check_and_the_save_cannot_overwrite_the_document(tmp_path, caplog):
+    """A migration started after the check waits for the target lock, then sees the document and refuses.
+
+    The lock spans the check and the save, so there is no window in which a second writer can create the
+    document unseen; it must never replace the first migration's write.
+    """
     outer_document = make_document()
     save_state(tmp_path / "state.json", outer_document)
     other = tmp_path / "injected"
@@ -250,32 +254,35 @@ def test_a_write_injected_between_the_check_and_the_save_is_refused(tmp_path, ca
     save_state(other / "state.json", injected_document)
     target = f"sqlite:///{tmp_path}/state.db"
 
-    real_store_for, real_load = cli.store_for, SqliteStore.load
-    nested: dict[str, int] = {}
-    loads = {"count": 0}
-
-    def store_for(value: str, state_path: Path):
-        if value.startswith("sqlite:///"):
-            # A short timeout keeps the nested attempt fast; the first migration holds the sidecar.
-            return SqliteStore(Path(value[len("sqlite:///") :]), timeout=0.05)
-        return real_store_for(value, state_path)
+    real_load = SqliteStore.load
+    second: dict[str, int] = {}
+    workers: list[threading.Thread] = []
 
     def loading(self):
-        loads["count"] += 1
         document = real_load(self)
-        if loads["count"] == 1:
-            nested["code"] = cli.main(["migrate", "--config", str(make_config(other)), "--to", target], env={})
+        if not workers:
+            # The first migration's check: start the second migration in the window before the first saves.
+            worker = threading.Thread(
+                target=lambda: second.update(
+                    code=cli.main(["migrate", "--config", str(make_config(other)), "--to", target], env={})
+                )
+            )
+            worker.start()
+            workers.append(worker)
         return document
 
-    cli.store_for, SqliteStore.load = store_for, loading
+    SqliteStore.load = loading
     try:
         with caplog.at_level(logging.ERROR):
             assert cli.main(["migrate", "--config", str(make_config(tmp_path)), "--to", target], env={}) == 0
+            for worker in workers:
+                worker.join(timeout=10)
+                assert not worker.is_alive(), "the injected migration did not finish"
     finally:
-        cli.store_for, SqliteStore.load = real_store_for, real_load
+        SqliteStore.load = real_load
 
-    assert nested.get("code") == 1, "the injected migration must be refused rather than replacing the document"
-    assert "locked by another writer" in caplog.text
+    assert second.get("code") == 1, "the injected migration must be refused rather than replacing the document"
+    assert "already holds a state document" in caplog.text
     assert SqliteStore(tmp_path / "state.db").load() == outer_document
 
 

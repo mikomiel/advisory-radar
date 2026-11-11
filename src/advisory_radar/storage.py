@@ -17,6 +17,7 @@ import contextvars
 import json
 import os
 import sqlite3
+import time
 import urllib.parse
 from collections.abc import Iterator
 from pathlib import Path
@@ -154,6 +155,11 @@ def _sqlite_contention(exc: sqlite3.OperationalError) -> bool:
     return "locked" in text or "busy" in text
 
 
+#: How long a blocking acquisition waits between attempts. One attempt already waits ``SqliteStore``'s
+#: ``timeout`` inside SQLite's own busy handler; this pause only keeps a waiting process from spinning.
+_LOCK_RETRY_SECONDS = 0.05
+
+
 class SqliteStore:
     """The document in a one-row SQLite table, with the lock in a sidecar database.
 
@@ -182,6 +188,9 @@ class SqliteStore:
         self._lock_path = path.with_name(path.name + ".lock")
         self._schema = schema
         self._owner = owner
+        #: How long one connection waits inside SQLite before an attempt fails: the busy handler's timeout for
+        #: a lock attempt, and the wait for a statement on the document database. A blocking lock retries after
+        #: an attempt fails this way rather than treating it as the deadline for acquiring the lock.
         self._timeout = timeout
         self._ready = False
 
@@ -233,11 +242,14 @@ class SqliteStore:
 
     @contextlib.contextmanager
     def lock(self, *, blocking: bool = True) -> Iterator[None]:
-        """Hold the sidecar database for the pass, as ``state.state_lock`` holds the ``flock`` file."""
+        """Hold the sidecar database for the pass, as ``state.state_lock`` holds the ``flock`` file.
+
+        ``blocking=True`` waits until it acquires, exactly as the JSON store's ``flock`` does: the bulk queue
+        callers depend on that, so a held sidecar is retried rather than turned into ``LockBusy`` once one
+        attempt's timeout expires. ``blocking=False`` asks once and answers ``LockBusy`` immediately.
+        """
         try:
             self._lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            # ``blocking=False`` must answer now rather than after the timeout: timeout=0 makes SQLite fail the
-            # lock request immediately, and the error it raises is the LockBusy the pipeline already answers with.
             connection = sqlite3.connect(
                 self._lock_path,
                 timeout=self._timeout if blocking else 0,
@@ -247,29 +259,40 @@ class SqliteStore:
             # A sidecar that cannot even be opened cannot exclude anyone, so it is a store fault, not contention.
             raise _sqlite_unavailable(self._path, exc) from exc
         try:
+            os.chmod(self._lock_path, 0o600)
+            self._acquire(connection, blocking=blocking)
             try:
-                os.chmod(self._lock_path, 0o600)
-                try:
-                    connection.execute("BEGIN IMMEDIATE")
-                except sqlite3.OperationalError as exc:
-                    if _sqlite_contention(exc):
-                        raise LockBusy(str(self._lock_path)) from exc
-                    raise
-                try:
-                    yield
-                except BaseException:
-                    connection.execute("ROLLBACK")
-                    raise
-                else:
-                    connection.execute("COMMIT")
-            except LockBusy:
+                yield
+            except BaseException:
+                connection.execute("ROLLBACK")
                 raise
-            except (sqlite3.DatabaseError, OSError) as exc:
-                raise _sqlite_unavailable(self._path, exc) from exc
+            else:
+                connection.execute("COMMIT")
+        except (sqlite3.DatabaseError, OSError) as exc:
+            raise _sqlite_unavailable(self._path, exc) from exc
         finally:
             # Closing is the backstop: SQLite rolls back on close, so a failing COMMIT cannot leave the lock
             # held by this process.
             connection.close()
+
+    def _acquire(self, connection: sqlite3.Connection, *, blocking: bool) -> None:
+        """Take the sidecar's write lock, waiting for it when ``blocking`` asks for that.
+
+        One ``BEGIN IMMEDIATE`` attempt waits up to ``self._timeout`` in SQLite's busy handler, so a blocking
+        acquisition sleeps briefly and tries again: treating that timeout as the deadline would make SQLite's
+        lock behave unlike the JSON store's, which waits however long the holder takes. Only contention is
+        retried -- a read-only or non-database sidecar raises at once and becomes ``StoreUnavailable``.
+        """
+        while True:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                return
+            except sqlite3.OperationalError as exc:
+                if not _sqlite_contention(exc):
+                    raise
+                if not blocking:
+                    raise LockBusy(str(self._lock_path)) from exc
+                time.sleep(_LOCK_RETRY_SECONDS)
 
     def _connect(self) -> sqlite3.Connection:
         self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)

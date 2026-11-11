@@ -13,6 +13,8 @@ import logging
 import sqlite3
 import stat
 import sys
+import threading
+import time
 
 import pytest
 
@@ -131,6 +133,69 @@ def test_the_sqlite_lock_is_released_when_the_body_raises(tmp_path):
         raise RuntimeError("boom")
     with store.lock(blocking=False):
         pass
+
+
+def test_a_blocking_lock_waits_while_a_non_blocking_one_answers(tmp_path, monkeypatch):
+    """``blocking=True`` waits however long the holder takes, as the JSON store's flock does.
+
+    The store's ``timeout`` is one attempt's wait inside SQLite, not the deadline for acquiring the lock: the
+    old code turned the first busy attempt into ``LockBusy``, so a pass that should have queued up behind a
+    slow one failed instead. ``blocking=False`` still answers at once, and contention writes nothing.
+    """
+    path = tmp_path / "state.db"
+    storage.SqliteStore(path).save(DOCUMENT)
+    first, second = storage.SqliteStore(path, timeout=0.05), storage.SqliteStore(path, timeout=0.05)
+    holding, release, contended = threading.Event(), threading.Event(), threading.Event()
+    real_contention = storage._sqlite_contention
+
+    def signalling(exc):
+        contention = real_contention(exc)
+        if contention:
+            contended.set()
+        return contention
+
+    monkeypatch.setattr(storage, "_sqlite_contention", signalling)
+
+    def holder() -> None:
+        with first.lock():
+            holding.set()
+            assert release.wait(timeout=10)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    assert holding.wait(timeout=10), "the first lock was never taken"
+
+    started = time.monotonic()
+    with pytest.raises(LockBusy), second.lock(blocking=False):
+        pass
+    assert time.monotonic() - started < 1.0, "a non-blocking lock must not wait out the busy timeout"
+
+    contended.clear()  # the non-blocking probe above is expected to see contention; the blocking one must too
+    outcome: dict[str, object] = {}
+
+    def blocking() -> None:
+        try:
+            with second.lock():
+                outcome["elapsed"] = time.monotonic() - started
+        except BaseException as exc:  # recorded so the assertion reports the refusal instead of a thread warning
+            outcome["error"] = exc
+
+    blocked = threading.Thread(target=blocking)
+    started = time.monotonic()
+    blocked.start()
+    try:
+        # Wait until the blocking attempt has met the held lock, so the release cannot race the acquisition.
+        assert contended.wait(timeout=10), "the blocking attempt never met the held lock"
+        release.set()
+    finally:
+        release.set()
+        blocked.join(timeout=10)
+        thread.join(timeout=10)
+    assert not blocked.is_alive() and not thread.is_alive()
+    assert "error" not in outcome, outcome.get("error")
+    assert "elapsed" in outcome, "the blocking acquisition never entered the lock"
+    assert outcome["elapsed"] >= 0.05, "the blocking lock waited for the holder"
+    assert storage.SqliteStore(path).load() == DOCUMENT, "contention must not change the document"
 
 
 def test_a_read_only_sqlite_store_is_unavailable_and_keeps_the_committed_document(tmp_path, read_only_sqlite):
