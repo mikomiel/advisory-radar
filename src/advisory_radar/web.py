@@ -1759,7 +1759,17 @@ def create_app(
             return ""
         return PRIVATE_SOURCE_REFUSAL
 
-    def probe_source(entry: dict, *, adding: bool) -> tuple[bool, str]:
+    def display_type(entry: dict) -> str:
+        """The type to show: the kind in use when it is one, else the value as written.
+
+        A ``type: ${SOME_KIND}`` that names a built-in shows the kind; one that resolves to anything else -- a
+        disabled entry is never expanded by a configuration load, so it can hold any reference -- is shown as
+        written rather than as resolved.
+        """
+        effective = expand_text(entry.get("type"))
+        return effective if effective in SOURCE_SPECS else str(entry.get("type", ""))
+
+    def probe_source(entry: dict, *, adding: bool, expand: bool = True) -> tuple[bool, str]:
         """Fetch one source entry the way a pass would, and render what it answered. Nothing is written.
 
         A probe can hold a source that was never saved, so the values it resolves are redacted together with the
@@ -1770,18 +1780,26 @@ def create_app(
         with the UI token alone.
         """
         resolved: list[str] = []
-        try:
-            # Expanded before anything is judged: ``url: ${FEED_URL}`` and ``type: ${SOURCE_KIND}`` are configured
-            # values, and a missing variable must be named as one.
-            expanded = expand_entry(entry, runtime.environment, resolved)
-        except Exception as exc:
-            message = pipeline.redact(f"{type(exc).__name__}: {exc}", [*secret_values(runtime.cfg), *resolved])
-            return False, _notice(esc(message), "critical")
+        if not expand:
+            # A live entry was expanded when the configuration loaded, and expansion is not recursive: doing it
+            # again would resolve a reference that was part of a *value*, so the probe could fetch a different
+            # URL from the one the pass fetched.
+            expanded = dict(entry)
+        else:
+            try:
+                # Expanded before anything is judged: ``url: ${FEED_URL}`` and ``type: ${SOURCE_KIND}`` are
+                # configured values, and a missing variable must be named as one.
+                expanded = expand_entry(entry, runtime.environment, resolved)
+            except Exception as exc:
+                message = pipeline.redact(f"{type(exc).__name__}: {exc}", [*secret_values(runtime.cfg), *resolved])
+                return False, _notice(esc(message), "critical")
         secrets = [*secret_values(runtime.cfg), *resolved]
         kind = expanded.get("type")
         spec = SOURCE_SPECS.get(kind) if isinstance(kind, str) else None
         if spec is None:
-            return False, _notice(f"{esc(str(kind))} is not a built-in source type.", "critical")
+            # As written, not as expanded: a disabled entry may carry ``type: ${SOMETHING}``, and rendering the
+            # resolved value here would publish it.
+            return False, _notice(f"{esc(str(entry.get('type', '')))} is not a built-in source type.", "critical")
         if kind == "webhook":
             identifier = esc(str(expanded.get("id", "")))
             return False, _notice(
@@ -1835,10 +1853,15 @@ def create_app(
             # Ownership, not "already saved": a disabled overlay source is still a source this page added, and
             # probing it must not become the way around the destination rule. It is read off the entry that was
             # selected, never off the submitted value, or the two could disagree.
-            ok, detail = probe_source(entry, adding=entry["id"] in added_source_ids(settings))
+            ok, detail = probe_source(
+                entry,
+                adding=entry["id"] in added_source_ids(settings),
+                # ``runtime.cfg.sources`` is already expanded; the merged document is not.
+                expand=not on_sources_page,
+            )
             tone = _badge("answered", "ok") if ok else _badge("failed", "critical")
             heading = (
-                f"<h2>{esc(identifier)} <span class='muted'>{esc(expand_text(entry.get('type')))}</span> {tone}</h2>"
+                f"<h2>{esc(identifier)} <span class='muted'>{esc(display_type(entry))}</span> {tone}</h2>"
                 "<p class='muted small'>A configured source; the probe reads it and delivers nothing.</p>"
             )
             title = f"{identifier} probe"
@@ -1855,7 +1878,7 @@ def create_app(
             ok, detail = probe_source(entry, adding=True)
             tone = _badge("answered", "ok") if ok else _badge("failed", "critical")
             heading = (
-                f"<h2>New {esc(expand_text(entry.get('type')))} source {tone}</h2>"
+                f"<h2>New {esc(display_type(entry))} source {tone}</h2>"
                 "<p class='muted small'>Not saved yet: the probe fetched it with the values from the form.</p>"
             )
             # The probed values are carried into a real save, so a working probe is one click from being stored.
@@ -2353,13 +2376,16 @@ def create_app(
         route_warnings = []
         for index, route in enumerate(routes, start=1):
             match = route.get("match") if isinstance(route, dict) else None
-            identifier = expand_text(match.get("source") if isinstance(match, dict) else None)
+            written = match.get("source") if isinstance(match, dict) else None
+            identifier = expand_text(written)
             if identifier and identifier not in configured_source_ids:
                 # A rule for a source nobody configured can never fire. Staging a rule before its source is
                 # legitimate, so this is reported rather than refused -- unlike an unknown tag, which no
                 # configuration could ever match.
                 route_warnings.append(
-                    f"<li>Rule {index} matches source <code>{esc(identifier)}</code>, which no configured source "
+                    # The comparison needs the expanded value; the message shows what was written, which is a
+                    # reference as often as a name -- and a reference is never a credential.
+                    f"<li>Rule {index} matches source <code>{esc(written)}</code>, which no configured source "
                     "has: it stays inert until that source exists.</li>"
                 )
         route_notice = _notice(f"<ul>{''.join(route_warnings)}</ul>", "warning") if route_warnings else ""

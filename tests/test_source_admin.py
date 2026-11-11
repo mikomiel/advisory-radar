@@ -1158,3 +1158,72 @@ def test_a_derived_id_reserves_a_disabled_notifier_id(tmp_path):
     client = TestClient(create_app(runtime, env, http=fake_http, resolve=public_resolver))
     assert new_source(client, **{"new:type": "rss", "new:url": "https://nodejs.org/feed/x.xml"}).status_code == 303
     assert overlay(tmp_path)["sources_added"][0]["id"] == "nodejs-org-2"
+
+
+def test_the_route_warning_shows_what_was_written_not_the_resolved_value(tmp_path):
+    client, _, _ = make_client(
+        tmp_path,
+        environment={"FRESHRSS_TOKEN": "s3cret-token"},
+        extra='routes:\n  - match: {source: "${FRESHRSS_TOKEN}"}\n    notifiers: [chat]\n',
+    )
+    signed_in(client)
+    page = client.get("/config").text
+    assert "s3cret-token" not in page, "the comparison may resolve a reference; the message may not print it"
+    assert "FRESHRSS_TOKEN" in page, "the reference itself is what the operator has to see"
+
+
+def test_a_disabled_source_with_a_referenced_type_does_not_print_its_value(tmp_path):
+    # A disabled entry is never expanded by a configuration load, so its type may hold any reference.
+    client, _, _ = make_client(
+        tmp_path,
+        sources=[
+            {
+                "id": "vendor",
+                "type": "${SOME_SECRET}",
+                "enabled": False,
+                "url": "https://feeds.example.net/feed.xml",
+            }
+        ],
+        environment={"SOME_SECRET": "s3cret-token"},
+    )
+    csrf, _ = signed_in(client)
+    response = client.post("/config/sources/probe", data={"csrf": csrf, "id": "vendor"})
+    assert response.status_code == 200
+    assert "s3cret-token" not in response.text
+    assert "SOME_SECRET" in response.text
+
+
+def test_every_path_fetches_the_url_the_pass_fetches(tmp_path):
+    """Expansion is not recursive, so a probe must expand a raw entry once and a live one not at all."""
+    seen: list[str] = []
+
+    def recording(method, url, headers, body):
+        seen.append(url)
+        return 200, {"ETag": '"v"'}, RSS
+
+    # FEED_URL's value itself contains a reference: the pass fetches the literal text, and so must a probe.
+    client, runtime, _ = make_client(
+        tmp_path,
+        sources=[{"id": "vendor", "type": "rss", "url": "${FEED_URL}"}],
+        environment={
+            "FEED_URL": "https://feeds.example.net/feed.xml?template=${CHANNEL}",
+            "CHANNEL": "security",
+        },
+        transport=recording,
+    )
+
+    def feed_urls() -> list[str]:
+        return [url for url in seen if "feeds.example.net" in url]
+
+    csrf, _ = signed_in(client)
+    pipeline.run_pass(runtime.cfg, runtime.sources, runtime.notifiers, http=recording)
+    assert feed_urls(), "the pass must have fetched the feed"
+    pass_url = feed_urls()[-1]
+    seen.clear()
+    assert client.post("/sources/probe", data={"csrf": csrf, "id": "vendor"}).status_code == 200
+    sources_url = feed_urls()[-1]
+    seen.clear()
+    assert client.post("/config/sources/probe", data={"csrf": csrf, "id": "vendor"}).status_code == 200
+    config_url = feed_urls()[-1]
+    assert sources_url == pass_url, "the live row was expanded once already; a second pass would change the URL"
+    assert config_url == pass_url, "a raw row expands once, exactly as the loader does"
