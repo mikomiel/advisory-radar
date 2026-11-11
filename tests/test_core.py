@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from advisory_radar import core
+from advisory_radar.config import DEFAULT_THRESHOLDS
 
 
 class TestIds:
@@ -118,32 +119,52 @@ class TestRouting:
         return core.CveFacts(cvss, ssvc, epss, None, complete, skipped=skipped, remote_unauth=remote)
 
     def test_critical_reasons_order(self):
-        assert core.critical_reason(self.facts(), kev=True) == "kev"
-        assert core.critical_reason(self.facts(ssvc="active"), kev=False) == "ssvc"
-        assert core.critical_reason(self.facts(cvss=9.5, remote=True), kev=False) == "remote"
-        assert core.critical_reason(self.facts(cvss=9.5, epss=0.5), kev=False) == "epss"
-        assert core.critical_reason(self.facts(cvss=9.5), kev=False) is None
+        assert core.critical_reason(self.facts(), kev=True, thresholds=DEFAULT_THRESHOLDS) == "kev"
+        assert core.critical_reason(self.facts(ssvc="active"), kev=False, thresholds=DEFAULT_THRESHOLDS) == "ssvc"
+        assert (
+            core.critical_reason(self.facts(cvss=9.5, remote=True), kev=False, thresholds=DEFAULT_THRESHOLDS)
+            == "remote"
+        )
+        assert core.critical_reason(self.facts(cvss=9.5, epss=0.5), kev=False, thresholds=DEFAULT_THRESHOLDS) == "epss"
+        assert core.critical_reason(self.facts(cvss=9.5), kev=False, thresholds=DEFAULT_THRESHOLDS) is None
 
     def test_level_suppression_needs_complete_data(self):
-        assert core.level_of(self.facts(cvss=3.0), kev=False, kev_known=True) == ("suppressed", None)
-        assert core.level_of(self.facts(cvss=3.0, complete=False), kev=False, kev_known=True) == ("warning", None)
-        assert core.level_of(self.facts(), kev=False, kev_known=False) == ("warning", None)
+        assert core.level_of(self.facts(cvss=3.0), kev=False, kev_known=True, thresholds=DEFAULT_THRESHOLDS) == (
+            "suppressed",
+            None,
+        )
+        assert core.level_of(
+            self.facts(cvss=3.0, complete=False), kev=False, kev_known=True, thresholds=DEFAULT_THRESHOLDS
+        ) == ("warning", None)
+        assert core.level_of(self.facts(), kev=False, kev_known=False, thresholds=DEFAULT_THRESHOLDS) == (
+            "warning",
+            None,
+        )
 
     def test_judge_picks_deciding_cve(self):
         facts = {"CVE-2026-1": self.facts(cvss=5.0), "CVE-2026-2": self.facts(cvss=9.8, remote=True)}
-        verdict = core.judge(["CVE-2026-1", "CVE-2026-2"], facts, frozenset(), True, None)
+        verdict = core.judge(
+            ["CVE-2026-1", "CVE-2026-2"], facts, frozenset(), True, None, thresholds=DEFAULT_THRESHOLDS
+        )
         assert verdict.tag == "critical"
         assert "CVE-2026-2" in verdict.line
 
     def test_judge_suppressed_and_warning(self):
         facts = {"CVE-2026-1": self.facts(cvss=2.0)}
-        assert core.judge(["CVE-2026-1"], facts, frozenset(), True, None).tag == "suppressed"
+        assert (
+            core.judge(["CVE-2026-1"], facts, frozenset(), True, None, thresholds=DEFAULT_THRESHOLDS).tag
+            == "suppressed"
+        )
         facts = {"CVE-2026-1": self.facts(cvss=6.0)}
-        assert core.judge(["CVE-2026-1"], facts, frozenset(), True, None).tag == "warning"
+        assert (
+            core.judge(["CVE-2026-1"], facts, frozenset(), True, None, thresholds=DEFAULT_THRESHOLDS).tag == "warning"
+        )
 
     def test_judge_unscored_never_suppressed(self):
         facts = {"CVE-2026-1": self.facts(complete=False, skipped=True)}
-        assert core.judge(["CVE-2026-1"], facts, frozenset(), True, None).tag == "warning"
+        assert (
+            core.judge(["CVE-2026-1"], facts, frozenset(), True, None, thresholds=DEFAULT_THRESHOLDS).tag == "warning"
+        )
 
     def test_metrics_line_english(self):
         line = core.metrics_line(9.8, 0.42, 0.99, "active", True)
@@ -193,7 +214,7 @@ class TestState:
         state = core.new_state()
         item = core.Item("g", "t", "https://x.example", "s", None, ("CVE-2026-1",))
         verdict = core.Verdict("suppressed", (("CVE-2026-1", "suppressed"),), "CVSS 2.0", "")
-        core._suppressed(state, ["CVE-2026-1"], verdict, item, {"CVE-2026-1": 2.0}, 100)
+        core._suppressed(state, ["CVE-2026-1"], verdict, item, {"CVE-2026-1": 2.0}, 100, DEFAULT_THRESHOLDS)
         assert state["seen"]["CVE-2026-1"]["outcome"] == "suppressed"
         assert "CVE-2026-1" in core._claimed(state)
 

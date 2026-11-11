@@ -115,9 +115,9 @@ in the container, `~/.local/share/advisory-radar/settings.json` for the rootless
 quadlet). It is created with mode `0600`, owned by the container user, and replaced
 atomically (a temporary file in the same directory, `fsync`, `os.replace`), so a
 half-written file cannot brick a start. `/config` stays read-only: the overlay holds
-only seven keys — `notifiers`, per-source `enabled`/`tag`, the sources it adds itself
-(`sources_added`), `poll_interval`, `hidden_source_hosts`, and the routing `routes`/`default`
-block — and the YAML owns everything else. A source the overlay adds is stored whole, may not
+only eight keys — `notifiers`, per-source `enabled`/`tag`, the sources it adds itself
+(`sources_added`), `poll_interval`, `hidden_source_hosts`, the routing `routes`/`default`
+block and the risk `thresholds` — and the YAML owns everything else. A source the overlay adds is stored whole, may not
 share an id with one the YAML defines, must have a literal id, and may not point into a private
 network unless the YAML sets `allow_private_sources: true`. That last check is a guard rail
 against a mistake rather than an isolation boundary — the pass resolves the name again when it
@@ -158,6 +158,39 @@ Two upstreams reward configuration rather than credentials:
   each instead of 6 s, so a pass finishes sooner.
 - **Conditional GET.** RSS/Atom sources keep the publisher's `ETag`/`Last-Modified` in the state, so an
   unchanged feed answers `304` and costs one round trip instead of the whole document.
+
+### Risk thresholds
+
+The severity decision reads three numbers, from a `thresholds` block in `config.yml` or from
+the overlay (the block is merged key by key, so a saved number leaves the YAML's other two in
+force; an empty field on the form stops overriding that key):
+
+```yaml
+thresholds:
+  critical_cvss: 9.0        # 0 < x <= 10
+  critical_epss: 0.10       # 0 < x <= 1
+  suppress_below_cvss: 4.0  # 0 <= x <= critical_cvss
+```
+
+`critical_cvss` and `critical_epss` decide when a CVE is critical (with a remote,
+unauthenticated, no-interaction vector, or with EPSS); `suppress_below_cvss` is the floor
+below which a completely measured CVE is recorded and watched but never sent. The note a
+message carries names the configured bar, not a hardcoded one, and the validation refuses a
+non-number, a value outside its range, and a floor above the critical bar.
+
+Changing a threshold changes the rules, so it does not send the watch list out: every
+watched CVE records the numbers it was judged under, and the first evaluation after a change
+records the new verdict without telling anyone. The entry keeps the level the reader was told
+(`level`) apart from the level the numbers in force make of it (`judged`), so a KEV hit or a
+CISA active flag that arrives later still escalates against what was actually sent. State
+written before the feature carries no record and is judged by the defaults, which is what was
+in force then.
+
+`/thresholds`, linked from `/config`, previews one advisory against the live numbers: the
+level, the reason, the metrics line and note the message would carry, and the route and
+notifiers it would reach. The advisory's identifiers are an input, because a rule may match
+on them; without one and with such a rule configured, the page says the destination cannot be
+predicted instead of guessing. It is a read-only GET, so a link to it can be shared.
 
 ### Routing
 

@@ -14,6 +14,13 @@ state_path: /data/state.json
 # Request one at https://nvd.nist.gov/developers/request-an-api-key
 # nvd_api_key: ${NVD_API_KEY}
 
+# The severity thresholds. These are the defaults; /config edits them without a restart,
+# and GET /thresholds previews what one advisory would be judged as and where it would go.
+# thresholds:
+#   critical_cvss: 9.0        # 0 < x <= 10
+#   critical_epss: 0.10       # 0 < x <= 1
+#   suppress_below_cvss: 4.0  # 0 <= x <= critical_cvss
+
 sources:
   - id: nodejs-security
     type: rss

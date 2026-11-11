@@ -1,7 +1,7 @@
 """The settings overlay: a small JSON document applied over the YAML configuration.
 
 ``settings.json`` lives beside the state file (the writable volume), not beside the YAML
-(``/config`` is mounted read-only), and holds only the seven keys the UI may change. The
+(``/config`` is mounted read-only), and holds only the eight keys the UI may change. The
 overlay is merged into the YAML *before* ``config.load_config`` validates, so a value the
 YAML would refuse is refused with the same message.
 
@@ -38,7 +38,16 @@ SETTINGS_NAME = "settings.json"
 MAX_SETTINGS_BYTES = 64 * 1024
 #: The only keys the overlay may carry. Everything else stays in the YAML.
 OVERLAY_KEYS = frozenset(
-    {"notifiers", "sources", "sources_added", "poll_interval", "hidden_source_hosts", "routes", "default"}
+    {
+        "notifiers",
+        "sources",
+        "sources_added",
+        "poll_interval",
+        "hidden_source_hosts",
+        "routes",
+        "default",
+        "thresholds",
+    }
 )
 #: Notifier keys that carry a credential: only a whole-value environment reference is accepted. One owner:
 #: ``config`` lists them, and an id may not be composed from a variable that supplies one.
@@ -56,11 +65,11 @@ def is_reference(value: object) -> bool:
 def validate_settings(settings: object) -> dict:
     """Refuse an overlay the runtime could not apply, without repeating the config validator.
 
-    Only rules specific to the overlay live here: the seven-key allowlist, the reference-only secret
+    Only rules specific to the overlay live here: the eight-key allowlist, the reference-only secret
     rule, the two-key edit of a YAML source, and the shape of a complete source the overlay adds. Values
-    the YAML validator checks -- a poll interval, a hidden-host list, a notifier's keys and its ``enabled``
-    boolean, a source's remaining keys, a route's match keys and whether a selected notifier is enabled --
-    are merged and left to it, so both sources of truth fail with one message.
+    the YAML validator checks -- a poll interval, a hidden-host list, a threshold number, a notifier's keys
+    and its ``enabled`` boolean, a source's remaining keys, a route's match keys and whether a selected
+    notifier is enabled -- are merged and left to it, so both sources of truth fail with one message.
     """
     if not isinstance(settings, dict):
         raise ConfigError("settings: the overlay must be a mapping")
@@ -73,6 +82,10 @@ def validate_settings(settings: object) -> dict:
         raise ConfigError("settings: routes must be a list of {match, notifiers} rules")
     if "default" in settings and not isinstance(settings["default"], list):
         raise ConfigError("settings: default must be a list of notifier ids")
+    # The threshold numbers are judged by ``config._thresholds`` after the merge; here only the shape, so a
+    # saved block is never a mapping the merge would have to guess at.
+    if "thresholds" in settings and not isinstance(settings["thresholds"], dict):
+        raise ConfigError("settings: thresholds must be a mapping of threshold name to number")
     if "notifiers" in settings:
         entries = settings["notifiers"]
         if not isinstance(entries, list):
