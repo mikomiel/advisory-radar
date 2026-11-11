@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 
@@ -9,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from advisory_radar.http import RedactFilter
-from advisory_radar.notifiers import GotifyNotifier, MatrixWebhookNotifier, NtfyNotifier
+from advisory_radar.notifiers import GotifyNotifier, MatrixWebhookNotifier, NtfyNotifier, WebhookNotifier
 from advisory_radar.runtime import Runtime
 from advisory_radar.sources import ChangedetectionSource, WebhookSource, webhook_item_from_payload
 from advisory_radar.web import create_app
@@ -467,3 +469,167 @@ def test_a_webhook_guid_carrying_a_newline_is_released_and_sent_once(tmp_path):
         )
     assert not (load_state_document(cfg.state_path, core.STATE_SCHEMA, "state").get("webhook_inbox") or {}).get("wh")
     assert len(sent) == 1, "the same inbox entry must not be classified and sent on every pass"
+
+
+# --- the signed generic webhook ------------------------------------------------------------------
+
+
+def webhook_payload(entry: dict) -> dict:
+    """What ``WebhookNotifier`` posts, spelled out so a test can pin the exact body."""
+    return {
+        "title": entry["title"],
+        "body": entry["body"],
+        "tag": entry["tag"],
+        "kind": entry["kind"],
+        "ids": entry["ids"],
+        "link": entry.get("link", ""),
+        "source": entry.get("source", ""),
+    }
+
+
+def webhook_entry() -> dict:
+    return {
+        "title": "CRITICAL: fixed — 修正",
+        "body": "\n- **Severity:** CVSS 9.8",
+        "tag": "critical",
+        "kind": "new",
+        "ids": ["CVE-2026-1"],
+        "link": "https://v.example/a",
+        "source": "vendor.example",
+    }
+
+
+def recording_http(calls: list):
+    def http(method, url, headers, body):
+        calls.append((method, url, dict(headers), body))
+        return 204, {}, b""
+
+    return http
+
+
+def test_a_signed_webhook_verifies_over_the_exact_posted_bytes():
+    calls: list = []
+    notifier = WebhookNotifier(
+        "w", "https://hooks.example/x", {"X-Custom": "1"}, secret="s3cret", clock=lambda: 1_700_000_000.9
+    )
+    entry = webhook_entry()
+    assert notifier.send(entry, recording_http(calls)) == 204
+    method, url, headers, body = calls[0]
+    assert (method, url) == ("POST", "https://hooks.example/x")
+    assert headers["Content-Type"] == "application/json" and headers["X-Custom"] == "1"
+    assert headers["X-ADR-Timestamp"] == "1700000000", "the header is the clock's whole seconds"
+    # Recompute exactly as the module docstring tells a receiver to: over the bytes that were posted.
+    expected = "sha256=" + hmac.new(b"s3cret", b"1700000000." + body, hashlib.sha256).hexdigest()
+    assert hmac.compare_digest(headers["X-ADR-Signature"], expected)
+    assert json.loads(body) == webhook_payload(entry)
+    assert body == json.dumps(webhook_payload(entry)).encode(), "the signed bytes are the posted bytes"
+
+
+def test_a_wrong_secret_fails_verification():
+    entry = webhook_entry()
+    signatures = []
+    for secret in ("right-secret", "wrong-secret"):
+        calls: list = []
+        notifier = WebhookNotifier("w", "https://hooks.example/x", secret=secret, clock=lambda: 1_700_000_000.0)
+        assert notifier.send(entry, recording_http(calls)) == 204
+        signatures.append(calls[0][2])
+    body = calls[0][3]
+    right, wrong = signatures
+    assert right["X-ADR-Signature"] != wrong["X-ADR-Signature"]
+    assert hmac.compare_digest(
+        right["X-ADR-Signature"],
+        "sha256=" + hmac.new(b"right-secret", b"1700000000." + body, hashlib.sha256).hexdigest(),
+    )
+    assert not hmac.compare_digest(
+        right["X-ADR-Signature"],
+        "sha256=" + hmac.new(b"wrong-secret", b"1700000000." + body, hashlib.sha256).hexdigest(),
+    )
+
+
+def test_without_a_secret_the_request_is_unchanged():
+    calls: list = []
+    entry = webhook_entry()
+    notifier = WebhookNotifier("w", "https://hooks.example/x", {"X-Custom": "1"})
+    assert notifier.send(entry, recording_http(calls)) == 204
+    _, url, headers, body = calls[0]
+    assert url == "https://hooks.example/x"
+    assert headers == {"Content-Type": "application/json", "X-Custom": "1"}
+    assert body == json.dumps(webhook_payload(entry)).encode(), "no secret, the same bytes as before signing"
+
+
+def test_the_signed_body_is_serialised_once(monkeypatch):
+    """A second serialisation would be signed, and the receiver's bytes would not match it."""
+    from advisory_radar import notifiers as notifier_module
+
+    calls: list = []
+    real_dumps = json.dumps
+    serialisations = iter(range(100))
+
+    def shifting_dumps(payload):
+        # Each call yields different bytes, so a signature taken over a re-serialisation cannot match the body.
+        return real_dumps(payload) + " " * next(serialisations)
+
+    monkeypatch.setattr(notifier_module.json, "dumps", shifting_dumps)
+    entry = webhook_entry()
+    notifier = WebhookNotifier("w", "https://hooks.example/x", secret="s3cret", clock=lambda: 1_700_000_000.0)
+    assert notifier.send(entry, recording_http(calls)) == 204
+    headers, body = calls[0][2], calls[0][3]
+    expected = "sha256=" + hmac.new(b"s3cret", b"1700000000." + body, hashlib.sha256).hexdigest()
+    assert hmac.compare_digest(headers["X-ADR-Signature"], expected)
+    assert json.loads(body) == webhook_payload(entry)
+
+
+def test_a_configured_header_cannot_spoof_the_signature():
+    calls: list = []
+    notifier = WebhookNotifier(
+        "w",
+        "https://hooks.example/x",
+        {"X-ADR-Signature": "sha256=spoofed", "x-adr-timestamp": "1"},
+        secret="s3cret",
+        clock=lambda: 1_700_000_000.0,
+    )
+    assert notifier.send(webhook_entry(), recording_http(calls)) == 204
+    headers = calls[0][2]
+    names = [name.lower() for name in headers]
+    assert names.count("x-adr-signature") == 1 and names.count("x-adr-timestamp") == 1
+    assert headers["X-ADR-Timestamp"] == "1700000000"
+    assert headers["X-ADR-Signature"] != "sha256=spoofed"
+
+
+def test_the_webhook_builder_carries_the_secret():
+    from advisory_radar.notifiers import build_notifier
+
+    notifier = build_notifier({"id": "w", "type": "webhook", "url": "https://hooks.example/x", "secret": "s3cret"}, {})
+    assert isinstance(notifier, WebhookNotifier)
+    assert notifier.secret == "s3cret"
+
+
+def test_a_webhook_signing_secret_reaches_the_built_notifier(tmp_path):
+    """The YAML key, the builder and the signature are one path.
+
+    A secret that never reaches the notifier would sign nothing, so the test goes through the real builder.
+    """
+    from advisory_radar.config import load_config
+    from advisory_radar.pipeline import build_plugins
+
+    path = tmp_path / "c.yml"
+    path.write_text(
+        "sources: []\n"
+        "notifiers:\n"
+        "  - id: hooks\n"
+        "    type: webhook\n"
+        "    url: ${HOOK}\n"
+        "    secret: ${SIGNING}\n"
+        f"state_path: {tmp_path}/state.json\n"
+    )
+    environment = {"HOOK": "https://hooks.example.net/x", "SIGNING": "s3cret-value"}
+    _, notifiers = build_plugins(load_config(path, environment), environment)
+    notifier = notifiers[0]
+    assert notifier.secret == "s3cret-value"
+    calls: list = []
+    assert notifier.send(webhook_entry(), recording_http(calls)) == 204
+    _, url, headers, body = calls[0]
+    assert url == "https://hooks.example.net/x"
+    timestamp = headers["X-ADR-Timestamp"].encode("ascii")
+    expected = "sha256=" + hmac.new(b"s3cret-value", timestamp + b"." + body, hashlib.sha256).hexdigest()
+    assert hmac.compare_digest(headers["X-ADR-Signature"], expected)

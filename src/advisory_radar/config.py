@@ -20,6 +20,7 @@ from pathlib import Path
 import yaml
 
 from .catalogue import SOURCE_SPECS
+from .delivery import QuietHours, parse_quiet_hours
 from .routing import MATCH_KEYS, SEVERITY_TAGS
 from .storage import Store, store_for
 
@@ -190,6 +191,12 @@ class Config:
     #: Per-source blocks resolved at load time, keyed by source id. Empty for a configuration that states no
     #: override, so the global block judges every message exactly as before this key existed.
     source_thresholds: Mapping[str, Thresholds] = field(default_factory=dict)
+    #: Whether the advisories a pass delivers to one routing group travel as one digest message. Off by
+    #: default, so an installation that never enables it sends exactly the messages it sent before.
+    digest: bool = False
+    #: The local-time window in which non-critical messages wait in the queue; ``None`` is no window. Held
+    #: entries stay pending and are released after the window ends, never counted as a failed attempt.
+    quiet_hours: QuietHours | None = None
     #: Ordered routing rules, first match wins. Empty means every message goes to every enabled notifier,
     #: exactly as it did before routing existed.
     routes: tuple[dict, ...] = ()
@@ -227,14 +234,16 @@ _SOURCE_KEYS = {"id", "type", "enabled", "thresholds", "interval"} | {
     key for spec in SOURCE_SPECS.values() for key in (*spec.required, *spec.optional)
 }
 #: The notifier keys whose value is a credential: the overlay accepts only a reference for them, and an id may
-#: not be composed from a variable that supplies one.
-NOTIFIER_SECRET_KEYS = ("url", "key", "password", "token")
+#: not be composed from a variable that supplies one. ``secret`` signs a generic webhook's requests; the other
+#: four authenticate the channel itself.
+NOTIFIER_SECRET_KEYS = ("url", "key", "password", "token", "secret")
 _NOTIFIER_KEYS = {
     "id",
     "type",
     "url",
     "key",
     "password",
+    "secret",
     "headers",
     "enabled",
     # gotify / smtp / ntfy fields
@@ -264,6 +273,8 @@ _TOP_KEYS = {
     "web",
     "allow_private_sources",
     "thresholds",
+    "digest",
+    "quiet_hours",
 }
 #: The keys a routing rule itself may carry; the match keys and the tag set are ``routing.py``'s.
 _ROUTE_KEYS = frozenset({"match", "notifiers"})
@@ -405,24 +416,27 @@ def load_document(path: Path, *, settings: dict | None = None) -> dict:
 
 
 def _merge_settings(document: dict, settings: dict) -> None:
-    """Overlay the eight writable keys onto the raw YAML document, in place."""
+    """Overlay the ten writable keys onto the raw YAML document, in place."""
     from .settings import validate_settings  # lazy: settings.py imports ConfigError from this module
 
     validate_settings(settings)
     if "notifiers" in settings:
-        # A full replacement is how a notifier is added, edited or disabled from the overlay. ``headers`` is
-        # the one field the overlay may not store (a mapping can carry a credential), so it stays in the YAML
-        # and is carried over by id: editing enablement must not silently drop authentication headers.
-        headers_by_id = {
-            entry.get("id"): entry["headers"]
+        # A full replacement is how a notifier is added, edited or disabled from the overlay. ``headers`` is a
+        # mapping the overlay may not store at all, and a signing ``secret`` is a credential the overlay may
+        # store only as a reference. Either can stay in the YAML, so both are carried over by id: editing
+        # enablement or an ordinary field must not silently drop authentication headers or unsign a webhook.
+        carried_keys = ("headers", "secret")
+        carried_by_id = {
+            entry["id"]: {key: entry[key] for key in carried_keys if key in entry}
             for entry in (document.get("notifiers") or [])
-            if isinstance(entry, dict) and "headers" in entry
+            if isinstance(entry, dict) and isinstance(entry.get("id"), str)
         }
         merged = []
         for entry in settings["notifiers"]:
             entry = dict(entry) if isinstance(entry, dict) else entry
-            if isinstance(entry, dict) and "headers" not in entry and entry.get("id") in headers_by_id:
-                entry["headers"] = headers_by_id[entry["id"]]
+            if isinstance(entry, dict):
+                for key, value in (carried_by_id.get(entry.get("id")) or {}).items():
+                    entry.setdefault(key, value)
             merged.append(entry)
         document["notifiers"] = merged
     if "sources" in settings:
@@ -433,6 +447,12 @@ def _merge_settings(document: dict, settings: dict) -> None:
         document["poll_interval"] = settings["poll_interval"]
     if "hidden_source_hosts" in settings:
         document["hidden_source_hosts"] = settings["hidden_source_hosts"]
+    if "digest" in settings:
+        # A plain replacement: the form renders the saved policy, so an unticked box must turn a YAML digest off.
+        document["digest"] = settings["digest"]
+    if "quiet_hours" in settings:
+        # An empty string is the form's "off" and overrides a YAML window too; the parser reads it as no window.
+        document["quiet_hours"] = settings["quiet_hours"]
     if "routes" in settings:
         # A full replacement, like the notifier list: the rules are edited as one ordered block, and the
         # merged validator then judges their shape and whether every id names an enabled notifier.
@@ -700,6 +720,19 @@ def config_from_document(
     poll = document.get("poll_interval", "15m")
     seconds = _interval_seconds(poll, "poll_interval")
 
+    # Delivery policy. ``digest`` accepts the documented boolean spellings after expansion, like every other
+    # switch. ``quiet_hours`` is written as the window itself; an empty or absent value is no window, and the
+    # parser refuses everything else with a message naming the form and never repeating the value -- it can be
+    # a ${NAME} reference that expanded to a credential, and this message is logged before redaction exists.
+    digest = _bool_option(document.get("digest", False), "digest")
+    raw_quiet_hours = document.get("quiet_hours")
+    quiet_hours: QuietHours | None = None
+    if raw_quiet_hours is not None and raw_quiet_hours != "":
+        try:
+            quiet_hours = parse_quiet_hours(raw_quiet_hours)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+
     web = document.get("web") or {}
     _require(isinstance(web, dict), "web must be a mapping")
     _require(
@@ -758,6 +791,8 @@ def config_from_document(
         nvd_api_key=raw_nvd_key.strip(),
         thresholds=thresholds,
         source_thresholds=source_thresholds,
+        digest=digest,
+        quiet_hours=quiet_hours,
         routes=routes,
         default_notifiers=default_notifiers,
         web_host=web_host,

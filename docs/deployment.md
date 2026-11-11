@@ -152,9 +152,10 @@ quadlet). It is created with mode `0600`, owned by the container user, and repla
 atomically (a temporary file in the same directory, `fsync`, `os.replace`), so a
 half-written file cannot brick a start. It is not part of the state document, whichever
 store holds that. `/config` stays read-only: the overlay holds
-only eight keys — `notifiers`, per-source `enabled`/`tag`/`thresholds`/`interval`, the sources it
+only ten keys — `notifiers`, per-source `enabled`/`tag`/`thresholds`/`interval`, the sources it
 adds itself (`sources_added`), `poll_interval`, `hidden_source_hosts`, the routing
-`routes`/`default` block and the risk `thresholds` — and the YAML owns everything else. A source the overlay adds is stored whole, may not
+`routes`/`default` block, the risk `thresholds`, the delivery `digest` switch and the
+`quiet_hours` window — and the YAML owns everything else. A source the overlay adds is stored whole, may not
 share an id with one the YAML defines, must have a literal id, and may not point into a private
 network unless the YAML sets `allow_private_sources: true`. That last check is a guard rail
 against a mistake rather than an isolation boundary — the pass resolves the name again when it
@@ -186,7 +187,7 @@ configuration it was rendered from, so a save from a page that has not seen a ne
 configuration — another save, a YAML edit, or an overlay deleted and recreated — is
 refused (`409`) rather than overwriting it. The notifier form rewrites the whole list, so
 every existing notifier must already use `${NAME}`/`${NAME_FILE}` references for `url`,
-`key`, `password` and `token`; a literal secret in the YAML is refused with an error
+`key`, `password`, `secret` and `token`; a literal secret in the YAML is refused with an error
 naming that notifier, and has to be moved to the environment first. Pending and parked messages are not touched by a
 reload. A reload re-reads the YAML and the overlay, so an edit to `config.yml` is picked
 up too; `web.host`, `web.port`, `state_path` and `storage` are refused rather than reported as
@@ -281,6 +282,38 @@ to every enabled notifier. Delivery records on the message which channels alread
 a retry re-sends the message only to the channels that have not had it — the failed channel is retried, the
 others are not repeated. The README's [Routing](../README.md#routing) section lists the match keys and an
 example.
+
+### Delivery policy and signed webhooks
+
+Two YAML keys, both editable on `/config`, decide how a pass sends what it queued. `digest: true`
+sends one message per routing group instead of one per advisory: the title states the count, the
+body lists one advisory per line (title plus up to three short identifiers), the tag is
+`critical` when any covered advisory is, and the message is capped at 20 lines and at the
+character budget one Discord message accepts. Anything beyond either cap is counted in a final
+`(+N more not listed)` line. Entries are grouped by the notifiers `routing.select` chooses, so
+a digest never mixes channels. A digest is posted once per destination, so a failed attempt
+counts once against every covered advisory, and delivery records each of them separately; a
+destination that already accepted an advisory is not sent it again, and a rebuilt digest carries
+only the advisories that destination still needs.
+
+`quiet_hours: "22:00-07:00"` is a local-time window, wrapping midnight and half-open (07:00 is
+outside it) during which **non-critical** messages wait in `pending`; they are not failed
+attempts and go out after the window. A critical message is never held, and a held message does
+not take one of the pass's delivery slots, so a queue of them cannot delay a critical advisory
+behind it. An empty value turns
+the window off, and `00:00-00:00` is an empty window. The window is read in the process's local
+timezone, which is UTC in the container unless `TZ` is set. Both keys are overlay-writable.
+
+A generic `webhook` notifier may carry `secret: ${WEBHOOK_SIGNING_SECRET}`. With one set, each
+request carries `X-ADR-Timestamp` (Unix seconds, the integer part of the clock) and
+`X-ADR-Signature`: `sha256=` followed by the lowercase hex HMAC-SHA256 of
+`timestamp + "." + body`, keyed with the secret and computed over the exact bytes posted. A
+receiver verifies a request by refusing a timestamp more than 300 seconds from its own clock,
+reading the raw body bytes, recomputing
+`hmac.new(secret.encode("utf-8"), timestamp.encode("ascii") + b"." + body, hashlib.sha256).hexdigest()`
+and comparing the two with `hmac.compare_digest`. With no secret, neither header is sent and
+the request is unchanged. The overlay stores the secret only as a reference, and a `secret`
+written in the YAML is carried over by id when the notifier form rewrites the list.
 
 ### Lists, the advisory page and screenshots
 

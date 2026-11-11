@@ -426,6 +426,8 @@ def _run_pass(
             persist=lambda: store.save(state),
             routes=cfg.routes,
             default=cfg.default_notifiers,
+            digest=cfg.digest,
+            quiet_hours=cfg.quiet_hours,
         )
     store.save(state)
     newly_parked = len(state["parked"]) - parked_before

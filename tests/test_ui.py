@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 
 from advisory_radar import core
 from advisory_radar.config import ConfigError, load_config
+from advisory_radar.delivery import QuietHours
 from advisory_radar.http import RedactFilter
 from advisory_radar.runtime import Runtime
 from advisory_radar.settings import load_settings, settings_path
@@ -728,6 +729,141 @@ def test_a_route_reference_round_trips_through_the_form(tmp_path):
     assert saved.status_code == 303
     overlay = load_settings(settings_path(runtime.cfg.state_path))
     assert overlay["routes"] == [{"match": {"source": "nodejs", "tag": "${ROUTE_TAG}"}, "notifiers": ["phone"]}]
+
+
+# --- the delivery policy and a signed-webhook secret in the forms ------------------------------
+
+
+def test_digest_and_quiet_hours_round_trip_through_the_settings_form(tmp_path):
+    client, token, runtime = make_client(tmp_path, body="sources: []\nnotifiers: []\n")
+    csrf, fingerprint = config_form(client, token)
+    page = client.get("/config").text
+    assert "name='digest'" in page and "name='quiet_hours'" in page
+    saved = client.post(
+        "/config/settings",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "poll_interval": "15m",
+            "hidden_source_hosts": "",
+            "digest": "1",
+            "quiet_hours": "22:00-07:00",
+        },
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303, saved.text
+    overlay = load_settings(settings_path(runtime.cfg.state_path))
+    assert overlay["digest"] is True and overlay["quiet_hours"] == "22:00-07:00"
+    assert runtime.cfg.digest is True
+    assert runtime.cfg.quiet_hours == QuietHours(22 * 60, 7 * 60)
+    rendered = client.get("/config").text
+    assert "name='digest' value='1' checked" in rendered
+    assert "name='quiet_hours' value='22:00-07:00'" in rendered
+
+    # Unticking the box and emptying the field turns both off, overriding the values the overlay holds.
+    csrf, fingerprint = config_form(client, token)
+    cleared = client.post(
+        "/config/settings",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "poll_interval": "15m",
+            "hidden_source_hosts": "",
+            "quiet_hours": "",
+        },
+        follow_redirects=False,
+    )
+    assert cleared.status_code == 303, cleared.text
+    assert runtime.cfg.digest is False and runtime.cfg.quiet_hours is None
+    assert load_settings(settings_path(runtime.cfg.state_path))["quiet_hours"] == ""
+
+
+def test_a_bad_quiet_hours_window_is_refused_by_the_form_without_echoing_it(tmp_path):
+    client, token, runtime = make_client(tmp_path, body="sources: []\nnotifiers: []\n")
+    csrf, fingerprint = config_form(client, token)
+    response = client.post(
+        "/config/settings",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "poll_interval": "15m",
+            "hidden_source_hosts": "",
+            "quiet_hours": "night-shift",
+        },
+    )
+    assert response.status_code == 400
+    assert "22:00-07:00" in response.text
+    assert "night-shift" not in response.text
+    assert not settings_path(runtime.cfg.state_path).exists(), "a refused window writes nothing"
+
+
+def test_a_yaml_webhook_secret_survives_a_notifier_form_save(tmp_path):
+    body = "sources: []\nnotifiers:\n  - id: hooks\n    type: webhook\n    url: ${HOOK}\n    secret: ${SIGNING}\n"
+    environment = {"HOOK": "https://hooks.example.net/x", "SIGNING": "s3cret-value"}
+    client, token, runtime = make_client(tmp_path, body=body, environment=environment)
+    assert runtime.notifiers[0].secret == "s3cret-value"
+    csrf, fingerprint = config_form(client, token)
+    page = client.get("/config").text
+    assert "name='field:hooks:secret'" in page, "the secret can be edited as a reference"
+    assert "value='${SIGNING}'" in page
+    assert "s3cret-value" not in page, "the credential value never reaches the page"
+    # A submission without the secret field (an older page, a partial POST) must not unsign the webhook.
+    saved = client.post(
+        "/config/notifiers",
+        data={"csrf": csrf, "fingerprint": fingerprint, "enabled:hooks": "1"},
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303, saved.text
+    assert "secret" not in load_settings(settings_path(runtime.cfg.state_path))["notifiers"][0], (
+        "the credential stays in the YAML and is carried over by id"
+    )
+    assert runtime.cfg.notifiers[0]["secret"] == "s3cret-value"
+    assert runtime.notifiers[0].secret == "s3cret-value"
+    assert "s3cret-value" not in settings_path(runtime.cfg.state_path).read_text()
+
+
+def test_a_new_webhook_secret_is_entered_and_stored_as_a_reference(tmp_path):
+    environment = {"HOOK": "https://hooks.example.net/x", "SIGNING": "s3cret-value"}
+    client, token, runtime = make_client(tmp_path, body="sources: []\nnotifiers: []\n", environment=environment)
+    csrf, fingerprint = config_form(client, token)
+    saved = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "new:id": "hooks",
+            "new:type": "webhook",
+            "new:reference": "${HOOK}",
+            "new:secret": "${SIGNING}",
+        },
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303, saved.text
+    overlay = load_settings(settings_path(runtime.cfg.state_path))
+    assert overlay["notifiers"][0]["secret"] == "${SIGNING}"
+    assert runtime.notifiers[0].secret == "s3cret-value"
+    assert "s3cret-value" not in settings_path(runtime.cfg.state_path).read_text()
+
+
+def test_a_literal_webhook_secret_is_refused_by_the_form(tmp_path):
+    environment = {"HOOK": "https://hooks.example.net/x"}
+    client, token, runtime = make_client(tmp_path, body="sources: []\nnotifiers: []\n", environment=environment)
+    csrf, fingerprint = config_form(client, token)
+    response = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "new:id": "hooks",
+            "new:type": "webhook",
+            "new:reference": "${HOOK}",
+            "new:secret": "s3cret-value",
+        },
+    )
+    assert response.status_code == 400
+    assert "reference" in response.text
+    assert "s3cret-value" not in response.text
+    assert not settings_path(runtime.cfg.state_path).exists()
 
 
 # --- /advisories/{identifier} ------------------------------------------------------------------

@@ -18,7 +18,7 @@ import time
 import pytest
 import yaml
 
-from advisory_radar import cli, config, core, pipeline
+from advisory_radar import cli, config, core, delivery, pipeline
 from advisory_radar.config import ConfigError, load_config
 from advisory_radar.http import RedactFilter
 from advisory_radar.runtime import Runtime
@@ -884,3 +884,62 @@ def test_a_per_source_edit_still_refuses_a_key_outside_enabled_tag_and_interval(
     )
     with pytest.raises(ConfigError, match="unknown keys"):
         load_config(path, {}, settings={"sources": {"edit": {"url": "https://elsewhere.example.net/x"}}})
+
+
+# --- the delivery policy and the signed-webhook secret -----------------------------------------
+
+
+def test_digest_and_quiet_hours_are_overlay_writable(tmp_path):
+    path = write_config(tmp_path, {})
+    cfg = load_config(path, {}, settings={"digest": True, "quiet_hours": "22:00-07:00"})
+    assert cfg.digest is True
+    assert cfg.quiet_hours == delivery.QuietHours(22 * 60, 7 * 60)
+    # The form stores the fields even when cleared, so an unticked box and an empty window override the YAML.
+    off = load_config(path, {}, settings={"digest": False, "quiet_hours": ""})
+    assert off.digest is False and off.quiet_hours is None
+
+
+def test_the_yaml_can_set_the_delivery_policy(tmp_path):
+    cfg = load_config(write_config(tmp_path, {"digest": True, "quiet_hours": "22:00-07:00"}), {})
+    assert cfg.digest is True and cfg.quiet_hours == delivery.QuietHours(22 * 60, 7 * 60)
+    assert load_config(write_config(tmp_path, {"digest": False, "quiet_hours": ""}), {}).quiet_hours is None
+
+
+def test_a_bad_quiet_hours_window_is_refused_without_echoing_it(tmp_path):
+    for bad, echo in (("night-shift", "night-shift"), ("24:00-07:00", "24:00"), (2200, "2200")):
+        path = write_config(tmp_path, {})
+        with pytest.raises(ConfigError) as caught:
+            load_config(path, {}, settings={"quiet_hours": bad})
+        assert "22:00-07:00" in str(caught.value), bad
+        assert echo not in str(caught.value), f"the refusal repeated the value: {caught.value}"
+
+
+def test_a_notifier_secret_in_the_overlay_must_be_a_reference(tmp_path):
+    path = write_config(tmp_path, {})
+    with pytest.raises(ConfigError) as caught:
+        load_config(
+            path,
+            {},
+            settings={
+                "notifiers": [{"id": "hook", "type": "webhook", "url": "${HOOK}", "secret": "s3cret-literal-value"}]
+            },
+        )
+    assert "secret" in str(caught.value) and "reference" in str(caught.value)
+    assert "s3cret-literal-value" not in str(caught.value)
+
+
+def test_a_yaml_notifier_secret_survives_an_overlay_notifier_save(tmp_path):
+    path = write_config(
+        tmp_path,
+        {"notifiers": [{"id": "hook", "type": "webhook", "url": "${HOOK}", "secret": "${SIGNING}"}]},
+    )
+    environment = {"HOOK": "https://hooks.example.net/x", "SIGNING": "s3cret"}
+    # The notifier form rewrites the list; the entry it submits carries only the fields the form edits.
+    overlay = {"notifiers": [{"id": "hook", "type": "webhook", "url": "${HOOK}"}]}
+    document = config.load_document(path, settings=overlay)
+    assert document["notifiers"][0]["secret"] == "${SIGNING}", "the overlay entry inherits the YAML secret by id"
+    cfg = load_config(path, environment, settings=overlay)
+    assert cfg.notifiers[0]["secret"] == "s3cret", "the builder still sees the signing secret"
+    # A reference the overlay states itself wins over the file's, exactly as every other overlay value does.
+    own = {"notifiers": [{"id": "hook", "type": "webhook", "url": "${HOOK}", "secret": "${OTHER}"}]}
+    assert load_config(path, {**environment, "OTHER": "other"}, settings=own).notifiers[0]["secret"] == "other"

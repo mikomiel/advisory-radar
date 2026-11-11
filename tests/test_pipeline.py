@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from advisory_radar import core, pipeline, storage
-from advisory_radar.config import ConfigError, load_config
+from advisory_radar.config import Config, ConfigError, load_config
 from advisory_radar.plugins import SourceWindow
 from advisory_radar.sources import RssSource, WebhookSource
 from advisory_radar.state import save_state
@@ -720,6 +720,40 @@ def _webhook_config(tmp_path: Path, watchlist: dict | None = None):
     return load_config(path, {})
 
 
+# --- delivery policy wired from the configuration ----------------------------------------------
+
+
+def queued_message(cve: str, tag: str = "warning") -> dict:
+    """A queue entry shaped like ``core.classify_new`` writes it, complete enough for ``_delivered``."""
+    return {
+        "kind": "new",
+        "tag": tag,
+        "title": f"{tag.upper()}: {cve} in widget",
+        "body": f"\n- **IDs:** {cve}",
+        "ids": [cve],
+        "cves": [cve],
+        "levels": {cve: tag},
+        "kev_only": [],
+        "scores": {cve: 7.5},
+        "thresholds": [9.0, 0.10, 4.0],
+        "source": "Vendor",
+        "source_id": "vendor",
+        "link": f"https://vendor.example/{cve}",
+    }
+
+
+def pending_config(tmp_path: Path, extra: str = "") -> Config:
+    """A configuration with no sources and one webhook notifier, so a pass only delivers the queue."""
+    path = tmp_path / "delivery.yml"
+    path.write_text(
+        "sources: []\n"
+        "notifiers:\n  - id: fake\n    type: webhook\n    url: https://hooks.example.com/x\n"
+        f"{extra}"
+        f"state_path: {tmp_path}/state.json\n"
+    )
+    return load_config(path, {})
+
+
 def test_two_carried_advisories_with_unusable_guids_both_survive(tmp_path):
     """Two raw carried identities stay distinct; a stand-in was only needed because normalising erased them."""
     make_policy(tmp_path)
@@ -847,3 +881,48 @@ def test_two_webhook_guids_that_differ_only_by_a_control_character_both_arrive(t
     stored = json.loads((tmp_path / "state.json").read_text())
     assert {"src:wh:wh:a\x7fb", "src:wh:wh:ab"} <= set(stored["seen"])
     assert not (stored.get("webhook_inbox") or {}).get("wh"), "both accepted entries must leave the inbox"
+
+
+def local_epoch(hour: int, minute: int = 0) -> int:
+    """An epoch whose *local* wall clock is this time, which is what a quiet-hours window reads."""
+    import datetime
+
+    return int(datetime.datetime(2026, 11, 11, hour, minute).timestamp())
+
+
+def test_a_pass_delivers_three_queued_advisories_as_one_digest(tmp_path):
+    cfg = pending_config(tmp_path, "digest: true\n")
+    state = core.new_state()
+    state["pending"] = [queued_message(f"CVE-2026-{number}") for number in (1, 2, 3)]
+    cfg.store().save(state)
+    notifier = FakeNotifier(200)
+    code = pipeline.run_pass(
+        cfg, [], [notifier], http=fake_http, clock=lambda: 1792600000.0, sleep=lambda seconds: None
+    )
+    assert code == 0
+    assert len(notifier.sent) == 1, "one POST for the pass"
+    assert notifier.sent[0]["kind"] == "digest"
+    assert notifier.sent[0]["title"] == "WARNING: digest of 3 advisories"
+    stored = cfg.store().load()
+    assert stored["pending"] == []
+    assert set(stored["seen"]) == {"CVE-2026-1", "CVE-2026-2", "CVE-2026-3"}
+    assert all(record["outcome"] == "delivered" for record in stored["seen"].values())
+
+
+def test_a_pass_honours_the_quiet_hours_policy(tmp_path):
+    cfg = pending_config(tmp_path, "quiet_hours: 22:00-07:00\n")
+    assert cfg.quiet_hours is not None
+    state = core.new_state()
+    state["pending"] = [queued_message("CVE-2026-1"), queued_message("CVE-2026-2", "critical")]
+    cfg.store().save(state)
+    notifier = FakeNotifier(200)
+
+    night = float(local_epoch(23))
+    assert pipeline.run_pass(cfg, [], [notifier], http=fake_http, clock=lambda: night, sleep=lambda s: None) == 0
+    assert [message["tag"] for message in notifier.sent] == ["critical"]
+    assert [entry["ids"][0] for entry in cfg.store().load()["pending"]] == ["CVE-2026-1"]
+
+    day = float(local_epoch(12))
+    assert pipeline.run_pass(cfg, [], [notifier], http=fake_http, clock=lambda: day, sleep=lambda s: None) == 0
+    assert [message["tag"] for message in notifier.sent] == ["critical", "warning"]
+    assert cfg.store().load()["pending"] == []

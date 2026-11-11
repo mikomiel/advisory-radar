@@ -917,6 +917,9 @@ def test_a_saved_but_unapplied_setting_is_not_reported_live(tmp_path):
     assert load_settings(settings_path(runtime.cfg.state_path)) == {
         "poll_interval": "30s",
         "hidden_source_hosts": [],
+        # The settings form carries the delivery policy too, and an omitted field is its off state.
+        "digest": False,
+        "quiet_hours": "",
     }
     page = client.get("/config?saved=1").text
     assert "not live yet" in page
@@ -1003,6 +1006,9 @@ def test_an_unavailable_store_refuses_a_reload_and_explains_a_settings_save(tmp_
     assert load_settings(settings_path(runtime.cfg.state_path)) == {
         "poll_interval": "30s",
         "hidden_source_hosts": [],
+        # The settings form carries the delivery policy too, and an omitted field is its off state.
+        "digest": False,
+        "quiet_hours": "",
     }
     assert "saved but not applied" in caplog.text
     assert "psycopg" in caplog.text

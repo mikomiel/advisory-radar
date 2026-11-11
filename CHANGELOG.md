@@ -8,6 +8,27 @@ operator action, and the release workflow then builds and pushes the image to
 ## [Unreleased]
 
 ### Added
+- Delivery can be scheduled instead of sent one advisory at a time. `digest: true` posts one
+  message per routing group, because entries that reach different channels cannot share one:
+  the title states the count, the body lists one advisory per line (title plus up to three
+  short identifiers), the tag is `critical` when any covered entry is, and the message is
+  capped at 20 lines and at the budget one Discord message accepts, with the rest counted in a
+  final `(+N more not listed)` line. A digest is posted once per destination, so a failed attempt
+  counts once against every covered advisory, and success is recorded for each of them; a
+  destination that already accepted an advisory is not sent it again, and a rebuilt digest carries
+  only the advisories it still needs.
+- `quiet_hours: "22:00-07:00"` holds non-critical messages in the queue until a local-time
+  window ends; a critical message is never held, and held entries take none of the pass's delivery
+  slots. Held entries are not failed attempts, and an
+  empty value (or `00:00-00:00`) means off. Both delivery keys are overlay-writable and appear
+  in the `/config` Settings form, and with both off delivery is the message-by-message loop it
+  was before.
+- A generic `webhook` notifier can carry a signing `secret` (a `${NAME}`/`${NAME_FILE}`
+  reference): every request adds `X-ADR-Timestamp` and `X-ADR-Signature`, the lowercase hex
+  HMAC-SHA256 of `timestamp + "." + body` over the exact posted bytes. The module documents the
+  receiver's recipe, including `hmac.compare_digest` and a 300-second replay tolerance. A YAML
+  secret survives a notifier-form save by id, the overlay stores it only as a reference, and
+  with no secret the request is byte-for-byte unchanged.
 - A `storage:` key moves the state document without changing its model: empty (the default)
   is the JSON file at `state_path`, `sqlite:///` is one SQLite file on the volume (WAL,
   `synchronous=FULL`, mode `0600`, with its lock in a sidecar database so a pass can save

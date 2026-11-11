@@ -1,7 +1,7 @@
 """The settings overlay: a small JSON document applied over the YAML configuration.
 
 ``settings.json`` lives beside the state file (the writable volume), not beside the YAML
-(``/config`` is mounted read-only), and holds only the eight keys the UI may change. The
+(``/config`` is mounted read-only), and holds only the ten keys the UI may change. The
 overlay is merged into the YAML *before* ``config.load_config`` validates, so a value the
 YAML would refuse is refused with the same message.
 
@@ -47,6 +47,8 @@ OVERLAY_KEYS = frozenset(
         "routes",
         "default",
         "thresholds",
+        "digest",
+        "quiet_hours",
     }
 )
 #: Notifier keys that carry a credential: only a whole-value environment reference is accepted. One owner:
@@ -65,12 +67,12 @@ def is_reference(value: object) -> bool:
 def validate_settings(settings: object) -> dict:
     """Refuse an overlay the runtime could not apply, without repeating the config validator.
 
-    Only rules specific to the overlay live here: the eight-key allowlist, the reference-only secret
+    Only rules specific to the overlay live here: the ten-key allowlist, the reference-only secret
     rule, the shape of a YAML source's ``enabled``/``tag``/``thresholds``/``interval`` edit, and the shape of
     a complete source the overlay adds. Values the YAML validator checks -- a poll interval, a per-source
     interval, a hidden-host list, a threshold number, a notifier's keys and its ``enabled`` boolean, a
-    source's remaining keys, a route's match keys and whether a selected notifier is enabled -- are merged
-    and left to it, so both sources of truth fail with one message.
+    source's remaining keys, a route's match keys, whether a selected notifier is enabled, and the delivery
+    policy -- are merged and left to it, so both sources of truth fail with one message.
     """
     if not isinstance(settings, dict):
         raise ConfigError("settings: the overlay must be a mapping")

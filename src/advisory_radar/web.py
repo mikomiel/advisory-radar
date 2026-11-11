@@ -809,6 +809,10 @@ FORM_BODY_LIMIT = 64 * 1024
 #: Notifier keys the /config form edits. None of them carries a credential: a secret-bearing key is
 #: written only as an environment reference, and ``headers`` is not writable at all.
 NOTIFIER_FORM_KEYS = ("topic", "priority", "host", "port", "from", "to", "username", "use_tls", "implicit_tls")
+#: Credential-bearing notifier keys the form edits as an environment reference, beside the one required
+#: reference the "new notifier" row fills. ``secret`` signs a generic webhook's requests; a value that is not a
+#: whole ``${NAME}``/``${NAME_FILE}`` reference is refused when the overlay is saved.
+NOTIFIER_REFERENCE_KEYS = ("secret",)
 #: Every editable key of a built-in source kind, so the "new source" block offers one field per key rather than
 #: one form per kind. Which of them the chosen kind actually reads comes from the catalogue.
 SOURCE_FORM_KEYS = tuple(
@@ -821,7 +825,8 @@ SOURCE_FORM_KEYS = tuple(
 #: property of a kind, so it is offered once rather than repeated in every ``SourceSpec``.
 SOURCE_UNIVERSAL_KEYS = ("interval",)
 #: The one secret-bearing key the "new notifier" row fills, per type. ``apprise`` (url+password) and
-#: ``gotify`` (url+token) need two references each, so they are added by editing the YAML.
+#: ``gotify`` (url+token) need two references each, so they are added by editing the YAML. A webhook's
+#: optional signing ``secret`` has its own field instead.
 NEW_NOTIFIER_REFERENCE = {
     "discord_webhook": "url",
     "matrix_webhook": "url",
@@ -1499,6 +1504,12 @@ def create_app(
         for key in SECRET_KEYS:
             if key not in entry:
                 continue
+            if key in NOTIFIER_REFERENCE_KEYS:
+                # A reference is rendered in its own editable field; a literal value stays hidden, as every
+                # other credential position does.
+                if not is_reference(entry[key]):
+                    notes.append(f"{key} set (not shown)")
+                continue
             notes.append(f"{key}={entry[key]}" if is_reference(entry[key]) else f"{key} set (not shown)")
         if "headers" in entry:
             notes.append("headers set in the YAML (not shown)")
@@ -1520,12 +1531,20 @@ def create_app(
                 f"aria-label='{esc(key)} for {esc(identifier)}'></label>"
                 for key in NOTIFIER_FORM_KEYS
             )
+            # A credential position is shown only when it is a reference: echoing a literal value into the page
+            # would publish the secret the field exists to keep out of the configuration file.
+            references = " ".join(
+                f"<label>{key} reference<input type='text' name='field:{esc(identifier)}:{key}' "
+                f"value='{esc(entry.get(key, '')) if is_reference(entry.get(key)) else ''}' "
+                f"placeholder='${{NAME}}' aria-label='{esc(key)} reference for {esc(identifier)}'></label>"
+                for key in NOTIFIER_REFERENCE_KEYS
+            )
             rows.append(
                 "<div class='notifier'><div class='notifier-head'>"
                 f"<b>{esc(identifier)}</b><span class='muted'>{esc(entry.get('type', ''))}</span>"
                 f"<label class='check'><input type='checkbox' name='enabled:{esc(identifier)}' value='1'{checked} "
                 f"aria-label='Enabled {esc(identifier)}'>enabled</label>"
-                f"</div><div class='field-grid'>{fields}</div>"
+                f"</div><div class='field-grid'>{fields} {references}</div>"
                 f"<p class='muted small'>{notifier_notes(entry) or 'no secret reference recorded'}</p></div>"
             )
         return "".join(rows)
@@ -2145,6 +2164,10 @@ def create_app(
             overlay["hidden_source_hosts"] = [
                 line.strip() for line in first(form, "hidden_source_hosts").splitlines() if line.strip()
             ]
+            # Both are stored even when cleared: an unticked box or an empty window must override a YAML value,
+            # and the merged validator refuses a window that is not HH:MM-HH:MM.
+            overlay["digest"] = "digest" in form
+            overlay["quiet_hours"] = first(form, "quiet_hours").strip()
             return commit_overlay(request, overlay)
 
     def parse_threshold_fields(form: dict[str, list[str]], prefix: str) -> dict:
@@ -2492,6 +2515,14 @@ def create_app(
                     updated[key] = value
                 else:
                     updated.pop(key, None)
+            for key in NOTIFIER_REFERENCE_KEYS:
+                value = first(form, f"field:{identifier}:{key}").strip()
+                if value:
+                    updated[key] = value
+                else:
+                    # An empty field stores no key: the merge carries a YAML secret over by id, so this form
+                    # cannot strip a credential the file owns, exactly as it cannot delete a YAML header.
+                    updated.pop(key, None)
             entries.append(updated)
         identifier = first(form, "new:id").strip()
         if identifier:
@@ -2520,6 +2551,10 @@ def create_app(
                     )
                 new[secret_key] = reference
             for key in NOTIFIER_FORM_KEYS:
+                value = first(form, f"new:{key}").strip()
+                if value:
+                    new[key] = value
+            for key in NOTIFIER_REFERENCE_KEYS:
                 value = first(form, f"new:{key}").strip()
                 if value:
                     new[key] = value
@@ -2775,10 +2810,23 @@ def create_app(
 
         hidden = document.get("hidden_source_hosts")
         hidden_text = "\n".join(str(host) for host in hidden) if isinstance(hidden, list) else ""
+        raw_digest = document.get("digest", False)
+        # Expanded the way the loader will read it: an unchecked box for a `${NAME}` reference that expands to
+        # true would silently turn the digest off on the next save of this form.
+        digest_text = (
+            expand_text(raw_digest) if isinstance(raw_digest, str) else ("true" if raw_digest is True else "false")
+        )
+        digest_checked = " checked" if digest_text.strip().lower() in {"1", "true", "yes", "on"} else ""
+        raw_quiet_hours = document.get("quiet_hours", "")
+        quiet_hours_text = raw_quiet_hours if isinstance(raw_quiet_hours, str) else ""
         type_options = "".join(
             f"<option value='{esc(kind)}'>{esc(kind)}</option>" for kind in sorted(NOTIFIER_BUILDERS)
         )
         new_fields = " ".join(f"<label>{key}<input type='text' name='new:{key}'></label>" for key in NOTIFIER_FORM_KEYS)
+        new_reference_fields = " ".join(
+            f"<label>{key} reference<input type='text' name='new:{key}' placeholder='${{NAME}}'></label>"
+            for key in NOTIFIER_REFERENCE_KEYS
+        )
         csrf = csrf_field(request)
         fingerprint = form_fingerprint(document)
         fingerprint_field = f"<input type='hidden' name='fingerprint' value='{fingerprint}'>"
@@ -2796,8 +2844,15 @@ def create_app(
             f"<input type='text' name='poll_interval' value='{esc(poll_text)}'></label>"
             "<label>Hidden source hosts (one per line)"
             f"<textarea name='hidden_source_hosts' rows='3'>{esc(hidden_text)}</textarea></label>"
+            "<label class='check'><input type='checkbox' name='digest' value='1'"
+            f"{digest_checked}> One digest per pass</label>"
+            "<label>Quiet hours (local time)"
+            f"<input type='text' name='quiet_hours' value='{esc(quiet_hours_text)}' "
+            "placeholder='22:00-07:00'></label>"
             "</div>"
-            "<p class='muted small'>Poll interval: 15m, 30s or 12h.</p>"
+            "<p class='muted small'>Poll interval: 15m, 30s or 12h. A digest sends one message per routing "
+            "group, capped so every channel accepts it. Quiet hours hold non-critical messages until the window "
+            "ends and never hold a critical one; an empty field means off.</p>"
             "<button class='btn btn-primary'>Save settings</button></form>"
             "<h2><span class='sec-num'>02</span>Risk thresholds</h2>"
             f'<form method="post" action="/config/thresholds">{csrf}{fingerprint_field}'
@@ -2864,14 +2919,14 @@ def create_app(
             f'<form method="post" action="/config/notifiers">{csrf}{fingerprint_field}'
             f"{notifier_form_entries(notifiers)}"
             "<h3>New notifier</h3>"
-            "<p class='muted small'>Secrets stay in the environment: the reference field takes ${NAME} or "
-            "${NAME_FILE} and is stored instead of the value. A type that needs two references, or a header, "
-            "is added by editing the YAML.</p>"
+            "<p class='muted small'>Secrets stay in the environment: a reference field takes ${NAME} or "
+            "${NAME_FILE} and is stored instead of the value. A webhook's optional signing secret is one of "
+            "them. A type that needs two references, or a header, is added by editing the YAML.</p>"
             "<div class='fields'>"
             "<label>id<input type='text' name='new:id'></label>"
             f"<label>type<select name='new:type'>{type_options}</select></label>"
             "<label>reference <input type='text' name='new:reference' placeholder='${NAME}'></label>"
-            f"{new_fields}</div>"
+            f"{new_reference_fields}{new_fields}</div>"
             "<button class='btn btn-primary'>Save notifiers</button></form>"
             "<h2><span class='sec-num'>05</span>Routes</h2>"
             f'<form method="post" action="/config/routes">{csrf}{fingerprint_field}'
