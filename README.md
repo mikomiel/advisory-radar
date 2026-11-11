@@ -159,8 +159,10 @@ A reload builds the new configuration and its plugins before it swaps them in un
 state lock. A shared configuration value goes through the same validator the YAML does,
 and the overlay adds its own restrictions (a notifier's secret must be a reference, a
 source the YAML defines may only be re-flagged and re-tagged there, a source the overlay
-adds must be a complete entry and may carry a secret only as a reference, `headers` may
-not be written), so a refused overlay is reported with
+adds must be a complete entry with a literal id and must carry a recognised secret as a
+reference — a URL is ordinary configuration, so a URL that embeds a token has to be written
+as one, and nothing can tell whether it was — `headers` may not be written), so a refused
+overlay is reported with
 the validator's message; the running configuration stays; a pass that already started finishes with the
 configuration it started with, and the next pass uses the reloaded one. The wait between
 passes follows the live interval, so shortening `poll_interval` takes effect without sleeping

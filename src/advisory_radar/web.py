@@ -1513,13 +1513,18 @@ def create_app(
         sources = document.get("sources") if isinstance(document, dict) else None
         return [entry for entry in (sources or []) if isinstance(entry, dict) and isinstance(entry.get("id"), str)]
 
+    def expand_text(value: object) -> str:
+        """A configured string as the loader will use it, or as written when a reference cannot resolve."""
+        if not isinstance(value, str) or not value:
+            return ""
+        try:
+            return str(expand_entry({"value": value}, runtime.environment).get("value") or value)
+        except ConfigError:
+            return value
+
     def effective_id(entry: dict) -> str:
         """The id this configured entry occupies once its references are expanded."""
-        raw = entry["id"]
-        try:
-            return str(expand_entry({"id": raw}, runtime.environment).get("id") or raw)
-        except ConfigError:
-            return raw  # an unset variable: the reference as written is still the id of this entry
+        return expand_text(entry["id"]) or entry["id"]
 
     def source_entry_by_id(overlay: dict, identifier: str, *, effective: bool) -> dict | None:
         """The configured entry the submitted id names, looked up the way the page that submitted it renders.
@@ -1556,7 +1561,10 @@ def create_app(
         """Every id the configuration occupies, sources and notifiers alike, as the validator will see them.
 
         A derived id has to miss these, not merely the ids written in the file: an id is unique across both
-        plugin kinds, and a YAML entry written ``${FEED_ID}`` occupies the value it expands to.
+        plugin kinds, an entry written ``${FEED_ID}`` occupies the value it expands to, and a *disabled*
+        entry's raw id still takes part in the validator's raw-id check. Reserving the expanded ids of disabled
+        entries too is therefore deliberately conservative: a wasted suffix is cheaper than a save refused after
+        the operator has typed everything else.
         """
         document, _ = form_document(overlay)
         ids: set[str] = set()
@@ -1761,26 +1769,26 @@ def create_app(
         yet. Only that case is subject to the private-destination rule, because only that case is reachable
         with the UI token alone.
         """
-        kind = entry.get("type")
-        spec = SOURCE_SPECS.get(kind) if isinstance(kind, str) else None
-        if spec is None:
-            return False, _notice(f"{esc(str(kind))} is not a built-in source type.", "critical")
-        if kind == "webhook":
-            identifier = esc(str(entry.get("id", "")))
-            return False, _notice(
-                "A webhook source has no remote side to read: push an item to "
-                f"<code>/webhooks/{identifier}</code> with the bearer secret.",
-                "warning",
-            )
         resolved: list[str] = []
         try:
-            # Expanded before the URL is judged: ``url: ${FEED_URL}`` is a configured value, not a bad scheme,
-            # and a missing variable must be named as one.
+            # Expanded before anything is judged: ``url: ${FEED_URL}`` and ``type: ${SOURCE_KIND}`` are configured
+            # values, and a missing variable must be named as one.
             expanded = expand_entry(entry, runtime.environment, resolved)
         except Exception as exc:
             message = pipeline.redact(f"{type(exc).__name__}: {exc}", [*secret_values(runtime.cfg), *resolved])
             return False, _notice(esc(message), "critical")
         secrets = [*secret_values(runtime.cfg), *resolved]
+        kind = expanded.get("type")
+        spec = SOURCE_SPECS.get(kind) if isinstance(kind, str) else None
+        if spec is None:
+            return False, _notice(f"{esc(str(kind))} is not a built-in source type.", "critical")
+        if kind == "webhook":
+            identifier = esc(str(expanded.get("id", "")))
+            return False, _notice(
+                "A webhook source has no remote side to read: push an item to "
+                f"<code>/webhooks/{identifier}</code> with the bearer secret.",
+                "warning",
+            )
         url = expanded.get("url")
         if not isinstance(url, str) or not url:
             return False, _notice("This source has no url to fetch.", "critical")
@@ -1805,9 +1813,16 @@ def create_app(
         add_form = ""
         if identifier:
             settings = saved_overlay()[0]
-            # ``/sources`` shows the effective id of an enabled source; ``/config`` shows the row as written.
+            # ``/sources`` shows the live snapshot, so it probes the live snapshot: a saved overlay that could
+            # not be applied yet must not make a row fetch something other than the row says. ``/config`` edits
+            # the saved overlay, so it looks up what it renders -- a raw row id.
             on_sources_page = active == "/sources"
-            entry = source_entry_by_id(settings, identifier, effective=on_sources_page)
+            if on_sources_page:
+                entry = next(
+                    (candidate for candidate in runtime.cfg.sources if candidate.get("id") == identifier), None
+                )
+            else:
+                entry = source_entry_by_id(settings, identifier, effective=False)
             if entry is None:
                 return page(
                     "Source probe",
@@ -1823,7 +1838,7 @@ def create_app(
             ok, detail = probe_source(entry, adding=entry["id"] in added_source_ids(settings))
             tone = _badge("answered", "ok") if ok else _badge("failed", "critical")
             heading = (
-                f"<h2>{esc(identifier)} <span class='muted'>{esc(str(entry.get('type', '')))}</span> {tone}</h2>"
+                f"<h2>{esc(identifier)} <span class='muted'>{esc(expand_text(entry.get('type')))}</span> {tone}</h2>"
                 "<p class='muted small'>A configured source; the probe reads it and delivers nothing.</p>"
             )
             title = f"{identifier} probe"
@@ -1840,7 +1855,7 @@ def create_app(
             ok, detail = probe_source(entry, adding=True)
             tone = _badge("answered", "ok") if ok else _badge("failed", "critical")
             heading = (
-                f"<h2>New {esc(str(entry.get('type', '')))} source {tone}</h2>"
+                f"<h2>New {esc(expand_text(entry.get('type')))} source {tone}</h2>"
                 "<p class='muted small'>Not saved yet: the probe fetched it with the values from the form.</p>"
             )
             # The probed values are carried into a real save, so a working probe is one click from being stored.
@@ -2331,14 +2346,15 @@ def create_app(
         source_type_options = "".join(
             f"<option value='{esc(kind)}'>{esc(kind)}</option>" for kind in sorted(SOURCE_SPECS)
         )
+        # Compared as the loader will see them: routing matches expanded values, and so does the warning.
         configured_source_ids = {
-            entry["id"] for entry in sources if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+            effective_id(entry) for entry in sources if isinstance(entry, dict) and isinstance(entry.get("id"), str)
         }
         route_warnings = []
         for index, route in enumerate(routes, start=1):
             match = route.get("match") if isinstance(route, dict) else None
-            identifier = match.get("source") if isinstance(match, dict) else None
-            if isinstance(identifier, str) and identifier and identifier not in configured_source_ids:
+            identifier = expand_text(match.get("source") if isinstance(match, dict) else None)
+            if identifier and identifier not in configured_source_ids:
                 # A rule for a source nobody configured can never fire. Staging a rule before its source is
                 # legitimate, so this is reported rather than refused -- unlike an unknown tag, which no
                 # configuration could ever match.

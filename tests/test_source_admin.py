@@ -23,7 +23,7 @@ from advisory_radar.config import ConfigError, load_config, load_document
 from advisory_radar.http import _host_of, private_destination, resolve_host, urllib_http
 from advisory_radar.runtime import Runtime
 from advisory_radar.settings import validate_settings
-from advisory_radar.state import save_state
+from advisory_radar.state import save_state, state_lock
 from advisory_radar.web import create_app
 
 #: Two entries, so a probe has something to count and a title to show.
@@ -1049,6 +1049,106 @@ def test_a_derived_id_does_not_take_a_notifier_id(tmp_path):
             {
                 "sources": [{"id": "vendor", "type": "rss", "url": "https://feeds.example.net/feed.xml"}],
                 "notifiers": [{"id": "nodejs-org", "type": "webhook", "url": "https://hooks.example.net/x"}],
+                "state_path": str(tmp_path / "data" / "state.json"),
+            }
+        )
+    )
+    env = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN}
+    runtime = Runtime.build(path, env)
+    client = TestClient(create_app(runtime, env, http=fake_http, resolve=public_resolver))
+    assert new_source(client, **{"new:type": "rss", "new:url": "https://nodejs.org/feed/x.xml"}).status_code == 303
+    assert overlay(tmp_path)["sources_added"][0]["id"] == "nodejs-org-2"
+
+
+def test_the_sources_page_probes_what_it_shows_when_a_save_is_not_live(tmp_path):
+    """A pass holding the lock leaves a saved overlay unapplied; the row must still fetch the row's URL."""
+
+    def distinct(method, url, headers, body):
+        title = b"OLD ITEM" if "old.example.net" in url else b"NEW ITEM"
+        return (
+            200,
+            {},
+            b"<rss version='2.0'><channel><title>t</title><item><title>"
+            + title
+            + (b"</title><guid>g</guid></item></channel></rss>"),
+        )
+
+    client, runtime, _ = make_client(tmp_path, transport=distinct)
+    assert new_source(client, **{"new:type": "rss", "new:url": "https://old.example.net/feed.xml"}).status_code == 303
+    assert [source.id for source in runtime.sources] == ["vendor", "old-example-net"]
+    with state_lock(runtime.cfg.state_path):  # the pass holds the lock, so the edit cannot be applied
+        csrf, fingerprint = signed_in(client)
+        edited = client.post(
+            "/config/sources",
+            data={
+                "csrf": csrf,
+                "fingerprint": fingerprint,
+                "enabled:vendor": "1",
+                "enabled:old-example-net": "1",
+                "added_url:old-example-net": "https://new.example.net/feed.xml",
+            },
+            follow_redirects=False,
+        )
+        assert edited.status_code == 303
+        csrf, _ = signed_in(client)
+        probed = client.post("/sources/probe", data={"csrf": csrf, "id": "old-example-net"})
+    assert probed.status_code == 200
+    assert "OLD ITEM" in probed.text, "the page renders the live configuration, so its probe reads that one"
+    assert "NEW ITEM" not in probed.text
+
+
+@pytest.mark.parametrize("path", ["/sources/probe", "/config/sources/probe"])
+def test_a_source_whose_type_is_a_reference_can_be_probed(tmp_path, path):
+    client, runtime, _ = make_client(
+        tmp_path,
+        sources=[{"id": "vendor", "type": "${SOURCE_KIND}", "url": "https://feeds.example.net/feed.xml"}],
+        environment={"SOURCE_KIND": "rss"},
+    )
+    assert [source.id for source in runtime.sources] == ["vendor"]
+    csrf, _ = signed_in(client)
+    response = client.post(path, data={"csrf": csrf, "id": "vendor"})
+    assert response.status_code == 200
+    assert "Answered with 2 entries." in response.text
+
+
+def test_the_route_warning_compares_the_values_routing_uses(tmp_path):
+    client, _, _ = make_client(
+        tmp_path,
+        sources=[{"id": "${FEED_ID}", "type": "rss", "url": "https://feeds.example.net/feed.xml"}],
+        environment={"FEED_ID": "vendor"},
+        extra="routes:\n  - match: {source: vendor}\n    notifiers: [chat]\n",
+    )
+    signed_in(client)
+    page = client.get("/config").text
+    assert "no configured source" not in page, "the rule matches the expanded id, so it is not inert"
+
+
+def test_a_derived_id_reserves_a_disabled_reference(tmp_path):
+    client, _, _ = make_client(
+        tmp_path,
+        sources=[
+            {
+                "id": "${FEED_ID}",
+                "type": "rss",
+                "enabled": False,
+                "url": "https://feeds.example.net/feed.xml",
+            }
+        ],
+        environment={"FEED_ID": "nodejs-org"},
+    )
+    assert new_source(client, **{"new:type": "rss", "new:url": "https://nodejs.org/feed/x.xml"}).status_code == 303
+    assert overlay(tmp_path)["sources_added"][0]["id"] == "nodejs-org-2", "reserved conservatively by design"
+
+
+def test_a_derived_id_reserves_a_disabled_notifier_id(tmp_path):
+    path = tmp_path / "config.yml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "sources": [{"id": "vendor", "type": "rss", "url": "https://feeds.example.net/feed.xml"}],
+                "notifiers": [
+                    {"id": "nodejs-org", "type": "webhook", "url": "https://hooks.example.net/x", "enabled": False}
+                ],
                 "state_path": str(tmp_path / "data" / "state.json"),
             }
         )

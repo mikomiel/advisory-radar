@@ -7,8 +7,11 @@ YAML would refuse is refused with the same message.
 
 Storage and the overlay-specific shape rules live here; the merge and the configuration
 validator own everything else. A secret-bearing notifier key may only be a ``${NAME}`` or
-``${NAME_FILE}`` reference, and ``headers`` cannot be written at all: no credential ever
-reaches this file.
+``${NAME_FILE}`` reference, ``headers`` cannot be written at all, and a source's
+``secret_keys`` are references: a credential the validator knows how to name never reaches
+this file. One limit worth knowing: a source ``url`` is ordinary configuration, so a URL
+that carries a token has to be written as a reference and nothing here can tell whether it
+was.
 """
 
 from __future__ import annotations
@@ -105,7 +108,10 @@ def validate_settings(settings: object) -> dict:
 
 
 def _validate_added_sources(added: object) -> None:
-    """A complete source the overlay adds: a mapping with an id and a built-in type, no literal secret.
+    """A complete source the overlay adds: a mapping with a literal id, a built-in type and its required keys.
+
+    Credentials this module can recognise -- a kind's ``secret_keys`` -- must be references; a ``url`` is not
+    one of them, so a URL that embeds a token is stored as written.
 
     A non-mapping is refused rather than skipped: ``config._merge_added_sources`` skips one it cannot read, so
     the entry would vanish between the two owners and the operator would see a saved source that never ran.
