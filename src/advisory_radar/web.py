@@ -492,7 +492,7 @@ def _external_link(url: object, text: object = None) -> str:
     The link comes from state, which is a file a person can edit: rendering it as an ``href`` without a
     check would make every page offer whatever scheme it named.
     """
-    label = esc(text if text not in (None, "") else (url if url is not None else ""))
+    label = esc(_field(text) or _field(url))
     if not isinstance(url, str) or not url.startswith("https://"):
         return label
     try:
@@ -519,8 +519,10 @@ def _levels_table(levels: object, scores: object) -> str:
             shown = esc(f"{score:g}")
         elif score is None:
             shown = "<span class='muted'>unscored</span>"
-        else:
+        elif isinstance(score, str):
             shown = esc(score)
+        else:
+            shown = "<span class='muted'>not recorded</span>"
         level = _field(levels[cve])
         rows.append(
             f"<tr><td class='mono'>{esc(cve)}</td>"
@@ -540,10 +542,13 @@ def _facts(facts: Sequence[tuple[str, str]]) -> str:
 
 
 def _identifier_list(values: object) -> str:
-    """A stored list of identifier strings; anything else is shown as the absence it is."""
+    """A stored list of identifiers; a nested container is skipped, never rendered as a Python repr."""
     if not isinstance(values, (list, tuple)) or not values:
         return "<span class='muted'>(none recorded)</span>"
-    return ", ".join(esc(value) for value in values)
+    shown = [value for value in values if not isinstance(value, (dict, list, tuple, set))]
+    if not shown:
+        return "<span class='muted'>(none recorded)</span>"
+    return ", ".join(esc(value) for value in shown)
 
 
 def _field(value: object) -> str:
@@ -552,11 +557,20 @@ def _field(value: object) -> str:
 
 
 def _section(path: str) -> str:
-    """The navigation section a path belongs to, so an error page keeps the reader's place."""
+    """The navigation section a path belongs to, so an error page keeps the reader's place.
+
+    Action routes belong to the page that issued them: ``/run`` and ``/reload`` are reached from the
+    dashboard and the configuration page. A global action such as ``/logout`` belongs to no section, which
+    is the empty answer.
+    """
     if path == "/":
         return "/"
     if path.startswith("/advisories/"):
         return "/alerts"
+    if path == "/run":
+        return "/"
+    if path == "/reload":
+        return "/config"
     for known, _ in _NAV:
         if known != "/" and (path == known or path.startswith(f"{known}/")):
             return known
@@ -587,6 +601,17 @@ def _stats(pairs: Sequence[tuple[str, object]]) -> str:
         for label, value in pairs
     )
     return f"<section class='stats'>{tiles}</section>"
+
+
+def _exit_code(value: object) -> tuple[str, str]:
+    """A stored exit code as text and the tone it earns.
+
+    Only an integer is a recorded result: 0 is good, anything else is a failure. A hand-edited or older
+    value is shown as unknown with a neutral tone rather than as a Python repr or a false failure.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value), ("ok" if value == 0 else "critical")
+    return "?", "neutral"
 
 
 def _outcome_tone(outcome: str) -> str:
@@ -1050,14 +1075,9 @@ def create_app(
             if stamp is not None and stamp >= today:
                 today_seen += 1
         when = _when(last.get("at"))
-        code = last.get("code", "?")
-        ok = _number(code, -1) == 0
-        if not when:
-            dot, exit_badge = "dot", _badge(code, "neutral")
-        elif ok:
-            dot, exit_badge = "dot dot-ok", _badge(code, "ok")
-        else:
-            dot, exit_badge = "dot dot-bad", _badge(code, "critical")
+        code_text, code_tone = _exit_code(last.get("code"))
+        dot = {"ok": "dot dot-ok", "critical": "dot dot-bad"}.get(code_tone, "dot") if when else "dot"
+        exit_badge = _badge(code_text, code_tone)
         body = (
             _stats(
                 [
@@ -1964,13 +1984,18 @@ def create_app(
             if until is not None and at >= until:
                 continue
             shown.append(run)
-        rows = "".join(
-            f"<tr><td class='nowrap'>{esc(_when(run.get('at')))}</td><td class='num'>{esc(run.get('sent', 0))}</td>"
-            f"<td class='num'>{esc(run.get('parked', 0))}</td><td class='num'>{esc(run.get('pending', 0))}</td>"
-            f"<td>{_badge(run.get('code', ''), 'ok' if _number(run.get('code'), -1) == 0 else 'critical')}</td>"
-            "</tr>"
-            for run in shown
-        )
+
+        def run_row(run: dict) -> str:
+            code_text, code_tone = _exit_code(run.get("code"))
+            return (
+                f"<tr><td class='nowrap'>{esc(_when(run.get('at')))}</td>"
+                f"<td class='num'>{esc(run.get('sent', 0))}</td>"
+                f"<td class='num'>{esc(run.get('parked', 0))}</td>"
+                f"<td class='num'>{esc(run.get('pending', 0))}</td>"
+                f"<td>{_badge(code_text, code_tone)}</td></tr>"
+            )
+
+        rows = "".join(run_row(run) for run in shown)
         filter_form = (
             "<form class='toolbar' method='get' action='/runs'>"
             f"<label>Exit code<input type='text' name='code' size='3' value='{esc(filters['code'])}'></label>"

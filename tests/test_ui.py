@@ -1162,11 +1162,15 @@ def _assert_shell(response, *, active: str, status: int) -> None:
     text = response.text
     assert "<html lang='en'>" in text
     assert "<meta name='viewport'" in text
-    assert text.count("<title>") == 1 and text.count("</title>") == 1
     title = re.search(r"<title>(.*?)</title>", text)
-    assert title is not None and title.group(1).endswith(" · advisory-radar")
-    assert text.count("<h1>") == 1 and text.count("</h1>") == 1
+    assert text.count("<title>") == 1 and text.count("</title>") == 1
+    assert title is not None
+    heading = re.search(r"<h1>(.*?)</h1>", text)
+    assert text.count("<h1>") == 1 and heading is not None
+    assert title.group(1) == f"{heading.group(1)} · advisory-radar", "the tab names the page it shows"
+    assert text.count("<style>") == 1 and text.count("</style>") == 1, "one inline stylesheet"
     assert text.count("<main") == 1 and "<main id='main'>" in text
+    assert "<a class='skip' href='#main'>Skip to content</a>" in text
     assert "<script" not in text and " onclick=" not in text and " style=" not in text
     # The stylesheet names the selector too, so the attribute is counted with its leading space.
     assert text.count(" aria-current='page'") == (1 if active else 0)
@@ -1186,7 +1190,6 @@ def test_every_page_carries_the_same_shell(tmp_path):
     client, token, _ = make_client(tmp_path, state=state)
     csrf = sign_in(client, token)
     assert csrf
-    identifier = advisory_token("CVE-2026-1")
     pages = {
         "/": "/",
         "/alerts": "/alerts",
@@ -1194,8 +1197,15 @@ def test_every_page_carries_the_same_shell(tmp_path):
         "/config": "/config",
         "/sources": "/sources",
         "/runs": "/runs",
-        f"/advisories/{identifier}": "/alerts",
+        f"/advisories/{advisory_token('CVE-2026-1')}": "/alerts",
     }
+    # A page route added later must join this test instead of silently going unchecked.
+    served = {
+        route.path
+        for route in client.app.routes
+        if "GET" in (getattr(route, "methods", None) or set()) and "{" not in getattr(route, "path", "")
+    }
+    assert served - set(pages) == {"/login", "/healthz", "/readyz", "/metrics", "/api/state", "/openapi.json"}
     for path, active in pages.items():
         response = client.get(path, headers={"accept": "text/html"})
         _assert_shell(response, active=active, status=200)
@@ -1215,21 +1225,31 @@ def test_every_page_carries_the_same_shell(tmp_path):
     _assert_shell(stale, active="/config", status=409)
     assert 'action="/logout"' in stale.text
 
-    # Signed out: the brand alone, and the login page still signs in.
+    # A refused form token still renders the section the action came from.
+    for path, active in (("/run", "/"), ("/reload", "/config"), ("/logout", "")):
+        refused = client.post(path, data={"csrf": "0" * 64}, headers={"accept": "text/html"})
+        _assert_shell(refused, active=active, status=403)
+
+    # Signed out: the brand alone, the login page still signs in, and the throttle has a page too.
     client.cookies.clear()
     login = client.get("/login", headers={"accept": "text/html"})
     _assert_shell(login, active="", status=200)
     assert "<nav class='links'" not in login.text
-    wrong = client.post("/login", data={"token": "nope"}, headers={"accept": "text/html"})
-    _assert_shell(wrong, active="", status=200)
-    assert "Wrong token" in wrong.text
+    for _ in range(6):
+        throttled = client.post("/login", data={"token": "nope"}, headers={"accept": "text/html"})
+        if throttled.status_code == 429:
+            break
+    else:
+        raise AssertionError("six wrong tokens must be refused by the login throttle")
+    _assert_shell(throttled, active="", status=429)
 
 
 def test_a_stored_value_is_data_not_a_lookup_key(tmp_path):
-    """A malformed outcome or tag is shown as the absence it is; it used to raise from the colour map.
+    """A malformed stored value is shown as the absence it is; it used to raise or render a Python repr.
 
-    The state loader validates the document's shape, not each field's type, so a hand-edited record can hold
-    a list where a string belongs. Nothing on the page may hash that value or render its Python repr.
+    The state loader validates the document's shape, not each field's type, so a hand-edited record can hold a
+    list where a string or an integer belongs. Nothing rendered may hash that value or show its repr: the
+    alert list, the advisory page, the parked queue, the dashboard and the run history are all checked.
     """
     state = core.new_state()
     state["seen"]["CVE-2026-1"] = {
@@ -1237,14 +1257,23 @@ def test_a_stored_value_is_data_not_a_lookup_key(tmp_path):
         "outcome": ["delivered"],
         "tag": ["critical"],
         "title": {"unexpected": "mapping"},
+        "link": ["https://vendor.example.net/advisory"],
+        "ids": ["CVE-2026-1", {"nested": "mapping"}],
         "levels": {"CVE-2026-1": ["critical"]},
+        "scores": {"CVE-2026-1": {"unexpected": "mapping"}},
     }
     state["parked"] = [{"tag": ["critical"], "title": {"unexpected": "mapping"}, "ids": ["CVE-2026-2"]}]
+    state["runs"] = [{"at": NOW, "code": ["0"], "sent": 0, "parked": 0, "pending": 0}]
     save_state(tmp_path / "state.json", state)
     client, token, _ = make_client(tmp_path, state=state)
     sign_in(client, token)
-    for path in ("/alerts", "/parked", f"/advisories/{advisory_token('CVE-2026-1')}"):
+    pages = ("/", "/alerts", "/parked", "/runs", f"/advisories/{advisory_token('CVE-2026-1')}")
+    for path in pages:
         response = client.get(path)
         assert response.status_code == 200, path
-        for rendered in ("['delivered']", "['critical']", "{'unexpected'"):
-            assert rendered not in response.text, f"{path} must not render {rendered}"
+        shown = html.unescape(response.text)
+        for rendered in ("['delivered']", "['critical']", "{'unexpected'", "['0']"):
+            assert rendered not in shown, f"{path} must not render {rendered}"
+    # An unusable exit code is unknown, not a recorded failure.
+    assert "<span class='badge badge-neutral'>?</span>" in client.get("/runs").text
+    assert "<span class='badge badge-neutral'>?</span>" in client.get("/").text
