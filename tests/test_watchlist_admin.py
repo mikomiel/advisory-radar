@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from advisory_radar import pipeline, watchlist
+from advisory_radar import core, pipeline, watchlist
 from advisory_radar.runtime import Runtime
 from advisory_radar.sources import RssSource
 from advisory_radar.web import create_app
@@ -922,3 +922,38 @@ def test_the_preview_judges_the_text_it_was_given(tmp_path):
         params={"preview": "1", "title": "DSA-6104-1 openssl - security update", "link": "https://lists.debian.org/x"},
     )
     assert "In scope" in clean.text
+
+
+def test_a_save_creates_the_file_the_pass_will_read(tmp_path):
+    """``missing/../scope.json`` resolves to a real file: a save must leave the pass able to read that file."""
+    configured = tmp_path / "missing" / ".." / "scope.json"
+    client, runtime = make_client(tmp_path, configured)
+    sign_in(client)
+    csrf, fingerprint, text = scope_form(client)
+    assert "not created yet" in text
+    response = submit(client, csrf, fingerprint, **{"new:id": "php", "new:aliases": "php", "debian_packages": "*"})
+    assert response.status_code == 303
+    assert (tmp_path / "scope.json").exists()
+    policy = watchlist.load_policy(watchlist.active_path(runtime.cfg.watchlist_path, runtime.cfg.state_path))
+    assert [product.id for product in policy.products] == ["php"], "the pass reads what the save created"
+    assert "not created yet" not in client.get("/watchlist").text
+
+
+def test_the_preview_matches_what_a_webhook_entry_is_judged_on(tmp_path):
+    """A webhook entry keeps its text, so the preview and that ingestion path must reach the same verdict."""
+    from advisory_radar.sources import webhook_item_from_payload
+
+    watch = write_scope(tmp_path / "scope.json", products=[], debian_source_packages=["openssl"])
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    title = " DSA-6104-1 openssl - security update"
+    entry = webhook_item_from_payload({"title": title, "link": "https://lists.debian.org/x", "guid": "g"})
+    assert entry is not None
+    item = core.Item(
+        entry["guid"], entry["title"], entry["link"], entry["summary"], None, (), source_title=entry["source_title"]
+    )
+    policy = watchlist.load_policy(watch)
+    page = client.get("/watchlist", params={"preview": "1", "title": title, "link": item.link})
+    reason = core.filter_reason(item, policy)
+    assert ("Out of scope" in page.text) is bool(reason), "the page and the entry agree on the verdict"
+    assert "judged exactly as typed" in page.text, "the page says what its input stands for"

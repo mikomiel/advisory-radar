@@ -3146,10 +3146,8 @@ def create_app(
         fingerprint = form_fingerprint(document)
         fingerprint_field = f"<input type='hidden' name='fingerprint' value='{fingerprint}'>"
         try:
-            scope_link = (
-                f"<a href='/watchlist'><code>{esc(watchlist.active_path(cfg.watchlist_path, cfg.state_path))}"
-                "</code></a>"
-            )
+            scope_name = watchlist.display_path(cfg.watchlist_path, cfg.state_path)
+            scope_link = f"<a href='/watchlist'><code>{esc(scope_name)}</code></a>"
         except SourceError as exc:
             # The document cannot even be inspected. Naming why is better than failing the whole page: every other
             # setting here still has to be editable, and the message is the one /watchlist and a pass would show.
@@ -3278,8 +3276,10 @@ def create_app(
         return (
             "<h2>Check an advisory</h2>"
             "<p class='muted small'>Paste an advisory's title and link to see whether the scope document keeps "
-            "it, and which product matched. It checks the scope document this page shows, not edits you have "
-            "not saved.</p>"
+            "it, and which product matched. The fields are judged exactly as typed, because they stand in for "
+            "what a pass sees after it fetches an entry; a feed normalises its own titles before that, so a "
+            "copied title may differ by spacing. It checks the scope document this page shows, not edits you "
+            "have not saved.</p>"
             "<form method='get' action='/watchlist'>"
             "<input type='hidden' name='preview' value='1'>"
             f"<div class='fields'>{fields}</div>"
@@ -3410,7 +3410,9 @@ def create_app(
         if saved is not None:
             notices += _notice(f"Scope <code>{esc(saved)}</code> saved. The next pass reads it.", "ok")
         try:
-            exists = watchlist.present(target)
+            # Read at the resolved name: it is the file a save creates, so the page and the pass agree on which
+            # document they are talking about even when the configured name has a ``..`` the filesystem cannot walk.
+            read_at, exists = watchlist.resolve_document(target)
         except SourceError as exc:
             # The path cannot even be inspected (a directory without the search bit, an I/O error). Answering
             # "absent" here would show the permissive default while the pass failed on the same path.
@@ -3422,7 +3424,7 @@ def create_app(
             return watchlist_scope_page(request, target, exists=True, notices=notices)
         if exists:
             try:
-                document = watchlist.read_watchlist(target)
+                document = watchlist.read_watchlist(read_at)
             except SourceError as exc:
                 # A document that exists but does not read as a watchlist: naming it is the only honest answer,
                 # and an editor over it would rewrite a file this program does not understand.
@@ -3489,7 +3491,7 @@ def create_app(
         cfg = runtime.cfg
         target = watchlist.editable_path(cfg.watchlist_path, cfg.state_path)
         try:
-            exists = watchlist.present(target)
+            exists = watchlist.present(watchlist.document_path(target))
         except SourceError:
             # Uninspectable: the save below answers with the same message, and this page must not also claim the
             # document is missing.

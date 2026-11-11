@@ -80,7 +80,9 @@ file.
 
 To check a rule before relying on it, paste an advisory's title and link into the page's
 *Check an advisory* form: it answers in scope or out of scope, names the products that
-matched, and is the same match and the same reason the pass uses.
+matched, and is the same match and the same reason the pass uses. It judges the text exactly
+as typed — a webhook entry is judged on exactly that text, while a feed normalises its own
+titles and summaries first, so a copied title can differ by spacing.
 
 ### Risk thresholds
 

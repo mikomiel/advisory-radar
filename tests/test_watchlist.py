@@ -319,7 +319,11 @@ def test_a_broken_link_is_a_present_document_not_a_missing_one(tmp_path):
     link = state_path.with_name("watchlist.json")
     link.parent.mkdir(parents=True)
     link.symlink_to(tmp_path / "gone.json")
-    assert active_path(None, state_path) == link
+    # The name resolves to the file it was meant to be; that file is what is missing, and the link still counts as
+    # a document rather than as an empty slot the page could create.
+    target = (tmp_path / "gone.json").resolve()
+    assert active_path(None, state_path) == target
+    assert watchlist.resolve_document(link) == (target, True)
     with pytest.raises(SourceError, match="cannot be read"):
         read_watchlist(active_path(None, state_path))
 

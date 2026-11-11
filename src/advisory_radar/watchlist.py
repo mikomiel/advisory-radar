@@ -155,6 +155,32 @@ def present(path: Path) -> bool:
     return True
 
 
+def document_path(path: Path) -> Path:
+    """The file a name points at: one identity, whatever ``..`` or a link in the name says.
+
+    A save creates the resolved file, so a read that kept the configured spelling could keep failing after a
+    successful save -- ``/data/missing/../scope.json`` is the shape that exposes it, because the filesystem cannot
+    traverse ``missing`` even though the target it normalises to is fine. Resolving both is what makes the page
+    and the pass agree on which file is the document.
+    """
+    try:
+        return path.resolve()
+    except (OSError, ValueError) as exc:  # a link loop, an embedded NUL
+        raise SourceError(f"watchlist {path} is not a usable path: {exc}") from exc
+
+
+def resolve_document(path: Path) -> tuple[Path, bool]:
+    """The file a name points at, and whether that is a document rather than an entry with nothing behind it.
+
+    A link that points at nothing counts as present: it is the operator's name for a file, and creating its target
+    would make the link point at a new document instead of reporting that the one it named is gone.
+    """
+    resolved = document_path(path)
+    if present(resolved):
+        return resolved, True
+    return resolved, path.is_symlink()
+
+
 def active_path(configured: Path | None, state_path: Path) -> Path:
     """The document a pass reads: the configured one, the saved one beside the state, else the packaged default.
 
@@ -162,9 +188,20 @@ def active_path(configured: Path | None, state_path: Path) -> Path:
     must fail the pass, because reading the packaged default instead would silently judge every advisory.
     """
     if configured is not None:
-        return configured
+        return document_path(configured)
     beside = state_path.with_name(WATCHLIST_NAME)
-    return beside if present(beside) else DEFAULT_DOCUMENT
+    return document_path(beside) if present(beside) else document_path(DEFAULT_DOCUMENT)
+
+
+def display_path(configured: Path | None, state_path: Path) -> Path:
+    """The name to show a reader: what the operator wrote, once it is known to resolve to a file at all.
+
+    A page shows the name, not the file behind it: ``watchlist: /data/scope.json`` is the useful sentence, and the
+    resolved path is an implementation detail of how a save finds the same file. A name that cannot be used is an
+    error here, and the page that shows it says so instead.
+    """
+    active_path(configured, state_path)
+    return editable_path(configured, state_path)
 
 
 def digest(document: object) -> str:
