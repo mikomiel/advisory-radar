@@ -279,6 +279,28 @@ def test_fetch_any_refuses_a_discovered_private_feed_before_fetching_it():
     assert calls == ["https://vendor.example.com/security"], "the internal GET must never be issued"
 
 
+@pytest.mark.parametrize(
+    "href",
+    [
+        "https://cdn.example.net/feeds/security.xml",  # another host
+        "http://vendor.example.com/feeds/security.xml",  # another scheme
+        "https://vendor.example.com:8443/feeds/security.xml",  # another port
+    ],
+)
+def test_fetch_any_refuses_a_feed_on_another_origin_before_fetching_it(href):
+    """The page's own host is the one the operator chose; discovery may not redirect the reader elsewhere."""
+    calls = []
+
+    def http(method, url, headers, body):
+        calls.append(url)
+        page = f'<html><head><link rel="alternate" type="application/rss+xml" href="{href}"></head></html>'
+        return 200, {}, page.encode()
+
+    with pytest.raises(feeds.FeedError, match="another origin"):
+        feeds.fetch_any(http, PAGE_URL)
+    assert calls == [PAGE_URL], "the other-origin GET must never be issued"
+
+
 def test_fetch_any_reads_a_json_feed_and_keeps_its_validators():
     def http(method, url, headers, body):
         return 200, {"ETag": '"v1"'}, JSON_FEED

@@ -24,6 +24,14 @@ MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 HTTP_TIMEOUT = 30
 
 
+#: Longest message one finished log record may carry. Identities come from a feed, so a publisher can otherwise
+#: hand this process a multi-megabyte line that nobody can read and a log pipeline has to store. The bound is
+#: applied to the record *after* redaction, because that is the last point that sees it whole: shortening first
+#: would leave the prefix of a configured credential where ``RedactFilter`` can no longer recognise and replace
+#: it.
+LOG_RECORD_LIMIT = 4096
+
+
 def resolve_host(host: str) -> tuple[str, ...]:
     """Every address a host resolves to, as text; empty when it cannot be resolved."""
     return tuple(info[4][0] for info in socket.getaddrinfo(host, None))
@@ -179,6 +187,9 @@ class RedactFilter(logging.Filter):
         text = record.getMessage()
         for secret in self.secrets:
             text = text.replace(secret, "[redacted]")
+        # Bound the finished record only now: a cut before the replacements could split a credential, and the
+        # remaining prefix would no longer match anything this filter knows how to redact.
+        text = text[:LOG_RECORD_LIMIT]
         record.msg, record.args, record.exc_info, record.exc_text = text, None, None, None
         return True
 

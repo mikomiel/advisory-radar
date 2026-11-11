@@ -94,14 +94,29 @@ def _reset_validators_on_policy_change(state: dict, policy: object) -> None:
     state["policy_digest"] = digest
 
 
+def _synthetic_identity(raw: str) -> str:
+    """A deterministic stand-in for a guid that normalises to nothing.
+
+    A guid that is not a Unicode scalar value cannot be stored or logged, so ``normalise_identity`` returns "".
+    A digest of the raw value keeps two distinct entries distinct and is stable across passes, so the same entry
+    is still recognised as already claimed when it is read again. The ``x-`` prefix makes it unmistakable
+    that this is not a guid a feed published.
+    """
+    return "x-" + hashlib.sha256(raw.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
 def _namespaced(item: core.Item, source_id: str) -> core.Item:
     """Give an item a source-scoped guid: two feeds may both publish guid ``1`` for unrelated advisories.
 
     The guid is normalised here, at the one door every source's items pass through, so a webhook payload or a
-    carried candidate cannot insert an identity in a spelling classification never compares against.
+    carried candidate cannot insert an identity in a spelling classification never compares against. A guid
+    that normalises to nothing -- an unpaired surrogate, say -- is replaced by a synthetic identity derived from
+    its raw value: the bare source prefix would be one identity shared by every such entry, so the second would
+    look already claimed and be dropped silently, losing its advisory.
     """
+    identity = normalise_identity(item.guid) or _synthetic_identity(item.guid)
     return core.Item(
-        f"{source_id}:{normalise_identity(item.guid)}",
+        f"{source_id}:{identity}",
         item.title,
         item.link,
         item.summary,
@@ -281,8 +296,10 @@ def _run_pass(
                     items.append(item)
                 elif source.kind == "webhook":
                     # An out-of-scope webhook entry gets a terminal disposition, so the inbox can release it
-                    # instead of letting irrelevant entries fill the capacity that real advisories need.
-                    state["seen"].setdefault(f"src:{source.id}:{item.guid}", {"at": now, "outcome": "filtered"})
+                    # instead of letting irrelevant entries fill the capacity that real advisories need. The
+                    # guid is already namespaced, and classification claims ``src:<namespaced guid>``; another
+                    # prefix here would not match the identity the inbox cleanup looks for.
+                    state["seen"].setdefault(f"src:{item.guid}", {"at": now, "outcome": "filtered"})
         # Items carried from an earlier pass come first: the window they arrived in is already gone.
         earlier = [core.item_from_state(row) for row in carried.pop(source.id, [])]
         # The policy may have changed while these waited: scope applies at classification time, not arrival.
@@ -380,11 +397,14 @@ def _run_pass(
         for row in rows
         if isinstance(row, dict)
     }
+    # Compared in the normalised form the readers now produce: a document written by an older version can hold
+    # a key that still carries a control character, and dropping it here would restart the item's clock.
+    live = {normalise_identity(guid) for guid in live_guids | carried_guids}
     for key in ("enrich_retry", "enrich_pending"):
         kept = {
             guid
             for guid in (state.get(key) or {})
-            if guid.split(":", 1)[0] not in fetched_ids or guid in live_guids or guid in carried_guids
+            if guid.split(":", 1)[0] not in fetched_ids or normalise_identity(guid) in live
         }
         core._prune_enrich_clock(state, key, kept)
 

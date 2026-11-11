@@ -1527,14 +1527,34 @@ def claim_key(value: str) -> str:
 
 
 def _log_id(value: str) -> str:
-    """An untrusted identifier made safe for one log record: single line, never truncated.
+    """An untrusted identifier made safe for one log record: single line, bounded by the log filter.
 
     Identities come from a feed, and a control character in one would otherwise end the record and let a
-    publisher write what looks like an application log line. The value is not shortened: redaction runs on the
-    finished record and replaces a whole configured credential, so a truncated value would leave its prefix in
-    the log where the redactor can no longer recognise it.
+    publisher write what looks like an application log line. The value is not shortened here: redaction runs on
+    the finished record and replaces a whole configured credential, so shortening first would leave its prefix
+    in the log where the redactor could no longer recognise it. The length bound therefore lives in
+    ``http.RedactFilter.filter``, after the replacements.
     """
     return " ".join(value.split())
+
+
+def _clock_key(clock: Mapping[str, int], guid: str) -> str:
+    """The key ``guid``'s enrichment clock is stored under, found through its normalised form.
+
+    A document written by an older version can hold an identity that still carries a control character; the
+    readers normalise it now, so the restored guid never compares equal to the stored key verbatim. Comparing
+    only those spellings would miss a 24-hour pending clock and restart it as a fresh 2-hour retry clock, which
+    sends an advisory before the page that would have supplied its CVEs was given its full chance. An existing
+    key is reused, so the stored document keeps its spelling and the first-fault time is preserved; with no
+    such key the normalised spelling is used, which is what a new entry needs.
+    """
+    wanted = normalise_identity(guid) or guid
+    if wanted in clock:
+        return wanted
+    for stored in clock:
+        if normalise_identity(stored) == wanted:
+            return stored
+    return wanted
 
 
 def classify_new(
@@ -1666,9 +1686,11 @@ def classify_new(
                 # A post may precede its CVE list: a page without one starts its own 24 h clock, and a later page
                 # fault does not shorten it.
                 found = None if page is None else page.cves or None
-                if page is not None or item.guid in waiting:
+                waiting_key = _clock_key(waiting, item.guid)
+                if page is not None or waiting_key in waiting:
                     clock, limit = waiting, NODEJS_PENDING_SECONDS
-                    retry.pop(item.guid, None)  # one clock per item: the day replaces an earlier fault's 2 h
+                    # One clock per item: the day replaces an earlier fault's 2 h.
+                    retry.pop(_clock_key(retry, item.guid), None)
             else:
                 release = intel.php_cves_on(day) if day else intel.php_cves(php) if php else None
                 found = None if release is None else list(dict.fromkeys([*release.cves, *release.ghsas]))
@@ -1676,12 +1698,12 @@ def classify_new(
                 if _enrichment_wait(clock, item.guid, now, limit):
                     deferred.append(item)  # waiting on its retry clock: carried so the feed cannot drop it
                     continue
-                retry.pop(item.guid, None)
-                waiting.pop(item.guid, None)
+                retry.pop(_clock_key(retry, item.guid), None)
+                waiting.pop(_clock_key(waiting, item.guid), None)
                 unenriched = True
             else:
-                retry.pop(item.guid, None)
-                waiting.pop(item.guid, None)
+                retry.pop(_clock_key(retry, item.guid), None)
+                waiting.pop(_clock_key(waiting, item.guid), None)
                 if release is not None and not found:
                     seen[f"src:{item.guid}"] = {"at": now, "outcome": "not-security"}
                     claimed.add(f"src:{item.guid}")
@@ -1813,7 +1835,8 @@ def _enrichment_wait(retry: dict[str, int], guid: str, now: int, limit: int = EN
     The first fault starts the clock. Once it has run out the entry is removed and the item goes out once as unknown
     severity; the claim then keeps it from being fetched or sent again.
     """
-    first = retry.setdefault(guid, now)
+    key = _clock_key(retry, guid)
+    first = retry.setdefault(key, now)
     if now - first < limit:
         LOG.warning(
             "enrichment: item %s waits for its CVE list or source page (first missing %d s ago); retried next pass",
@@ -1826,7 +1849,7 @@ def _enrichment_wait(retry: dict[str, int], guid: str, now: int, limit: int = EN
         _log_id(guid),
         now - first,
     )
-    del retry[guid]
+    del retry[key]
     return False
 
 

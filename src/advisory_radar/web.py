@@ -3408,7 +3408,10 @@ def create_app(
             return JSONResponse(
                 {"error": "inbox full, retry after the next pass"}, status_code=429, headers={"Retry-After": "60"}
             )
-        return JSONResponse({"queued": entry["guid"]})
+        # ``JSONResponse`` encodes with ``ensure_ascii=False``, so a guid that is not a Unicode scalar value
+        # failed to encode after the entry was already persisted: the sender got a 500 for an accepted request.
+        # Escaping it the way /api/state does preserves the value and answers 2xx.
+        return Response(json.dumps({"queued": entry["guid"]}, ensure_ascii=True), media_type="application/json")
 
     @app.get("/api/state")
     def api_state(request: Request):

@@ -11,7 +11,7 @@ import pytest
 from advisory_radar import core, pipeline
 from advisory_radar.config import ConfigError, load_config
 from advisory_radar.plugins import SourceWindow
-from advisory_radar.sources import RssSource
+from advisory_radar.sources import RssSource, WebhookSource
 from advisory_radar.state import save_state
 from advisory_radar.watchlist import load_policy
 
@@ -80,6 +80,20 @@ class FakeNotifier:
     def send(self, entry, http):
         self.sent.append(entry)
         return self.status
+
+
+class WindowSource:
+    """A source that returns a fixed window, so a test controls the items and their identities."""
+
+    kind = "feed"
+
+    def __init__(self, source_id: str, items, host: str = "") -> None:
+        self.id = source_id
+        self._items = tuple(items)
+        self.host = host
+
+    def fetch(self, http, state=None):
+        return SourceWindow(self.id, self._items, False, self.host)
 
 
 def make_config(tmp_path: Path, **overrides):
@@ -453,3 +467,98 @@ def test_a_document_from_an_older_reader_is_normalised_before_it_is_judged(tmp_p
     assert "src:test:https://vendor.example.com/a\u007f" in stored["seen"], (
         "the stored document is not rewritten: the claim is compared in its normalised form instead"
     )
+
+
+def test_two_unusable_guids_are_two_advisories_not_one(tmp_path):
+    """Normalising an unencodable guid to nothing must not fold two distinct advisories into one identity."""
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path)
+    source = WindowSource(
+        "s1",
+        [
+            core.Item("\ud800", "first vendor advisory", "https://vendor.example.com/a", "notes", NOW - 3600, ()),
+            core.Item("\ud801", "second vendor advisory", "https://vendor.example.com/b", "notes", NOW - 3600, ()),
+        ],
+    )
+    notifier = FakeNotifier()
+    code = pipeline.run_pass(cfg, [source], [notifier], http=fake_http, clock=lambda: float(NOW), sleep=lambda s: None)
+    assert code == 0
+    assert len(notifier.sent) == 2, "the second advisory must not be dropped as already claimed"
+    stored = json.loads((tmp_path / "state.json").read_text())
+    identities = sorted(key for key in stored["seen"] if key.startswith("src:s1:"))
+    assert len(identities) == 2
+    assert all(key.startswith("src:s1:x-") for key in identities), "a synthetic identity must be unmistakable"
+    assert all(set(key[len("src:s1:x-") :]) <= set("0123456789abcdef") for key in identities)
+
+
+def test_a_legacy_enrichment_clock_key_is_found_through_its_normalised_form(tmp_path):
+    """An older document's key carries a control character; restarting it would shorten a 24-hour clock."""
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path)
+    nodejs = core.Item(
+        "wh:a\nb",
+        "Wednesday, October 21, 2026 Security Releases",
+        "https://nodejs.org/en/blog/vulnerability/october-2026-security-releases",
+        "notes",
+        NOW - 3600,
+        (),
+    )
+    state = core.new_state()
+    state["seeded"] = {"s1": True}
+    # What an older version stored: the identity still carries the newline the readers now remove. The item's
+    # restored identity is s1:wh:ab, so a verbatim lookup would miss this 3-hour-old 24-hour pending clock and
+    # start a fresh 2-hour retry clock instead.
+    state["enrich_pending"] = {"s1:wh:a\nb": NOW - 3 * 3600}
+    save_state(cfg.state_path, state)
+    code = pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [nodejs], host="nodejs.org")],
+        [FakeNotifier()],
+        http=fake_http,
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 0
+    stored = json.loads((tmp_path / "state.json").read_text())
+    assert stored["carry"]["s1"][0]["guid"] == "s1:wh:ab", "the item waits on the pending clock"
+    assert "enrich_retry" not in stored, "the pending clock must not restart as a 2-hour retry clock"
+    assert stored["enrich_pending"] == {"s1:wh:a\nb": NOW - 3 * 3600}, (
+        "the found key keeps its spelling and first-fault time; the document is not rewritten"
+    )
+
+
+def test_a_filtered_webhook_entry_is_released_from_the_inbox(tmp_path):
+    """The claim must be ``src:<namespaced guid>``; another prefix leaves the inbox entry unclaimed forever."""
+    watch = tmp_path / "watchlist.json"
+    watch.write_text(
+        json.dumps(
+            {
+                "schema": "security-watchlist.v1",
+                "debian_source_packages": ["curl"],
+                "excluded_products": [],
+                "products": [{"id": "libfoo", "aliases": ["libfoo"], "domains": ["libfoo.example"]}],
+            }
+        )
+    )
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "sources:\n  - id: wh\n    type: webhook\nnotifiers: []\n"
+        f"state_path: {tmp_path}/state.json\nwatchlist: {watch}\n"
+    )
+    cfg = load_config(cfg_path, {})
+    state = core.new_state()
+    state["seeded"] = {"wh": True}
+    state["webhook_inbox"] = {"wh": [{"guid": "wh:noise", "title": "garden notes", "link": "", "summary": ""}]}
+    save_state(cfg.state_path, state)
+    code = pipeline.run_pass(
+        cfg,
+        [WebhookSource("wh")],
+        [],
+        http=fake_http,
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 0
+    stored = json.loads((tmp_path / "state.json").read_text())
+    assert stored.get("webhook_inbox", {}) == {}, "a filtered entry must be released, not held forever"
+    assert stored["seen"]["src:wh:wh:noise"]["outcome"] == "filtered"

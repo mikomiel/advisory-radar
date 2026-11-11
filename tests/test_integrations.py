@@ -111,6 +111,26 @@ def test_webhook_intake_and_source_roundtrip(tmp_path):
     assert window.items[0].explicit == ("CVE-2026-7777",)
 
 
+def test_a_webhook_guid_that_cannot_be_encoded_is_still_accepted(tmp_path):
+    """The entry is persisted first; its guid must not then turn an accepted request into a 500."""
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_WEBHOOK_SECRET": "s3cret"}
+    app = create_app(Runtime.build(cfg_path, environment), environment)
+    client = TestClient(app)
+    # An escaped unpaired surrogate is valid JSON but not a Unicode scalar value, so a response that encodes it
+    # verbatim fails after the entry is already on disk. The sender escapes JSON by default, as here.
+    response = client.post(
+        "/webhooks/wh",
+        content=b'{"title": "Vendor advisory", "guid": "\\ud800legacy"}',
+        headers={"Authorization": "Bearer s3cret", "Content-Type": "application/json"},
+    )
+    assert response.status_code == 200
+    assert response.json()["queued"] == "wh:\ud800legacy"
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["webhook_inbox"]["wh"][0]["guid"] == "wh:\ud800legacy"
+
+
 def test_notifier_payload_shapes():
     calls = []
 

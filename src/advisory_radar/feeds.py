@@ -715,6 +715,24 @@ _FEED_ACCEPT = (
     "application/rss+xml, application/atom+xml, application/feed+json, application/json, application/xml, text/xml"
 )
 
+#: The port a scheme connects to when the URL names none, so ``https://host`` and ``https://host:443`` agree.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(url: str) -> tuple[str, str | None, int | None] | None:
+    """A URL's origin as ``(scheme, host, effective port)``, or None when it has no usable authority.
+
+    ``urlsplit`` lowercases the scheme and host and raises for a malformed port or IPv6 bracket. Such a URL is
+    not this page's origin, and None keeps the caller's comparison from raising on remote-authored text. A
+    missing port means the scheme's default: a link that spells out ``:443`` names the same origin as one that
+    does not.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+        return parts.scheme, parts.hostname, parts.port or _DEFAULT_PORTS.get(parts.scheme)
+    except ValueError:
+        return None
+
 
 def fetch_any(
     http: Http, url: str, validators: Mapping[str, str] | None = None
@@ -742,11 +760,15 @@ def fetch_any(
         target = discover_feed(body, url)
         if target is None:
             raise FeedError("page offers no feed link")
-        # The page is remote-authored, so its link is too: without this check a public page could aim the next
-        # poll at loopback or the metadata service. ``allow_private_sources`` deliberately does not apply --
-        # that allowance is for an operator-authored source URL, and an operator who needs a private feed can
-        # configure that feed directly. The refusal has to come before the request; a rejection after the
-        # response cannot unmake the internal GET.
+        # The page is remote-authored, so its link is too. The page's own host is the one the operator already
+        # chose, so discovery may not redirect the reader to a host an attacker picked: the feed must share the
+        # page's scheme, host and port. A feed genuinely served from another host is configured directly. The
+        # private-destination rule stays as well, and ``allow_private_sources`` deliberately applies to neither
+        # -- that allowance is for an operator-authored source URL. Both refusals have to come before the
+        # request; a rejection after the response cannot unmake the internal GET.
+        advertised = _origin(target)
+        if advertised is None or advertised != _origin(url):
+            raise FeedError("page advertises a feed on another origin")
         if private_destination(target):
             raise FeedError("page advertises a feed on a private address")
         status, _, body = http("GET", target, {"Accept": _FEED_ACCEPT}, None)

@@ -122,9 +122,14 @@ share an id with one the YAML defines, must have a literal id, and may not point
 network unless the YAML sets `allow_private_sources: true`. That last check is a guard rail
 against a mistake rather than an isolation boundary — the pass resolves the name again when it
 fetches — and the operator token is a full-trust credential, so treat it accordingly. A feed
-URL discovered from a page's `<link rel="alternate">` is checked the same way and is refused
-before it is fetched, whatever `allow_private_sources` says: that URL was chosen by a remote
-page, not by the operator. While the overlay holds a
+URL discovered from a page's `<link rel="alternate">` is held to two rules, both checked
+before it is fetched and neither relaxed by `allow_private_sources`: it must share the
+page's own origin — the same scheme, host and port — and it must not resolve to a loopback
+or private address. The first is the containment: the page's own host is the one the
+operator already chose, so discovery cannot redirect the reader to a host an attacker
+picked, and a feed genuinely served from another host is configured directly. The second
+keeps the existing guard rail, because that URL was chosen by a remote page, not by the
+operator. While the overlay holds a
 `notifiers` list it replaces the YAML's membership and ordinary fields, so a notifier
 added to the YAML later is not used until that section is removed from the overlay; a
 notifier's `headers` are the exception, staying in the YAML and carried over by id. A
