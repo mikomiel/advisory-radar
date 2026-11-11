@@ -78,14 +78,17 @@ thresholds:                 # these are the defaults
 A message's note names the bar that decided it (`CVSS >= 7.5, remote attack, ...`), so the
 text cannot claim a threshold the configuration no longer has. Changing a threshold is a
 change of rules, not of the world, so it does not send the backlog out: each watched CVE
-records the numbers it was judged under, and the first evaluation after a change records
-the new level instead of escalating it. A CVE in KEV, or one CISA flags as actively
-exploited, still escalates — that is evidence, not a rule.
+records the numbers it was judged under, and the first evaluation after a change records the
+new verdict without telling anyone. The entry keeps what you were actually told apart from
+what the numbers now say, so a KEV hit or a CISA active flag that arrives later still
+escalates — that is evidence, not a rule.
 
 `/thresholds`, linked from `/config`, previews one advisory: give it a CVSS, an EPSS, its
-KEV and SSVC state, a source and a product, and it shows the level, the reason, the exact
-metrics line and note the message would carry, and which route and notifiers would receive
-it. It reads the live configuration and writes nothing, so the link can be shared.
+KEV and SSVC state, a source, a product and the advisory's identifiers, and it shows the
+level, the reason, the exact metrics line and note the message would carry, and which route
+and notifiers would receive it. It reads the live configuration and writes nothing, so the
+link can be shared. A route that matches on identifiers needs them: without one the page says
+the destination cannot be predicted rather than guessing.
 
 ### Routing
 

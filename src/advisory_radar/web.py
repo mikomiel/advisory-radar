@@ -2621,6 +2621,10 @@ def create_app(
         remote = request.query_params.get("remote") == "1"
         source = (request.query_params.get("source") or "").strip()
         product = (request.query_params.get("product") or "").strip()
+        # A rule can match on the advisory's identifiers, so they are an input of the routing answer, not a
+        # constant: a preview that invented one would predict a destination the real message never reaches.
+        ids_text = (request.query_params.get("ids") or "").strip()
+        identifiers = [part for part in re.split(r"[,\s]+", ids_text) if part]
 
         def choice(value: str, label: str, current: str) -> str:
             return f"<option value='{esc(value)}'{' selected' if value == current else ''}>{esc(label)}</option>"
@@ -2662,28 +2666,42 @@ def create_app(
                 # Nothing is sent, so naming a route would describe a message that never exists.
                 destination = "<p class='muted'>No message is sent, so nothing is routed.</p>"
             else:
-                selected, where = routing.select(
-                    {
-                        "tag": level,
-                        "source_id": source,
-                        "products": [product] if product else [],
-                        "ids": ["CVE-0000-0000"],
-                    },
-                    cfg.routes,
-                    cfg.default_notifiers,
-                    [str(entry.get("id", "")) for entry in cfg.notifiers],
-                )
-                destination = (
-                    f"<p>Routing: <b>{esc(where)}</b> · "
-                    + (f"notifiers <b>{esc(', '.join(selected))}</b>" if selected else "no notifier")
-                    + "</p>"
-                )
-                if not selected:
-                    destination += _notice(
-                        "No rule names a notifier for this message and the configuration has no default: the "
-                        "pass would fail on it rather than drop it.",
+                id_rules = [
+                    str(position)
+                    for position, route in enumerate(cfg.routes, start=1)
+                    if isinstance(route, dict) and isinstance(route.get("match"), dict) and "ids" in route["match"]
+                ]
+                if id_rules and not identifiers:
+                    destination = _notice(
+                        "Rule "
+                        + ", ".join(id_rules)
+                        + " matches on identifiers, so the destination cannot be predicted without them. Add the "
+                        "advisory's ids above.",
                         "warning",
                     )
+                else:
+                    selected, where = routing.select(
+                        {
+                            "tag": level,
+                            "source_id": source,
+                            "products": [product] if product else [],
+                            "ids": identifiers,
+                        },
+                        cfg.routes,
+                        cfg.default_notifiers,
+                        [str(entry.get("id", "")) for entry in cfg.notifiers],
+                    )
+                    destination = (
+                        f"<p>Routing: <b>{esc(where)}</b> · "
+                        + (f"notifiers <b>{esc(', '.join(selected))}</b>" if selected else "no notifier")
+                        + "</p>"
+                    )
+                    if not selected:
+                        destination += _notice(
+                            "No rule names a notifier for this message and the configuration has no default: the "
+                            "pass would fail on it rather than drop it.",
+                            "warning",
+                        )
             carries = "Recorded with" if level == "suppressed" else "The message would carry"
             result = (
                 "<h2>Result</h2>"
@@ -2708,6 +2726,8 @@ def create_app(
             "<div class='fields'>"
             f"<label>Source<select name='source'>{source_options}</select></label>"
             f"<label>Product id<input type='text' name='product' value='{esc(product)}'></label>"
+            f"<label>Advisory ids<input type='text' name='ids' value='{esc(ids_text)}' "
+            "placeholder='CVE-2026-1234 GHSA-abcd-...'></label>"
             "</div>"
             "<button class='btn btn-primary' name='preview' value='1'>Preview</button>"
             f" <a class='btn btn-quiet' href='/config'>Change the thresholds</a>"

@@ -139,6 +139,13 @@ NODEJS_PENDING_SECONDS = 24 * 3600
 OSV_SEVERITY_SCORE = {"LOW": 3.9, "MODERATE": 6.9, "HIGH": 8.9, "CRITICAL": 9.0}
 
 RANK = {"suppressed": 0, "warning": 1, "critical": 2}
+
+
+def _rank(level: object) -> int:
+    """The escalation precedence of a stored level; a damaged or unknown value ranks below every real one."""
+    return RANK.get(level, 0) if isinstance(level, str) else 0
+
+
 #: The level words a message shows. The tag sent to notifiers (``critical``, ``warning``) and the levels kept
 #: in state stay English.
 LEVEL_LABEL = {"critical": "CRITICAL", "warning": "WARNING"}
@@ -1442,6 +1449,7 @@ def _delivered(
                 "title": entry["source"],
                 "link": entry["link"],
                 "thresholds": judged_by,
+                "judged": level,
             }
             if "scores" in entry:  # A message queued before the key existed has no score on record: legacy.
                 state["watch"][cve]["cvss"] = entry["scores"].get(cve)
@@ -1449,6 +1457,7 @@ def _delivered(
         watch = state["watch"].get(entry["cves"][0])
         if watch is not None:
             watch["level"] = entry["tag"]
+            watch["judged"] = entry["tag"]
             watch["thresholds"] = Thresholds.from_snapshot(entry.get("thresholds")).snapshot()
     # An Adobe message was recorded in state["adobe"] when it was queued; delivering or dropping it changes nothing.
 
@@ -1470,6 +1479,7 @@ def _suppressed(
             "since": now,
             "last_eval": now,
             "level": level,
+            "judged": level,
             "title": headline(item.title, item.summary)[0],
             "link": item.link,
             "cvss": scores.get(cve),
@@ -1851,14 +1861,19 @@ def reevaluate(
             continue
         entry["last_eval"] = now
         level, reason = level_of(current, cve in kev, kev_known, thresholds=thresholds)
+        # Two levels, deliberately kept apart: ``level`` is what the reader was last told, and ``judged`` is what
+        # the numbers in force now make of the CVE, whether or not anything was sent. A re-baseline raises only
+        # the second, so it stays silent -- while later evidence (KEV, SSVC) can still escalate against the first.
+        told = _rank(entry.get("level"))
         judged_by = Thresholds.from_snapshot(entry.get("thresholds"))
         entry["thresholds"] = thresholds.snapshot()
-        if judged_by != thresholds and not (reason in ("kev", "ssvc") and level == "critical"):
-            # Re-baseline: record what this CVE is under the new numbers, send nothing. A settings edit is not
-            # a change in the world, so it must not look like one.
-            entry["level"] = level
-            LOG.info("reevaluate: %s recorded as %s under changed thresholds; nothing sent", cve, level)
-            continue
+        evidence = reason in ("kev", "ssvc") and _rank(level) > told
+        if judged_by != thresholds:
+            entry["judged"] = level
+            if not evidence:
+                # A settings edit is not a change in the world, so it must not look like one.
+                LOG.info("reevaluate: %s recorded as %s under changed thresholds; nothing sent", cve, level)
+                continue
         held = reason == "remote" and not _score_is_new(entry, thresholds)
         if held:  # Judge again without the remote rule, so EPSS can still escalate.
             level, reason = level_of(
@@ -1866,7 +1881,7 @@ def reevaluate(
             )
         if level == "warning" and not (current.cvss is not None and current.cvss >= thresholds.suppress_below_cvss):
             continue  # Still unscored or LOW: not an escalation.
-        if RANK[level] <= RANK[entry["level"]]:
+        if _rank(level) <= max(told, _rank(entry.get("judged"))) and not evidence:
             if held and entry["level"] != "critical":
                 LOG.info(
                     "reevaluate: %s already scored %.1f when sent; the remote rule alone does not escalate it",

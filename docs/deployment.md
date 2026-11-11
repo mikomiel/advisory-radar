@@ -180,13 +180,17 @@ non-number, a value outside its range, and a floor above the critical bar.
 
 Changing a threshold changes the rules, so it does not send the watch list out: every
 watched CVE records the numbers it was judged under, and the first evaluation after a change
-records the new level without escalating. A CVE in KEV, or one CISA flags as actively
-exploited, still escalates — that is evidence rather than a rule. State written before the
-feature carries no such record and is judged by the defaults, which is what was in force then.
+records the new verdict without telling anyone. The entry keeps the level the reader was told
+(`level`) apart from the level the numbers in force make of it (`judged`), so a KEV hit or a
+CISA active flag that arrives later still escalates against what was actually sent. State
+written before the feature carries no record and is judged by the defaults, which is what was
+in force then.
 
 `/thresholds`, linked from `/config`, previews one advisory against the live numbers: the
 level, the reason, the metrics line and note the message would carry, and the route and
-notifiers it would reach. It is a read-only GET, so a link to it can be shared.
+notifiers it would reach. The advisory's identifiers are an input, because a rule may match
+on them; without one and with such a rule configured, the page says the destination cannot be
+predicted instead of guessing. It is a read-only GET, so a link to it can be shared.
 
 ### Routing
 

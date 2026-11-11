@@ -45,6 +45,22 @@ routes:
     notifiers: [phone]
 default: [ops]
 """
+BODY_IDS = """\
+sources: []
+notifiers:
+  - id: ops
+    type: ntfy
+    url: ${OPS_HOOK}
+    topic: advisories
+  - id: phone
+    type: ntfy
+    url: ${PHONE_HOOK}
+    topic: alerts
+routes:
+  - match: {ids: "CVE-2026-*"}
+    notifiers: [phone]
+default: [ops]
+"""
 ENVIRONMENT = {"OPS_HOOK": "https://ntfy.example.net/OPS", "PHONE_HOOK": "https://ntfy.example.net/PHONE"}
 
 
@@ -262,7 +278,8 @@ def test_a_threshold_change_rebaselines_a_watched_cve_without_queueing():
     core.reevaluate(state, intel, frozenset(), True, NOW, "", thresholds=Thresholds(critical_cvss=7.0))
 
     assert state["pending"] == [], "a rule change is not news: nothing may be sent"
-    assert state["watch"][cve]["level"] == "critical", "the change is recorded, so a later change is an escalation"
+    assert state["watch"][cve]["judged"] == "critical", "the new rules' verdict is recorded..."
+    assert state["watch"][cve]["level"] == "warning", "...but the reader was told warning, and still has been"
     assert state["watch"][cve]["thresholds"] == [7.0, 0.10, 4.0]
     assert state["watch"][cve]["last_eval"] == NOW
 
@@ -270,13 +287,34 @@ def test_a_threshold_change_rebaselines_a_watched_cve_without_queueing():
 def test_a_stricter_threshold_records_the_downgrade():
     state = core.new_state()
     cve = "CVE-2026-7001"
-    state["watch"][cve] = watch_entry(cve, level="critical", cvss=9.5)
+    state["watch"][cve] = watch_entry(cve, level="critical", judged="critical", cvss=9.5)
     intel = Facts(**{cve: facts(9.5, remote=True)})
 
     core.reevaluate(state, intel, frozenset(), True, NOW, "", thresholds=Thresholds(critical_cvss=9.9))
 
     assert state["pending"] == []
+    assert state["watch"][cve]["judged"] == "warning"
+    assert state["watch"][cve]["level"] == "critical", "a downgrade is not news either, and the record stays true"
+
+
+def test_evidence_after_a_re_baseline_still_escalates():
+    """A silent re-baseline must not swallow the KEV hit that arrives with the next evaluation."""
+    state = core.new_state()
+    cve = "CVE-2026-7004"
+    state["watch"][cve] = watch_entry(cve, cvss=8.0)  # sent as a warning under the defaults
+    looser = Thresholds(critical_cvss=7.0)
+    remote = Facts(**{cve: facts(8.0, remote=True)})
+
+    core.reevaluate(state, remote, frozenset(), True, NOW, "", thresholds=looser)
+    assert state["pending"] == []
+    assert state["watch"][cve]["judged"] == "critical"
     assert state["watch"][cve]["level"] == "warning"
+
+    # The next daily evaluation finds the CVE in KEV: that is evidence, and the reader has never had it.
+    core.reevaluate(state, remote, frozenset({cve}), True, NOW + core.REEVAL_INTERVAL, "", thresholds=looser)
+
+    queued = [entry for entry in state["pending"] if entry["kind"] == "escalation"]
+    assert queued and queued[0]["cves"] == [cve] and queued[0]["tag"] == "critical"
 
 
 def test_a_kev_hit_still_escalates_across_a_threshold_change():
@@ -402,6 +440,24 @@ def test_the_preview_reports_the_default_selection(tmp_path):
     page = preview(client, cvss="5.0", source="nodejs")  # a warning from a source only a critical rule names
     assert "Warning" in page
     assert "default" in page and "ops" in page
+
+
+def test_the_preview_will_not_predict_a_route_that_needs_identifiers(tmp_path):
+    """A rule can match on the ids, so without them the page must say so rather than guess."""
+    client, _, _ = make_client(tmp_path, body=BODY_IDS)
+    sign_in(client)
+    page = preview(client, cvss="9.8", kev="yes")
+    assert "Routing:" not in page
+    assert "cannot be predicted without them" in page
+
+
+def test_the_preview_uses_the_identifiers_it_is_given(tmp_path):
+    client, _, _ = make_client(tmp_path, body=BODY_IDS)
+    sign_in(client)
+    page = preview(client, cvss="9.8", kev="yes", ids="CVE-2026-1234")
+    assert "Routing:" in page and "route 1" in page and "phone" in page
+    # A different identifier falls through the same rule to the default.
+    assert "default" in preview(client, cvss="9.8", kev="yes", ids="CVE-2025-1234")
 
 
 def test_the_preview_refuses_a_bad_number(tmp_path):

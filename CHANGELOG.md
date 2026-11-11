@@ -107,8 +107,11 @@ operator action, and the release workflow then builds and pushes the image to
 - `GET /thresholds`, linked from `/config`: a preview of what one advisory would be judged
   as and where its message would go. It renders the live thresholds and calls the same
   `core.level_of` and `routing.select` the pass calls, showing the level, the reason, the
-  metrics line and note the message would carry, and the matching route and notifiers. It
-  is a read-only GET -- nothing is written, so a link to it can be shared.
+  metrics line and note the message would carry, and the matching route and notifiers. The
+  advisory's identifiers are an input, because a rule may match on them: a preview that
+  invented one would predict a destination the real message never reaches, so without one
+  and with such a rule configured the page says so instead. It is a read-only GET -- nothing
+  is written, so a link to it can be shared.
 
 ### Fixed
 - A first pass whose every source failed wrote no state at all, so `/sources` reported
@@ -157,10 +160,11 @@ operator action, and the release workflow then builds and pushes the image to
   longer has; the escalation note does the same for EPSS.
 - A saved threshold re-baselines what is already watched instead of escalating it: each
   watch entry records the numbers it was judged under (`state["watch"][*]["thresholds"]`),
-  and the first evaluation after a change records the new level without sending anything. A
-  CVE in KEV, or one CISA flags as actively exploited, still escalates -- evidence rather
-  than a rule. State written before this change carries no record and is judged by the
-  defaults, which is what judged it.
+  and the first evaluation after a change records the new verdict without sending anything.
+  The entry keeps the level the reader was told (`level`) apart from the level the numbers in
+  force make of it (`judged`), so a KEV hit, or CISA's active flag, that arrives later still
+  escalates against what was actually sent. State written before this change carries no
+  record and is judged by the defaults, which is what judged it.
 - `/sources` leads with what this instance monitors: each enabled source's state, last
   attempt, last success, entries and error, with a probe per row. The built-in catalogue
   stays on the page, below the configured sources it documents. The `/config` source table
