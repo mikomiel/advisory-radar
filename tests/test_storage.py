@@ -495,24 +495,25 @@ def test_a_driver_message_that_names_the_token_alone_is_scrubbed(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("url", "name", "value"),
+    ("url", "option", "value"),
     [
+        # A non-credential option is refused too: the rule is the query string, not a list of credential names.
+        ("postgresql://db.example/radar?sslmode=require", "sslmode", "require"),
+        # PostgreSQL 18's OAuth secret is why the list was dropped: libpq can add a keyword this program has
+        # never heard of, and it must not slip through.
+        ("postgresql://db.example/radar?oauth_client_secret=s3cr3t-oauth", "oauth_client_secret", "s3cr3t-oauth"),
         ("postgresql://db.example/radar?password=bad%password", "password", "bad%password"),
-        ("postgresql://db.example/radar?passfile=/run/secrets/pgpass", "passfile", "/run/secrets/pgpass"),
-        ("postgresql://db.example/radar?sslpassword=s3cr3t-ssl", "sslpassword", "s3cr3t-ssl"),
-        ("postgresql://db.example/radar?sslcert=/run/secrets/client.crt", "sslcert", "/run/secrets/client.crt"),
-        ("postgresql://db.example/radar?sslkey=/run/secrets/client.key", "sslkey", "/run/secrets/client.key"),
-        # libpq percent-decodes an option name before matching it, so this spelling is the same option.
+        # A percent-encoded option name is the same option to libpq.
         ("postgresql://db.example/radar?pass%77ord=s3cr3t-encoded", "password", "s3cr3t-encoded"),
     ],
 )
-def test_a_credential_in_the_postgres_query_string_is_refused_before_the_driver(
-    url, name, value, tmp_path, monkeypatch
-):
-    """This program does not parse libpq options, so a credential in the query string is refused, not used.
+def test_a_postgres_query_string_is_refused_before_the_driver(url, option, value, tmp_path, monkeypatch):
+    """This program does not parse libpq options, so the whole query string is refused, not a list of names.
 
-    A ``migrate`` target's credentials are in no configuration this process redacts, and libpq can quote the
-    value alone; the refusal is therefore checked before a driver exists to build such a message.
+    libpq keeps adding keywords -- PostgreSQL 18's ``oauth_client_secret`` was the last one -- so a list of
+    credential names would always trail it. The static refusal is checked before a driver exists, and it carries
+    neither the option name nor its value: a ``migrate`` target's credentials are in no configuration this
+    process redacts.
     """
     driver_calls: list[str] = []
 
@@ -526,8 +527,12 @@ def test_a_credential_in_the_postgres_query_string_is_refused_before_the_driver(
     with pytest.raises(ValueError) as caught:
         storage.PostgreSqlStore(url)
     message = str(caught.value)
-    assert name in message, "the refusal names the parameter, so an operator can act on it"
-    assert value not in message, "the refusal must never carry the credential"
+    assert "does not parse libpq options" in message, "the refusal says why every option is out of scope"
+    # The only option-like words are the uppercase PG* environment variables the message tells the operator to
+    # use; the lowercase option name from the URL never appears, and neither does its value.
+    assert option not in message, "the refusal must not echo the parameter name"
+    assert value not in message, "the refusal must not echo the value"
+    assert url.split("?", 1)[1] not in message, "the raw query string is never repeated"
     assert driver_calls == []
     # A configuration reaches the same refusal through the one parser, so `migrate --to` cannot skip it.
     with pytest.raises(ValueError):
@@ -575,7 +580,7 @@ def test_an_encoded_fragment_in_the_userinfo_stays_a_password_position():
     assert repr(store) == "PostgreSqlStore(host='db.example', database='radar')"
 
 
-def test_a_non_credential_query_parameter_is_not_refused():
-    # The check is a fixed credential vocabulary, not a ban on the libpq options this program does not read.
-    store = storage.PostgreSqlStore("postgresql://db.example/radar?sslmode=require")
-    assert repr(store) == "PostgreSqlStore(host='db.example', database='radar')"
+def test_a_fragment_free_query_string_cannot_even_carry_a_non_credential_option():
+    # The rule is the query string itself, so there is no option list to keep in step with libpq.
+    with pytest.raises(ValueError, match="may not carry a query string"):
+        storage.PostgreSqlStore("postgresql://db.example/radar?sslmode=require")

@@ -330,16 +330,14 @@ def _malformed_percent_escape(userinfo: str) -> bool:
     return False
 
 
-#: libpq options whose value is a credential. A password belongs in the userinfo or the environment: this
-#: program does not parse libpq's option set, so it refuses these rather than accepting a value it can neither
-#: validate nor scrub from a driver message.
-_QUERY_CREDENTIALS = ("passfile", "password", "sslcert", "sslkey", "sslpassword")
-
-#: The refusal names the option and nothing else: the value may be the only copy of a password, and a
-#: ``migrate`` target's credentials are in no configuration this process redacts.
-_QUERY_CREDENTIAL_REFUSAL = (
-    "unsupported state store: the PostgreSQL URL supplies {name} as a query parameter; a credential belongs "
-    "in the userinfo or the environment, not in the query string"
+#: One static refusal covers every libpq option, credential or not: libpq keeps adding keywords (PostgreSQL 18's
+#: ``oauth_client_secret`` was the last one), so a list of credential names would always trail it. A query
+#: string is refused whole, which makes the credential inventory complete by construction -- no option can slip
+#: through, whether or not this program has heard of it -- and the message names no option and no value.
+_QUERY_REFUSAL = (
+    "unsupported state store: a PostgreSQL connection target may not carry a query string; this program does "
+    "not parse libpq options -- set them in the environment (PGSSLMODE, PGSERVICEFILE, ...) or in the "
+    "server's own configuration"
 )
 
 #: A raw ``#`` is read two ways: ``urlsplit`` starts a fragment there, while libpq keeps it in the userinfo or
@@ -349,24 +347,6 @@ _FRAGMENT_REFUSAL = (
     "unsupported state store: the PostgreSQL URL contains a raw #; a fragment is not part of a connection "
     "target this program parses. Percent-encode a literal # (for example %23) in the userinfo or the database"
 )
-
-
-def _query_credential(url: str) -> str:
-    """The credential-bearing libpq option a PostgreSQL URL names in its query string, or "".
-
-    libpq percent-decodes an option name before matching it and matches it case-sensitively (``?pass%77ord=``
-    is ``password``, ``?PASSWORD=`` is an unknown option), so the check does the same and returns the canonical
-    name -- never the text from the URL, which a refusal must not echo.
-    """
-    for field in urllib.parse.urlsplit(url).query.split("&"):
-        name = field.partition("=")[0]
-        try:
-            decoded = urllib.parse.unquote(name, errors="strict")
-        except UnicodeDecodeError:
-            continue  # not a resolvable option name; the driver's own parse is not this check's business
-        if decoded in _QUERY_CREDENTIALS:
-            return decoded
-    return ""
 
 
 def _password_tokens(password: str) -> set[str]:
@@ -387,12 +367,12 @@ def _postgres_target(url: str) -> tuple[str, str]:
     Parsing here is a credential control as much as a validation: a refusal that quoted the URL would put its
     password into a log line. The password is never returned from this function or stored on its own.
 
-    A password belongs in the userinfo or the environment. libpq also accepts credentials as query parameters,
-    but this program does not parse libpq's option set: a query string that names one is refused here, so a
-    value this code can neither validate nor scrub never reaches the driver. A raw ``#`` is refused too, because
-    Python's parser and libpq disagree about it and both credential checks read the URL the way Python does.
-    What remains -- a fragment-free URL whose only credential position is the userinfo -- is exactly what the
-    scrubber covers.
+    A password belongs in the userinfo or the environment. libpq also accepts connection options -- credentials
+    among them -- as query parameters, and it keeps adding keywords (``oauth_client_secret`` arrived in
+    PostgreSQL 18); this program does not parse that option set. A query string is therefore refused whole, so
+    no option can slip past a list that would always trail libpq. A raw ``#`` is refused too, because Python's
+    parser and libpq disagree about it. What remains -- a fragment-free, query-free URL whose only credential
+    position is the userinfo -- is exactly what the scrubber covers.
     """
     try:
         parts = urllib.parse.urlsplit(url)
@@ -405,9 +385,8 @@ def _postgres_target(url: str) -> tuple[str, str]:
         raise ValueError(_FRAGMENT_REFUSAL)
     if _malformed_percent_escape(_userinfo(url)):
         raise ValueError(_MALFORMED_USERINFO)
-    supplied = _query_credential(url)
-    if supplied:
-        raise ValueError(_QUERY_CREDENTIAL_REFUSAL.format(name=supplied))
+    if parts.query:
+        raise ValueError(_QUERY_REFUSAL)
     return host, parts.path.lstrip("/")
 
 

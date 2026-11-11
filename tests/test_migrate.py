@@ -100,11 +100,20 @@ def test_migrate_refuses_an_unusable_target_without_echoing_it(tmp_path, monkeyp
     assert "s3cr3t-pass" not in caplog.text
 
 
-def test_migrate_refuses_a_target_credential_in_the_query_string(tmp_path, monkeypatch, caplog):
-    """A ``--to`` credential is in no configuration this process redacts, so the target is refused first.
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgresql://db.example/radar?password=bad%password",
+        # A keyword this program has never heard of is refused the same way: the query string is out of scope,
+        # not a list of names that libpq would keep outgrowing.
+        "postgresql://db.example/radar?oauth_client_secret=bad%password",
+    ],
+)
+def test_migrate_refuses_a_postgres_query_string_before_the_driver(url, tmp_path, monkeypatch, caplog):
+    """A ``--to`` credential is in no configuration this process redacts, and libpq can quote the value alone.
 
-    libpq can quote the value alone in its parse error; the URL must never reach it, and the log line an
-    operator pastes into an issue must carry the parameter name rather than the credential.
+    The refusal is static and names no option, so neither the value nor the parameter name can reach the log an
+    operator pastes into an issue.
     """
     driver_calls: list[str] = []
 
@@ -118,15 +127,14 @@ def test_migrate_refuses_a_target_credential_in_the_query_string(tmp_path, monke
     config = make_config(tmp_path)
     save_state(tmp_path / "state.json", make_document())
     with caplog.at_level(logging.ERROR):
-        code = cli.main(
-            ["migrate", "--config", str(config), "--to", "postgresql://db.example/radar?password=bad%password"],
-            env={},
-        )
+        code = cli.main(["migrate", "--config", str(config), "--to", url], env={})
     assert code == 1
     assert driver_calls == [], "the URL must be refused before the driver can quote it"
+    assert "does not parse libpq options" in caplog.text
     assert "bad%password" not in caplog.text
     assert "%password" not in caplog.text
-    assert "password" in caplog.text, "the parameter is named, so the operator can act on it"
+    for option in ("password", "oauth_client_secret"):
+        assert option not in caplog.text, "the log names no option, because none is parsed"
 
 
 @pytest.mark.parametrize(
