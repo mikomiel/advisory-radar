@@ -112,6 +112,38 @@ operator action, and the release workflow then builds and pushes the image to
   invented one would predict a destination the real message never reaches, so without one
   and with such a rule configured the page says so instead. It is a read-only GET -- nothing
   is written, so a link to it can be shared.
+- Per-source thresholds: a `sources:` entry may carry its own `thresholds` block, partial or
+  complete, merged key by key over the global block and validated by the same rules and
+  ranges with the source's id in the message. `Config.thresholds_for(source_id)` resolves it
+  at load time; `core.classify_new` judges an item with its source's block and
+  `core.reevaluate` re-judges each watch entry with the block of the source that queued it
+  (recorded on the watch entry at delivery and at suppression, with the global block as the
+  fallback for state written before this change or damaged by hand). Both the YAML list and
+  the overlay's `sources`/`sources_added` entries accept the block, and `/config` edits each
+  source's three numbers under the global ones, leaving a field empty when it follows the
+  global block.
+- Three routing predicates in a rule's `match`: `min_cvss` (the highest CVSS the message
+  reports is at least this), `epss_gte` (the highest EPSS it reports is at least this) and
+  `kev` (true when a CVE it names is in the KEV catalog, false when none is). They read only
+  what the classification measured, carried on the queue entry as `scores`, `epss` and `kev`;
+  a message with no measured score satisfies no numeric predicate, and an unmeasured KEV
+  membership (an unreadable catalog) satisfies neither boolean. The validator judges each
+  match value by its key instead of requiring a non-empty string, so a predicate outside its
+  range or a non-boolean `kev` is refused when the configuration loads. `/config` exposes the
+  three on every route row, and `/thresholds` predicts them from the values it was given.
+
+### Changed
+- `/thresholds` judges the previewed advisory with the previewed source's own threshold
+  block when it has one and says so, instead of always using the global block.
+- `settings.validate_settings` accepts a source's `thresholds` block in an overlay edit and
+  in an added source, checking only its shape; the numbers are merged and judged by the
+  configuration validator with the YAML's messages.
+- A watch entry records the source that queued it, so a per-source threshold change is a
+  change of rules for that source only: it re-baselines that source's CVEs without sending
+  them, while a new KEV hit or CISA active flag still escalates against what the reader was
+  actually told.
+- `_SOURCE_KEYS` treats `thresholds` as a structural source key, like `enabled`; the source
+  catalogue keeps owning only the keys a kind's builder reads.
 
 ### Fixed
 - A first pass whose every source failed wrote no state at all, so `/sources` reported

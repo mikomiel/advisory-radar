@@ -66,10 +66,11 @@ def validate_settings(settings: object) -> dict:
     """Refuse an overlay the runtime could not apply, without repeating the config validator.
 
     Only rules specific to the overlay live here: the eight-key allowlist, the reference-only secret
-    rule, the two-key edit of a YAML source, and the shape of a complete source the overlay adds. Values
-    the YAML validator checks -- a poll interval, a hidden-host list, a threshold number, a notifier's keys
-    and its ``enabled`` boolean, a source's remaining keys, a route's match keys and whether a selected
-    notifier is enabled -- are merged and left to it, so both sources of truth fail with one message.
+    rule, the shape of a YAML source's ``enabled``/``tag``/``thresholds`` edit, and the shape of a complete
+    source the overlay adds. Values the YAML validator checks -- a poll interval, a hidden-host list, a
+    threshold number, a notifier's keys and its ``enabled`` boolean, a source's remaining keys, a route's
+    match keys and whether a selected notifier is enabled -- are merged and left to it, so both sources of
+    truth fail with one message.
     """
     if not isinstance(settings, dict):
         raise ConfigError("settings: the overlay must be a mapping")
@@ -110,12 +111,18 @@ def validate_settings(settings: object) -> dict:
             raise ConfigError("settings: sources must be a mapping of source id to enabled/tag")
         for identifier, changes in sources.items():
             if not isinstance(changes, dict):
-                raise ConfigError(f"settings: source {identifier!r} must map to enabled/tag")
-            extra = set(changes) - {"enabled", "tag"}
+                raise ConfigError(f"settings: source {identifier!r} must map to enabled/tag/thresholds")
+            extra = set(changes) - {"enabled", "tag", "thresholds"}
             if extra:
                 raise ConfigError(f"settings: source {identifier!r}: unknown keys {sorted(extra)}")
             if "tag" in changes and not isinstance(changes["tag"], str):
                 raise ConfigError(f"settings: source {identifier!r}: tag must be a string")
+            # The numbers are judged by ``config._thresholds`` after the merge, over the YAML's own block;
+            # only the mapping shape is checked here, so a malformed saved block never reaches the merge.
+            if "thresholds" in changes and not isinstance(changes["thresholds"], dict):
+                raise ConfigError(
+                    f"settings: source {identifier!r}: thresholds must be a mapping of threshold name to number"
+                )
     if "sources_added" in settings:
         _validate_added_sources(settings["sources_added"])
     return settings
@@ -169,6 +176,12 @@ def _validate_added_sources(added: object) -> None:
                     f"settings: added source {identifier!r}: {key} must be a ${{NAME}} or ${{NAME_FILE}} "
                     "reference; a literal secret is never stored"
                 )
+        # A per-source threshold block is ordinary numbers, but its shape is checked here too: the entry is
+        # stored whole, so a stored block the merge cannot read would be written and only refused on reload.
+        if "thresholds" in entry and not isinstance(entry["thresholds"], dict):
+            raise ConfigError(
+                f"settings: added source {identifier!r}: thresholds must be a mapping of threshold name to number"
+            )
 
 
 def fingerprint(settings: dict) -> str:

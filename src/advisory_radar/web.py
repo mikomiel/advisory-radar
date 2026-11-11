@@ -1968,6 +1968,15 @@ def create_app(
                 f"{esc(identifier)}{'' if enabled else ' (disabled)'}</option>"
                 for identifier, enabled in choices
             ) + "".join(f"<option value='{esc(value)}' selected>{esc(value)} (reference)</option>" for value in extra)
+            # A predicate's value is a number or a boolean, which a ${...} reference can never expand to, so unlike
+            # the four string keys there is no reference to preserve here; the number renders as ``str`` so it
+            # parses back to the same value when the browser resubmits it.
+            kev = match.get("kev")
+            kev_options = (
+                f"<option value=''{' selected' if 'kev' not in match else ''}>any</option>"
+                f"<option value='true'{' selected' if kev is True else ''}>in KEV</option>"
+                f"<option value='false'{' selected' if kev is False else ''}>not in KEV</option>"
+            )
             rows.append(
                 f"<tr><td><input type='text' name='route:{index}:source' "
                 # ``safe_text``: a runtime built from a bare Config renders the already-expanded document, and
@@ -1981,6 +1990,14 @@ def create_app(
                 f"<td><input type='text' name='route:{index}:ids' "
                 f"value='{safe_text(match.get('ids', ''))}' placeholder='CVE-2026-*' "
                 f"aria-label='Rule {index} ids pattern'></td>"
+                f"<td><input type='text' name='route:{index}:min_cvss' size='4' "
+                f"value='{safe_text(match.get('min_cvss', ''))}' placeholder='9.0' "
+                f"aria-label='Rule {index} minimum CVSS'></td>"
+                f"<td><input type='text' name='route:{index}:epss_gte' size='4' "
+                f"value='{safe_text(match.get('epss_gte', ''))}' placeholder='0.1' "
+                f"aria-label='Rule {index} minimum EPSS'></td>"
+                f"<td><select name='route:{index}:kev' aria-label='Rule {index} KEV membership'>{kev_options}"
+                "</select></td>"
                 f"<td><select name='route:{index}:notifiers' multiple size='2' "
                 f"aria-label='Rule {index} notifiers'>{options}</select></td></tr>"
             )
@@ -1997,12 +2014,14 @@ def create_app(
         return (
             "<div class='scroll'><table><tr><th scope='col'>Source id</th><th scope='col'>Tag</th>"
             "<th scope='col'>Product id</th><th scope='col'>IDs pattern</th>"
+            "<th scope='col'>Min CVSS</th><th scope='col'>Min EPSS</th><th scope='col'>KEV</th>"
             f"<th scope='col'>Notifiers</th></tr>{''.join(rows)}</table></div>"
             "<p><label>Default notifiers (when no rule matches)"
             f"<select name='default' multiple size='3'>{default_options}</select></label></p>"
             "<p class='muted'>Rules are checked in order and the first match wins. An entirely empty row is "
             "ignored; a partly filled one is saved as written and the validator reports what is wrong. Only "
-            "enabled notifiers may be selected.</p>"
+            "enabled notifiers may be selected. A numeric or KEV predicate matches only what the message "
+            "measured: an advisory with no score never satisfies one.</p>"
         )
 
     def commit_overlay(request: Request, overlay: dict):
@@ -2080,13 +2099,79 @@ def create_app(
             ]
             return commit_overlay(request, overlay)
 
+    def parse_threshold_fields(form: dict[str, list[str]], prefix: str) -> dict:
+        """The thresholds one block's fields carry: a number where one parses, the text as typed otherwise.
+
+        Storing an unparseable value as typed is what makes the merged validator refuse it with the message
+        the YAML would give (``thresholds.critical_cvss must be a number``); an empty field is simply absent,
+        so it keeps following whatever block lies beneath this one.
+        """
+        values = {}
+        for key in THRESHOLD_KEYS:
+            value = first(form, f"{prefix}:{key}").strip()
+            if not value:
+                continue
+            try:
+                values[key] = float(value)
+            except ValueError:
+                values[key] = value
+        return values
+
+    def save_source_thresholds(overlay: dict, base: dict, form: dict[str, list[str]]) -> None:
+        """Write each source's own threshold fields into the overlay entry that owns that source.
+
+        A source the YAML defines is edited through the ``sources`` mapping, so its ``enabled``/``tag`` entry is
+        kept as it stands; a source the overlay adds is stored whole in ``sources_added``, so its block belongs
+        there. A source with every field empty stores no block: that is how an override is removed, and it is
+        why the form renders the inherited value as a placeholder rather than as a value the browser would
+        resubmit. A submission that did not render the per-source rows cannot clear them, exactly as the
+        sources form refuses to read an absent row as a deliberate disable.
+        """
+        if not any(name.startswith("source_threshold:") for name in form):
+            return
+        added = added_source_ids(overlay)
+        sources = overlay.get("sources")
+        changes = dict(sources) if isinstance(sources, dict) else {}
+        for entry in base.get("sources") or []:
+            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                continue
+            identifier = entry["id"]
+            values = parse_threshold_fields(form, f"source_threshold:{identifier}")
+            if identifier in added:
+                stored = overlay.get("sources_added")
+                entries = [dict(item) if isinstance(item, dict) else item for item in stored or []]
+                for item in entries:
+                    if not isinstance(item, dict) or item.get("id") != identifier:
+                        continue
+                    if values:
+                        item["thresholds"] = values
+                    else:
+                        item.pop("thresholds", None)
+                overlay["sources_added"] = entries
+            elif values:
+                change = dict(changes.get(identifier) or {})
+                change["thresholds"] = values
+                changes[identifier] = change
+            elif "thresholds" in (changes.get(identifier) or {}):
+                change = dict(changes[identifier])
+                change.pop("thresholds", None)
+                if change:
+                    changes[identifier] = change
+                else:
+                    changes.pop(identifier, None)
+        if changes:
+            overlay["sources"] = changes
+        else:
+            overlay.pop("sources", None)
+
     @app.post("/config/thresholds", dependencies=[Depends(require_csrf)])
     def save_thresholds_form(request: Request):
-        """Store the risk thresholds the form carries; an empty field falls back to the YAML value.
+        """Store the risk thresholds the form carries; an empty field falls back to the value beneath it.
 
-        A value that parses as a number is stored as one; anything else is stored as typed and judged by the
-        merged validator like every other overlay value, so a typo is refused with ``thresholds.critical_cvss
-        must be a number`` and nothing is written.
+        The global block and each source's own block are one rule set edited by one form: a source states only
+        the numbers that differ, so the fields it leaves empty follow the global block rather than being frozen
+        into it. A value that parses as a number is stored as one; anything else is stored as typed and judged
+        by the merged validator like every other overlay value, and nothing is written when it refuses.
         """
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
@@ -2097,23 +2182,14 @@ def create_app(
             stale = stale_form(request, form, base)
             if stale is not None:
                 return stale
-            changes = {}
-            for key in THRESHOLD_KEYS:
-                value = first(form, f"threshold:{key}").strip()
-                if not value:
-                    continue
-                try:
-                    changes[key] = float(value)
-                except ValueError:
-                    # Stored as typed, so the merged validator refuses it with the message the YAML would give
-                    # (``thresholds.critical_cvss must be a number``) and nothing is written.
-                    changes[key] = value
+            changes = parse_threshold_fields(form, "threshold")
             if changes:
                 # The block is rebuilt whole, so a field cleared here stops overriding the YAML for that key
                 # instead of keeping the previous save.
                 overlay["thresholds"] = changes
             else:
                 overlay.pop("thresholds", None)
+            save_source_thresholds(overlay, base, form)
             return commit_overlay(request, overlay)
 
     @app.post("/config/sources", dependencies=[Depends(require_csrf)])
@@ -2141,10 +2217,13 @@ def create_app(
                     identifier = entry["id"]
                     if identifier in owned:
                         continue  # an added source is stored whole, below; two owners for one row would drift
-                    changes[identifier] = {
-                        "enabled": f"enabled:{identifier}" in form,
-                        "tag": first(form, f"tag:{identifier}").strip(),
-                    }
+                    # The row owns enablement and the watch tag; a threshold block saved by the thresholds form
+                    # lives in the same entry and must survive this one, or editing a checkbox would silently
+                    # drop the source's own numbers.
+                    change = dict((overlay.get("sources") or {}).get(identifier) or {})
+                    change["enabled"] = f"enabled:{identifier}" in form
+                    change["tag"] = first(form, f"tag:{identifier}").strip()
+                    changes[identifier] = change
                 overlay["sources"] = changes
             added: list[dict] = []
             error = ""
@@ -2325,6 +2404,19 @@ def create_app(
                 value = first(form, f"{prefix}:{key}").strip()
                 if value:
                     match[key] = value
+            for key in ("min_cvss", "epss_gte"):
+                value = first(form, f"{prefix}:{key}").strip()
+                if not value:
+                    continue
+                try:
+                    match[key] = float(value)
+                except ValueError:
+                    # Stored as typed, so the validator refuses it with ``match.min_cvss must be a number`` and
+                    # nothing is written, rather than the browser silently dropping the predicate.
+                    match[key] = value
+            kev = first(form, f"{prefix}:kev").strip()
+            if kev in ("true", "false"):
+                match["kev"] = kev == "true"
             selected = [value for value in form.get(f"{prefix}:notifiers", []) if value]
             if not match and not selected:
                 continue  # an entirely empty row is not a rule
@@ -2492,6 +2584,37 @@ def create_app(
             """
             return esc(raw_thresholds.get(key, getattr(DEFAULT_THRESHOLDS, key)))
 
+        def source_threshold_text(entry: dict, key: str) -> str:
+            """A source's own number as written, or the empty string when that key follows the global block.
+
+            An empty field is what "no override for this key" looks like: rendering the inherited value would
+            make the browser resubmit it on the next save and silently turn an inheritance into an override,
+            freezing the source at numbers the global block may no longer have.
+            """
+            block = entry.get("thresholds")
+            return esc(block[key]) if isinstance(block, dict) and key in block else ""
+
+        source_threshold_rows = "".join(
+            f"<tr><td><b>{esc(entry['id'])}</b>"
+            f"{" <span class='muted'>(disabled)</span>" if entry.get('enabled', True) is False else ''}</td>"
+            + "".join(
+                f"<td><input type='text' size='5' name='source_threshold:{esc(entry['id'])}:{key}' "
+                f"value='{source_threshold_text(entry, key)}' placeholder='{threshold_text(key)}' "
+                f"aria-label='{esc(key)} for source {esc(entry['id'])}'></td>"
+                for key in THRESHOLD_KEYS
+            )
+            + "</tr>"
+            for entry in sources
+            if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+        )
+        source_threshold_table = (
+            "<div class='scroll'><table><tr><th scope='col'>Source</th>"
+            "<th scope='col'>Critical at CVSS</th><th scope='col'>Critical at EPSS</th>"
+            f"<th scope='col'>Suppress below CVSS</th></tr>{source_threshold_rows}</table></div>"
+            if source_threshold_rows
+            else "<p class='muted small'>No source is configured, so no source can override the block.</p>"
+        )
+
         hidden = document.get("hidden_source_hosts")
         hidden_text = "\n".join(str(host) for host in hidden) if isinstance(hidden, list) else ""
         type_options = "".join(
@@ -2537,6 +2660,12 @@ def create_app(
             "third is recorded and watched but never sent. An empty field uses the YAML value. A change applies "
             "to the next pass, and it re-baselines what is already watched instead of sending the backlog out."
             "</p>"
+            "<h3>Per-source overrides</h3>"
+            f"{source_threshold_table}"
+            "<p class='muted small'>A source may raise or lower the bar for its own items: it states only the "
+            "numbers that differ, and an empty field follows the block above (shown greyed). Clearing every "
+            "field removes the override. A block written in the YAML is shown here too and is edited on the same "
+            "terms: the form cannot delete a number the file owns, but it can override it.</p>"
             "<button class='btn btn-primary'>Save thresholds</button> "
             "<a class='btn btn-quiet' href='/thresholds'>Preview a decision</a></form>"
             "<h2><span class='sec-num'>03</span>Sources</h2>"
@@ -2588,12 +2717,17 @@ def create_app(
 
     #: The preview's numeric fields and the range each accepts, so a hand-written URL cannot raise a 500.
     PREVIEW_RANGES = {"cvss": (0.0, 10.0), "epss": (0.0, 1.0)}
+    #: The key the preview files its typed score under when it names no identifier. A real queue entry keys its
+    #: scores by CVE, but a predicate reads the values: the preview has one advisory, measured as the operator
+    #: typed it, and naming no identifier must not turn a real score into an unmeasured one.
+    PREVIEW_ADVISORY = "advisory"
 
     @app.get("/thresholds", response_class=HTMLResponse)
     def threshold_preview(request: Request):
         """What one advisory would be judged as, and where it would go, under the thresholds in force.
 
-        A read: it renders the numbers the running configuration loaded and calls the same ``core.level_of`` and
+        A read: it renders the numbers the running configuration loaded -- the previewed source's own block when
+        it has one, and the global block otherwise -- and calls the same ``core.level_of`` and
         ``routing.select`` the pass calls, so the answer cannot drift from the decision it describes. Nothing is
         written and no state is read, so the link can be shared and repeated.
         """
@@ -2644,8 +2778,10 @@ def create_app(
             # true to what was asked instead of silently previewing a message from no source at all.
             source_options += choice(source, f"{source} (not configured)", source)
         result = ""
+        # The source decides which rules judge the item, exactly as the pass does: its own block if it states
+        # one, the global block for a source that does not or an id this configuration does not define.
+        thresholds = cfg.thresholds_for(source)
         if "preview" in request.query_params:
-            thresholds = cfg.thresholds
             facts = core.CveFacts(cvss, ssvc or None, epss, None, True, remote_unauth=remote)
             level, reason = core.level_of(facts, kev_choice == "yes", kev_choice != "unknown", thresholds=thresholds)
             line = core.metrics_line(cvss, epss, None, ssvc or None, kev_choice == "yes")
@@ -2687,26 +2823,46 @@ def create_app(
                 # Nothing is sent, so naming a route would describe a message that never exists.
                 destination = "<p class='muted'>No message is sent, so nothing is routed.</p>"
             else:
-                id_rules = [
-                    str(position)
-                    for position, route in enumerate(cfg.routes, start=1)
-                    if isinstance(route, dict) and isinstance(route.get("match"), dict) and "ids" in route["match"]
-                ]
-                if id_rules and not identifiers:
-                    destination = _notice(
+
+                def rules_matching(key: str) -> list[str]:
+                    return [
+                        str(position)
+                        for position, route in enumerate(cfg.routes, start=1)
+                        if isinstance(route, dict) and isinstance(route.get("match"), dict) and key in route["match"]
+                    ]
+
+                unpredictable = []
+                if rules_matching("ids") and not identifiers:
+                    unpredictable.append(
                         "Rule "
-                        + ", ".join(id_rules)
+                        + ", ".join(rules_matching("ids"))
                         + " matches on identifiers, so the destination cannot be predicted without them. Add the "
-                        "advisory's ids above.",
-                        "warning",
+                        "advisory's ids above."
                     )
+                if rules_matching("kev") and kev_choice == "unknown":
+                    unpredictable.append(
+                        "Rule "
+                        + ", ".join(rules_matching("kev"))
+                        + " matches on KEV membership, which the catalogue cannot tell here, so the destination "
+                        "cannot be predicted. Say whether the CVE is in KEV above."
+                    )
+                if unpredictable:
+                    destination = _notice(" ".join(unpredictable), "warning")
                 else:
+                    # Only what the classification measured reaches this decision: the scores above are the
+                    # previewed message's own, and a score the operator did not type stays unmeasured.
+                    measured = identifiers or (PREVIEW_ADVISORY,)
                     selected, where = routing.select(
                         {
                             "tag": level,
                             "source_id": source,
                             "products": [product] if product else [],
                             "ids": identifiers,
+                            "scores": {key: cvss for key in measured} if cvss is not None else {},
+                            "epss": {key: epss for key in measured} if epss is not None else {},
+                            # None is "the catalogue is unknown": the entry then satisfies neither predicate,
+                            # exactly as a real one does when no catalogue could be read.
+                            "kev": True if kev_choice == "yes" else False if kev_choice == "" else None,
                         },
                         cfg.routes,
                         cfg.default_notifiers,
@@ -2755,13 +2911,20 @@ def create_app(
             "</form>"
         )
         thresholds_now = (
-            f"critical at CVSS <b>{cfg.thresholds.critical_cvss}</b> or EPSS "
-            f"<b>{cfg.thresholds.critical_epss}</b>, suppressed below CVSS "
-            f"<b>{cfg.thresholds.suppress_below_cvss}</b>"
+            f"critical at CVSS <b>{thresholds.critical_cvss}</b> or EPSS "
+            f"<b>{thresholds.critical_epss}</b>, suppressed below CVSS "
+            f"<b>{thresholds.suppress_below_cvss}</b>"
+        )
+        # Naming the source's own block matters: the same advisory is critical under one and a warning under the
+        # other, so a preview that did not say which numbers it used would be true only by accident.
+        scope = (
+            f"the live thresholds for <b>{esc(source)}</b>, which overrides the global block"
+            if source and thresholds != cfg.thresholds
+            else "the live thresholds"
         )
         body = (
             "<p class='muted'>What one advisory would be classified as, and where the message would go, under "
-            f"the live thresholds: {thresholds_now}. Nothing is delivered and nothing is written.</p>"
+            f"{scope}: {thresholds_now}. Nothing is delivered and nothing is written.</p>"
             f"{form}{result}"
         )
         return page("Threshold preview", body, active="/config", actions=sign_out_form(request))

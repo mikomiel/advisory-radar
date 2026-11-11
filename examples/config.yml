@@ -25,6 +25,11 @@ sources:
   - id: nodejs-security
     type: rss
     url: https://nodejs.org/en/feed/vulnerability.xml
+    # A source may raise or lower the bar for its own items. It states only the numbers that
+    # differ from the global block above; the rest follow it, key by key, and the same ranges
+    # apply.
+    # thresholds:
+    #   critical_cvss: 7.0
   # - id: freshrss
   #   type: freshrss
   #   url: https://freshrss.example.com
@@ -69,6 +74,17 @@ notifiers:
   #   to: admin@example.com
   #   username: radar@example.com
   #   password: ${SMTP_PASSWORD}
+
+# Optional routing: rules are checked in order and the first match wins, so the most
+# specific rule goes first. Every key present in one rule must match; a numeric predicate
+# (min_cvss, epss_gte) and kev read only what the classification measured, and a message with
+# no measured score never satisfies one.
+# routes:
+#   - match: {source: nodejs-security}
+#     notifiers: [discord]
+#   - match: {min_cvss: 9.5, epss_gte: 0.3, kev: true}
+#     notifiers: [discord]
+# default: [discord]
 
 # Web UI listen address inside the container.
 web:

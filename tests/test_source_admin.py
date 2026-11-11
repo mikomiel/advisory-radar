@@ -19,10 +19,10 @@ import yaml
 from fastapi.testclient import TestClient
 
 from advisory_radar import core, pipeline
-from advisory_radar.config import ConfigError, load_config, load_document
+from advisory_radar.config import ConfigError, Thresholds, load_config, load_document
 from advisory_radar.http import _host_of, private_destination, resolve_host, urllib_http
 from advisory_radar.runtime import Runtime
-from advisory_radar.settings import validate_settings
+from advisory_radar.settings import save_settings, settings_path, validate_settings
 from advisory_radar.state import save_state, state_lock
 from advisory_radar.web import create_app
 
@@ -1564,3 +1564,120 @@ def test_a_failed_attempt_keeps_the_last_success(tmp_path):
     assert "unreachable" in after["error"]
     assert after["ok_at"] == first["ok_at"], "the last success survives a later failure"
     assert after["at"] >= first["at"]
+
+
+# --- a source's own threshold block ------------------------------------------------------------
+
+
+def test_the_overlay_may_edit_a_yaml_sources_threshold_block(tmp_path):
+    """A YAML source keeps its keys in the file, but the overlay may override its numbers."""
+    merged = load_config(
+        write_config(tmp_path),
+        {},
+        settings={"sources": {"vendor": {"thresholds": {"critical_cvss": 7.5}}}},
+    )
+    assert merged.thresholds_for("vendor") == Thresholds(7.5, 0.1, 4.0)
+    assert merged.thresholds_for(None) == Thresholds()
+
+
+def test_a_source_edit_threshold_must_be_a_mapping():
+    with pytest.raises(ConfigError) as caught:
+        validate_settings({"sources": {"vendor": {"thresholds": ["critical_cvss"]}}})
+    assert str(caught.value) == ("settings: source 'vendor': thresholds must be a mapping of threshold name to number")
+
+
+def test_an_added_source_carries_its_own_threshold_block(tmp_path):
+    entry = {
+        "id": "added",
+        "type": "rss",
+        "url": "https://feeds.example.net/added.xml",
+        "thresholds": {"critical_epss": 0.4},
+    }
+    validate_settings({"sources_added": [entry]})
+    merged = load_config(write_config(tmp_path), {}, settings={"sources_added": [entry]})
+    assert merged.thresholds_for("added") == Thresholds(9.0, 0.4, 4.0)
+    assert merged.thresholds_for("vendor") == Thresholds(), "the YAML source is untouched"
+
+
+def test_an_added_source_threshold_must_be_a_mapping():
+    with pytest.raises(ConfigError) as caught:
+        validate_settings(
+            {
+                "sources_added": [
+                    {"id": "added", "type": "rss", "url": "https://feeds.example.net/a.xml", "thresholds": "high"}
+                ]
+            }
+        )
+    assert str(caught.value) == (
+        "settings: added source 'added': thresholds must be a mapping of threshold name to number"
+    )
+
+
+def test_an_added_source_block_is_judged_by_the_config_validator(tmp_path):
+    entry = {
+        "id": "added",
+        "type": "rss",
+        "url": "https://feeds.example.net/added.xml",
+        "thresholds": {"critical_cvss": 0},
+    }
+    with pytest.raises(ConfigError) as caught:
+        load_config(write_config(tmp_path), {}, settings={"sources_added": [entry]})
+    assert str(caught.value) == "added: thresholds.critical_cvss must be above 0 and at most 10"
+
+
+def test_editing_an_added_source_keeps_its_threshold_block(tmp_path):
+    """The sources form rewrites an added entry whole, so the block it does not edit must survive."""
+    stored = {
+        "sources_added": [
+            {
+                "id": "added",
+                "type": "rss",
+                "url": "https://feeds.example.net/a.xml",
+                "thresholds": {"critical_cvss": 7.5},
+            }
+        ]
+    }
+    save_settings(settings_path(tmp_path / "data" / "state.json"), stored, now=0)
+    client, runtime, _ = make_client(tmp_path)
+    assert runtime.cfg.thresholds_for("added") == Thresholds(7.5, 0.1, 4.0)
+
+    csrf, fingerprint = signed_in(client)
+    saved = client.post(
+        "/config/sources",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "enabled:vendor": "1",
+            "enabled:added": "1",
+            "added_url:added": "https://feeds.example.net/b.xml",
+        },
+        follow_redirects=False,
+    )
+
+    assert saved.status_code == 303
+    assert overlay(tmp_path)["sources_added"][0]["thresholds"] == {"critical_cvss": 7.5}
+    runtime.reload(blocking=True)
+    assert runtime.cfg.thresholds_for("added") == Thresholds(7.5, 0.1, 4.0)
+
+
+def test_the_sources_form_keeps_a_source_threshold_override(tmp_path):
+    """Editing enablement or the watch tag must not drop the numbers the thresholds form saved."""
+    save_settings(
+        settings_path(tmp_path / "data" / "state.json"),
+        {"sources": {"vendor": {"thresholds": {"critical_cvss": 7.5}}}},
+        now=0,
+    )
+    client, runtime, _ = make_client(tmp_path)
+    assert runtime.cfg.thresholds_for("vendor") == Thresholds(7.5, 0.1, 4.0)
+
+    csrf, fingerprint = signed_in(client)
+    saved = client.post(
+        "/config/sources",
+        data={"csrf": csrf, "fingerprint": fingerprint, "enabled:vendor": "1", "tag:vendor": "security"},
+        follow_redirects=False,
+    )
+
+    assert saved.status_code == 303
+    stored = overlay(tmp_path)["sources"]["vendor"]
+    assert stored["thresholds"] == {"critical_cvss": 7.5}
+    assert stored["enabled"] is True and stored["tag"] == "security"

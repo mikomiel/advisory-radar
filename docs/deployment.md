@@ -115,9 +115,9 @@ in the container, `~/.local/share/advisory-radar/settings.json` for the rootless
 quadlet). It is created with mode `0600`, owned by the container user, and replaced
 atomically (a temporary file in the same directory, `fsync`, `os.replace`), so a
 half-written file cannot brick a start. `/config` stays read-only: the overlay holds
-only eight keys — `notifiers`, per-source `enabled`/`tag`, the sources it adds itself
-(`sources_added`), `poll_interval`, `hidden_source_hosts`, the routing `routes`/`default`
-block and the risk `thresholds` — and the YAML owns everything else. A source the overlay adds is stored whole, may not
+only eight keys — `notifiers`, per-source `enabled`/`tag`/`thresholds`, the sources it adds
+itself (`sources_added`), `poll_interval`, `hidden_source_hosts`, the routing
+`routes`/`default` block and the risk `thresholds` — and the YAML owns everything else. A source the overlay adds is stored whole, may not
 share an id with one the YAML defines, must have a literal id, and may not point into a private
 network unless the YAML sets `allow_private_sources: true`. That last check is a guard rail
 against a mistake rather than an isolation boundary — the pass resolves the name again when it
@@ -178,25 +178,47 @@ below which a completely measured CVE is recorded and watched but never sent. Th
 message carries names the configured bar, not a hardcoded one, and the validation refuses a
 non-number, a value outside its range, and a floor above the critical bar.
 
+A source entry may carry its own `thresholds` block, in the YAML's `sources:` list, in the
+overlay's per-source edit (`sources: {nodejs: {thresholds: {...}}}`) or in an entry the
+overlay adds (`sources_added`). It may be partial: the keys it states are merged over the
+global block, key by key, and the merged block is validated by the same rules and ranges,
+with the source's id prefixed to a refusal (`nodejs: thresholds.critical_cvss must be a
+number`). An overlay edit of a YAML source merges its block key by key too, so a saved number
+never drops the file's other keys for that source; a source with every field empty on
+`/config` keeps no overlay block and follows the global one. A disabled source's block is not
+resolved until it is enabled, exactly as its `${NAME}` references are not.
+
 Changing a threshold changes the rules, so it does not send the watch list out: every
-watched CVE records the numbers it was judged under, and the first evaluation after a change
-records the new verdict without telling anyone. The entry keeps the level the reader was told
+watched CVE records the numbers it was judged under — its source's own block when it has one
+— and the first evaluation after a change records the new verdict without telling anyone. A
+source's block moving re-baselines only the CVEs that source queued, and the global block
+moving leaves a source with its own block alone. The entry keeps the level the reader was told
 (`level`) apart from the level the numbers in force make of it (`judged`), so a KEV hit or a
 CISA active flag that arrives later still escalates against what was actually sent. State
-written before the feature carries no record and is judged by the defaults, which is what was
-in force then.
+written before the source was recorded, and a hand-edited record whose source or numbers
+cannot be read, is judged by the global block and never raises.
 
-`/thresholds`, linked from `/config`, previews one advisory against the live numbers: the
-level, the reason, the metrics line and note the message would carry, and the route and
-notifiers it would reach. The advisory's identifiers are an input, because a rule may match
-on them; without one and with such a rule configured, the page says the destination cannot be
-predicted instead of guessing. It is a read-only GET, so a link to it can be shared.
+`/thresholds`, linked from `/config`, previews one advisory against the live numbers — the
+previewed source's own block when it has one, and the global block otherwise — and names
+which of the two it used. It shows the level, the reason, the metrics line and note the
+message would carry, and the route and notifiers it would reach, including a `min_cvss`,
+`epss_gte` or `kev` predicate evaluated from the CVSS, EPSS and KEV state you typed. The
+advisory's identifiers are an input, because a rule may match on them; without one and with
+such a rule configured, the page says the destination cannot be predicted instead of guessing.
+The same is said for a `kev` rule when the catalog state is "unknown", because membership was
+then not measured. It is a read-only GET, so a link to it can be shared.
 
 ### Routing
 
 Notification routing lives in `config.yml` by default: an ordered `routes` list plus an
 optional `default`, each naming notifier ids. The same block can be saved to the settings
-overlay from `/config`, where it then replaces the YAML's rules. Every id must name an enabled notifier in the effective merged
+overlay from `/config`, where it then replaces the YAML's rules. A rule's `match` may carry a
+source id, a severity tag, a watchlist product, an ids pattern, `min_cvss`, `epss_gte` and
+`kev`; every key present must match, and the three predicates read the CVSS, EPSS and KEV
+membership the classification measured for the message, so a message with no measured score
+satisfies no numeric predicate and an unmeasured KEV membership satisfies neither `kev: true`
+nor `kev: false`. The validator refuses a numeric predicate outside its range and a `kev` that
+is not a boolean, as it refuses an unknown match key. Every id must name an enabled notifier in the effective merged
 configuration (a notifier the overlay adds counts, one it disables does not), or the configuration is refused
 when it loads; `release-parked` and `drop-parked` read the YAML alone and do not enforce that membership, so a
 route to an overlay-only channel cannot block queue recovery. With no `routes` block every message still goes
