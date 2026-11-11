@@ -1227,3 +1227,52 @@ def test_every_path_fetches_the_url_the_pass_fetches(tmp_path):
     config_url = feed_urls()[-1]
     assert sources_url == pass_url, "the live row was expanded once already; a second pass would change the URL"
     assert config_url == pass_url, "a raw row expands once, exactly as the loader does"
+
+
+def test_a_disabled_webhook_does_not_print_its_resolved_id(tmp_path):
+    client, _, _ = make_client(
+        tmp_path,
+        sources=[{"id": "${SOME_SECRET}", "type": "webhook", "enabled": False}],
+        environment={"SOME_SECRET": "s3cret-token"},
+    )
+    csrf, _ = signed_in(client)
+    response = client.post("/config/sources/probe", data={"csrf": csrf, "id": "${SOME_SECRET}"})
+    assert response.status_code == 200
+    assert "no remote side" in response.text
+    assert "s3cret-token" not in response.text, "the webhook hint names the endpoint, not the credential"
+    assert "[redacted]" in response.text
+
+
+def test_a_bare_config_app_does_not_print_a_route_secret(tmp_path):
+    path = write_config(tmp_path, extra='routes:\n  - match: {source: "${SOME_SECRET}"}\n    notifiers: [chat]\n')
+    env = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, "SOME_SECRET": "s3cret-token"}
+    client = TestClient(create_app(load_config(path, env), env, http=fake_http, resolve=public_resolver))
+    signed_in(client)
+    page = client.get("/config").text
+    assert "s3cret-token" not in page
+    # That runtime's document *is* the resolved configuration, so the reference is gone with it: the page shows
+    # a redaction rather than a reference it no longer has.
+    assert "[redacted]" in page
+
+
+def test_a_bare_config_app_probes_the_url_the_pass_fetches(tmp_path):
+    """A bare ``Config`` runtime keeps the expanded document, so its rows must not be expanded again."""
+    seen: list[str] = []
+
+    def recording(method, url, headers, body):
+        seen.append(url)
+        return 200, {"ETag": '"v"'}, RSS
+
+    path = write_config(tmp_path, sources=[{"id": "vendor", "type": "rss", "url": "${FEED_URL}"}])
+    env = {
+        "ADVISORY_RADAR_AUTH_TOKEN": TOKEN,
+        "FEED_URL": "https://feeds.example.net/feed.xml?template=${CHANNEL}",
+        "CHANNEL": "security",
+    }
+    cfg = load_config(path, env)
+    client = TestClient(create_app(cfg, env, http=recording, resolve=public_resolver))
+    csrf, _ = signed_in(client)
+    assert client.post("/config/sources/probe", data={"csrf": csrf, "id": "vendor"}).status_code == 200
+    probed = [url for url in seen if "feeds.example.net" in url][-1]
+    assert probed == cfg.sources[0]["url"], "the loader expanded this once; the probe must not do it again"
+    assert "${CHANNEL}" in probed

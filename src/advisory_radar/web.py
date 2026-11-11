@@ -912,7 +912,9 @@ def create_app(
     injectable so a test can answer without a network.
     """
     if not isinstance(runtime, Runtime):
-        runtime = Runtime.from_config(runtime)
+        # The environment is kept: a bare Config's document is already expanded, but a form value the operator
+        # types into it still has to resolve against the same environment the configuration did.
+        runtime = Runtime.from_config(runtime, environment=dict(env))
     app = FastAPI(title="advisory-radar", docs_url=None, redoc_url=None)
     auth = Auth(env.get("ADVISORY_RADAR_AUTH_TOKEN", ""))
 
@@ -1513,6 +1515,15 @@ def create_app(
         sources = document.get("sources") if isinstance(document, dict) else None
         return [entry for entry in (sources or []) if isinstance(entry, dict) and isinstance(entry.get("id"), str)]
 
+    def safe_text(value: object) -> str:
+        """A configuration-derived value rendered as text: redacted against the secrets, then escaped.
+
+        Diagnostics compare expanded values; what they *show* may be a reference, an id from the live snapshot or
+        a document that was already expanded (a bare ``Config`` runtime keeps one). Redacting every one of them
+        is cheaper than reasoning per call site about which document it came from.
+        """
+        return esc(pipeline.redact(str(value), secret_values(runtime.cfg)))
+
     def expand_text(value: object) -> str:
         """A configured string as the loader will use it, or as written when a reference cannot resolve."""
         if not isinstance(value, str) or not value:
@@ -1799,9 +1810,11 @@ def create_app(
         if spec is None:
             # As written, not as expanded: a disabled entry may carry ``type: ${SOMETHING}``, and rendering the
             # resolved value here would publish it.
-            return False, _notice(f"{esc(str(entry.get('type', '')))} is not a built-in source type.", "critical")
+            return False, _notice(f"{safe_text(entry.get('type', ''))} is not a built-in source type.", "critical")
         if kind == "webhook":
-            identifier = esc(str(expanded.get("id", "")))
+            # Redacted with this probe's resolutions: a disabled source was never expanded by a load, so the
+            # configuration's own secret list does not carry the value just resolved here.
+            identifier = esc(pipeline.redact(str(expanded.get("id", "")), secrets))
             return False, _notice(
                 "A webhook source has no remote side to read: push an item to "
                 f"<code>/webhooks/{identifier}</code> with the bearer secret.",
@@ -1844,7 +1857,7 @@ def create_app(
             if entry is None:
                 return page(
                     "Source probe",
-                    _notice(f"No configured source has id {esc(identifier)}.", "critical")
+                    _notice(f"No configured source has id {safe_text(identifier)}.", "critical")
                     + f"<p><a href='{back}'>Back</a></p>",
                     active=active,
                     actions=sign_out_form(request),
@@ -1856,12 +1869,13 @@ def create_app(
             ok, detail = probe_source(
                 entry,
                 adding=entry["id"] in added_source_ids(settings),
-                # ``runtime.cfg.sources`` is already expanded; the merged document is not.
-                expand=not on_sources_page,
+                # Expanded exactly as often as the loader did: the live snapshot always is, the merged document
+                # of a file-backed runtime is not, and a bare ``Config`` runtime keeps the expanded one.
+                expand=runtime.config_path is not None and not on_sources_page,
             )
             tone = _badge("answered", "ok") if ok else _badge("failed", "critical")
             heading = (
-                f"<h2>{esc(identifier)} <span class='muted'>{esc(display_type(entry))}</span> {tone}</h2>"
+                f"<h2>{safe_text(identifier)} <span class='muted'>{safe_text(display_type(entry))}</span> {tone}</h2>"
                 "<p class='muted small'>A configured source; the probe reads it and delivers nothing.</p>"
             )
             title = f"{identifier} probe"
@@ -1878,7 +1892,7 @@ def create_app(
             ok, detail = probe_source(entry, adding=True)
             tone = _badge("answered", "ok") if ok else _badge("failed", "critical")
             heading = (
-                f"<h2>New {esc(display_type(entry))} source {tone}</h2>"
+                f"<h2>New {safe_text(display_type(entry))} source {tone}</h2>"
                 "<p class='muted small'>Not saved yet: the probe fetched it with the values from the form.</p>"
             )
             # The probed values are carried into a real save, so a working probe is one click from being stored.
@@ -1935,14 +1949,16 @@ def create_app(
             ) + "".join(f"<option value='{esc(value)}' selected>{esc(value)} (reference)</option>" for value in extra)
             rows.append(
                 f"<tr><td><input type='text' name='route:{index}:source' "
-                f"value='{esc(match.get('source', ''))}' placeholder='source id' "
+                # ``safe_text``: a runtime built from a bare Config renders the already-expanded document, and
+                # this field is a view of it. On the file-backed path the value is a reference and is unchanged.
+                f"value='{safe_text(match.get('source', ''))}' placeholder='source id' "
                 f"aria-label='Rule {index} source id'></td>"
                 f"<td><select name='route:{index}:tag' aria-label='Rule {index} tag'>{tag_options}</select></td>"
                 f"<td><input type='text' name='route:{index}:product' "
-                f"value='{esc(match.get('product', ''))}' placeholder='product id' "
+                f"value='{safe_text(match.get('product', ''))}' placeholder='product id' "
                 f"aria-label='Rule {index} product id'></td>"
                 f"<td><input type='text' name='route:{index}:ids' "
-                f"value='{esc(match.get('ids', ''))}' placeholder='CVE-2026-*' "
+                f"value='{safe_text(match.get('ids', ''))}' placeholder='CVE-2026-*' "
                 f"aria-label='Rule {index} ids pattern'></td>"
                 f"<td><select name='route:{index}:notifiers' multiple size='2' "
                 f"aria-label='Rule {index} notifiers'>{options}</select></td></tr>"
@@ -2385,7 +2401,7 @@ def create_app(
                 route_warnings.append(
                     # The comparison needs the expanded value; the message shows what was written, which is a
                     # reference as often as a name -- and a reference is never a credential.
-                    f"<li>Rule {index} matches source <code>{esc(written)}</code>, which no configured source "
+                    f"<li>Rule {index} matches source <code>{safe_text(written)}</code>, which no configured source "
                     "has: it stays inert until that source exists.</li>"
                 )
         route_notice = _notice(f"<ul>{''.join(route_warnings)}</ul>", "warning") if route_warnings else ""
