@@ -332,7 +332,12 @@ FreshRSS GReader export by its `version` URL rather than by having an items list
 that answers an HTML page instead is followed through that page's
 `<link rel="alternate">` autodiscovery exactly once; the page is not crawled, and no
 validator is stored for it, because a page's `ETag` says nothing about the feed behind
-it. Conditional GET still applies to a feed that answers directly.
+it. Conditional GET still applies to a feed that answers directly. The advertised feed
+must be a public destination: a discovered link that resolves to a loopback or private
+address is refused **before** it is fetched, even when `allow_private_sources` is set,
+because the page — not the operator — chose that URL. An operator who needs a private
+feed configures that feed directly, which is the allowance `allow_private_sources`
+already describes.
 
 Every source may carry `interval: 30m` (the same `<n><s|m|h>` spelling as
 `poll_interval`) to be fetched at its own pace; without one it follows the global

@@ -121,7 +121,10 @@ adds itself (`sources_added`), `poll_interval`, `hidden_source_hosts`, the routi
 share an id with one the YAML defines, must have a literal id, and may not point into a private
 network unless the YAML sets `allow_private_sources: true`. That last check is a guard rail
 against a mistake rather than an isolation boundary — the pass resolves the name again when it
-fetches — and the operator token is a full-trust credential, so treat it accordingly. While the overlay holds a
+fetches — and the operator token is a full-trust credential, so treat it accordingly. A feed
+URL discovered from a page's `<link rel="alternate">` is checked the same way and is refused
+before it is fetched, whatever `allow_private_sources` says: that URL was chosen by a remote
+page, not by the operator. While the overlay holds a
 `notifiers` list it replaces the YAML's membership and ordinary fields, so a notifier
 added to the YAML later is not used until that section is removed from the overlay; a
 notifier's `headers` are the exception, staying in the YAML and carried over by id. A
