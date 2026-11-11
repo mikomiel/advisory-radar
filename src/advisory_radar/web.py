@@ -3288,7 +3288,7 @@ def create_app(
 
     def watchlist_preview_verdict(document: dict, values: Mapping[str, str]) -> str:
         """What the scope does with one advisory: ``core``'s own match and rule, so the answer cannot drift."""
-        if not (values["title"] or values["link"]):
+        if not (values["title"].strip() or values["link"].strip()):
             return _notice("Give the advisory a title or a link to check.", "warning")
         from . import core  # lazy, like the other core use here: this module is imported before both
 
@@ -3403,7 +3403,9 @@ def create_app(
         cfg = runtime.cfg
         target = watchlist.editable_path(cfg.watchlist_path, cfg.state_path)
         params = request.query_params
-        values = {name: (params.get(name) or "").strip() for name in ("title", "link", "source_title", "summary")}
+        # As typed, not trimmed: the pass reads an advisory's own text, and the Debian rule anchors its title, so a
+        # preview that tidied the input would answer for an advisory the pass would judge differently.
+        values = {name: params.get(name) or "" for name in ("title", "link", "source_title", "summary")}
         notices = ""
         if saved is not None:
             notices += _notice(f"Scope <code>{esc(saved)}</code> saved. The next pass reads it.", "ok")

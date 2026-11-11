@@ -463,3 +463,28 @@ def test_the_configuration_refuses_a_watchlist_path_with_a_nul(tmp_path):
     path.write_text('sources: []\nnotifiers: []\nstate_path: state.json\nwatchlist: "scope\\u0000.json"\n')
     with pytest.raises(ConfigError, match="NUL"):
         load_config(path, {})
+
+
+def test_every_way_a_document_cannot_be_read_is_one_answer(tmp_path):
+    """The page and the pass report one unreadable document, whatever the filesystem did."""
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    invalid = tmp_path / "invalid.json"
+    invalid.write_bytes(b'{"schema": "security-watchlist.v1"}\xff')
+    loop = tmp_path / "loop.json"
+    loop.symlink_to(loop)
+    for broken in (directory, invalid, loop):
+        assert watchlist.present(broken) is True, "the entry is there; it just cannot be read"
+        with pytest.raises(SourceError, match="cannot be read"):
+            read_watchlist(broken)
+    component = tmp_path / "file"
+    component.write_text("x")
+    assert watchlist.present(component / "under.json") is False, "ENOTDIR: nothing can be there"
+
+
+def test_a_document_root_is_not_a_document(tmp_path):
+    """``watchlist: /`` has no name to build the sidecar lock from; it must refuse, not raise."""
+    root = Path("/")
+    assert watchlist.present(root) is True
+    with pytest.raises(SourceError, match="does not name a document"):
+        save_watchlist(root, lambda current: document(), expected="")

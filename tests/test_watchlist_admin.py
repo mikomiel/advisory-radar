@@ -880,3 +880,45 @@ def test_a_document_nested_too_deeply_is_reported_and_not_saved_over(tmp_path):
     assert response.status_code == 200
     assert "cannot be read" in response.text
     assert watch.read_text() == before
+
+
+def test_a_scope_path_that_is_a_directory_root_is_refused_not_a_crash(tmp_path):
+    """`watchlist: /` has no name for the sidecar lock, so a save must refuse before it locks."""
+    client, _ = make_client(tmp_path, Path("/"))
+    sign_in(client)
+    page = client.get("/watchlist")
+    assert page.status_code == 200
+    assert "cannot be read" in page.text
+    csrf = CSRF_RE.search(client.get("/").text).group(1)
+    response = client.post(
+        "/watchlist",
+        data={
+            "csrf": csrf,
+            "fingerprint": "",
+            "debian_packages": "*",
+            "excluded_products": "",
+            "new:id": "",
+            "new:aliases": "",
+            "new:domains": "",
+        },
+    )
+    assert response.status_code == 200, "the refusal is a page, not a 500"
+    assert "does not name a document" in response.text
+
+
+def test_the_preview_judges_the_text_it_was_given(tmp_path):
+    """The pass reads an advisory's title as published; trimming it would answer for a different advisory."""
+    watch = write_scope(tmp_path / "scope.json", products=[], debian_source_packages=["openssl"])
+    client, _ = make_client(tmp_path, watch)
+    sign_in(client)
+    spaced = client.get(
+        "/watchlist",
+        params={"preview": "1", "title": " DSA-6104-1 openssl - security update", "link": "https://lists.debian.org/x"},
+    )
+    assert "Out of scope" in spaced.text, "the anchored DSA title no longer matches once the space is removed"
+    assert "debian_source_packages" in spaced.text
+    clean = client.get(
+        "/watchlist",
+        params={"preview": "1", "title": "DSA-6104-1 openssl - security update", "link": "https://lists.debian.org/x"},
+    )
+    assert "In scope" in clean.text

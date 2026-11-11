@@ -201,8 +201,12 @@ def save_watchlist(path: Path, build: Callable[[dict | None], dict], *, expected
     """
     try:
         target = path.resolve()
-    except ValueError as exc:  # an embedded NUL: no lock, no read and no replacement can name this path
+    except (OSError, ValueError) as exc:  # an embedded NUL, a link loop: no path to read or replace
         raise SourceError(f"watchlist {path} is not a usable path: {exc}") from exc
+    if not target.name:
+        # A directory root (``watchlist: /``) is a path, not a document, and it has no name for the sidecar lock:
+        # refusing it here is the difference between a refusal and a crash.
+        raise SourceError(f"watchlist {path} does not name a document; point watchlist: at a file")
     if path.is_symlink() and not present(target):
         # The link names a file that is not there. Creating it would leave the operator editing a document they
         # did not name, with whatever the link pointed at before gone from their point of view.

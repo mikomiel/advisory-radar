@@ -1006,3 +1006,9 @@ def test_a_scope_nested_too_deeply_fails_the_pass(tmp_path):
     path.write_text(f"sources: []\nnotifiers: []\nstate_path: {tmp_path}/state.json\nwatchlist: {scope}\n")
     cfg = load_config(path, {})
     assert pipeline.run_pass(cfg, [], [], http=fake_http, clock=lambda: float(NOW), sleep=lambda s: None) == 1
+
+
+def test_a_scope_path_that_is_a_directory_fails_the_pass(tmp_path):
+    cfg = _webhook_config(tmp_path)
+    (tmp_path / "watchlist.json").mkdir()
+    assert pipeline.run_pass(cfg, [], [], http=fake_http, clock=lambda: float(NOW), sleep=lambda s: None) == 1
