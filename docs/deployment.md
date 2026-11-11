@@ -114,9 +114,11 @@ in the container, `~/.local/share/advisory-radar/settings.json` for the rootless
 quadlet). It is created with mode `0600`, owned by the container user, and replaced
 atomically (a temporary file in the same directory, `fsync`, `os.replace`), so a
 half-written file cannot brick a start. `/config` stays read-only: the overlay holds
-only six keys — `notifiers`, per-source `enabled`/`tag`, `poll_interval`,
-`hidden_source_hosts`, and the routing `routes`/`default` block — and the YAML owns
-everything else. While the overlay holds a
+only seven keys — `notifiers`, per-source `enabled`/`tag`, the sources it adds itself
+(`sources_added`), `poll_interval`, `hidden_source_hosts`, and the routing `routes`/`default`
+block — and the YAML owns everything else. A source the overlay adds is stored whole and may
+not share an id with one the YAML defines, and it may not point into a private network unless
+the YAML sets `allow_private_sources: true`. While the overlay holds a
 `notifiers` list it replaces the YAML's membership and ordinary fields, so a notifier
 added to the YAML later is not used until that section is removed from the overlay; a
 notifier's `headers` are the exception, staying in the YAML and carried over by id. A

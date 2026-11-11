@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from advisory_radar import core, pipeline
 from advisory_radar.config import ConfigError, load_config, load_document
-from advisory_radar.http import private_destination, urllib_http
+from advisory_radar.http import private_destination, resolve_host, urllib_http
 from advisory_radar.runtime import Runtime
 from advisory_radar.settings import validate_settings
 from advisory_radar.state import save_state
@@ -225,6 +225,7 @@ def test_an_edit_that_drops_a_required_key_is_refused_readably(tmp_path):
             "csrf": csrf,
             "fingerprint": fingerprint,
             "enabled:vendor": "1",
+            "enabled:nodejs-org": "1",
             "added_url:nodejs-org": "",  # the field was cleared
         },
         follow_redirects=False,
@@ -691,12 +692,13 @@ def test_a_webhook_source_can_be_added_without_a_url(tmp_path):
 
 
 def test_a_credential_echoed_in_a_link_is_redacted(tmp_path):
+    # Upper case on purpose: extracting the origin lowercases a hostname, so the redactor has to see both forms.
     watches = json.dumps(
         {
             "abc": {
                 "last_changed": 1792600000,
                 "title": "a watch",
-                "link": "https://s3cret-token.example.net/w/abc",
+                "link": "https://AbCdEf123456.example.net/w/abc",
             }
         }
     ).encode()
@@ -716,13 +718,13 @@ def test_a_credential_echoed_in_a_link_is_redacted(tmp_path):
                 "api_key": "${CHANGEDETECTION_API_KEY}",
             }
         ],
-        environment={"CHANGEDETECTION_API_KEY": "s3cret-token"},
+        environment={"CHANGEDETECTION_API_KEY": "AbCdEf123456"},
         transport=echoing,
     )
     csrf, fingerprint = signed_in(client)
     response = client.post("/config/sources/probe", data={"csrf": csrf, "fingerprint": fingerprint, "id": "changes"})
     assert response.status_code == 200
-    assert "s3cret-token" not in response.text, "a link's origin is source-supplied text too"
+    assert "abcdef123456" not in response.text.lower(), "the origin is source-supplied text, in every case form"
     assert "[redacted]" in response.text
 
 
@@ -753,3 +755,49 @@ def test_a_dry_run_writes_nothing_even_when_every_source_fails(tmp_path):
     )
     assert code == 1
     assert not (tmp_path / "data" / "state.json").exists()
+
+
+def test_an_encoded_port_cannot_hide_a_loopback_destination(tmp_path):
+    # The real resolver, no stub: 127.0.0.1 is answered locally. ``%3A8080`` is a *port* to the transport,
+    # which unquotes the whole authority before it splits host from port, so it must be a port here too.
+    client, _, _ = make_client(tmp_path, resolve=resolve_host)
+    response = new_source(client, **{"new:type": "rss", "new:url": "http://127.0.0.1%3A8080/feed.xml"})
+    assert response.status_code == 400
+    assert "private network" in response.text
+
+
+def test_a_source_whose_host_becomes_internal_can_still_be_disabled(tmp_path):
+    addresses = {"value": PUBLIC_ADDRESS}
+
+    def resolver(host: str) -> tuple[str, ...]:
+        return (addresses["value"],)
+
+    client, _, _ = make_client(tmp_path, resolve=resolver)
+    added = new_source(client, **{"new:type": "rss", "new:url": "https://nas.example.net/feed.xml"})
+    assert added.status_code == 303
+    # The name now resolves into a private network. Switching the source off is what the operator needs, so
+    # the destination rule judges only what would actually be fetched.
+    addresses["value"] = "172.16.0.9"
+    csrf, fingerprint = signed_in(client)
+    saved = client.post(
+        "/config/sources",
+        data={"csrf": csrf, "fingerprint": fingerprint, "enabled:vendor": "1", "tag:vendor": ""},
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303
+    assert overlay(tmp_path)["sources_added"][0]["enabled"] is False
+    # Turning it back on is judged again, and refused while the destination is internal.
+    csrf, fingerprint = signed_in(client)
+    refused = client.post(
+        "/config/sources",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "enabled:vendor": "1",
+            "enabled:nas-example-net": "1",
+            "added_url:nas-example-net": "https://nas.example.net/feed.xml",
+        },
+        follow_redirects=False,
+    )
+    assert refused.status_code == 400
+    assert "private network" in refused.text

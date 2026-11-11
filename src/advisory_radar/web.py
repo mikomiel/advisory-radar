@@ -1649,6 +1649,16 @@ def create_app(
             for value in form[name][:1]
         )
 
+    def redacted_origin(link: object, secrets: Sequence[str]) -> str:
+        """A link's origin with every secret removed.
+
+        The origin is source-supplied text too -- a watch can name its own host -- and the extraction lowercases
+        a hostname, so the lowercase form of a secret is redacted as well: otherwise a credential reflected in
+        upper case would be rendered in the one form the redactor no longer matches.
+        """
+        origin = _public_url(str(link or ""))
+        return pipeline.redact(origin, [*secrets, *(secret.lower() for secret in secrets)])
+
     def probe_window(window, secrets: Sequence[str]) -> str:
         """What one probe answered: the entry count, the truncation flag and the first few items.
 
@@ -1659,9 +1669,7 @@ def create_app(
         rows = "".join(
             f"<tr><td>{esc(_short(pipeline.redact(item.title, secrets), 80))}</td>"
             f"<td class='mono nowrap'>{esc(_when(item.published))}</td>"
-            # The origin is source-supplied too: a watch can name its own host, so the redaction covers what
-            # the origin extraction leaves rather than the raw link alone.
-            f"<td>{esc(pipeline.redact(_public_url(item.link), secrets))}</td></tr>"
+            f"<td>{esc(redacted_origin(item.link, secrets))}</td></tr>"
             for item in items[:5]
         )
         table = (
@@ -2008,6 +2016,10 @@ def create_app(
                                 updated[key] = value
                             else:
                                 updated.pop(key, None)
+                    # Only what will actually run is judged: a disabled source is not built and not fetched, so
+                    # neither a missing key nor a destination that has since become internal may stop it being
+                    # disabled -- that would leave the operator unable to switch off a source they cannot edit.
+                    if spec is not None and updated["enabled"]:
                         missing = [key for key in spec.required if not updated.get(key)]
                         if missing:
                             # Refused here, in words: letting the builder raise would report a bare KeyError.

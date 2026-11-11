@@ -1,7 +1,7 @@
 """The settings overlay: a small JSON document applied over the YAML configuration.
 
 ``settings.json`` lives beside the state file (the writable volume), not beside the YAML
-(``/config`` is mounted read-only), and holds only the six keys the UI may change. The
+(``/config`` is mounted read-only), and holds only the seven keys the UI may change. The
 overlay is merged into the YAML *before* ``config.load_config`` validates, so a value the
 YAML would refuse is refused with the same message.
 

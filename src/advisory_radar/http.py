@@ -29,6 +29,25 @@ def resolve_host(host: str) -> tuple[str, ...]:
     return tuple(info[4][0] for info in socket.getaddrinfo(host, None))
 
 
+def _host_of(url: str) -> str | None:
+    """The host the transport will dial: the authority is unquoted, then userinfo and port are removed.
+
+    ``urllib.request.Request`` unquotes the whole authority *before* ``http.client`` splits it into host and
+    port, so ``http://127.0.0.1%3A8080/`` dials loopback on port 8080. Extracting the hostname first and
+    unquoting afterwards would judge ``127.0.0.1:8080`` as one unresolvable name and let it through.
+    """
+    try:
+        authority = urllib.parse.unquote(urllib.parse.urlsplit(url).netloc)
+    except ValueError:
+        return None
+    if "@" in authority:
+        authority = authority.rsplit("@", 1)[1]
+    try:
+        return urllib.parse.urlsplit(f"//{authority}").hostname
+    except ValueError:
+        return None
+
+
 def private_destination(url: str, resolve: Callable[[str], Iterable[str]] = resolve_host) -> bool:
     """Whether this URL's host is, or resolves to, an address that is not on the public internet.
 
@@ -37,14 +56,9 @@ def private_destination(url: str, resolve: Callable[[str], Iterable[str]] = reso
     address is out of reach of a save-time check, so the rule it feeds is "who may point this instance at an
     internal address", and the YAML -- written by whoever runs the host -- is never subject to it.
     """
-    try:
-        # Unquoted exactly as ``urllib.request.Request`` unquotes it before it dials: ``%31%32%37.0.0.1`` is
-        # ``127.0.0.1`` to the transport, so it has to be to this check too.
-        host = urllib.parse.unquote(urllib.parse.urlsplit(url).hostname or "")
-    except ValueError:
-        return True  # a URL nobody can parse must not be fetched either
+    host = _host_of(url)
     if not host:
-        return True
+        return True  # a URL nobody can parse must not be fetched either
     try:
         addresses = tuple(resolve(host))
     except (OSError, UnicodeError):
