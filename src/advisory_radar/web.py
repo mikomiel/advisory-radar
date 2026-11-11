@@ -2417,6 +2417,11 @@ def create_app(
             kev = first(form, f"{prefix}:kev").strip()
             if kev in ("true", "false"):
                 match["kev"] = kev == "true"
+            elif kev:
+                # Anything else is kept as typed so the merged validator refuses it with
+                # ``routes[1]: match.kev must be true or false`` and nothing is written. Dropping it, as the
+                # form used to, would silently broaden the rule to every message.
+                match["kev"] = kev
             selected = [value for value in form.get(f"{prefix}:notifiers", []) if value]
             if not match and not selected:
                 continue  # an entirely empty row is not a rule
@@ -2717,10 +2722,6 @@ def create_app(
 
     #: The preview's numeric fields and the range each accepts, so a hand-written URL cannot raise a 500.
     PREVIEW_RANGES = {"cvss": (0.0, 10.0), "epss": (0.0, 1.0)}
-    #: The key the preview files its typed score under when it names no identifier. A real queue entry keys its
-    #: scores by CVE, but a predicate reads the values: the preview has one advisory, measured as the operator
-    #: typed it, and naming no identifier must not turn a real score into an unmeasured one.
-    PREVIEW_ADVISORY = "advisory"
 
     @app.get("/thresholds", response_class=HTMLResponse)
     def threshold_preview(request: Request):
@@ -2824,13 +2825,22 @@ def create_app(
                 destination = "<p class='muted'>No message is sent, so nothing is routed.</p>"
             else:
 
-                def rules_matching(key: str) -> list[str]:
+                def rules_matching(*keys: str) -> list[str]:
                     return [
                         str(position)
                         for position, route in enumerate(cfg.routes, start=1)
-                        if isinstance(route, dict) and isinstance(route.get("match"), dict) and key in route["match"]
+                        if isinstance(route, dict)
+                        and isinstance(route.get("match"), dict)
+                        and any(key in route["match"] for key in keys)
                     ]
 
+                # A numeric predicate and a KEV rule are satisfied only through the CVE the message names: the
+                # classifier fills its scores from the CVEs it judged, so an alias-free advisory carries none
+                # however high its own OSV severity is. Attributing the typed numbers to a GHSA would predict a
+                # rule the real message never reaches, so the page asks for the CVE id instead of inventing one.
+                cve_identifiers = [identifier for identifier in identifiers if core.CVE_RE.fullmatch(identifier)]
+                numeric_rules = rules_matching("min_cvss", "epss_gte")
+                kev_rules = rules_matching("kev")
                 unpredictable = []
                 if rules_matching("ids") and not identifiers:
                     unpredictable.append(
@@ -2839,30 +2849,47 @@ def create_app(
                         + " matches on identifiers, so the destination cannot be predicted without them. Add the "
                         "advisory's ids above."
                     )
-                if rules_matching("kev") and kev_choice == "unknown":
+                if numeric_rules and not cve_identifiers:
                     unpredictable.append(
                         "Rule "
-                        + ", ".join(rules_matching("kev"))
+                        + ", ".join(numeric_rules)
+                        + " matches on a numeric predicate, which is satisfied only through the CVE the message "
+                        "names, and no CVE id was given: the destination cannot be predicted. Add the advisory's "
+                        "CVE id above; an advisory-level score is not a CVE measurement."
+                    )
+                if kev_rules and not cve_identifiers:
+                    unpredictable.append(
+                        "Rule "
+                        + ", ".join(kev_rules)
+                        + " matches on KEV membership, which is satisfied only through the CVE the message names, "
+                        "and no CVE id was given: the destination cannot be predicted. Add the advisory's CVE id "
+                        "above."
+                    )
+                elif kev_rules and kev_choice == "unknown":
+                    unpredictable.append(
+                        "Rule "
+                        + ", ".join(kev_rules)
                         + " matches on KEV membership, which the catalogue cannot tell here, so the destination "
                         "cannot be predicted. Say whether the CVE is in KEV above."
                     )
                 if unpredictable:
                     destination = _notice(" ".join(unpredictable), "warning")
                 else:
-                    # Only what the classification measured reaches this decision: the scores above are the
-                    # previewed message's own, and a score the operator did not type stays unmeasured.
-                    measured = identifiers or (PREVIEW_ADVISORY,)
                     selected, where = routing.select(
                         {
                             "tag": level,
                             "source_id": source,
                             "products": [product] if product else [],
                             "ids": identifiers,
-                            "scores": {key: cvss for key in measured} if cvss is not None else {},
-                            "epss": {key: epss for key in measured} if epss is not None else {},
-                            # None is "the catalogue is unknown": the entry then satisfies neither predicate,
-                            # exactly as a real one does when no catalogue could be read.
-                            "kev": True if kev_choice == "yes" else False if kev_choice == "" else None,
+                            # Only a CVE id is scored: with none, the message has no per-CVE measurement, as the
+                            # classifier's own entry would have none.
+                            "scores": {identifier: cvss for identifier in cve_identifiers} if cvss is not None else {},
+                            "epss": {identifier: epss for identifier in cve_identifiers} if epss is not None else {},
+                            # The typed answer stands for the CVE it is given for; a message naming no CVE names
+                            # none in the catalog when the catalog was read, and an unknown one was not measured.
+                            "kev": None
+                            if kev_choice == "unknown"
+                            else (kev_choice == "yes" if cve_identifiers else False),
                         },
                         cfg.routes,
                         cfg.default_notifiers,

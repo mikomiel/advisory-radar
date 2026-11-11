@@ -551,6 +551,43 @@ def classified(kev: frozenset[str] = frozenset(), *, kev_known: bool = True) -> 
     return state
 
 
+class GhsaOnlyFacts(Facts):
+    """An Intel whose one advisory has no CVE alias, so the level comes from the advisory's own label."""
+
+    def ghsa(self, identifier):
+        return core.OsvFacts((), 9.8, True)
+
+
+def test_a_message_with_no_cve_carries_no_measured_score():
+    """The preview mirrors this: a numeric or KEV predicate is satisfied only through a CVE the message names."""
+    state = core.new_state()
+    item = core.Item(
+        "g1",
+        "GHSA-aaaa-bbbb-cccc advisory",
+        "https://vendor.example.net/a",
+        "notes",
+        NOW - 60,
+        ("GHSA-aaaa-bbbb-cccc",),
+    )
+    core.classify_new(
+        state,
+        [item],
+        GhsaOnlyFacts(),
+        frozenset(),
+        True,
+        NOW,
+        "vendor.example.net",
+        Policy((), (), ()),
+        source_id="php-releases",
+        thresholds=DEFAULT_THRESHOLDS,
+    )
+    queued = state["pending"][0]
+    assert queued["tag"] == "critical", "the advisory's own OSV severity still decides the level"
+    assert queued["cves"] == []
+    assert queued["scores"] == {} and queued["epss"] == {}, "an advisory-level score is not a CVE measurement"
+    assert queued["kev"] is False, "a message naming no CVE names none in the catalog"
+
+
 def test_a_queued_message_carries_the_facts_a_predicate_reads():
     """Only what the classification measured is recorded: no score is ever invented for a predicate."""
     queued = classified(frozenset({"CVE-2026-7777"}))["pending"][0]

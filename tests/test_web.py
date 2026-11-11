@@ -1175,7 +1175,10 @@ def test_the_preview_predicts_a_numeric_and_kev_predicate(tmp_path):
     client, token, _ = predicate_client(tmp_path)
     signed_in(client, token)
 
-    matched = client.get("/thresholds", params={"preview": "1", "cvss": "9.8", "epss": "0.4", "kev": "yes"}).text
+    matched = client.get(
+        "/thresholds",
+        params={"preview": "1", "cvss": "9.8", "epss": "0.4", "kev": "yes", "ids": "CVE-2026-1234"},
+    ).text
     assert "Routing:" in matched and "route 1" in matched and "phone" in matched
     assert "overrides the global block" not in matched, "no source was previewed, so the global block applies"
 
@@ -1186,15 +1189,63 @@ def test_the_preview_predicts_a_numeric_and_kev_predicate(tmp_path):
         {"cvss": "9.8", "epss": "0.4", "kev": "unknown"},  # membership not measured
         {"cvss": "9.8", "epss": "0.4"},  # not in KEV, so kev: true fails
     ):
-        page = client.get("/thresholds", params={"preview": "1", **query}).text
+        page = client.get("/thresholds", params={"preview": "1", "ids": "CVE-2026-1234", **query}).text
         assert "Routing: <b>default</b>" in page or "cannot be predicted" in page, query
+
+
+def test_the_preview_attributes_a_measured_score_to_a_cve_only(tmp_path):
+    """The queue entry is scored per CVE, so a GHSA id stands for no measurement at all."""
+    client, token, _ = predicate_client(tmp_path)
+    signed_in(client, token)
+
+    # A lower-case id is the same CVE: the classifier's pattern is case-insensitive, and so is this one.
+    predicted = client.get(
+        "/thresholds",
+        params={"preview": "1", "cvss": "9.8", "epss": "0.4", "kev": "yes", "ids": "cve-2026-1234"},
+    ).text
+    assert "Routing:" in predicted and "route 1" in predicted and "phone" in predicted
+
+    for identifier in ("GHSA-aaaa-bbbb-cccc", "", "CVE-26-1"):
+        params = {"preview": "1", "cvss": "9.8", "epss": "0.4", "kev": "yes"}
+        if identifier:
+            params["ids"] = identifier
+        page = client.get("/thresholds", params=params).text
+        assert "Routing:" not in page, identifier
+        assert "cannot be predicted" in page and "CVE id" in page, identifier
+        assert "an advisory-level score is not a CVE measurement" in page, identifier
 
 
 def test_the_preview_will_not_predict_a_kev_rule_against_an_unknown_catalogue(tmp_path):
     client, token, _ = predicate_client(tmp_path)
     signed_in(client, token)
 
-    page = client.get("/thresholds", params={"preview": "1", "cvss": "9.8", "epss": "0.4", "kev": "unknown"}).text
+    page = client.get(
+        "/thresholds",
+        params={"preview": "1", "cvss": "9.8", "epss": "0.4", "kev": "unknown", "ids": "CVE-2026-1234"},
+    ).text
 
     assert "Routing:" not in page
     assert "matches on KEV membership" in page and "cannot be predicted" in page
+
+
+def test_a_kev_value_that_is_not_a_boolean_is_refused(tmp_path):
+    """Dropping it would silently broaden the rule to every message; the validator must refuse it."""
+    client, token, runtime = predicate_client(tmp_path)
+    csrf, fingerprint = config_form(client, token)
+
+    refused = client.post(
+        "/config/routes",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "route:1:tag": "critical",
+            "route:1:kev": "yes",
+            "route:1:notifiers": ["phone"],
+        },
+        follow_redirects=False,
+    )
+
+    assert refused.status_code == 400
+    assert "match.kev must be true or false" in refused.text
+    assert not (tmp_path / "settings.json").exists()
+    assert runtime.cfg.routes[0]["match"]["kev"] is True, "the running rules are unchanged"
