@@ -55,6 +55,38 @@ ones you do not run. Package patterns filter Debian DSA titles.
 }
 ```
 
+### Risk thresholds
+
+Three numbers decide a level. They can be changed on `/config`, or written in a
+`thresholds` block in `config.yml`:
+
+```yaml
+thresholds:                 # these are the defaults
+  critical_cvss: 9.0        # 0 < x <= 10
+  critical_epss: 0.10       # 0 < x <= 1
+  suppress_below_cvss: 4.0  # 0 <= x <= critical_cvss
+```
+
+- **critical** — the CVE is in the CISA KEV catalog, CISA records active exploitation
+  (SSVC), or its CVSS is at or above `critical_cvss` with a remote, unauthenticated,
+  no-interaction vector, or with an EPSS score at or above `critical_epss`.
+- **suppressed** — every lookup answered, the KEV catalog was readable, and the CVSS is
+  below `suppress_below_cvss`. The advisory is recorded and watched; no message is sent.
+- **warning** — everything else, an unmeasured severity included: an unknown is never
+  suppressed.
+
+A message's note names the bar that decided it (`CVSS >= 7.5, remote attack, ...`), so the
+text cannot claim a threshold the configuration no longer has. Changing a threshold is a
+change of rules, not of the world, so it does not send the backlog out: each watched CVE
+records the numbers it was judged under, and the first evaluation after a change records
+the new level instead of escalating it. A CVE in KEV, or one CISA flags as actively
+exploited, still escalates — that is evidence, not a rule.
+
+`/thresholds`, linked from `/config`, previews one advisory: give it a CVSS, an EPSS, its
+KEV and SSVC state, a source and a product, and it shows the level, the reason, the exact
+metrics line and note the message would carry, and which route and notifiers would receive
+it. It reads the live configuration and writes nothing, so the link can be shared.
+
 ### Routing
 
 By default every message goes to every enabled notifier. A `routes` list in `config.yml`
@@ -125,10 +157,10 @@ paging.
 
 ### Settings without a restart
 
-The `/config` page changes seven things without editing the YAML or restarting the
+The `/config` page changes eight things without editing the YAML or restarting the
 container: `notifiers`, each source's `enabled` flag and watch `tag`, the sources the
-overlay itself adds, `poll_interval`, `hidden_source_hosts`, and the routing
-`routes`/`default` block. The notifier form manages
+overlay itself adds, `poll_interval`, `hidden_source_hosts`, the routing
+`routes`/`default` block, and the risk thresholds. The notifier form manages
 the whole list — that is how a channel
 is added, edited or disabled — and while the overlay holds a notifier list, that list
 replaces the YAML's membership and ordinary fields; only a notifier's `headers` stay in
@@ -192,7 +224,9 @@ turns critical, and never re-sends what you already received.
 - Configurable source plugins: RSS/Atom, FreshRSS (GReader API), changedetection.io (API poll + inbound webhook), generic inbound webhook; vendor enrichment for Debian DSA, php.net ChangeLog, Node.js security blog, Adobe APSB bulletins
 - Enrichment plugins: CVE.org, NVD, FIRST EPSS, CISA KEV, OSV, Debian security tracker
 - Notifier plugins: Discord webhook, Matrix (Hookshot), ntfy, Gotify, Apprise, generic webhook, SMTP
-- Severity decision per CVE with re-evaluation window and one escalation per level
+- Severity decision per CVE with re-evaluation window and one escalation per level; the
+  thresholds are configurable on `/config`, and `/thresholds` previews what one advisory
+  would be judged as and where its message would go
 - Filterable `/alerts` and `/runs` lists with their state in the URL, keyset pagination for
   the alert history, and a per-advisory page (`/advisories/<id>`) showing the stored
   classification and delivery record

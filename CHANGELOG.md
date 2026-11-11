@@ -97,6 +97,18 @@ operator action, and the release workflow then builds and pushes the image to
   temporary directory, serves the app on loopback, signs in through the real login form with
   Playwright and writes the five README screenshots at 1024 px wide, cropped to the page.
   Playwright is not a project dependency, and no CI job runs it.
+- A `thresholds` block in `config.yml` (or in the settings overlay, merged key by key) for
+  the three numbers the severity decision reads: `critical_cvss`, `critical_epss` and
+  `suppress_below_cvss`, with their previous hardcoded values as defaults. The numbers are
+  validated (a number in range, and a floor no higher than the critical bar) and reach the
+  decision as a `config.Thresholds` value instead of a module constant, so a saved change
+  applies to the next pass. `/config` edits them with the same fingerprint/stale-form
+  refusal as the other sections, and an empty field falls back to the YAML value.
+- `GET /thresholds`, linked from `/config`: a preview of what one advisory would be judged
+  as and where its message would go. It renders the live thresholds and calls the same
+  `core.level_of` and `routing.select` the pass calls, showing the level, the reason, the
+  metrics line and note the message would carry, and the matching route and notifiers. It
+  is a read-only GET -- nothing is written, so a link to it can be shared.
 
 ### Fixed
 - A first pass whose every source failed wrote no state at all, so `/sources` reported
@@ -139,6 +151,16 @@ operator action, and the release workflow then builds and pushes the image to
   waiting for a sweep. The schedules stay as the backstop.
 
 ### Changed
+
+- The note a message carries names the threshold that decided it (`CVSS >= 7.5, remote
+  attack, ...`) instead of a literal 9.0, so the text cannot claim a bar the configuration no
+  longer has; the escalation note does the same for EPSS.
+- A saved threshold re-baselines what is already watched instead of escalating it: each
+  watch entry records the numbers it was judged under (`state["watch"][*]["thresholds"]`),
+  and the first evaluation after a change records the new level without sending anything. A
+  CVE in KEV, or one CISA flags as actively exploited, still escalates -- evidence rather
+  than a rule. State written before this change carries no record and is judged by the
+  defaults, which is what judged it.
 - `/sources` leads with what this instance monitors: each enabled source's state, last
   attempt, last success, entries and error, with a probe per row. The built-in catalogue
   stays on the page, below the configured sources it documents. The `/config` source table
