@@ -159,8 +159,8 @@ operator action, and the release workflow then builds and pushes the image to
 
 ### Security
 - A source added from `/config` may not point into a private network unless the YAML sets
-  `allow_private_sources: true`: the settings overlay is reachable with the UI token alone,
-  and only whoever writes the YAML should be able to aim the fetcher at an internal address.
+  `allow_private_sources: true`. It is a guard rail against pointing this instance at a
+  router page by mistake, not a privilege the YAML keeps and the overlay does not.
   The check reads the destination the way the transport does -- the authority is unquoted
   before the host is separated from the port, so `%3A8080` is a port and not part of a name --
   and refuses loopback, private, shared, link-local, site-local and multicast addresses and

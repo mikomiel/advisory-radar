@@ -88,8 +88,9 @@ class Config:
     #: A free NVD API key: raises the anonymous 5-per-30 s limit to 50 and shortens the pace in ``core.Intel``.
     nvd_api_key: str = ""
     #: Whether a source added from the settings overlay may point into a private network. Off by default: the
-    #: YAML is written by whoever runs the host, an overlay entry by whoever holds the UI token, and only the
-    #: first of those should be able to aim this process at an internal address.
+    #: check is an operator-controlled guard rail against pointing this instance at a router page by mistake,
+    #: turned off for an installation whose sources live on the LAN. It is not an isolation boundary -- see
+    #: :func:`advisory_radar.http.private_destination` for what it does and does not cover.
     allow_private_sources: bool = False
     #: Ordered routing rules, first match wins. Empty means every message goes to every enabled notifier,
     #: exactly as it did before routing existed.

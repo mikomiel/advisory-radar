@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -19,7 +20,7 @@ from fastapi.testclient import TestClient
 
 from advisory_radar import core, pipeline
 from advisory_radar.config import ConfigError, load_config, load_document
-from advisory_radar.http import private_destination, resolve_host, urllib_http
+from advisory_radar.http import _host_of, private_destination, resolve_host, urllib_http
 from advisory_radar.runtime import Runtime
 from advisory_radar.settings import validate_settings
 from advisory_radar.state import save_state
@@ -949,3 +950,35 @@ def test_a_bare_config_app_redacts_a_row_origin(tmp_path):
     signed_in(client)
     page = client.get("/config").text
     assert "abcdef123456" not in page.lower()
+
+
+def test_a_probe_finds_a_yaml_source_by_the_id_the_page_shows(tmp_path):
+    """``/sources`` renders the expanded configuration, so its button submits the value, not the reference."""
+    client, runtime, _ = make_client(
+        tmp_path,
+        sources=[{"id": "${FEED_ID}", "type": "rss", "url": "https://feeds.example.net/feed.xml"}],
+        environment={"FEED_ID": "vendor"},
+    )
+    assert [source.id for source in runtime.sources] == ["vendor"]
+    csrf, _ = signed_in(client)
+    from_sources_page = client.post("/sources/probe", data={"csrf": csrf, "id": "vendor"})
+    assert from_sources_page.status_code == 200
+    assert "Answered with 2 entries." in from_sources_page.text
+    from_config_page = client.post("/config/sources/probe", data={"csrf": csrf, "id": "${FEED_ID}"})
+    assert from_config_page.status_code == 200
+    assert "Answered with 2 entries." in from_config_page.text
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1%3A8080/x",
+        "http://[::1]:8080/x",
+        "http://%5B::1%5D/x",
+        "http://user:pw@127.0.0.1/x",
+    ],
+)
+def test_the_check_reads_the_authority_the_transport_carries(url):
+    """No network: the host the check judges is the host ``Request`` hands to the connection layer."""
+    transport_host = urllib.request.Request(url).host
+    assert _host_of(url) == urllib.parse.urlsplit("//" + transport_host).hostname

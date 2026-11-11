@@ -1513,6 +1513,23 @@ def create_app(
         sources = document.get("sources") if isinstance(document, dict) else None
         return [entry for entry in (sources or []) if isinstance(entry, dict) and isinstance(entry.get("id"), str)]
 
+    def source_entry_by_id(overlay: dict, identifier: str) -> dict | None:
+        """The configured entry this id names, whether it was given expanded or as it is written.
+
+        ``/sources`` renders the *expanded* configuration, so its Test button submits ``vendor`` for a YAML
+        entry written ``${FEED_ID}``; ``/config`` renders the reference and submits that. One lookup answers
+        both, and an id the overlay adds is literal, so it needs no second form.
+        """
+        for entry in saved_source_entries(overlay):
+            raw = entry["id"]
+            try:
+                effective = expand_entry({"id": raw}, runtime.environment).get("id")
+            except ConfigError:
+                effective = raw  # an unset variable: the raw reference is still the id of this entry
+            if identifier in (raw, effective):
+                return entry
+        return None
+
     def derive_source_id(url: str, kind: str, taken: set[str]) -> str:
         """A stable id from a source URL's host, unique against the ids already configured.
 
@@ -1768,10 +1785,7 @@ def create_app(
         if identifier:
             settings = saved_overlay()[0]
             owned = added_source_ids(settings)
-            entry = next(
-                (candidate for candidate in saved_source_entries(settings) if candidate["id"] == identifier),
-                None,
-            )
+            entry = source_entry_by_id(settings, identifier)
             if entry is None:
                 return page(
                     "Source probe",
