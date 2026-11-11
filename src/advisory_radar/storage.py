@@ -58,6 +58,14 @@ _MALFORMED_USERINFO = (
     "(for example %40 for @)"
 )
 
+#: Refused before a host, database or password is derived: an authority Python cannot read back whole may be
+#: read differently by libpq, and the part it hides could be the credential. Static like the other refusals,
+#: so it never carries the target.
+_AMBIGUOUS_TARGET = (
+    "unsupported state store: the PostgreSQL URL cannot be parsed unambiguously; a password belongs in the "
+    "userinfo, with a literal / or @ percent-encoded (for example %2F or %40)"
+)
+
 #: A SQLite document must not be written at the path of a file that lives beside ``state_path``: the KEV cache
 #: and the settings overlay are replaced atomically by their own writers, so the first pass would destroy one.
 #: The refusal names the file's role, never the path, so a log line and the message cannot disagree about it.
@@ -209,10 +217,13 @@ class SqliteStore:
         owner: str = DEFAULT_OWNER,
         timeout: float = 5.0,
     ) -> None:
-        self._path = path
+        #: Resolved, so the document and a symlink to it share one lock: the sidecar is derived from the name,
+        #: and two spellings of one file would otherwise lock different files and let two passes proceed at
+        #: once. ``strict=False`` still resolves the parent of a document that does not exist yet.
+        self._path = path.resolve(strict=False)
         #: The same suffix ``state.state_lock`` gives the JSON file, so a store and a pass over the same path
         #: still exclude each other.
-        self._lock_path = path.with_name(path.name + ".lock")
+        self._lock_path = self._path.with_name(self._path.name + ".lock")
         self._schema = schema
         self._owner = owner
         #: How long one connection waits inside SQLite before an attempt fails: the busy handler's timeout for
@@ -411,6 +422,39 @@ def _password_tokens(password: str) -> set[str]:
     return tokens
 
 
+def _refuse_ambiguous_target(parts: urllib.parse.SplitResult) -> None:
+    """Refuse an authority or path this program cannot read the way libpq might.
+
+    A raw ``/`` in the password moves it into the path for ``urlsplit`` -- ``radar:/secret@host/db`` is host
+    ``radar`` with the secret in the path -- while libpq keeps it in the userinfo, so a host, database or
+    password derived here would be wrong and could print the credential. Every such shape fails closed before
+    any of those fields is computed: an ``@`` in the path, a trailing ``:``, a second ``@``, or a netloc that
+    does not round-trip through the parsed pieces.
+    """
+    netloc = parts.netloc
+    if "@" in parts.path or netloc.endswith(":") or netloc.count("@") > 1:
+        raise ValueError(_AMBIGUOUS_TARGET)
+    try:
+        hostname, port = parts.hostname or "", parts.port
+    except ValueError as exc:  # a malformed port or bracket: its text may itself be the credential
+        raise ValueError(_AMBIGUOUS_TARGET) from exc
+    # The host is case-insensitive and an IPv6 host is bracketed in the netloc, so the round trip undoes exactly
+    # those two normalisations. Anything else differing is a shape Python did not read whole.
+    userinfo, _, hostport = netloc.rpartition("@")
+    rebuilt_userinfo = ""
+    if "@" in netloc:
+        username = parts.username or ""
+        rebuilt_userinfo = username if parts.password is None else f"{username}:{parts.password}"
+        if rebuilt_userinfo != userinfo:
+            raise ValueError(_AMBIGUOUS_TARGET)
+    rebuilt = f"{rebuilt_userinfo}@" if "@" in netloc else ""
+    rebuilt += f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None:
+        rebuilt += f":{port}"
+    if rebuilt.lower() != netloc.lower():
+        raise ValueError(_AMBIGUOUS_TARGET)
+
+
 def _postgres_target(url: str) -> tuple[str, str]:
     """The host and database a PostgreSQL URL names, refusing any other shape without echoing the value.
 
@@ -426,13 +470,14 @@ def _postgres_target(url: str) -> tuple[str, str]:
     """
     try:
         parts = urllib.parse.urlsplit(url)
-        host = parts.hostname or ""
     except ValueError as exc:  # a malformed bracket or escape is a shape refusal, not a crash
         raise ValueError(_UNSUPPORTED_STORE) from exc
     if parts.scheme not in _POSTGRES_SCHEMES:
         raise ValueError(_UNSUPPORTED_STORE)
     if "#" in url:
         raise ValueError(_FRAGMENT_REFUSAL)
+    _refuse_ambiguous_target(parts)
+    host = parts.hostname or ""
     if _malformed_percent_escape(_userinfo(url)):
         raise ValueError(_MALFORMED_USERINFO)
     if parts.query:

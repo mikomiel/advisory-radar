@@ -198,6 +198,23 @@ def test_a_blocking_lock_waits_while_a_non_blocking_one_answers(tmp_path, monkey
     assert storage.SqliteStore(path).load() == DOCUMENT, "contention must not change the document"
 
 
+def test_a_symlink_to_the_database_shares_its_lock(tmp_path):
+    """One document, one lock: a sidecar named after the spelling would let two passes over one file proceed."""
+    real = tmp_path / "state.db"
+    storage.SqliteStore(real).save(DOCUMENT)
+    alias = tmp_path / "alias.db"
+    alias.symlink_to(real)
+    assert storage.SqliteStore(alias).load() == DOCUMENT
+    assert repr(storage.SqliteStore(alias)) == repr(storage.SqliteStore(real)), "both spellings name one store"
+
+    with (
+        storage.SqliteStore(real).lock(),
+        pytest.raises(LockBusy),
+        storage.SqliteStore(alias).lock(blocking=False),
+    ):
+        pass
+
+
 def test_a_read_only_sqlite_store_is_unavailable_and_keeps_the_committed_document(tmp_path, read_only_sqlite):
     path = tmp_path / "state.db"
     storage.SqliteStore(path).save(DOCUMENT)
@@ -586,6 +603,54 @@ def test_a_malformed_percent_escape_is_refused_before_the_driver_runs(monkeypatc
     # A configuration reaches the same refusal through the one parser.
     with pytest.raises(ValueError):
         storage.store_for(url, tmp_path / "state.json")
+
+
+def test_a_password_hidden_in_the_path_is_refused_and_never_printed():
+    """A raw ``/`` moves the password into the path for ``urlsplit``; libpq keeps it in the userinfo.
+
+    The shape is refused before a host, database or password exists, so no ``repr`` or ``_unavailable`` can be
+    built from it. The same secret in the one position this program understands is never printed either.
+    """
+    url = "postgresql://radar:/synthetic-secret@db.example/radar"
+    with pytest.raises(ValueError) as caught:
+        storage.PostgreSqlStore(url)
+    assert "synthetic-secret" not in str(caught.value)
+
+    store = storage.PostgreSqlStore("postgresql://radar:synthetic-secret@db.example/radar")
+    assert "synthetic-secret" not in repr(store)
+    reason = RuntimeError('invalid percent-encoded token: "synthetic-secret"')
+    assert "synthetic-secret" not in store._unavailable(reason)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # The password's raw "/" leaves a path a credential cannot legally occupy.
+        "postgresql://radar:/synthetic-secret@db.example/radar",
+        # A trailing ":" is a password separator whose password the path took.
+        "postgresql://radar:/synthetic-secret",
+        # Two "@" leave the userinfo and the host ambiguous.
+        "postgresql://radar@db.example@host/radar",
+        # A port that is not a number: its text may be a misplaced password, and urlsplit's own error quotes it.
+        "postgresql://db.example:synthetic-secret/radar",
+        # A netloc urlsplit normalises beyond the host's case: a leading-zero port does not round-trip.
+        "postgresql://db.example:05432/radar",
+    ],
+)
+def test_an_ambiguous_postgres_target_is_refused_before_the_driver(url, monkeypatch):
+    driver_calls: list[str] = []
+
+    class _Driver:
+        @staticmethod
+        def connect(url: str):
+            driver_calls.append(url)
+            raise AssertionError("the driver must not be reached")
+
+    monkeypatch.setitem(sys.modules, "psycopg", _Driver)
+    with pytest.raises(ValueError) as caught:
+        storage.PostgreSqlStore(url)
+    assert "synthetic-secret" not in str(caught.value)
+    assert driver_calls == []
 
 
 def test_a_driver_message_that_names_the_token_alone_is_scrubbed(monkeypatch):
