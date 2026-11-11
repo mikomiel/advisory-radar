@@ -2565,6 +2565,8 @@ def _deliver_batch(
     entries is posted as it was rendered. An entry whose destinations have all accepted is delivered even
     when another entry in the batch failed, an entry with a refused destination takes one attempt for the
     pass, and a batch whose entries all park lets the pass continue, exactly as a single parked message does.
+    Every refused entry is charged its attempt before any parking is attempted, so a full parked queue cannot
+    leave a later covered entry with no attempt or status recorded.
     """
     covered = list(batch.entries)
     for entry in covered:
@@ -2622,7 +2624,8 @@ def _deliver_batch(
                 status_text,
                 " ".join(entry["title"].split()),
             )
-    remaining = []
+    # Account for every covered entry before any parking is attempted. A full parked queue must not leave a
+    # later covered entry with no attempt recorded: the failed POST covered it just as much as the first one.
     for index, entry in enumerate(covered):
         if index in delivered:
             continue
@@ -2631,9 +2634,16 @@ def _deliver_batch(
             status = max(statuses)
         entry["attempts"] = entry.get("attempts", 0) + 1
         entry["last_status"] = status
+    blocked = False
+    remaining = []
+    for index, entry in enumerate(covered):
+        if index in delivered:
+            continue
+        status = entry["last_status"]
         if entry["attempts"] >= MAX_DELIVERY_ATTEMPTS or now - entry["first_attempt_at"] > PARK_AFTER:
             if not _park(state, entry, status, now):
-                return False
+                # The entry stays pending exactly as ``_park`` left it; the pass still fails below.
+                blocked = True
         else:
             remaining.append((entry, status))
     for entry, status in remaining:
@@ -2645,7 +2655,7 @@ def _deliver_batch(
             MAX_DELIVERY_ATTEMPTS,
             len(state["pending"]),
         )
-    return not remaining
+    return not remaining and not blocked
 
 
 def _park(state: dict, entry: dict, status: int, now: int) -> bool:

@@ -479,3 +479,45 @@ def test_equivalent_destination_sets_share_one_digest():
     assert ops.sent[0]["ids"] == ["CVE-2026-1", "CVE-2026-2"]
     assert phone.sent[0]["ids"] == ["CVE-2026-1", "CVE-2026-2"]
     assert state["pending"] == []
+
+
+def test_a_full_parked_queue_still_accounts_for_every_entry_in_the_failed_digest():
+    """The failed POST covered every entry, so a refused park must not leave a later entry unaccounted."""
+    state = core.new_state()
+    first = queued("CVE-2026-1")
+    first.update({"attempts": 2, "first_attempt_at": NOW - 600})
+    second = queued("CVE-2026-2")
+    state["pending"] = [first, second]
+    state["parked"] = [
+        {"title": f"parked {number}", "ids": [f"CVE-2026-{number}"]} for number in range(core.MAX_PARKED)
+    ]
+    ops = Recorder(status=500)
+
+    assert core.deliver(state, [ops], no_http, NOW, digest=True) is False
+    assert len(ops.sent) == 1, "one digest POST covered both entries"
+    assert [entry["attempts"] for entry in state["pending"]] == [3, 1], "both entries take one attempt"
+    assert [entry["last_status"] for entry in state["pending"]] == [500, 500]
+    assert len(state["parked"]) == core.MAX_PARKED, "parking was blocked, so the entry stays pending"
+    assert [entry["ids"][0] for entry in state["pending"]] == ["CVE-2026-1", "CVE-2026-2"]
+
+
+def test_complementary_acknowledgements_let_one_entry_finish_while_the_other_keeps_its_attempt():
+    state = core.new_state()
+    first = queued("CVE-2026-1")
+    first["sent_to"] = ["good"]
+    second = queued("CVE-2026-2")
+    second["sent_to"] = ["bad"]
+    state["pending"] = [first, second]
+    good, bad = Recorder("good"), Recorder("bad", status=500)
+
+    assert core.deliver(state, [good, bad], no_http, NOW, digest=True) is False
+    assert [message["ids"] for message in good.sent] == [["CVE-2026-2"]], "good needs only the entry it lacks"
+    assert [message["ids"] for message in bad.sent] == [["CVE-2026-1"]], "bad needs only the entry it lacks"
+    assert [entry["ids"][0] for entry in state["pending"]] == ["CVE-2026-1"]
+    assert state["pending"][0]["attempts"] == 1
+    assert state["pending"][0]["last_status"] == 500
+    assert state["pending"][0]["sent_to"] == ["good"], "the accepted destination is kept"
+    record = state["seen"]["CVE-2026-2"]
+    assert record["outcome"] == "delivered", "the entry with every destination accepted left the queue"
+    assert state["deliveries"][record["delivery"]]["delivered_to"] == ["bad", "good"]
+    assert "CVE-2026-1" not in state["seen"]
