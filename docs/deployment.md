@@ -207,7 +207,10 @@ message would carry, and the route and notifiers it would reach, including a `mi
 advisory's identifiers are an input, because a rule may match on them; without one and with
 such a rule configured, the page says the destination cannot be predicted instead of guessing.
 The same is said for a `kev` rule when the catalog state is "unknown", because membership was
-then not measured. It is a read-only GET, so a link to it can be shared.
+then not measured. A numeric or `kev` predicate is also not predicted without the advisory's
+CVE id: the classifier records a score per CVE it judged, so a typed advisory-level score is
+not the measurement such a rule reads, and the page asks for the CVE id rather than inventing
+one. It is a read-only GET, so a link to it can be shared.
 
 ### Routing
 

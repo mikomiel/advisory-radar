@@ -111,7 +111,10 @@ level, the reason, the exact metrics line and note the message would carry, and 
 and notifiers would receive it. It judges the advisory with the previewed source's own block
 when it has one, says which numbers it used, and reads the live configuration without writing
 anything, so the link can be shared. A route that matches on identifiers needs them: without
-one the page says the destination cannot be predicted rather than guessing.
+one the page says the destination cannot be predicted rather than guessing. A numeric or
+`kev` predicate needs the advisory's CVE id for the same reason: the classifier records a
+score per CVE it judged, so an advisory-level score is not a measurement a rule can read, and
+the page asks for the CVE id instead of inventing one.
 
 ### Routing
 
