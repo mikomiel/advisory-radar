@@ -189,12 +189,14 @@ class SqliteStore:
         return f"SqliteStore({str(self._path)!r})"
 
     def load(self) -> dict | None:
-        if not self._path.exists():
-            # A read creates nothing: the JSON store answers a missing file the same way, and a dry run over a
-            # store that was never written must not leave an empty database behind.
-            return None
         connection = None
         try:
+            if not self._path.exists():
+                # A read creates nothing: the JSON store answers a missing file the same way, and a dry run
+                # over a store that was never written must not leave an empty database behind. The lookup is
+                # inside the translated block because it is a filesystem read too: an inaccessible ancestor
+                # raises, and that is the store being unavailable rather than a raw traceback out of /readyz.
+                return None
             connection = self._connect()
             self._prepare(connection)
             row = connection.execute(_SQLITE_SELECT).fetchone()
@@ -340,6 +342,14 @@ _QUERY_CREDENTIAL_REFUSAL = (
     "in the userinfo or the environment, not in the query string"
 )
 
+#: A raw ``#`` is read two ways: ``urlsplit`` starts a fragment there, while libpq keeps it in the userinfo or
+#: the database name and still parses what follows -- so the credential checks built on Python's view can miss
+#: a password libpq then quotes. Refusing the shape removes that whole disagreement instead of mirroring libpq.
+_FRAGMENT_REFUSAL = (
+    "unsupported state store: the PostgreSQL URL contains a raw #; a fragment is not part of a connection "
+    "target this program parses. Percent-encode a literal # (for example %23) in the userinfo or the database"
+)
+
 
 def _query_credential(url: str) -> str:
     """The credential-bearing libpq option a PostgreSQL URL names in its query string, or "".
@@ -379,8 +389,10 @@ def _postgres_target(url: str) -> tuple[str, str]:
 
     A password belongs in the userinfo or the environment. libpq also accepts credentials as query parameters,
     but this program does not parse libpq's option set: a query string that names one is refused here, so a
-    value this code can neither validate nor scrub never reaches the driver. What remains -- the userinfo -- is
-    the only credential position the scrubber has to cover.
+    value this code can neither validate nor scrub never reaches the driver. A raw ``#`` is refused too, because
+    Python's parser and libpq disagree about it and both credential checks read the URL the way Python does.
+    What remains -- a fragment-free URL whose only credential position is the userinfo -- is exactly what the
+    scrubber covers.
     """
     try:
         parts = urllib.parse.urlsplit(url)
@@ -389,6 +401,8 @@ def _postgres_target(url: str) -> tuple[str, str]:
         raise ValueError(_UNSUPPORTED_STORE) from exc
     if parts.scheme not in _POSTGRES_SCHEMES:
         raise ValueError(_UNSUPPORTED_STORE)
+    if "#" in url:
+        raise ValueError(_FRAGMENT_REFUSAL)
     if _malformed_percent_escape(_userinfo(url)):
         raise ValueError(_MALFORMED_USERINFO)
     supplied = _query_credential(url)

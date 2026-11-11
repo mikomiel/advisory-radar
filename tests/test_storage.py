@@ -190,6 +190,22 @@ def test_a_filesystem_failure_reading_the_store_is_a_store_error(tmp_path, monke
         opened[-1].execute("SELECT 1")  # a closed handle: the refusal must not leak the connection
 
 
+def test_a_failed_path_lookup_reading_the_store_is_a_store_error(tmp_path, monkeypatch):
+    """The existence check is a filesystem read too: a lookup that raises is the store being unavailable.
+
+    ``load`` used to ask ``Path.exists()`` before its protected block, so an inaccessible ancestor raised
+    ``PermissionError`` straight into ``/readyz``, ``/metrics`` and ``migrate``.
+    """
+
+    def denied(self):
+        raise PermissionError(13, "Permission denied", str(self))
+
+    monkeypatch.setattr(type(tmp_path), "exists", denied)
+    with pytest.raises(storage.StoreUnavailable) as caught:
+        storage.SqliteStore(tmp_path / "state.db").load()
+    assert not isinstance(caught.value, OSError)
+
+
 def test_a_pass_over_a_read_only_sqlite_store_fails_instead_of_raising(tmp_path, read_only_sqlite, caplog):
     path = tmp_path / "state.db"
     document = core.new_state()
@@ -517,6 +533,46 @@ def test_a_credential_in_the_postgres_query_string_is_refused_before_the_driver(
     with pytest.raises(ValueError):
         storage.store_for(url, tmp_path / "state.json")
     assert driver_calls == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # urlsplit starts a fragment, so no query parameter exists for this program; libpq keeps the "#" in the
+        # database name and parses the password option, then quotes the bad token.
+        "postgresql://db.example/radar#?password=bad%password",
+        # The same disagreement in the userinfo: libpq reads the password before the "@", urlsplit sees none.
+        "postgresql://radar:bad%password#x@db.example/radar",
+    ],
+)
+def test_a_raw_fragment_in_the_postgres_target_is_refused_before_the_driver(url, tmp_path, monkeypatch):
+    """Both credential checks read the URL the way ``urlsplit`` does, so a raw ``#`` is refused rather than
+    mirrored: libpq would read the same text differently and could quote a password this code never saw."""
+    driver_calls: list[str] = []
+
+    class _Driver:
+        @staticmethod
+        def connect(url: str):
+            driver_calls.append(url)
+            raise AssertionError("the driver must not be reached")
+
+    monkeypatch.setitem(sys.modules, "psycopg", _Driver)
+    with pytest.raises(ValueError) as caught:
+        storage.PostgreSqlStore(url)
+    message = str(caught.value)
+    assert "fragment" in message, "the refusal says what is wrong"
+    for part in ("bad%password", "%password", "bad"):
+        assert part not in message, "no part of the credential may appear in the refusal"
+    assert driver_calls == []
+    with pytest.raises(ValueError):
+        storage.store_for(url, tmp_path / "state.json")
+    assert driver_calls == []
+
+
+def test_an_encoded_fragment_in_the_userinfo_stays_a_password_position():
+    # A properly percent-encoded # is not a fragment: it is part of the password, and the store accepts it.
+    store = storage.PostgreSqlStore("postgresql://radar:s3cr3t%23pass@db.example/radar")
+    assert repr(store) == "PostgreSqlStore(host='db.example', database='radar')"
 
 
 def test_a_non_credential_query_parameter_is_not_refused():

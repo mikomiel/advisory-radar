@@ -13,6 +13,8 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 from advisory_radar import cli, core
 from advisory_radar.state import load_state_document, save_state
 from advisory_radar.storage import SqliteStore
@@ -125,6 +127,35 @@ def test_migrate_refuses_a_target_credential_in_the_query_string(tmp_path, monke
     assert "bad%password" not in caplog.text
     assert "%password" not in caplog.text
     assert "password" in caplog.text, "the parameter is named, so the operator can act on it"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "postgresql://db.example/radar#?password=bad%password",
+        "postgresql://radar:bad%password#x@db.example/radar",
+    ],
+)
+def test_migrate_refuses_a_fragment_target_before_the_driver(url, tmp_path, monkeypatch, caplog):
+    """A raw ``#`` is where Python's parser and libpq disagree, and ``--to`` credentials are in no redactor."""
+    driver_calls: list[str] = []
+
+    class _Driver:
+        @staticmethod
+        def connect(url: str):
+            driver_calls.append(url)
+            raise RuntimeError('invalid percent-encoded token: "bad%password"')
+
+    monkeypatch.setitem(sys.modules, "psycopg", _Driver)
+    config = make_config(tmp_path)
+    save_state(tmp_path / "state.json", make_document())
+    with caplog.at_level(logging.ERROR):
+        code = cli.main(["migrate", "--config", str(config), "--to", url], env={})
+    assert code == 1
+    assert driver_calls == [], "the URL must be refused before the driver can quote it"
+    assert "fragment" in caplog.text
+    assert "bad%password" not in caplog.text
+    assert "%password" not in caplog.text
 
 
 def test_the_document_is_the_same_after_a_round_trip_through_sqlite(tmp_path):
