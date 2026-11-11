@@ -450,5 +450,6 @@ def test_a_document_from_an_older_reader_is_normalised_before_it_is_judged(tmp_p
         "the advisory recorded under a control-bearing identity must not be delivered again"
     )
     stored = json.loads((tmp_path / "state.json").read_text())
-    assert "src:test:https://vendor.example.com/a" in stored["seen"]
-    assert not [key for key in stored["seen"] if key.endswith("\u007f")]
+    assert "src:test:https://vendor.example.com/a\u007f" in stored["seen"], (
+        "the stored document is not rewritten: the claim is compared in its normalised form instead"
+    )

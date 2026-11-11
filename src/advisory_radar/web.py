@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 
 import yaml
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from itsdangerous import BadSignature, URLSafeSerializer
 
 from . import __version__, feeds, pipeline
@@ -3409,10 +3409,13 @@ def create_app(
             )
         return JSONResponse({"queued": entry["guid"]})
 
-    @app.get("/api/state", response_class=JSONResponse)
+    @app.get("/api/state")
     def api_state(request: Request):
         if not require_auth(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return JSONResponse(load_state())
+        # ``ensure_ascii`` escapes a legacy identity that is not a Unicode scalar value instead of failing to
+        # encode the whole response, so one bad record in state cannot take the endpoint down. The values are
+        # preserved, only their JSON spelling changes.
+        return Response(json.dumps(load_state(), ensure_ascii=True), media_type="application/json")
 
     return app

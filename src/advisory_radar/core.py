@@ -38,7 +38,7 @@ from pathlib import Path
 
 from . import adobe, routing
 from .config import DEFAULT_THRESHOLDS, Thresholds
-from .feeds import FeedExport
+from .feeds import FeedExport, normalise_identity
 from .feeds import parse_feed as parse_greader
 from .http import MESSAGE_LIMIT, Http, inert, parse_json
 from .state import SourceError, load_state_document, save_state
@@ -1501,10 +1501,38 @@ def _suppressed(
 
 
 def _claimed(state: dict) -> set[str]:
-    """Every id the worker already answers for: seen, queued, or parked (a parked message is not lost)."""
-    return set(state["seen"]) | {
+    """Every id the worker already answers for: seen, queued, or parked (a parked message is not lost).
+
+    Compared in the normalised form a reader produces today. A document written by an older version can hold
+    an identity that still carries a control character, and comparing the two spellings verbatim would fail
+    to recognise the same advisory and deliver it twice. The stored value is deliberately not rewritten: a
+    migration would have to invent collision rules for data it cannot repair, while comparing costs one
+    function call and loses nothing.
+    """
+    stored = set(state["seen"]) | {
         identifier for entry in (*state["pending"], *state.get("parked", ())) for identifier in entry["ids"]
     }
+    return {_identity_key(value) for value in stored if isinstance(value, str)}
+
+
+def _identity_key(value: str) -> str:
+    """One stored identifier in the form a reader produces: ``src:<source>:<guid>`` keeps its prefix."""
+    if value.startswith("src:"):
+        body = value[len("src:") :]
+        source, separator, guid = body.partition(":")
+        if separator:
+            return f"src:{source}:{normalise_identity(guid)}"
+        return f"src:{normalise_identity(body)}"
+    return normalise_identity(value) or value
+
+
+def _log_id(value: str) -> str:
+    """An untrusted identifier made safe for one log record: single line, bounded.
+
+    Identities come from a feed, and a control character in one would otherwise end the record and let a
+    publisher write what looks like an application log line.
+    """
+    return " ".join(value.split())[:200]
 
 
 def classify_new(
@@ -1767,7 +1795,7 @@ def classify_new(
                 }
             )
         claimed.update(ids)
-        LOG.info("classified %s as %s", item.guid if not item.explicit else item.explicit[0], verdict.tag)
+        LOG.info("classified %s as %s", _log_id(item.guid if not item.explicit else item.explicit[0]), verdict.tag)
     if backlog:
         LOG.info("recorded %d item(s) older than %d days as backlog, not alerted", backlog, BACKLOG_AGE // DAY)
     if not retry:
@@ -1787,13 +1815,13 @@ def _enrichment_wait(retry: dict[str, int], guid: str, now: int, limit: int = EN
     if now - first < limit:
         LOG.warning(
             "enrichment: item %s waits for its CVE list or source page (first missing %d s ago); retried next pass",
-            guid,
+            _log_id(guid),
             now - first,
         )
         return True
     LOG.warning(
         "enrichment: item %s has no CVE list or readable source page after %d s; sent once with unknown severity",
-        guid,
+        _log_id(guid),
         now - first,
     )
     del retry[guid]
@@ -2528,8 +2556,8 @@ def manage_parked_entry(state_path: Path, index: int, release: bool, now: int, *
 
 
 def _audit_ids(entry: dict) -> str:
-    shown = [identifier for identifier in entry["ids"] if not identifier.startswith("src:")][:MAX_SHOWN_IDS]
-    return ",".join(shown) or "no-id"
+    shown = [_log_id(identifier) for identifier in entry["ids"] if not identifier.startswith("src:")]
+    return ",".join(shown[:MAX_SHOWN_IDS]) or "no-id"
 
 
 def seed(state: dict, items: Sequence[Item], now: int) -> list[Item]:
