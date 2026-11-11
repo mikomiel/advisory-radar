@@ -16,7 +16,7 @@ from .catalogue import SOURCE_SPECS
 from .config import Config, ConfigError, load_config, secret_values
 from .http import Http, urllib_http
 from .runtime import Runtime, read_config
-from .state import SourceError, serialize_json
+from .state import LockBusy, SourceError, serialize_json
 from .storage import StoreUnavailable, store_for
 
 LOG = logging.getLogger("advisory_radar")
@@ -185,8 +185,10 @@ def _migrate(cfg: Config, target_value: str) -> int:
     """Copy the state document from the configured store to ``--to``, refusing to overwrite a document.
 
     The source is only read, so no lock is taken: every store's save is atomic, which makes one ``load()`` a
-    consistent snapshot even while a pass runs. The target is checked before it is written, because a
-    migration that replaced a live document would destroy the only record of what had already been sent.
+    consistent snapshot even while a pass runs. The target is locked across the emptiness check *and* the
+    save, because two migrations -- or a running instance -- could otherwise both see an empty target and the
+    second would replace the first's document, destroying the only record of what had already been sent. The
+    lock is what makes the check meaningful: no other writer can create the document between the two calls.
     """
     if target_value == cfg.storage:
         LOG.error("--to is the configured store, so a migration would move nothing")
@@ -206,10 +208,14 @@ def _migrate(cfg: Config, target_value: str) -> int:
         LOG.error("%s holds no state document yet; nothing to migrate", source)
         return 1
     try:
-        if target.load() is not None:
-            LOG.error("%s already holds a state document; refusing to overwrite it", target)
-            return 1
-        target.save(document)
+        with target.lock():
+            if target.load() is not None:
+                LOG.error("%s already holds a state document; refusing to overwrite it", target)
+                return 1
+            target.save(document)
+    except LockBusy:
+        LOG.error("%s is locked by another writer; nothing was written", target)
+        return 1
     except (SourceError, StoreUnavailable, OSError) as exc:
         LOG.error("%s", exc)
         return 1

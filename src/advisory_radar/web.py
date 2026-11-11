@@ -2111,7 +2111,7 @@ def create_app(
             runtime.reload(blocking=False)
         except LockBusy:
             LOG.info("settings revision %d saved; a pass holds the lock, so it is not live yet", stored["revision"])
-        except (ConfigError, SourceError) as exc:
+        except (ConfigError, SourceError, StoreUnavailable) as exc:
             LOG.warning(
                 "settings revision %d saved but not applied: %s",
                 stored["revision"],
@@ -2624,7 +2624,7 @@ def create_app(
                 actions=sign_out_form(request),
                 status_code=409,
             )
-        except (ConfigError, SourceError) as exc:
+        except (ConfigError, SourceError, StoreUnavailable) as exc:
             message = esc(pipeline.redact(str(exc), secret_values(runtime.cfg)))
             return page(
                 "Reload refused",

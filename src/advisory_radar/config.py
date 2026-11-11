@@ -340,7 +340,7 @@ def _credential_names(document: dict) -> set[str]:
     publish the key on every page, log line and metric label that shows the id. A variable that only names
     something -- ``id: tenant-${TENANT}`` -- stays usable in an id. The scan is deliberately blind to whether an
     entry is enabled or which kind it is: both are configuration, and both can supply a value an enabled entry's
-    id borrows.
+    id borrows. The store locator counts too: a PostgreSQL URL embeds a password.
     """
     names: set[str] = set()
     for entry in document.get("sources") or []:
@@ -353,6 +353,9 @@ def _credential_names(document: dict) -> set[str]:
         if isinstance(entry, dict):
             for key in (*NOTIFIER_SECRET_KEYS, "headers"):
                 names |= _reference_names(entry.get(key))
+    # The store locator can embed a credential (``postgresql://radar:${DB_PASSWORD}@db.example/radar``), and an
+    # id composed from that variable would publish the password wherever the id is shown.
+    names |= _reference_names(document.get("storage"))
     names |= _reference_names(document.get("nvd_api_key"))
     return names
 

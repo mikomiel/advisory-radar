@@ -11,6 +11,7 @@ import json
 import logging
 import signal
 import stat
+import sys
 import threading
 import time
 
@@ -458,6 +459,24 @@ def test_a_reload_cannot_move_the_store(tmp_path):
     assert "storage" in str(caught.value)
     assert runtime.cfg.storage == ""
     assert not moved.exists()
+
+
+def test_a_reload_refuses_an_unavailable_store_before_changing_anything(tmp_path, monkeypatch):
+    # The lock, the load and the applied marker are one publication. An unreachable database at any of them
+    # used to escape as StoreUnavailable past the callers that answer ConfigError, so the overlay was saved and
+    # the browser saw a 500; it must be a refusal the operator can act on.
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+    path = write_config(tmp_path, {"storage": "postgresql://radar@db.example/radar"})
+    runtime = Runtime.build(path, {})
+    save_overlay(tmp_path, {"poll_interval": "30s"})
+
+    with pytest.raises(ConfigError) as caught:
+        runtime.reload(blocking=False)
+    message = str(caught.value)
+    assert "not applied" in message
+    assert "psycopg" in message, "the refusal still names the missing piece"
+    assert runtime.cfg.poll_interval_seconds == 900, "a refused reload leaves the live configuration"
+    assert runtime.overlay["settings"] == {}, "a refused reload leaves the applied overlay"
 
 
 def test_an_overlay_over_the_reader_limit_is_never_written(tmp_path):

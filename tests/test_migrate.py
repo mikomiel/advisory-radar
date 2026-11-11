@@ -6,8 +6,11 @@ and what the operator sees. No PostgreSQL server is needed; an unusable target f
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import sqlite3
 import sys
+import threading
 from pathlib import Path
 
 from advisory_radar import cli, core
@@ -106,3 +109,126 @@ def test_the_document_is_the_same_after_a_round_trip_through_sqlite(tmp_path):
     (tmp_path / "state.json").unlink()
     assert cli.main(["migrate", "--config", str(back), "--to", ""], env={}) == 0
     assert load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state") == document
+
+
+def test_two_migrations_against_the_same_target_cannot_both_write(tmp_path):
+    """The check and the save are one critical section: the second migration waits, then sees the document."""
+    first_document = make_document()
+    save_state(tmp_path / "state.json", first_document)
+    other = tmp_path / "second"
+    other.mkdir()
+    second_document = make_document()
+    second_document["pending"][0]["title"] = "the other migration"
+    save_state(other / "state.json", second_document)
+    target = f"sqlite:///{tmp_path}/state.db"
+
+    real_save, real_lock = SqliteStore.save, SqliteStore.lock
+    locked = threading.Event()
+    attempted = threading.Event()
+    release = threading.Event()
+    attempts: list[bool] = []
+    saves: list[dict] = []
+
+    @contextlib.contextmanager
+    def signalling_lock(self, *, blocking: bool = True):
+        attempts.append(blocking)
+        if len(attempts) == 1:
+            locked.set()
+        else:
+            attempted.set()
+        with real_lock(self, blocking=blocking):
+            yield
+
+    def gated_save(self, document: dict) -> None:
+        saves.append(document)
+        if len(saves) == 1:
+            assert release.wait(timeout=10)
+        real_save(self, document)
+
+    SqliteStore.lock, SqliteStore.save = signalling_lock, gated_save
+    try:
+        results: dict[str, int] = {}
+
+        def migrate(config: Path, key: str) -> None:
+            results[key] = cli.main(["migrate", "--config", str(config), "--to", target], env={})
+
+        first = threading.Thread(target=migrate, args=(make_config(tmp_path), "first"))
+        first.start()
+        assert locked.wait(timeout=10), "the first migration never took the target lock"
+        second = threading.Thread(target=migrate, args=(make_config(other), "second"))
+        second.start()
+        # With the lock the second migration waits for it, so this event says the attempt happened; without the
+        # lock it never asks, and the bound keeps the failing case from hanging instead of going red.
+        attempted.wait(timeout=2)
+        release.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+        assert not first.is_alive() and not second.is_alive()
+    finally:
+        SqliteStore.lock, SqliteStore.save = real_lock, real_save
+
+    assert sorted(results.values()) == [0, 1], "exactly one migration may create the target document"
+    assert SqliteStore(tmp_path / "state.db").load() == first_document
+
+
+def test_a_write_injected_between_the_check_and_the_save_is_refused(tmp_path, caplog):
+    """A writer that appears after the check must not be overwritten: the target lock excludes it."""
+    outer_document = make_document()
+    save_state(tmp_path / "state.json", outer_document)
+    other = tmp_path / "injected"
+    other.mkdir()
+    injected_document = make_document()
+    injected_document["pending"][0]["title"] = "injected while the first migration checked"
+    save_state(other / "state.json", injected_document)
+    target = f"sqlite:///{tmp_path}/state.db"
+
+    real_store_for, real_load = cli.store_for, SqliteStore.load
+    nested: dict[str, int] = {}
+    loads = {"count": 0}
+
+    def store_for(value: str, state_path: Path):
+        if value.startswith("sqlite:///"):
+            # A short timeout keeps the nested attempt fast; the first migration holds the sidecar.
+            return SqliteStore(Path(value[len("sqlite:///") :]), timeout=0.05)
+        return real_store_for(value, state_path)
+
+    def loading(self):
+        loads["count"] += 1
+        document = real_load(self)
+        if loads["count"] == 1:
+            nested["code"] = cli.main(["migrate", "--config", str(make_config(other)), "--to", target], env={})
+        return document
+
+    cli.store_for, SqliteStore.load = store_for, loading
+    try:
+        with caplog.at_level(logging.ERROR):
+            assert cli.main(["migrate", "--config", str(make_config(tmp_path)), "--to", target], env={}) == 0
+    finally:
+        cli.store_for, SqliteStore.load = real_store_for, real_load
+
+    assert nested.get("code") == 1, "the injected migration must be refused rather than replacing the document"
+    assert "locked by another writer" in caplog.text
+    assert SqliteStore(tmp_path / "state.db").load() == outer_document
+
+
+def test_migrate_refuses_a_read_only_target_without_writing(tmp_path, read_only_sqlite, caplog):
+    """A target that cannot be written is the store refusal, not a traceback and not a half-migration."""
+    config = make_config(tmp_path)
+    document = make_document()
+    save_state(tmp_path / "state.json", document)
+    target = tmp_path / "state.db"
+    SqliteStore(target).save(core.new_state())
+    connection = sqlite3.connect(target)
+    try:
+        connection.execute("DELETE FROM state")
+        connection.commit()
+    finally:
+        connection.close()
+    assert SqliteStore(target).load() is None, "the target must be empty for the migration to try"
+    read_only_sqlite(target)
+
+    with caplog.at_level(logging.ERROR):
+        code = cli.main(["migrate", "--config", str(config), "--to", f"sqlite:///{target}"], env={})
+    assert code == 1
+    assert "unavailable" in caplog.text
+    assert SqliteStore(target).load() is None, "a refused migration writes nothing"

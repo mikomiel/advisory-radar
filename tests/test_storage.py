@@ -9,13 +9,15 @@ foreign schema is refused, the bytes on disk are private, and the lock excludes 
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import stat
 import sys
 
 import pytest
 
-from advisory_radar import core, storage
+from advisory_radar import core, pipeline, storage
+from advisory_radar.config import load_config
 from advisory_radar.state import LockBusy, SourceError, serialize_json
 
 DOCUMENT = {
@@ -131,6 +133,52 @@ def test_the_sqlite_lock_is_released_when_the_body_raises(tmp_path):
         pass
 
 
+def test_a_read_only_sqlite_store_is_unavailable_and_keeps_the_committed_document(tmp_path, read_only_sqlite):
+    path = tmp_path / "state.db"
+    storage.SqliteStore(path).save(DOCUMENT)
+    read_only_sqlite(path)
+    with pytest.raises(storage.StoreUnavailable) as caught:
+        storage.SqliteStore(path).save({**DOCUMENT, "pending": [{"title": "x"}]})
+    assert "unavailable" in str(caught.value)
+    assert storage.SqliteStore(path).load() == DOCUMENT, "a refused write must not replace the committed document"
+
+
+def test_a_directory_the_store_cannot_write_is_unavailable(tmp_path):
+    # A parent that is a regular file raises OSError from mkdir; it must reach the caller as the store refusal,
+    # not as a traceback out of a pass.
+    blocker = tmp_path / "data"
+    blocker.write_text("not a directory")
+    with pytest.raises(storage.StoreUnavailable):
+        storage.SqliteStore(blocker / "state.db").save(DOCUMENT)
+
+
+def test_a_lock_fault_that_is_not_contention_is_a_store_error(tmp_path):
+    # A sidecar that is not a database fails BEGIN IMMEDIATE with SQLITE_NOTADB, not SQLITE_BUSY. The caller
+    # answers LockBusy with "try again shortly", so only a genuine busy/locked result may be labelled so.
+    store = storage.SqliteStore(tmp_path / "state.db")
+    (tmp_path / "state.db.lock").write_bytes(b"not a database")
+    with pytest.raises(storage.StoreUnavailable), store.lock(blocking=False):
+        pass
+
+
+def test_a_pass_over_a_read_only_sqlite_store_fails_instead_of_raising(tmp_path, read_only_sqlite, caplog):
+    path = tmp_path / "state.db"
+    document = core.new_state()
+    document["pending"].append({"tag": "warning", "title": "T", "ids": ["CVE-2026-1"]})
+    storage.SqliteStore(path).save(document)
+    read_only_sqlite(path)
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        f"sources: []\nnotifiers: []\nstate_path: {tmp_path}/state.json\nstorage: sqlite:///{path}\n"
+    )
+    cfg = load_config(config_path, {})
+    with caplog.at_level(logging.ERROR):
+        code = pipeline.run_pass(cfg, [], [], http=lambda method, url, headers, body: (404, {}, b""))
+    assert code == 1, "a store that cannot be written is a failed pass, not a traceback"
+    assert "unavailable" in caplog.text
+    assert storage.SqliteStore(path).load() == document, "the pass must leave the committed document in place"
+
+
 # --------------------------------------------------------------------------
 # store_for
 
@@ -195,6 +243,8 @@ class _FakeConnection:
         self.closed = False
 
     def cursor(self) -> _FakeCursor:
+        if self.closed:
+            raise RuntimeError("the session was closed")
         return _FakeCursor(self)
 
     def result_for(self, sql: str) -> tuple | None:
@@ -309,3 +359,91 @@ def test_the_postgres_lock_refuses_a_lock_held_elsewhere(monkeypatch):
     assert _sent(fake, "SELECT pg_try_advisory_lock(%s)")
     assert _sent(fake, "SELECT pg_advisory_unlock(%s)") == []
     assert fake.closed
+
+
+def test_a_write_inside_the_lock_uses_the_locking_session(monkeypatch):
+    """A terminated locking session must fail the write, not let it land through a replacement connection.
+
+    The advisory lock belongs to one session. If a save opened its own connection, a lock lost with that
+    session would be acquired by another instance while this body still wrote -- and re-delivered.
+    """
+    connections: list[_FakeConnection] = []
+
+    class _Driver:
+        @staticmethod
+        def connect(url: str) -> _FakeConnection:
+            connection = _FakeConnection()
+            connections.append(connection)
+            return connection
+
+    monkeypatch.setitem(sys.modules, "psycopg", _Driver)
+    store = storage.PostgreSqlStore("postgresql://radar:s3cr3t-pass@db.example/radar")
+    with store.lock():
+        locking = connections[-1]
+        locking.close()  # the server terminated the session that held the advisory lock
+        with pytest.raises(storage.StoreUnavailable):
+            store.save(DOCUMENT)
+    assert len(connections) == 1, "the write must not be sent through a replacement session"
+    assert not [sql for sql, _ in locking.statements if "INSERT INTO state" in sql]
+
+
+def test_an_operation_outside_the_lock_still_uses_its_own_connection(monkeypatch):
+    # The binding is scoped to the lock: a plain save must open and close a connection exactly as before.
+    connections: list[_FakeConnection] = []
+
+    class _Driver:
+        @staticmethod
+        def connect(url: str) -> _FakeConnection:
+            connection = _FakeConnection()
+            connections.append(connection)
+            return connection
+
+    monkeypatch.setitem(sys.modules, "psycopg", _Driver)
+    store = storage.PostgreSqlStore("postgresql://radar@db.example/radar")
+    store.save(DOCUMENT)
+    assert len(connections) == 1
+    assert connections[0].closed
+    assert [params for sql, params in connections[0].statements if "INSERT INTO state" in sql] == [
+        (serialize_json(DOCUMENT),)
+    ]
+
+
+def test_a_malformed_percent_escape_is_refused_before_the_driver_runs(monkeypatch, tmp_path):
+    """libpq quotes the offending token -- the password -- so the shape is refused while it cannot leak."""
+    driver_calls: list[str] = []
+
+    class _Driver:
+        @staticmethod
+        def connect(url: str):
+            driver_calls.append(url)
+            raise AssertionError("the driver must not be reached")
+
+    monkeypatch.setitem(sys.modules, "psycopg", _Driver)
+    url = "postgresql://radar:bad%password@db.example/radar"
+    with pytest.raises(ValueError) as caught:
+        storage.PostgreSqlStore(url)
+    message = str(caught.value)
+    assert "bad%password" not in message
+    assert "%password" not in message
+    assert driver_calls == []
+    # A configuration reaches the same refusal through the one parser.
+    with pytest.raises(ValueError):
+        storage.store_for(url, tmp_path / "state.json")
+
+
+def test_a_driver_message_that_names_the_token_alone_is_scrubbed(monkeypatch):
+    # A malformed escape is refused above, but a driver message may still repeat the password without the
+    # "@" the old rule needed. The scrubber must remove the token wherever it appears.
+    class _Driver:
+        @staticmethod
+        def connect(url: str):
+            raise RuntimeError('invalid percent-encoded token: "s3cr3t%2Dpass"')
+
+    monkeypatch.setitem(sys.modules, "psycopg", _Driver)
+    store = storage.PostgreSqlStore("postgresql://radar:s3cr3t%2Dpass@db.example/radar")
+    with pytest.raises(storage.StoreUnavailable) as caught:
+        store.load()
+    message = str(caught.value)
+    assert "s3cr3t" not in message
+    assert "[redacted]" in message
+    assert "db.example/radar" in message, "the reason stays useful"

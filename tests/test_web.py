@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -964,6 +965,48 @@ def test_a_refused_reload_keeps_the_running_configuration(tmp_path):
     assert "poll_interval must look like 15m, 30s or 12h" in response.text
     assert runtime.cfg.poll_interval_seconds == 900
     assert load_settings(overlay) == {"poll_interval": "banana"}, "the file is left for the operator"
+
+
+def test_an_unavailable_store_refuses_a_reload_and_explains_a_settings_save(tmp_path, monkeypatch, caplog):
+    # An unreachable database must not turn either form into a 500: the reload says it was refused, and a
+    # settings save that already wrote settings.json says the revision is not live instead of leaving it
+    # unexplained.
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        f"sources: []\nnotifiers: []\nstate_path: {tmp_path}/state.json\n"
+        "storage: postgresql://radar@db.example/radar\nweb:\n  port: 8080\n"
+    )
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "secret-token"}
+    runtime = Runtime.build(cfg_path, environment)
+    client = TestClient(create_app(runtime, environment))
+    login = client.post("/login", data={"token": "secret-token"}, follow_redirects=False)
+    assert login.status_code == 303
+    client.cookies.set("advisory_radar_session", login.cookies.get("advisory_radar_session"))
+    page = client.get("/config").text
+    csrf = CSRF_RE.search(page).group(1)
+    fingerprint = FINGERPRINT_RE.search(page).group(1)
+
+    refused = client.post("/reload", data={"csrf": csrf})
+    assert refused.status_code == 400
+    assert "Reload refused" in refused.text
+    assert "psycopg" in refused.text
+    assert runtime.overlay["settings"] == {}
+
+    with caplog.at_level(logging.WARNING):
+        saved = client.post(
+            "/config/settings",
+            data={"csrf": csrf, "fingerprint": fingerprint, "poll_interval": "30s"},
+            follow_redirects=False,
+        )
+    assert saved.status_code == 303, "a saved revision that cannot be applied is not a server error"
+    assert load_settings(settings_path(runtime.cfg.state_path)) == {
+        "poll_interval": "30s",
+        "hidden_source_hosts": [],
+    }
+    assert "saved but not applied" in caplog.text
+    assert "psycopg" in caplog.text
+    assert "not live yet" in client.get("/config?saved=1").text
 
 
 def test_a_source_disabled_on_the_form_is_gone_from_the_next_pass(tmp_path):

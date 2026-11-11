@@ -129,7 +129,15 @@ document, which is why `state_path` is still required when the document lives el
 `advisory-radar migrate --config /config/config.yml --to sqlite:///data/state.db` copies
 the document read through the configured store into another one. It refuses a target that
 already holds a document and prints both stores, never the URL, which can carry a password.
-The source is left in place: set `storage:` and restart once the copy looks right.
+The source is left in place: set `storage:` and restart once the copy looks right. Run it
+against a quiesced source: the command reads one consistent snapshot, but a pass that keeps
+running can record deliveries, parked messages and seen identifiers after that snapshot, and
+nothing in the copy accounts for them, so stop the service (or copy the store) first.
+
+PostgreSQL behaviour beyond the missing-driver path is unit-tested against a fake connection
+rather than a live server: the advisory lock, the connection that carries it and the credential
+scrubbing are pinned by tests, so treat a switch to the PostgreSQL store as a change to verify
+on the target database first.
 
 ### The settings overlay
 

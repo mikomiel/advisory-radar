@@ -13,6 +13,7 @@ scrubbed before it becomes an exception.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import json
 import os
 import sqlite3
@@ -47,6 +48,13 @@ _POSTGRES_SCHEMES = frozenset({"postgres", "postgresql"})
 _UNSUPPORTED_STORE = (
     "unsupported state store; use no value for the JSON file, sqlite:///path/to/state.db, or "
     "postgresql://host/database (postgres:// is the same)"
+)
+
+#: Refused before the driver runs: libpq decodes the userinfo and quotes the offending token -- which is the
+#: password -- in its own message. Like ``_UNSUPPORTED_STORE`` this is static, so the refusal cannot leak it.
+_MALFORMED_USERINFO = (
+    "unsupported state store: the PostgreSQL userinfo has a malformed percent escape; percent-encode it "
+    "(for example %40 for @)"
 )
 
 
@@ -122,6 +130,30 @@ ON CONFLICT (id) DO UPDATE SET document = excluded.document
 """
 
 
+def _sqlite_unavailable(path: Path, exc: BaseException) -> StoreUnavailable:
+    """A SQLite fault that is not contention: this store cannot be used.
+
+    A full disk and a read-only database reach the caller the same way a missing driver does, because the
+    pipeline and the CLI already answer ``StoreUnavailable`` with a reported failure instead of a traceback.
+    """
+    return StoreUnavailable(f"the state store at {path} is unavailable: {exc}")
+
+
+def _sqlite_contention(exc: sqlite3.OperationalError) -> bool:
+    """Whether this fault is another writer holding the database, rather than the store being unusable.
+
+    SQLite reports both through ``OperationalError``, so only the result code settles which it is:
+    ``SQLITE_BUSY`` and ``SQLITE_LOCKED`` mean the lock is held elsewhere, and everything else -- a read-only
+    database, a full disk, a path that is not a database -- is a store fault. An extended code keeps the
+    primary one in its low byte.
+    """
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        return code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
+
+
 class SqliteStore:
     """The document in a one-row SQLite table, with the lock in a sidecar database.
 
@@ -177,39 +209,57 @@ class SqliteStore:
         return _read_document(row[0], schema=self._schema, owner=self._owner, location=str(self._path))
 
     def save(self, document: dict) -> None:
-        """One statement, so the write is the row's own transaction and can never join the lock's."""
+        """One statement, so the write is the row's own transaction and can never join the lock's.
+
+        A fault here is the store being unusable -- a full disk, a read-only database -- not a pass-level
+        error, so it is translated into the refusal the pipeline and the CLI already report.
+        """
         payload = serialize_json(document)
-        connection = self._connect()
         try:
-            self._prepare(connection)
-            connection.execute(_SQLITE_UPSERT, (payload,))
-        finally:
-            connection.close()
+            connection = self._connect()
+            try:
+                self._prepare(connection)
+                connection.execute(_SQLITE_UPSERT, (payload,))
+            finally:
+                connection.close()
+        except (sqlite3.DatabaseError, OSError) as exc:
+            raise _sqlite_unavailable(self._path, exc) from exc
 
     @contextlib.contextmanager
     def lock(self, *, blocking: bool = True) -> Iterator[None]:
         """Hold the sidecar database for the pass, as ``state.state_lock`` holds the ``flock`` file."""
-        self._lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        # ``blocking=False`` must answer now rather than after the timeout: timeout=0 makes SQLite fail the
-        # lock request immediately, and the error it raises is the LockBusy the pipeline already answers with.
-        connection = sqlite3.connect(
-            self._lock_path,
-            timeout=self._timeout if blocking else 0,
-            isolation_level=None,
-        )
         try:
-            os.chmod(self._lock_path, 0o600)
+            self._lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            # ``blocking=False`` must answer now rather than after the timeout: timeout=0 makes SQLite fail the
+            # lock request immediately, and the error it raises is the LockBusy the pipeline already answers with.
+            connection = sqlite3.connect(
+                self._lock_path,
+                timeout=self._timeout if blocking else 0,
+                isolation_level=None,
+            )
+        except (sqlite3.DatabaseError, OSError) as exc:
+            # A sidecar that cannot even be opened cannot exclude anyone, so it is a store fault, not contention.
+            raise _sqlite_unavailable(self._path, exc) from exc
+        try:
             try:
-                connection.execute("BEGIN IMMEDIATE")
-            except sqlite3.OperationalError as exc:
-                raise LockBusy(str(self._lock_path)) from exc
-            try:
-                yield
-            except BaseException:
-                connection.execute("ROLLBACK")
+                os.chmod(self._lock_path, 0o600)
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                except sqlite3.OperationalError as exc:
+                    if _sqlite_contention(exc):
+                        raise LockBusy(str(self._lock_path)) from exc
+                    raise
+                try:
+                    yield
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
+                else:
+                    connection.execute("COMMIT")
+            except LockBusy:
                 raise
-            else:
-                connection.execute("COMMIT")
+            except (sqlite3.DatabaseError, OSError) as exc:
+                raise _sqlite_unavailable(self._path, exc) from exc
         finally:
             # Closing is the backstop: SQLite rolls back on close, so a failing COMMIT cannot leave the lock
             # held by this process.
@@ -233,6 +283,53 @@ class SqliteStore:
         self._ready = True
 
 
+#: The digits of a percent escape. A ``%`` with anything else after it is a malformed token libpq refuses.
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _userinfo(url: str) -> str:
+    """The ``user:password`` section of a URL, or "" when it carries none.
+
+    The authority ends at the first ``/``, ``?`` or ``#`` (a URL may carry its query straight after the
+    host), and the userinfo is what precedes the last ``@`` inside it. One splitter serves the credential
+    check and the scrubber, so the two cannot disagree about where a password stops being a password.
+    """
+    _, separator, rest = url.partition("://")
+    if not separator:
+        return ""
+    ends = [rest.find(marker) for marker in ("/", "?", "#") if rest.find(marker) >= 0]
+    authority = rest[: min(ends)] if ends else rest
+    return authority.rsplit("@", 1)[0] if "@" in authority else ""
+
+
+def _malformed_percent_escape(userinfo: str) -> bool:
+    """Whether the userinfo holds a ``%`` that does not begin a two-digit percent escape.
+
+    libpq decodes the userinfo before connecting and refuses the whole URL with ``invalid percent-encoded
+    token: "bad%password"`` -- quoting the password. Refusing the shape here keeps the driver, and its
+    message, out of it entirely.
+    """
+    index = userinfo.find("%")
+    while index >= 0:
+        escape = userinfo[index + 1 : index + 3]
+        if len(escape) != 2 or any(digit not in _HEX_DIGITS for digit in escape):
+            return True
+        index = userinfo.find("%", index + 3)
+    return False
+
+
+def _password_tokens(password: str) -> set[str]:
+    """Every spelling of a password a driver message can repeat: as written, decoded, and fully encoded.
+
+    A message can name the raw text from the URL or a decoded form of it, and neither has to be followed by
+    an ``@``: libpq's own parse refusal quotes the token alone.
+    """
+    tokens = {password, urllib.parse.unquote(password)}
+    tokens |= {urllib.parse.quote(token, safe="") for token in tokens}
+    tokens.discard("")
+    return tokens
+
+
 def _postgres_target(url: str) -> tuple[str, str]:
     """The host and database a PostgreSQL URL names, refusing any other shape without echoing the value.
 
@@ -246,6 +343,8 @@ def _postgres_target(url: str) -> tuple[str, str]:
         raise ValueError(_UNSUPPORTED_STORE) from exc
     if parts.scheme not in _POSTGRES_SCHEMES:
         raise ValueError(_UNSUPPORTED_STORE)
+    if _malformed_percent_escape(_userinfo(url)):
+        raise ValueError(_MALFORMED_USERINFO)
     return host, parts.path.lstrip("/")
 
 
@@ -288,29 +387,38 @@ class PostgreSqlStore:
     or row lock held for the pass would block those saves. An advisory lock touches no data, so it excludes
     other passes while leaving this session free to write.
 
-    Every operation opens and closes its own connection. A pass saves a handful of times, and one shared
-    session would be neither thread-safe for the web UI nor safe to leave idle in a transaction; closing a
-    session also releases every advisory lock it holds, which is the backstop if an unlock cannot be sent.
+    Outside a lock every operation opens and closes its own connection: a pass saves a handful of times, and
+    one shared session would be neither thread-safe for the web UI nor safe to leave idle in a transaction.
+    Inside ``lock()`` the operations travel on the session that holds the advisory lock itself -- see
+    ``_lock_connection`` for why a save must not open its own.
     """
 
     def __init__(self, url: str, *, schema: str = DEFAULT_SCHEMA, owner: str = DEFAULT_OWNER) -> None:
         self._url = url
         self._host, self._database = _postgres_target(url)
+        userinfo = _userinfo(url)
+        #: The password as the URL spells it, for ``_scrub``; never rendered on its own.
+        self._password = userinfo.split(":", 1)[1] if ":" in userinfo else ""
         self._schema = schema
         self._owner = owner
         self._ready = False
+        #: The connection the current ``lock()`` context entered on, or None outside one. A pass's saves must
+        #: travel on the session that holds the advisory lock: were they sent on independent connections, a
+        #: terminated locking session would free the lock while this body still ran, and the class would then
+        #: write a stale document over the new holder's and re-deliver. It is per context rather than per
+        #: instance, so a web request cannot borrow another thread's lock.
+        self._lock_connection: contextvars.ContextVar = contextvars.ContextVar(
+            f"advisory-radar-postgres-lock-{id(self)}", default=None
+        )
 
     def __repr__(self) -> str:
         # Host and database identify the store; the URL's password must never appear in a traceback or a log.
         return f"PostgreSqlStore(host={self._host!r}, database={self._database!r})"
 
     def load(self) -> dict | None:
-        connection = self._connect()
-        try:
+        with self._connection() as connection:
             self._prepare(connection)
             row = self._run(connection, _POSTGRES_SELECT, fetch=True)
-        finally:
-            connection.close()
         if row is None:
             return None
         return _read_document(row[0], schema=self._schema, owner=self._owner, location=self._target)
@@ -318,17 +426,15 @@ class PostgreSqlStore:
     def save(self, document: dict) -> None:
         """One upsert, committed on its own: the row is replaced whole or not at all."""
         payload = serialize_json(document)
-        connection = self._connect()
-        try:
+        with self._connection() as connection:
             self._prepare(connection)
             self._run(connection, _POSTGRES_UPSERT, (payload,))
-        finally:
-            connection.close()
 
     @contextlib.contextmanager
     def lock(self, *, blocking: bool = True) -> Iterator[None]:
         """Hold the session advisory lock for the pass; ``blocking=False`` answers immediately."""
         connection = self._connect()
+        token = self._lock_connection.set(connection)
         try:
             row = self._run(
                 connection,
@@ -342,6 +448,25 @@ class PostgreSqlStore:
                 yield
             finally:
                 self._unlock(connection)
+        finally:
+            self._lock_connection.reset(token)
+            connection.close()
+
+    @contextlib.contextmanager
+    def _connection(self) -> Iterator[object]:
+        """The locking connection inside ``lock()``, or one belonging to this operation alone.
+
+        The lock is a *session* lock, so the writes it protects have to travel on that session. If the session
+        dies mid-pass, its next statement fails and ``StoreUnavailable`` reaches the caller; opening a fresh
+        connection instead would let the pass write a document the new lock holder knows nothing about.
+        """
+        leased = self._lock_connection.get()
+        if leased is not None:
+            yield leased
+            return
+        connection = self._connect()
+        try:
+            yield connection
         finally:
             connection.close()
 
@@ -412,12 +537,16 @@ class PostgreSqlStore:
         """Remove the credential from text that is about to become a message.
 
         psycopg can quote the offending connection string in a connection error, which is the leak this class
-        exists to prevent. The URL and the ``password@`` fragment inside it are what a driver reproduces; a
-        bare password is not, and replacing one would mangle unrelated words when it is short.
+        exists to prevent. The URL is replaced whole; separately every spelling of the userinfo's password is
+        replaced wherever the driver repeats it, because a message can name the token alone, with no ``@`` next
+        to it -- ``invalid percent-encoded token: "bad%password"`` is exactly that shape.
         """
-        password = urllib.parse.urlsplit(self._url).password
         text = text.replace(self._url, "[redacted]")
-        return text.replace(f"{password}@", "[redacted]@") if password else text
+        if not self._password:
+            return text
+        for token in _password_tokens(self._password):
+            text = text.replace(token, "[redacted]")
+        return text
 
 
 def store_for(value: str | None, state_path: Path) -> Store:
