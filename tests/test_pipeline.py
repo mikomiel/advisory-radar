@@ -9,6 +9,7 @@ import pytest
 
 from advisory_radar import core, pipeline
 from advisory_radar.config import ConfigError, load_config
+from advisory_radar.plugins import SourceWindow
 from advisory_radar.sources import RssSource
 from advisory_radar.watchlist import load_policy
 
@@ -178,3 +179,91 @@ def test_config_env_expansion_and_unknown_key(tmp_path):
     missing.write_text("sources:\n  - id: s\n    type: rss\n    url: ${NOPE}\nnotifiers: []\n")
     with pytest.raises(ConfigError):
         load_config(missing, {})
+
+
+# --- a source may be polled at its own pace ------------------------------------------------------
+
+NOW = 1792600000
+
+
+class CountingSource:
+    """A source that counts its fetches; its window is empty, so the pass has nothing to classify."""
+
+    kind = "feed"
+
+    def __init__(self, source_id: str) -> None:
+        self.id = source_id
+        self.calls = 0
+
+    def fetch(self, http, state):
+        self.calls += 1
+        return SourceWindow(self.id, (), False, "")
+
+
+def interval_config(tmp_path: Path, entries: list[dict]):
+    """A config whose sources carry the intervals under test; notifiers are absent, so nothing is sent."""
+    make_policy(tmp_path)
+    lines = ["sources:"]
+    for entry in entries:
+        lines.append(f"  - id: {entry['id']}\n    type: rss\n    url: https://feeds.example.com/{entry['id']}")
+        if entry.get("interval"):
+            lines.append(f"    interval: {entry['interval']}")
+    lines.append("notifiers: []")
+    lines.append(f"state_path: {tmp_path}/state.json")
+    lines.append(f"watchlist: {tmp_path}/watchlist.json")
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text("\n".join(lines) + "\n")
+    return load_config(cfg_path, {})
+
+
+def run_at(cfg, sources, now: int) -> int:
+    return pipeline.run_pass(
+        cfg, sources, [FakeNotifier()], http=fake_http, clock=lambda: float(now), sleep=lambda s: None
+    )
+
+
+def test_a_source_interval_thins_its_fetch_but_not_the_pass(tmp_path):
+    cfg = interval_config(tmp_path, [{"id": "slow", "interval": "30m"}])
+    assert cfg.source_intervals == {"slow": 1800}
+    source = CountingSource("slow")
+    assert run_at(cfg, [source], NOW) == 0
+    assert source.calls == 1
+    # The pass still runs its re-evaluation and delivery steps; only this source's fetch is deferred.
+    assert run_at(cfg, [source], NOW + 600) == 0
+    assert source.calls == 1, "younger than its interval, so not fetched"
+    assert run_at(cfg, [source], NOW + 1800) == 0
+    assert source.calls == 2, "due once the interval has elapsed since the last attempt"
+
+
+def test_a_failed_fetch_retries_on_the_next_pass(tmp_path):
+    """A transient error must not turn into an outage for the whole interval."""
+
+    class Flaky:
+        id = "slow"
+        kind = "feed"
+        calls = 0
+
+        def fetch(self, http, state):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transient")
+            return SourceWindow(self.id, (), False, "")
+
+    cfg = interval_config(tmp_path, [{"id": "slow", "interval": "12h"}])
+    source = Flaky()
+    assert run_at(cfg, [source], NOW) == 1
+    assert source.calls == 1
+    assert run_at(cfg, [source], NOW + 60) == 0
+    assert source.calls == 2, "a failed attempt is not a reason to wait out the interval"
+
+
+def test_a_fast_and_a_slow_source_are_polled_at_their_own_paces(tmp_path):
+    cfg = interval_config(tmp_path, [{"id": "fast", "interval": "1m"}, {"id": "slow", "interval": "12h"}])
+    assert cfg.source_intervals == {"fast": 60, "slow": 43200}
+    fast, slow = CountingSource("fast"), CountingSource("slow")
+    run_at(cfg, [fast, slow], NOW)
+    assert (fast.calls, slow.calls) == (1, 1)
+    run_at(cfg, [fast, slow], NOW + 120)
+    assert (fast.calls, slow.calls) == (2, 1)
+    run_at(cfg, [fast, slow], NOW + 240)
+    assert (fast.calls, slow.calls) == (3, 1)

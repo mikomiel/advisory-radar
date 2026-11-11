@@ -166,6 +166,10 @@ class Config:
     notifiers: tuple[dict, ...]
     watchlist_path: Path | None
     poll_interval_seconds: int = 900
+    #: Per-source poll intervals in seconds, keyed by source id. A source absent from this map is polled at
+    #: ``poll_interval_seconds``. The pipeline throttles the fetch only: re-evaluation, escalation and delivery
+    #: keep running for every source every pass, so a slow feed never delays an alert about something else.
+    source_intervals: Mapping[str, int] = field(default_factory=dict)
     state_path: Path = Path("data/state.json")
     hidden_source_hosts: frozenset[str] = frozenset()
     adobe_commerce: bool = False
@@ -208,9 +212,10 @@ class Config:
 #: built-in. A key a builder needs but this set rejects is an integration nobody can configure, so the
 #: allowlist is derived rather than repeated; ``tests/test_catalogue.py`` pins it to the registry and
 #: ``tests/test_integrations.py`` loads one complete YAML per built-in through ``load_config`` and
-#: ``build_plugins``. ``thresholds`` is structural rather than a builder key: it never reaches a source's
-#: constructor, it changes the rules the source's items are judged by.
-_SOURCE_KEYS = {"id", "type", "enabled", "thresholds"} | {
+#: ``build_plugins``. ``thresholds`` and ``interval`` are structural rather than builder keys: neither reaches a
+#: source's constructor. ``thresholds`` changes the rules the source's items are judged by, and ``interval``
+#: changes how often it is polled.
+_SOURCE_KEYS = {"id", "type", "enabled", "thresholds", "interval"} | {
     key for spec in SOURCE_SPECS.values() for key in (*spec.required, *spec.optional)
 }
 #: The notifier keys whose value is a credential: the overlay accepts only a reference for them, and an id may
@@ -576,6 +581,20 @@ def _routing(document: dict, notifiers: list[dict], *, strict: bool = True) -> t
     return tuple(routes), default
 
 
+def _interval_seconds(raw: object, where: str) -> int:
+    """An ``<n><s|m|h>`` interval as seconds; the value itself never reaches the message.
+
+    An interval can be written with a ``${NAME}`` reference, which expands to a string of unknown content, and
+    this message is logged before any redaction exists. One parser serves the global ``poll_interval`` and the
+    per-source ``interval`` so the two cannot accept different spellings.
+    """
+    match = re.fullmatch(r"(\d+)([smh])", str(raw))
+    _require(match is not None, f"{where} must look like 15m, 30s or 12h")
+    seconds = int(match.group(1)) * {"s": 1, "m": 60, "h": 3600}[match.group(2)]
+    _require(seconds > 0, f"{where} must be greater than zero")
+    return seconds
+
+
 def config_from_document(
     document: dict, path: Path, env: dict[str, str] | None = None, *, lenient: bool = False
 ) -> Config:
@@ -658,12 +677,16 @@ def config_from_document(
         for entry in sources
         if entry.get("thresholds") is not None
     }
+    # Only enabled sources are below, so a disabled entry's interval is judged when it is enabled -- the same
+    # rule its other references follow, since a disabled plugin is never built and never expanded.
+    source_intervals = {
+        entry["id"]: _interval_seconds(entry["interval"], f"{entry['id']}: interval")
+        for entry in sources
+        if "interval" in entry
+    }
 
     poll = document.get("poll_interval", "15m")
-    match = re.fullmatch(r"(\d+)([smh])", str(poll))
-    _require(match is not None, "poll_interval must look like 15m, 30s or 12h")
-    seconds = int(match.group(1)) * {"s": 1, "m": 60, "h": 3600}[match.group(2)]
-    _require(seconds > 0, "poll_interval must be greater than zero")
+    seconds = _interval_seconds(poll, "poll_interval")
 
     web = document.get("web") or {}
     _require(isinstance(web, dict), "web must be a mapping")
@@ -705,6 +728,7 @@ def config_from_document(
         notifiers=tuple(entry for entry in notifiers if entry.get("enabled", True)),
         watchlist_path=watchlist_path,
         poll_interval_seconds=seconds,
+        source_intervals=source_intervals,
         state_path=state_path,
         hidden_source_hosts=hidden,
         adobe_commerce=_bool_option(document.get("adobe_commerce", False), "adobe_commerce"),

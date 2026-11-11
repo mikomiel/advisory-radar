@@ -39,7 +39,8 @@ class SourceSpec:
 SOURCE_SPECS: dict[str, SourceSpec] = {
     "rss": SourceSpec(
         kind="rss",
-        summary="Any RSS 2.0 or Atom feed URL, read in one conditional GET.",
+        summary="Any RSS 2.0, Atom, RSS 1.0 or JSON Feed URL, or a page that advertises one, read in one "
+        "conditional GET.",
         required=("url",),
         optional=("tag", "enabled"),
         example={

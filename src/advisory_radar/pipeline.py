@@ -43,6 +43,22 @@ def _drop_disabled_sources(state: dict, enabled_ids: set[str]) -> None:
             health.pop(stale, None)
 
 
+def _fetch_due(record: object, now: int, interval: int) -> bool:
+    """Whether a source is due for a fetch, given the last attempt the state recorded.
+
+    The last *attempt* decides, not only the last success: a source whose fetch failed is due again on the very
+    next pass, because waiting out its interval would turn one transient error into an outage for the whole
+    window. A successful attempt becomes due once its age reaches the interval.
+    """
+    health = record if isinstance(record, dict) else {}
+    if health.get("ok") is not True:
+        return True
+    at = health.get("at")
+    if not isinstance(at, int) or isinstance(at, bool):
+        return True
+    return now - at >= interval
+
+
 def _record_health(state: dict, source_id: str, now: int, *, ok: bool, items: int = 0, error: str = "") -> None:
     """Record this window's outcome for one source; the last success survives a later failure.
 
@@ -167,6 +183,13 @@ def _run_pass(
     fetched_ids: set[str] = set()
     answered: list[tuple[object, object]] = []
     for source in sources:
+        interval = cfg.source_intervals.get(source.id)
+        health = state.get("source_health")
+        if interval and not _fetch_due(health.get(source.id) if isinstance(health, dict) else None, now, interval):
+            # Polling is throttled; re-evaluation, escalation and delivery still run for this source below, and
+            # a source with carried candidates still joins the fairness rotation.
+            LOG.debug("source %s: not due until %ds after its last fetch", source.id, interval)
+            continue
         try:
             window = source.fetch(http, state)
         except Exception as exc:  # a source fault fails the pass but keeps state

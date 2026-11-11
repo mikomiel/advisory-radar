@@ -66,11 +66,11 @@ def validate_settings(settings: object) -> dict:
     """Refuse an overlay the runtime could not apply, without repeating the config validator.
 
     Only rules specific to the overlay live here: the eight-key allowlist, the reference-only secret
-    rule, the shape of a YAML source's ``enabled``/``tag``/``thresholds`` edit, and the shape of a complete
-    source the overlay adds. Values the YAML validator checks -- a poll interval, a hidden-host list, a
-    threshold number, a notifier's keys and its ``enabled`` boolean, a source's remaining keys, a route's
-    match keys and whether a selected notifier is enabled -- are merged and left to it, so both sources of
-    truth fail with one message.
+    rule, the shape of a YAML source's ``enabled``/``tag``/``thresholds``/``interval`` edit, and the shape of
+    a complete source the overlay adds. Values the YAML validator checks -- a poll interval, a per-source
+    interval, a hidden-host list, a threshold number, a notifier's keys and its ``enabled`` boolean, a
+    source's remaining keys, a route's match keys and whether a selected notifier is enabled -- are merged
+    and left to it, so both sources of truth fail with one message.
     """
     if not isinstance(settings, dict):
         raise ConfigError("settings: the overlay must be a mapping")
@@ -108,11 +108,11 @@ def validate_settings(settings: object) -> dict:
     if "sources" in settings:
         sources = settings["sources"]
         if not isinstance(sources, dict):
-            raise ConfigError("settings: sources must be a mapping of source id to enabled/tag")
+            raise ConfigError("settings: sources must be a mapping of source id to enabled/tag/interval")
         for identifier, changes in sources.items():
             if not isinstance(changes, dict):
-                raise ConfigError(f"settings: source {identifier!r} must map to enabled/tag/thresholds")
-            extra = set(changes) - {"enabled", "tag", "thresholds"}
+                raise ConfigError(f"settings: source {identifier!r} must map to enabled/tag/thresholds/interval")
+            extra = set(changes) - {"enabled", "tag", "thresholds", "interval"}
             if extra:
                 raise ConfigError(f"settings: source {identifier!r}: unknown keys {sorted(extra)}")
             if "tag" in changes and not isinstance(changes["tag"], str):
@@ -123,6 +123,8 @@ def validate_settings(settings: object) -> dict:
                 raise ConfigError(
                     f"settings: source {identifier!r}: thresholds must be a mapping of threshold name to number"
                 )
+            # ``interval`` is format-checked by the merged configuration validator, where the YAML's own
+            # ``interval`` is checked too: one owner for what a valid interval is.
     if "sources_added" in settings:
         _validate_added_sources(settings["sources_added"])
     return settings

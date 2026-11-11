@@ -30,6 +30,7 @@ sources:
     # apply.
     # thresholds:
     #   critical_cvss: 7.0
+    # interval: 1h            # optional: this source's own poll pace (default: poll_interval)
   # - id: freshrss
   #   type: freshrss
   #   url: https://freshrss.example.com

@@ -766,3 +766,78 @@ def test_test_notify_sends_through_a_notifier_the_overlay_added(tmp_path):
 
     assert cli.main(["--config", str(path), "test-notify"], env={"OPS_HOOK": SECRET}, http=http) == 0
     assert calls == [SECRET]
+
+
+# --- a per-source poll interval ---------------------------------------------------------------
+
+
+def test_a_source_may_carry_its_own_poll_interval(tmp_path):
+    path = write_config(
+        tmp_path,
+        {
+            "sources": [
+                {"id": "slow", "type": "rss", "url": "https://feeds.example.com/slow.xml", "interval": "2h"},
+                {"id": "default", "type": "rss", "url": "https://feeds.example.com/default.xml"},
+            ]
+        },
+    )
+    cfg = load_config(path, {})
+    assert cfg.source_intervals == {"slow": 7200}, "only the source that names one is throttled"
+    assert cfg.poll_interval_seconds == 900, "a source interval does not move the global pace"
+    assert cfg.sources[0]["interval"] == "2h"
+
+
+@pytest.mark.parametrize(("interval", "message"), [("banana", "must look like"), ("0m", "greater than zero")])
+def test_an_invalid_source_interval_is_refused(tmp_path, interval, message):
+    path = write_config(
+        tmp_path,
+        {"sources": [{"id": "slow", "type": "rss", "url": "https://feeds.example.com/slow.xml", "interval": interval}]},
+    )
+    with pytest.raises(ConfigError) as exc:
+        load_config(path, {})
+    assert "slow: interval" in str(exc.value)
+    assert message in str(exc.value)
+
+
+def test_the_overlay_can_set_an_interval_for_a_yaml_source_or_one_it_adds(tmp_path):
+    path = write_config(
+        tmp_path,
+        {"sources": [{"id": "edit", "type": "rss", "url": "https://feeds.example.com/edit.xml"}]},
+    )
+    cfg = load_config(
+        path,
+        {},
+        settings={
+            "sources": {"edit": {"interval": "30m"}},
+            "sources_added": [
+                {
+                    "id": "added",
+                    "type": "rss",
+                    "url": "https://feeds.example.com/added.xml",
+                    "interval": "45m",
+                }
+            ],
+        },
+    )
+    assert cfg.source_intervals == {"edit": 1800, "added": 2700}
+    assert cfg.sources[0]["interval"] == "30m"
+
+
+def test_a_bad_overlay_interval_fails_with_the_message_the_yaml_gives(tmp_path):
+    source = {"id": "edit", "type": "rss", "url": "https://feeds.example.com/edit.xml"}
+    yaml_path = write_config(tmp_path, {"sources": [{**source, "interval": "banana"}]}, name="bad.yml")
+    with pytest.raises(ConfigError) as from_yaml:
+        load_config(yaml_path, {})
+    overlay_path = write_config(tmp_path, {"sources": [source]})
+    with pytest.raises(ConfigError) as from_overlay:
+        load_config(overlay_path, {}, settings={"sources": {"edit": {"interval": "banana"}}})
+    assert str(from_overlay.value) == str(from_yaml.value)
+
+
+def test_a_per_source_edit_still_refuses_a_key_outside_enabled_tag_and_interval(tmp_path):
+    path = write_config(
+        tmp_path,
+        {"sources": [{"id": "edit", "type": "rss", "url": "https://feeds.example.com/edit.xml"}]},
+    )
+    with pytest.raises(ConfigError, match="unknown keys"):
+        load_config(path, {}, settings={"sources": {"edit": {"url": "https://elsewhere.example.net/x"}}})

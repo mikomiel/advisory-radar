@@ -115,8 +115,8 @@ in the container, `~/.local/share/advisory-radar/settings.json` for the rootless
 quadlet). It is created with mode `0600`, owned by the container user, and replaced
 atomically (a temporary file in the same directory, `fsync`, `os.replace`), so a
 half-written file cannot brick a start. `/config` stays read-only: the overlay holds
-only eight keys — `notifiers`, per-source `enabled`/`tag`/`thresholds`, the sources it adds
-itself (`sources_added`), `poll_interval`, `hidden_source_hosts`, the routing
+only eight keys — `notifiers`, per-source `enabled`/`tag`/`thresholds`/`interval`, the sources it
+adds itself (`sources_added`), `poll_interval`, `hidden_source_hosts`, the routing
 `routes`/`default` block and the risk `thresholds` — and the YAML owns everything else. A source the overlay adds is stored whole, may not
 share an id with one the YAML defines, must have a literal id, and may not point into a private
 network unless the YAML sets `allow_private_sources: true`. That last check is a guard rail
@@ -156,8 +156,14 @@ Two upstreams reward configuration rather than credentials:
   30 s to 50 (free, requested at <https://nvd.nist.gov/developers/request-an-api-key>). The per-pass budget
   (`MAX_NVD_CALLS`) is unchanged, so a key buys **time, not breadth**: the same lookups wait 0.6 s
   each instead of 6 s, so a pass finishes sooner.
-- **Conditional GET.** RSS/Atom sources keep the publisher's `ETag`/`Last-Modified` in the state, so an
-  unchanged feed answers `304` and costs one round trip instead of the whole document.
+- **Conditional GET.** An `rss` source keeps the publisher's `ETag`/`Last-Modified` in the state, so an
+  unchanged feed answers `304` and costs one round trip instead of the whole document. A URL that answers an
+  HTML page is followed once through the page's feed autodiscovery link; no validator is stored for that
+  hop, because a page's `ETag` says nothing about the feed it advertises.
+- **Per-source pace.** `interval: 30m` on a source entry (the same `<n><s|m|h>` spelling as
+  `poll_interval`) thins only that source's fetching; an absent key follows the global interval. The pass
+  still re-evaluates, escalates and delivers for every source, and a failed fetch is retried on the next
+  pass rather than waiting out the interval. The key is accepted by every kind and is editable on `/config`.
 
 ### Risk thresholds
 

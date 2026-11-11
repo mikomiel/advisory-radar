@@ -8,6 +8,23 @@ operator action, and the release workflow then builds and pushes the image to
 ## [Unreleased]
 
 ### Added
+- An `rss` source reads any published feed shape without a new configuration key: RSS 2.0,
+  Atom, RSS 1.0 (RDF) and JSON Feed are recognised from the document, and a URL that answers
+  an HTML page is followed once through the page's `<link rel="alternate">` autodiscovery
+  link. JSON Feed is dispatched on its `version` URL, never on its items list, so the
+  FreshRSS GReader export keeps its own parser. Conditional GET is unchanged for a feed that
+  answers directly; no validator is stored for an autodiscovered page, because a page's
+  `ETag` says nothing about the feed behind it.
+- A per-source `interval` (`30m`, the same `<n><s|m|h>` spelling as `poll_interval`) thins
+  only that source's fetching. The pass still re-evaluates, escalates and delivers for every
+  source, and a failed fetch is retried on the next pass instead of waiting out the interval.
+  The key is accepted by every source kind, editable on `/config` and validated by the one
+  configuration validator.
+- OPML 2.0 import on `/config`: a pasted subscription list adds every `<outline>` with an
+  `xmlUrl` as an `rss` source, descending into folders. A feed already configured, or
+  repeated in the document, is skipped and counted; every URL is checked exactly as a single
+  add is, and a document that cannot be read, holds no feed, or names an unusable address is
+  refused without writing anything.
 - Sources can be added, edited and removed on `/config` without touching the read-only
   config mount. The settings overlay gained `sources_added`: a source the YAML does not
   define is stored whole in the overlay, while the YAML keeps owning the entries the file
