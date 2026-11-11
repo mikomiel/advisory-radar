@@ -20,8 +20,9 @@ class SourceSpec:
     is loaded through ``load_config`` and built through ``build_source`` by the test suite, so a snippet
     here cannot rot into one nobody checked.
 
-    ``secret_keys`` names the keys that carry a credential. A source URL is public configuration, so it is
-    not one: only a ``token``, ``api_key`` or similar may never be stored literally in the settings overlay.
+    ``secret_keys`` names the keys the overlay refuses to store literally. A source URL is not one of them:
+    it is usually public configuration, and a URL that carries a token must be written as a ``${NAME}``
+    reference because nothing can tell the two apart.
     """
 
     kind: str

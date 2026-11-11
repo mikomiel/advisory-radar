@@ -829,8 +829,10 @@ def test_a_probe_of_a_disabled_overlay_source_is_still_judged(tmp_path):
         follow_redirects=False,
     )
     assert saved.status_code == 303
+    # A disabled source has no row on ``/sources`` (that page lists what will run); ``/config`` renders it, and
+    # probing from there is judged by ownership all the same.
     csrf, fingerprint = signed_in(client)
-    probed = client.post("/sources/probe", data={"csrf": csrf, "id": "nas-example-net"})
+    probed = client.post("/config/sources/probe", data={"csrf": csrf, "id": "nas-example-net"})
     assert probed.status_code == 200
     assert "private network" in probed.text
 
@@ -978,7 +980,81 @@ def test_a_probe_finds_a_yaml_source_by_the_id_the_page_shows(tmp_path):
         "http://user:pw@127.0.0.1/x",
     ],
 )
-def test_the_check_reads_the_authority_the_transport_carries(url):
-    """No network: the host the check judges is the host ``Request`` hands to the connection layer."""
+def test_the_check_normalises_the_authority_the_way_the_request_object_does(url):
+    """No network, and no claim about how the connection splits host from port.
+
+    This pins the normalisation the check reproduces -- unquote the authority, drop userinfo and port -- against
+    the object that performs it. The userinfo case is why ``_host_of`` strips it: ``Request.host`` keeps it and
+    the connection refuses the URL outright.
+    """
     transport_host = urllib.request.Request(url).host
     assert _host_of(url) == urllib.parse.urlsplit("//" + transport_host).hostname
+
+
+def test_a_disabled_source_cannot_shadow_the_row_that_was_probed(tmp_path):
+    """Uniqueness is checked on the entries that load, so a disabled reference may expand to a live id."""
+
+    def distinct(method, url, headers, body):
+        if "old.example.net" in url:
+            return (
+                200,
+                {},
+                b"<rss version='2.0'><channel><title>old</title>"
+                b"<item><title>OLD FEED ITEM</title><guid>o1</guid></item></channel></rss>",
+            )
+        return (
+            200,
+            {},
+            b"<rss version='2.0'><channel><title>new</title>"
+            b"<item><title>NEW FEED ITEM</title><guid>n1</guid></item></channel></rss>",
+        )
+
+    client, _, _ = make_client(
+        tmp_path,
+        sources=[
+            {
+                "id": "${FEED_ID}",
+                "type": "rss",
+                "enabled": False,
+                "url": "https://old.example.net/feed.xml",
+            }
+        ],
+        environment={"FEED_ID": "vendor"},
+        transport=distinct,
+    )
+    added = new_source(client, **{"new:id": "vendor", "new:type": "rss", "new:url": "https://new.example.net/x.xml"})
+    assert added.status_code == 303
+    csrf, _ = signed_in(client)
+    # ``/sources`` lists the enabled source, which is the added one; the disabled row shares its effective id.
+    probed = client.post("/sources/probe", data={"csrf": csrf, "id": "vendor"})
+    assert probed.status_code == 200
+    assert "NEW FEED ITEM" in probed.text
+    assert "OLD FEED ITEM" not in probed.text
+
+
+def test_a_derived_id_reserves_the_ids_in_use(tmp_path):
+    client, _, _ = make_client(
+        tmp_path,
+        sources=[{"id": "${FEED_ID}", "type": "rss", "url": "https://feeds.example.net/feed.xml"}],
+        environment={"FEED_ID": "nodejs-org"},
+    )
+    assert new_source(client, **{"new:type": "rss", "new:url": "https://nodejs.org/feed/x.xml"}).status_code == 303
+    assert overlay(tmp_path)["sources_added"][0]["id"] == "nodejs-org-2"
+
+
+def test_a_derived_id_does_not_take_a_notifier_id(tmp_path):
+    path = tmp_path / "config.yml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "sources": [{"id": "vendor", "type": "rss", "url": "https://feeds.example.net/feed.xml"}],
+                "notifiers": [{"id": "nodejs-org", "type": "webhook", "url": "https://hooks.example.net/x"}],
+                "state_path": str(tmp_path / "data" / "state.json"),
+            }
+        )
+    )
+    env = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN}
+    runtime = Runtime.build(path, env)
+    client = TestClient(create_app(runtime, env, http=fake_http, resolve=public_resolver))
+    assert new_source(client, **{"new:type": "rss", "new:url": "https://nodejs.org/feed/x.xml"}).status_code == 303
+    assert overlay(tmp_path)["sources_added"][0]["id"] == "nodejs-org-2"

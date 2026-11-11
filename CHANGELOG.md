@@ -27,8 +27,7 @@ operator action, and the release workflow then builds and pushes the image to
   ids. `/sources` is now the operational page — one line per enabled source with its state,
   timestamps, entries and error beside the probe button — and `/metrics` exports
   `advisory_radar_source_up`, `_source_last_success_timestamp_seconds` and `_source_items`,
-  labelled by source id, so one broken feed is visible while every pass-level number is
-  green.
+  labelled by source id, so a failing feed is named rather than only failing the pass.
 - A source catalogue (`advisory_radar/catalogue.py`): one `SourceSpec` per
   built-in kind with its summary, required and optional keys, a tested example
   and a docs anchor. The config key allowlist is derived from it instead of
@@ -46,7 +45,9 @@ operator action, and the release workflow then builds and pushes the image to
   `hidden_source_hosts`. A shared configuration value fails with the `ConfigError` the YAML
   gives, and the overlay adds its own restrictions — a secret-bearing key must be a
   `${NAME}`/`${NAME_FILE}` reference, a source edit is `enabled`/`tag` only, and `headers`
-  may not be written — so no credential reaches the file.
+  may not be written. A credential is therefore only ever a reference, with one limit worth knowing: a
+  source `url` is ordinary configuration to the validator, so a URL that carries a token has to be
+  written as a reference and nothing here can tell whether it was.
 - Hot reload: a saved overlay, `POST /reload` and `SIGHUP` rebuild the plugins off to the
   side and swap them under the state lock; the scheduler reads the configuration per pass,
   and the wait between passes restarts on a reload so a shorter `poll_interval` takes

@@ -1513,22 +1513,27 @@ def create_app(
         sources = document.get("sources") if isinstance(document, dict) else None
         return [entry for entry in (sources or []) if isinstance(entry, dict) and isinstance(entry.get("id"), str)]
 
-    def source_entry_by_id(overlay: dict, identifier: str) -> dict | None:
-        """The configured entry this id names, whether it was given expanded or as it is written.
+    def effective_id(entry: dict) -> str:
+        """The id this configured entry occupies once its references are expanded."""
+        raw = entry["id"]
+        try:
+            return str(expand_entry({"id": raw}, runtime.environment).get("id") or raw)
+        except ConfigError:
+            return raw  # an unset variable: the reference as written is still the id of this entry
 
-        ``/sources`` renders the *expanded* configuration, so its Test button submits ``vendor`` for a YAML
-        entry written ``${FEED_ID}``; ``/config`` renders the reference and submits that. One lookup answers
-        both, and an id the overlay adds is literal, so it needs no second form.
+    def source_entry_by_id(overlay: dict, identifier: str, *, effective: bool) -> dict | None:
+        """The configured entry the submitted id names, looked up the way the page that submitted it renders.
+
+        ``/config`` renders the YAML as written, so its Test button submits a raw id, and raw ids are unique.
+        ``/sources`` renders the expanded configuration and lists the enabled sources only, so its button
+        submits an effective id and the lookup is limited to what that page could have shown -- otherwise a
+        disabled entry whose reference expands to the same value could shadow the row that was clicked.
         """
-        for entry in saved_source_entries(overlay):
-            raw = entry["id"]
-            try:
-                effective = expand_entry({"id": raw}, runtime.environment).get("id")
-            except ConfigError:
-                effective = raw  # an unset variable: the raw reference is still the id of this entry
-            if identifier in (raw, effective):
-                return entry
-        return None
+        candidates = saved_source_entries(overlay)
+        if effective:
+            candidates = [entry for entry in candidates if entry.get("enabled", True) is not False]
+            return next((entry for entry in candidates if effective_id(entry) == identifier), None)
+        return next((entry for entry in candidates if entry["id"] == identifier), None)
 
     def derive_source_id(url: str, kind: str, taken: set[str]) -> str:
         """A stable id from a source URL's host, unique against the ids already configured.
@@ -1547,6 +1552,21 @@ def create_app(
             identifier = f"{base}-{suffix}"
         return identifier
 
+    def effective_plugin_ids(overlay: dict) -> set[str]:
+        """Every id the configuration occupies, sources and notifiers alike, as the validator will see them.
+
+        A derived id has to miss these, not merely the ids written in the file: an id is unique across both
+        plugin kinds, and a YAML entry written ``${FEED_ID}`` occupies the value it expands to.
+        """
+        document, _ = form_document(overlay)
+        ids: set[str] = set()
+        for key in ("sources", "notifiers"):
+            entries = document.get(key) if isinstance(document, dict) else None
+            for entry in entries or []:
+                if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+                    ids.add(effective_id(entry))
+        return ids
+
     def new_source_from_form(form: dict[str, list[str]]) -> tuple[dict | None, str]:
         """The source the "new source" block describes, or why it cannot be one yet.
 
@@ -1564,8 +1584,7 @@ def create_app(
                 entry[key] = value
         identifier = first(form, "new:id").strip()
         if not identifier and "url" in entry:
-            taken = {candidate["id"] for candidate in saved_source_entries(saved_overlay()[0])}
-            identifier = derive_source_id(entry["url"], kind, taken)
+            identifier = derive_source_id(entry["url"], kind, effective_plugin_ids(saved_overlay()[0]))
         if identifier:
             if "$" in identifier:
                 # An id becomes a page value and a metric label; a reference there would publish its value.
@@ -1585,8 +1604,9 @@ def create_app(
     def added_source_fields(entry: dict, spec) -> str:
         """The editable keys of one added source, as inline inputs.
 
-        The stored value is shown, not the origin: an operator fixing a feed path needs the whole URL, and the
-        stored value is a ``${NAME}`` reference whenever the URL carries a credential.
+        The stored value is shown, not the origin: an operator fixing a feed path needs the whole URL. A URL
+        that carries a credential must be written as a ``${NAME}`` reference; the validator treats ``url`` as
+        ordinary configuration and cannot tell the two apart.
         """
         if spec is None:
             return "<span class='muted small'>unknown type</span>"
@@ -1635,7 +1655,8 @@ def create_app(
             f"aria-label='Watch tag for {esc(identifier)}'></td>"
             f"{editable}{remove}"
             f"<td><button class='btn' type='submit' formaction='/config/sources/probe' "
-            f"name='id' value='{esc(identifier)}'>Test</button></td></tr>"
+            f"name='id' value='{esc(identifier)}' title='fetches the saved values, not unsaved edits'>"
+            f"Test</button></td></tr>"
         )
 
     def source_form_entries(entries, added_ids: set[str]) -> str:
@@ -1784,8 +1805,9 @@ def create_app(
         add_form = ""
         if identifier:
             settings = saved_overlay()[0]
-            owned = added_source_ids(settings)
-            entry = source_entry_by_id(settings, identifier)
+            # ``/sources`` shows the effective id of an enabled source; ``/config`` shows the row as written.
+            on_sources_page = active == "/sources"
+            entry = source_entry_by_id(settings, identifier, effective=on_sources_page)
             if entry is None:
                 return page(
                     "Source probe",
@@ -1796,8 +1818,9 @@ def create_app(
                     status_code=404,
                 )
             # Ownership, not "already saved": a disabled overlay source is still a source this page added, and
-            # probing it must not become the way around the destination rule.
-            ok, detail = probe_source(entry, adding=identifier in owned)
+            # probing it must not become the way around the destination rule. It is read off the entry that was
+            # selected, never off the submitted value, or the two could disagree.
+            ok, detail = probe_source(entry, adding=entry["id"] in added_source_ids(settings))
             tone = _badge("answered", "ok") if ok else _badge("failed", "critical")
             heading = (
                 f"<h2>{esc(identifier)} <span class='muted'>{esc(str(entry.get('type', '')))}</span> {tone}</h2>"

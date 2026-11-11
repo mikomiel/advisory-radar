@@ -69,9 +69,10 @@ answering `ok` forever.
 
 Alert on `advisory_radar_ready == 0`, `advisory_radar_parked > 0`, and — for the
 earliest signal — on `time() - advisory_radar_last_pass_timestamp_seconds`
-exceeding a few poll intervals. A single broken feed is `advisory_radar_source_up == 0`
-while every pass-level number stays green: that is the alert the run history cannot
-give you, and `/sources` shows the same state with the error text beside it.
+exceeding a few poll intervals. A broken feed also fails the pass and shows up in
+`advisory_radar_last_pass_exit`, but that number says a pass failed, not which feed did:
+`advisory_radar_source_up{source}` is the per-source signal, and `/sources` shows the same
+state with the error text beside it.
 
 ## Configuration
 
