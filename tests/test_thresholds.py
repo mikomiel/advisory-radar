@@ -253,6 +253,9 @@ def test_judge_uses_the_configured_thresholds_on_both_paths():
 
 def test_the_remote_note_names_the_configured_bar():
     assert "CVSS >= 7.5," in core.reason_note("remote", Thresholds(critical_cvss=7.5))
+    assert "CVSS >= 7.500001," in core.reason_note("remote", Thresholds(critical_cvss=7.500001)), (
+        "the note names the decision boundary exactly, not a rounded display value"
+    )
     assert "CVSS >= 9," not in core.reason_note("remote", Thresholds(critical_cvss=7.5))
     assert "9.0" not in core.reason_note("remote", Thresholds(critical_cvss=7.5))
     # KEV and SSVC are observed exploitation: they need no threshold in their note.
@@ -445,6 +448,7 @@ def test_a_save_that_is_not_live_yet_does_not_render_its_old_values(tmp_path):
     rendered = dict(re.findall(r"name='threshold:(\w+)' size='5'[^>]*value='([^']*)'", page))
     assert rendered["critical_cvss"] == "9.0", "the form shows the saved default, not the stale live value"
     assert rendered["critical_epss"] == "0.1" and rendered["suppress_below_cvss"] == "4.0"
+    assert "name='poll_interval' value='15m'" in page, "the poll interval has the same fallback"
 
     # Saving the form as rendered must leave the configuration where the reset put it.
     csrf, fingerprint = config_form(client)
@@ -522,6 +526,22 @@ def test_the_preview_reports_the_default_selection(tmp_path):
     page = preview(client, cvss="5.0", source="nodejs")  # a warning from a source only a critical rule names
     assert "Warning" in page
     assert "default" in page and "ops" in page
+
+
+def test_the_preview_explains_why_an_unmeasured_item_is_a_warning(tmp_path):
+    """A warning is not always "above the floor": an unknown score or KEV catalog is why it was not suppressed."""
+    client, _, _ = make_client(tmp_path)
+    sign_in(client)
+
+    unknown_kev = preview(client, cvss="2.0", kev="unknown")
+    assert "Warning" in unknown_kev
+    assert "KEV catalog is unknown" in unknown_kev
+    assert "at or above the suppression floor" not in unknown_kev
+
+    no_score = preview(client)
+    assert "Warning" in no_score
+    assert "no score is known" in no_score
+    assert "at or above the suppression floor" not in no_score
 
 
 def test_the_preview_will_not_predict_a_route_that_needs_identifiers(tmp_path):

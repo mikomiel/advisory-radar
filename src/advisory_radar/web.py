@@ -2650,22 +2650,37 @@ def create_app(
             level, reason = core.level_of(facts, kev_choice == "yes", kev_choice != "unknown", thresholds=thresholds)
             line = core.metrics_line(cvss, epss, None, ssvc or None, kev_choice == "yes")
             note = core.reason_note(reason, thresholds)
-            why = {
+            decisions = {
                 "kev": "the CVE is in the CISA KEV catalog: exploitation observed in the wild.",
                 "ssvc": "CISA records active exploitation (SSVC).",
                 "remote": f"CVSS is at or above {thresholds.critical_cvss} with a remote, unauthenticated, "
                 "no-interaction vector.",
                 "epss": f"CVSS is at or above {thresholds.critical_cvss} and EPSS is at or above "
                 f"{thresholds.critical_epss}.",
-            }.get(
-                reason or "",
-                "no CVE, score or exploitation signal reaches the critical rules, and the item is "
-                + (
-                    "below the suppression floor, so it is recorded and watched and no message is sent."
-                    if level == "suppressed"
-                    else "at or above the suppression floor, so it is sent as a warning."
-                ),
-            )
+            }
+            if reason in decisions:
+                why = decisions[reason]
+            elif level == "suppressed":
+                why = (
+                    "no CVE, score or exploitation signal reaches the critical rules, and the item is below the "
+                    "suppression floor, so it is recorded and watched and no message is sent."
+                )
+            elif cvss is None:
+                # Suppression needs a measured score: without one the item is unknown, not low.
+                why = (
+                    "no CVE, score or exploitation signal reaches the critical rules, and no score is known, so "
+                    "the severity is unknown and the item is sent as a warning."
+                )
+            elif kev_choice == "unknown":
+                why = (
+                    "no CVE, score or exploitation signal reaches the critical rules, and the KEV catalog is "
+                    "unknown, so the item cannot be suppressed and is sent as a warning."
+                )
+            else:
+                why = (
+                    "no CVE, score or exploitation signal reaches the critical rules, and the item is at or above "
+                    "the suppression floor, so it is sent as a warning."
+                )
             tone = {"critical": "critical", "warning": "warning", "suppressed": "ok"}[level]
             label = {"critical": "Critical", "warning": "Warning", "suppressed": "Suppressed"}[level]
             if level == "suppressed":
