@@ -58,10 +58,11 @@ def _host_of(url: str) -> str | None:
 def private_destination(url: str, resolve: Callable[[str], Iterable[str]] = resolve_host) -> bool:
     """Whether this URL's host is, or resolves to, an address that is not on the public internet.
 
-    This answers a question about a *form*, not about every fetch: it is checked when a source is added from
-    the settings overlay and when a new source is probed. A public name that later resolves to a private
-    address is out of reach of a save-time check, so the rule it feeds is "who may point this instance at an
-    internal address", and the YAML -- written by whoever runs the host -- is never subject to it.
+    It is a guard rail against pointing this instance at a router page or a metadata service by mistake, not
+    an isolation boundary: the pass resolves the name again when it fetches, so a name whose answer changes is
+    followed, and the operator token can reach whatever the host can reach anyway. It answers a question about
+    a *form* -- checked when a source is added from the settings overlay and when a new source is probed -- and
+    a configured YAML source is never subject to it.
     """
     host = _host_of(url)
     if not host:

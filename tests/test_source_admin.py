@@ -250,6 +250,7 @@ def test_an_edit_that_drops_a_required_key_is_refused_readably(tmp_path):
             ],
             "defined twice",
         ),
+        ([{"id": "${SOURCE_ID}", "type": "webhook"}], "literal"),
         ([{"id": "a", "type": "changedetection", "url": "https://c.example.net", "api_key": "literal"}], "reference"),
     ],
 )
@@ -900,3 +901,49 @@ def test_a_wrapped_or_zoned_literal_is_refused(address):
 
 def test_a_public_ipv6_address_is_allowed():
     assert not private_destination("https://feeds.example.net/", resolve=lambda host: ("2001:4860:4860::8888",))
+
+
+def test_an_added_source_id_must_be_literal(tmp_path):
+    """An id is a page value and a metric label on an unauthenticated endpoint: a reference would publish it."""
+    client, _, _ = make_client(tmp_path, environment={"SOURCE_ID_SECRET": "abcdef1234567890"})
+    response = new_source(client, **{"new:id": "${SOURCE_ID_SECRET}", "new:type": "webhook"})
+    assert response.status_code == 400
+    assert "literal" in response.text
+    assert "abcdef1234567890" not in response.text, "the refusal names the reference, never the value it holds"
+    assert not (tmp_path / "data" / "settings.json").exists()
+
+
+def test_the_sources_page_redacts_a_stored_error_at_render_time(tmp_path):
+    client, runtime, _ = make_client(
+        tmp_path,
+        sources=[
+            {
+                "id": "vendor",
+                "type": "freshrss",
+                "url": "https://rss.example.net",
+                "token": "${FRESHRSS_TOKEN}",
+            }
+        ],
+        environment={"FRESHRSS_TOKEN": "s3cret-token"},
+    )
+    state = core.new_state()
+    # As an older binary, or a hand edit, could have left it: the page is a redaction boundary of its own.
+    state["source_health"] = {"vendor": {"at": 1, "ok": False, "ok_at": 0, "items": 0, "error": "boom s3cret-token"}}
+    save_state(runtime.cfg.state_path, state)
+    signed_in(client)
+    page = client.get("/sources").text
+    assert "s3cret-token" not in page
+    assert "boom" in page
+
+
+def test_a_bare_config_app_redacts_a_row_origin(tmp_path):
+    # ``create_app`` accepts a validated Config, and that runtime keeps the *expanded* document.
+    path = write_config(
+        tmp_path,
+        sources=[{"id": "vendor", "type": "rss", "url": "https://${FEED_TOKEN}.feeds.example.net/x.xml"}],
+    )
+    env = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, "FEED_TOKEN": "AbCdEf123456"}
+    client = TestClient(create_app(load_config(path, env), env, http=fake_http, resolve=public_resolver))
+    signed_in(client)
+    page = client.get("/config").text
+    assert "abcdef123456" not in page.lower()

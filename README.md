@@ -244,16 +244,25 @@ line per enabled source — the last attempt, the last success, the entries in t
 window and the error that attempt reported — with the same numbers exported as
 metrics (see `docs/deployment.md`).
 
-A source added on that page may not point into a private network: the form is
-reachable with the UI token alone, and aiming this process at an internal address
-is a decision for whoever runs the host. A configured YAML source is never subject
-to the rule — a FreshRSS or changedetection.io instance on the LAN stays a supported
-target — and `allow_private_sources: true` in the YAML lifts it for added sources
-too. A probe of a source the page added is judged whether or not that source is
-enabled: switching it off is allowed without the check, probing it is not. Every
-origin either page shows — a probe's answer and a configured source on `/sources` —
-and every title a probe shows is redacted against the secrets the configuration
-resolved, so neither page can be used to read a `${NAME}` back out.
+A source added on that page may not point into a private network: the form refuses
+an address that resolves to loopback or to an internal range, unless the YAML sets
+`allow_private_sources: true`. A configured YAML source is never subject to the
+check, so a FreshRSS or changedetection.io instance on the LAN stays a supported
+target, and a probe of a source the page added is judged whether or not that source
+is enabled — switching it off is allowed without the check, probing it is not.
+
+That check is a guard rail against pointing this instance at a router page by
+mistake, not an isolation boundary. The pass resolves the name again when it
+fetches, so a name whose answer changes is followed, and the UI token is a
+full-trust credential besides: it can read every advisory, rewrite every
+notification target and run a pass. Anyone who must not reach the internal network
+must not hold it.
+
+Every origin the two pages show — a probe's answer and a configured source on
+`/sources` — every title a probe shows, and the source id itself are all restricted:
+the origins and titles are redacted against the secrets the configuration resolved,
+and an id the overlay adds must be literal text, because it is rendered on a page
+and used as a metric label on the unauthenticated `/metrics` endpoint.
 
 | Kind | Summary | Required keys | Optional keys |
 |---|---|---|---|

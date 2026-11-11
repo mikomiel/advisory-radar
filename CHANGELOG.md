@@ -167,8 +167,13 @@ operator action, and the release workflow then builds and pushes the image to
   the IPv6 ranges that wrap an IPv4 one (`::/96`, `64:ff9b::/96`, `2002::/16`). A disabled
   source is not checked, so one whose host later resolves internally can still be switched
   off; probing is judged by ownership instead, so a probe of a source the overlay added is
-  checked even while that source is disabled. A configured YAML source is unaffected, so a LAN FreshRSS or
+  checked even while that source is disabled. This is a guard rail against a mistake, not an
+  isolation boundary: the pass resolves the name again when it fetches, and the operator
+  token can already reach whatever the host can reach. A configured YAML source is unaffected, so a LAN FreshRSS or
   changedetection.io target behaves as before.
+- An id the settings overlay adds must be literal text: it is rendered on `/sources`, kept in
+  the state's health map and used as a metric label on the unauthenticated `/metrics`
+  endpoint, so a `${NAME}` reference there would publish the value it expands to.
 - A probe's answer is redacted against every secret the entry resolved, not only its error:
   a source can echo a request token back in a feed title or in a link's host, and the probe
   page must not become a way to read a `${NAME}` out. The origin is redacted before it is

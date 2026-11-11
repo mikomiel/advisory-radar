@@ -121,6 +121,13 @@ def _validate_added_sources(added: object) -> None:
             raise ConfigError("settings: every added source needs a string id")
         if identifier in seen:
             raise ConfigError(f"settings: added source {identifier!r} is defined twice")
+        if "$" in identifier:
+            # The id is rendered on `/sources`, kept in the state's health map and used as a metric label on the
+            # unauthenticated `/metrics` endpoint, so a reference here would publish the value it expands to.
+            # A YAML-composed id stays allowed: that file is written by whoever runs the host.
+            raise ConfigError(
+                f"settings: added source {identifier!r}: the id must be literal text, not a ${{NAME}} reference"
+            )
         seen.add(identifier)
         kind = entry.get("type")
         if not isinstance(kind, str) or kind not in SOURCE_SPECS:

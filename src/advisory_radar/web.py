@@ -1550,6 +1550,9 @@ def create_app(
             taken = {candidate["id"] for candidate in saved_source_entries(saved_overlay()[0])}
             identifier = derive_source_id(entry["url"], kind, taken)
         if identifier:
+            if "$" in identifier:
+                # An id becomes a page value and a metric label; a reference there would publish its value.
+                return None, "the id must be literal text, not a ${NAME} reference"
             entry["id"] = identifier
         if not entry.get("id"):
             return None, "the new source needs an id, or a url to derive one from"
@@ -1590,8 +1593,9 @@ def create_app(
         identifier = entry["id"]
         spec = source_spec(entry)
         checked = " checked" if entry.get("enabled", True) is not False else ""
-        # The origin only: a source URL can carry a token in its userinfo, query or path.
-        public = _public_url(str(entry.get("url", "")))
+        # The origin only, redacted: a source URL can carry a token in its userinfo, query, path or host, and
+        # a runtime built from a bare Config renders the document it was given, which is already expanded.
+        public = redacted_origin(entry.get("url", ""), secret_values(runtime.cfg))
         origin = f"<br><span class='muted small'>{esc(public)}</span>" if public else ""
         badge = f"{_badge('added', 'neutral')} " if added else ""
         editable = (
@@ -2423,7 +2427,7 @@ def create_app(
                 if not record
                 else (_badge("ok", "ok") if record.get("ok") else _badge("failing", "critical"))
             )
-            error = str(record.get("error") or "")
+            error = pipeline.redact(str(record.get("error") or ""), secret_values(runtime.cfg))
             # 0 is the state's "never", not midnight 1970: a source that has not succeeded must say so.
             attempt = _when(record.get("at")) if record.get("at") else "never"
             success = _when(record.get("ok_at")) if record.get("ok_at") else "never"
