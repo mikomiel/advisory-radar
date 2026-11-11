@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
 
 from advisory_radar import core, pipeline
 from advisory_radar.config import ConfigError, load_config
-from advisory_radar.sources import RssSource
+from advisory_radar.plugins import SourceWindow
+from advisory_radar.sources import RssSource, WebhookSource
+from advisory_radar.state import save_state
 from advisory_radar.watchlist import load_policy
 
 
@@ -77,6 +80,20 @@ class FakeNotifier:
     def send(self, entry, http):
         self.sent.append(entry)
         return self.status
+
+
+class WindowSource:
+    """A source that returns a fixed window, so a test controls the items and their identities."""
+
+    kind = "feed"
+
+    def __init__(self, source_id: str, items, host: str = "") -> None:
+        self.id = source_id
+        self._items = tuple(items)
+        self.host = host
+
+    def fetch(self, http, state=None):
+        return SourceWindow(self.id, self._items, False, self.host)
 
 
 def make_config(tmp_path: Path, **overrides):
@@ -178,3 +195,544 @@ def test_config_env_expansion_and_unknown_key(tmp_path):
     missing.write_text("sources:\n  - id: s\n    type: rss\n    url: ${NOPE}\nnotifiers: []\n")
     with pytest.raises(ConfigError):
         load_config(missing, {})
+
+
+# --- a source may be polled at its own pace ------------------------------------------------------
+
+NOW = 1792600000
+
+
+class CountingSource:
+    """A source that counts its fetches; its window is empty, so the pass has nothing to classify."""
+
+    kind = "feed"
+
+    def __init__(self, source_id: str) -> None:
+        self.id = source_id
+        self.calls = 0
+
+    def fetch(self, http, state):
+        self.calls += 1
+        return SourceWindow(self.id, (), False, "")
+
+
+def interval_config(tmp_path: Path, entries: list[dict]):
+    """A config whose sources carry the intervals under test; notifiers are absent, so nothing is sent."""
+    make_policy(tmp_path)
+    lines = ["sources:"]
+    for entry in entries:
+        lines.append(f"  - id: {entry['id']}\n    type: rss\n    url: https://feeds.example.com/{entry['id']}")
+        if entry.get("interval"):
+            lines.append(f"    interval: {entry['interval']}")
+    lines.append("notifiers: []")
+    lines.append(f"state_path: {tmp_path}/state.json")
+    lines.append(f"watchlist: {tmp_path}/watchlist.json")
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text("\n".join(lines) + "\n")
+    return load_config(cfg_path, {})
+
+
+def run_at(cfg, sources, now: int, notifier=None) -> int:
+    return pipeline.run_pass(
+        cfg,
+        sources,
+        [notifier if notifier is not None else FakeNotifier()],
+        http=fake_http,
+        clock=lambda: float(now),
+        sleep=lambda s: None,
+    )
+
+
+def test_a_source_interval_thins_its_fetch_but_not_the_pass(tmp_path):
+    cfg = interval_config(tmp_path, [{"id": "slow", "interval": "30m"}])
+    assert cfg.source_intervals == {"slow": 1800}
+    source = CountingSource("slow")
+    assert run_at(cfg, [source], NOW) == 0
+    assert source.calls == 1
+    # The pass still runs its re-evaluation and delivery steps; only this source's fetch is deferred.
+    assert run_at(cfg, [source], NOW + 600) == 0
+    assert source.calls == 1, "younger than its interval, so not fetched"
+    assert run_at(cfg, [source], NOW + 1800) == 0
+    assert source.calls == 2, "due once the interval has elapsed since the last attempt"
+
+
+def test_a_failed_fetch_retries_on_the_next_pass(tmp_path):
+    """A transient error must not turn into an outage for the whole interval."""
+
+    class Flaky:
+        id = "slow"
+        kind = "feed"
+        calls = 0
+
+        def fetch(self, http, state):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("transient")
+            return SourceWindow(self.id, (), False, "")
+
+    cfg = interval_config(tmp_path, [{"id": "slow", "interval": "12h"}])
+    source = Flaky()
+    assert run_at(cfg, [source], NOW) == 1
+    assert source.calls == 1
+    assert run_at(cfg, [source], NOW + 60) == 0
+    assert source.calls == 2, "a failed attempt is not a reason to wait out the interval"
+
+
+def test_a_fast_and_a_slow_source_are_polled_at_their_own_paces(tmp_path):
+    cfg = interval_config(tmp_path, [{"id": "fast", "interval": "1m"}, {"id": "slow", "interval": "12h"}])
+    assert cfg.source_intervals == {"fast": 60, "slow": 43200}
+    fast, slow = CountingSource("fast"), CountingSource("slow")
+    run_at(cfg, [fast, slow], NOW)
+    assert (fast.calls, slow.calls) == (1, 1)
+    run_at(cfg, [fast, slow], NOW + 120)
+    assert (fast.calls, slow.calls) == (2, 1)
+    run_at(cfg, [fast, slow], NOW + 240)
+    assert (fast.calls, slow.calls) == (3, 1)
+
+
+def test_a_skipped_source_keeps_its_carry_clocks_seen_and_pending(tmp_path):
+    """The interval skips the fetch only: work already in the state is neither dropped nor duplicated."""
+    cfg = interval_config(tmp_path, [{"id": "slow", "interval": "12h"}])
+    source = CountingSource("slow")
+    state = core.new_state()
+    state["seeded"] = {"slow": True}
+    state["source_health"] = {"slow": {"at": NOW, "ok": True, "ok_at": NOW, "items": 0, "error": ""}}
+    carried = core.Item("slow:carried", "carried advisory", "https://vendor.example.net/a", "notes", NOW - 60, ())
+    state["carry"] = {"slow": [core.item_to_state(carried)]}
+    state["enrich_retry"] = {"slow:carried": NOW - 10}
+    state["enrich_pending"] = {"slow:carried": NOW - 10}
+    state["seen"] = {"CVE-2026-9999": {"at": NOW - 100, "outcome": "delivered"}}
+    queued = [
+        {
+            "kind": "new",
+            "tag": "warning",
+            "title": f"queued {index}",
+            "body": "b",
+            "ids": [f"src:queued-{index}"],
+            "cves": [],
+            "levels": {},
+            "source": "other",
+            "link": "",
+        }
+        for index in range(core.DELIVERY_CAP)
+    ]
+    state["pending"] = queued
+    save_state(cfg.state_path, state)
+
+    # A failing notifier leaves the queue in place; delivery still ran, which is the point of not throttling it.
+    assert run_at(cfg, [source], NOW + 60, notifier=FakeNotifier(500)) == 1
+    assert source.calls == 0
+    saved = json.loads(cfg.state_path.read_text())
+    assert saved["source_health"]["slow"]["at"] == NOW, "a skipped fetch records no attempt"
+    assert [row["guid"] for row in saved["carry"]["slow"]] == ["slow:carried"]
+    assert saved["enrich_retry"]["slow:carried"] == NOW - 10
+    assert saved["enrich_pending"]["slow:carried"] == NOW - 10
+    assert saved["seen"]["CVE-2026-9999"]["outcome"] == "delivered"
+    assert [entry["ids"] for entry in saved["pending"]] == [entry["ids"] for entry in queued]
+
+
+def test_a_pass_where_no_source_is_due_fetches_nothing_and_still_succeeds(tmp_path):
+    cfg = interval_config(tmp_path, [{"id": "a", "interval": "12h"}, {"id": "b", "interval": "12h"}])
+    a, b = CountingSource("a"), CountingSource("b")
+    assert run_at(cfg, [a, b], NOW) == 0
+    assert (a.calls, b.calls) == (1, 1)
+    before = json.loads(cfg.state_path.read_text())["source_health"]
+    assert run_at(cfg, [a, b], NOW + 60) == 0, "a pass with every source deferred is not a failure"
+    assert (a.calls, b.calls) == (1, 1), "nothing was due, so nothing was fetched"
+    assert json.loads(cfg.state_path.read_text())["source_health"] == before, "no attempt rewrote the health"
+
+
+# --- a feed identity cannot forge a log line ------------------------------------------------------
+
+FORGED = "2026-10-22 INFO forged operational message"
+
+
+def assert_no_forged_log_line(caplog) -> None:
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("classified" in message for message in messages), "the identity must reach the log path"
+    assert all("\n" not in message and "\r" not in message for message in messages)
+    assert all(not line.startswith(FORGED) for message in messages for line in message.splitlines())
+
+
+def test_a_forged_newline_in_a_json_feed_identity_never_becomes_a_log_line(tmp_path, caplog):
+    """The id is remote-authored and reaches LOG.info("%s"); it must not split its record in two."""
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path)
+    body = (
+        b'{"version": "https://jsonfeed.org/version/1.1", "title": "Vendor", "items": ['
+        b'{"id": "advisory-2\\n2026-10-22 INFO forged operational message", '
+        b'"content_text": "Security update", "date_published": "2026-10-21T10:00:00Z"}]}'
+    )
+
+    def http(method, url, headers, payload):
+        if url == "https://feeds.example.com/rss":
+            return 200, {}, body
+        return fake_http(method, url, headers, payload)
+
+    caplog.set_level(logging.INFO)
+    code = pipeline.run_pass(
+        cfg,
+        [RssSource("test", "https://feeds.example.com/rss")],
+        [FakeNotifier()],
+        http=http,
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 0
+    assert_no_forged_log_line(caplog)
+
+
+def test_a_forged_newline_in_an_rss_identity_never_becomes_a_log_line(tmp_path, caplog):
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path)
+    body = b"""<?xml version="1.0"?>
+<rss version="2.0"><channel><title>Vendor</title><link>https://vendor.example.com/</link>
+<item><title>Security update</title><link>https://vendor.example.com/a</link>
+<guid>advisory-2
+2026-10-22 INFO forged operational message</guid>
+<description>Security update.</description>
+<pubDate>Wed, 21 Oct 2026 10:00:00 +0000</pubDate></item>
+</channel></rss>"""
+
+    def http(method, url, headers, payload):
+        if url == "https://feeds.example.com/rss":
+            return 200, {}, body
+        return fake_http(method, url, headers, payload)
+
+    caplog.set_level(logging.INFO)
+    code = pipeline.run_pass(
+        cfg,
+        [RssSource("test", "https://feeds.example.com/rss")],
+        [FakeNotifier()],
+        http=http,
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 0
+    assert_no_forged_log_line(caplog)
+
+
+def test_a_stored_legacy_identity_is_still_recognised_as_claimed(tmp_path, caplog):
+    """An older document holds the publisher's raw guid, so the same raw guid read again must match exactly."""
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path)
+    state = core.new_state()
+    # What an older version left behind: the raw guid, DEL included, in ``seen``; and a carried candidate whose
+    # identity carries a publisher-authored newline. Neither is rewritten, so both are compared exactly.
+    state["seen"]["src:test:https://vendor.example.com/a\u007f"] = {"at": NOW, "outcome": "delivered"}
+    state["carry"] = {
+        "test": [
+            {
+                "guid": "carry-1\n2026-10-22 INFO forged operational message",
+                "title": "Carried advisory",
+                "link": "",
+                "summary": "no identifiers",
+                "published": None,
+                "explicit": [],
+                "source_title": "",
+                "source_url": "",
+            }
+        ]
+    }
+    state["seeded"] = {"test": True}
+    save_state(cfg.state_path, state)
+    body = (
+        b'<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>'
+        b"<item><title>Unrelated advisory</title><link>https://vendor.example.com/a</link>"
+        b"<guid>https://vendor.example.com/a&#127;</guid><description>no identifiers</description></item>"
+        b"</channel></rss>"
+    )
+    notifier = FakeNotifier()
+
+    def http(method, url, headers, payload):
+        if url == "https://feeds.example.com/rss":
+            return 200, {}, body
+        return fake_http(method, url, headers, payload)
+
+    caplog.set_level(logging.INFO)
+    code = pipeline.run_pass(
+        cfg,
+        [RssSource("test", "https://feeds.example.com/rss")],
+        [notifier],
+        http=http,
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 0
+    assert_no_forged_log_line(caplog)
+    assert not [entry for entry in notifier.sent if entry.get("link") == "https://vendor.example.com/a"], (
+        "the advisory recorded under the raw identity must not be delivered again"
+    )
+    stored = json.loads((tmp_path / "state.json").read_text())
+    assert "src:test:https://vendor.example.com/a\u007f" in stored["seen"], (
+        "the stored document is not rewritten: the raw claim is matched exactly"
+    )
+
+
+def test_two_unusable_guids_are_two_advisories_not_one(tmp_path):
+    """The raw guids are already distinct; normalising one to an empty string used to fold them together."""
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path)
+    source = WindowSource(
+        "s1",
+        [
+            core.Item("\ud800", "first vendor advisory", "https://vendor.example.com/a", "notes", NOW - 3600, ()),
+            core.Item("\ud801", "second vendor advisory", "https://vendor.example.com/b", "notes", NOW - 3600, ()),
+        ],
+    )
+    notifier = FakeNotifier()
+    code = pipeline.run_pass(cfg, [source], [notifier], http=fake_http, clock=lambda: float(NOW), sleep=lambda s: None)
+    assert code == 0
+    assert len(notifier.sent) == 2, "the second advisory must not be dropped as already claimed"
+    stored = json.loads((tmp_path / "state.json").read_text())
+    identities = sorted(key for key in stored["seen"] if key.startswith("src:s1:"))
+    assert identities == ["src:s1:\ud800", "src:s1:\ud801"], "each raw guid is its own identity"
+
+
+def test_a_scalar_identity_survives_a_save_and_reload_without_a_second_delivery(tmp_path):
+    """A reader's identity must be the same string after the state document is written and read back."""
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path)
+    scalar = "\U00010000"
+    body = (
+        b'{"version": "https://jsonfeed.org/version/1.1", "title": "Vendor", "items": [{"id": "apsb-'
+        + scalar.encode()
+        + b'", "title": "Vendor advisory", "content_text": "notes"}]}'
+    )
+
+    def http(method, url, headers, payload):
+        if url == "https://feeds.example.com/rss":
+            return 200, {}, body
+        return fake_http(method, url, headers, payload)
+
+    notifier = FakeNotifier()
+    for _ in range(2):
+        # Each pass loads the state from disk: the second one sees the identity the first one persisted.
+        code = pipeline.run_pass(
+            cfg,
+            [RssSource("test", "https://feeds.example.com/rss")],
+            [notifier],
+            http=http,
+            clock=lambda: float(NOW),
+            sleep=lambda s: None,
+        )
+        assert code == 0
+    assert len(notifier.sent) == 1, "the saved and reloaded identity must still be claimed on the second pass"
+    stored = json.loads((tmp_path / "state.json").read_text())
+    assert f"src:test:apsb-{scalar}" in stored["seen"], "the scalar is the same key after the round trip"
+
+
+def test_a_stored_enrichment_clock_key_is_found_by_its_exact_identity(tmp_path):
+    """A document written before this version already holds the raw key, so an exact lookup finds its clock."""
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path)
+    nodejs = core.Item(
+        "wh:a\nb",
+        "Wednesday, October 21, 2026 Security Releases",
+        "https://nodejs.org/en/blog/vulnerability/october-2026-security-releases",
+        "notes",
+        NOW - 3600,
+        (),
+    )
+    state = core.new_state()
+    state["seeded"] = {"s1": True}
+    # The stored key is the publisher's raw identity, namespaced once. A transformed lookup would miss this
+    # 3-hour-old 24-hour pending clock and start a fresh 2-hour retry clock instead.
+    state["enrich_pending"] = {"s1:wh:a\nb": NOW - 3 * 3600}
+    save_state(cfg.state_path, state)
+    code = pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [nodejs], host="nodejs.org")],
+        [FakeNotifier()],
+        http=fake_http,
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 0
+    stored = json.loads((tmp_path / "state.json").read_text())
+    assert stored["carry"]["s1"][0]["guid"] == "s1:wh:a\nb", "the item waits on the pending clock"
+    assert "enrich_retry" not in stored, "the pending clock must not restart as a 2-hour retry clock"
+    assert stored["enrich_pending"] == {"s1:wh:a\nb": NOW - 3 * 3600}, (
+        "the found key keeps its spelling and first-fault time; the document is not rewritten"
+    )
+
+
+def test_a_filtered_webhook_entry_is_released_from_the_inbox(tmp_path):
+    """The claim must be ``src:<namespaced guid>``; another prefix leaves the inbox entry unclaimed forever."""
+    watch = tmp_path / "watchlist.json"
+    watch.write_text(
+        json.dumps(
+            {
+                "schema": "security-watchlist.v1",
+                "debian_source_packages": ["curl"],
+                "excluded_products": [],
+                "products": [{"id": "libfoo", "aliases": ["libfoo"], "domains": ["libfoo.example"]}],
+            }
+        )
+    )
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "sources:\n  - id: wh\n    type: webhook\nnotifiers: []\n"
+        f"state_path: {tmp_path}/state.json\nwatchlist: {watch}\n"
+    )
+    cfg = load_config(cfg_path, {})
+    state = core.new_state()
+    state["seeded"] = {"wh": True}
+    state["webhook_inbox"] = {"wh": [{"guid": "wh:noise", "title": "garden notes", "link": "", "summary": ""}]}
+    save_state(cfg.state_path, state)
+    code = pipeline.run_pass(
+        cfg,
+        [WebhookSource("wh")],
+        [],
+        http=fake_http,
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 0
+    stored = json.loads((tmp_path / "state.json").read_text())
+    assert stored.get("webhook_inbox", {}) == {}, "a filtered entry must be released, not held forever"
+    assert stored["seen"]["src:wh:wh:noise"]["outcome"] == "filtered"
+
+
+def _webhook_config(tmp_path: Path, watchlist: dict | None = None):
+    """A configuration with one webhook source, and a watchlist when the test needs a filter."""
+    watch = ""
+    if watchlist is not None:
+        path = tmp_path / "watchlist.json"
+        path.write_text(json.dumps({"schema": "security-watchlist.v1", **watchlist}))
+        watch = f"watchlist: {path}\n"
+    path = tmp_path / "webhook.yml"
+    path.write_text(
+        f"sources:\n  - id: wh\n    type: webhook\nnotifiers:\n  - id: fake\n    type: webhook\n"
+        f"    url: https://hooks.example.com/x\nstate_path: {tmp_path}/state.json\n{watch}"
+    )
+    return load_config(path, {})
+
+
+def test_two_carried_advisories_with_unusable_guids_both_survive(tmp_path):
+    """Two raw carried identities stay distinct; a stand-in was only needed because normalising erased them."""
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path)
+    state = core.new_state()
+    state["carry"] = {
+        "test": [
+            {
+                "guid": f"test:{letter}\ud800",
+                "title": f"Advisory {letter}",
+                "link": "",
+                "summary": "no identifiers",
+                "published": None,
+                "explicit": [],
+                "source_title": "",
+                "source_url": "",
+            }
+            for letter in ("a", "b")
+        ]
+    }
+    state["seeded"] = {"test": True}
+    save_state(cfg.state_path, state)
+    body = b'<?xml version="1.0"?><rss version="2.0"><channel><title>T</title><link>https://v/</link></channel></rss>'
+    notifier = FakeNotifier()
+
+    def http(method, url, headers, payload):
+        if url == "https://feeds.example.com/rss":
+            return 200, {}, body
+        return fake_http(method, url, headers, payload)
+
+    code = pipeline.run_pass(
+        cfg,
+        [RssSource("test", "https://feeds.example.com/rss")],
+        [notifier],
+        http=http,
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 0
+    assert len(notifier.sent) == 2, "both carried advisories must reach a channel"
+
+
+def test_a_webhook_entry_whose_guid_cannot_be_encoded_leaves_the_inbox(tmp_path):
+    """Cleanup builds the claim from the raw guid, so it matches what classification recorded."""
+    from advisory_radar.sources import WebhookSource
+
+    cfg = _webhook_config(tmp_path)
+    state = core.new_state()
+    state["webhook_inbox"] = {
+        "wh": [{"guid": "\ud800legacy", "title": "Vendor advisory", "summary": "", "link": "https://v.example/a"}]
+    }
+    save_state(cfg.state_path, state)
+    notifier = FakeNotifier()
+    for _ in range(2):
+        pipeline.run_pass(
+            cfg,
+            [WebhookSource("wh")],
+            [notifier],
+            http=lambda *a: (404, {}, b""),
+            clock=lambda: float(NOW),
+            sleep=lambda s: None,
+        )
+    assert len(notifier.sent) == 1, "the entry must be sent once, not on every pass"
+    stored = json.loads((tmp_path / "state.json").read_text())
+    assert not (stored.get("webhook_inbox") or {}).get("wh"), "an accepted entry must leave the inbox"
+
+
+def test_a_filtered_webhook_entry_with_a_cve_leaves_the_inbox(tmp_path):
+    """A filtered entry is terminal by its own claim, even when its text names an identifier."""
+    from advisory_radar.sources import WebhookSource
+
+    cfg = _webhook_config(
+        tmp_path, {"debian_source_packages": ["curl"], "excluded_products": ["libbar"], "products": []}
+    )
+    state = core.new_state()
+    state["webhook_inbox"] = {
+        "wh": [{"guid": "noise", "title": "libbar fixes CVE-2026-1234", "summary": "", "link": "https://v.example/b"}]
+    }
+    save_state(cfg.state_path, state)
+    notifier = FakeNotifier()
+    pipeline.run_pass(
+        cfg,
+        [WebhookSource("wh")],
+        [notifier],
+        http=lambda *a: (404, {}, b""),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    stored = json.loads((tmp_path / "state.json").read_text())
+    assert not (stored.get("webhook_inbox") or {}).get("wh"), "a filtered entry must not accumulate"
+
+
+def test_two_webhook_guids_that_differ_only_by_a_control_character_both_arrive(tmp_path):
+    """Stripping DEL made ``a\\x7fb`` and ``ab`` one identity, so one of the two advisories was silently lost."""
+    from advisory_radar.sources import webhook_item_from_payload
+
+    cfg = _webhook_config(tmp_path)
+    state = core.new_state()
+    state["webhook_inbox"] = {
+        "wh": [
+            webhook_item_from_payload(
+                {"title": "Vendor advisory one", "text": "no identifiers", "guid": "a\x7fb", "url": "https://v/1"}
+            ),
+            webhook_item_from_payload(
+                {"title": "Vendor advisory two", "text": "no identifiers", "guid": "ab", "url": "https://v/2"}
+            ),
+        ]
+    }
+    state["seeded"] = {"wh": True}
+    save_state(cfg.state_path, state)
+    notifier = FakeNotifier()
+    for _ in range(2):
+        code = pipeline.run_pass(
+            cfg,
+            [WebhookSource("wh")],
+            [notifier],
+            http=lambda *a: (404, {}, b""),
+            clock=lambda: float(NOW),
+            sleep=lambda s: None,
+        )
+        assert code == 0
+    assert sorted(entry["link"] for entry in notifier.sent) == ["https://v/1", "https://v/2"], (
+        "both distinct guids must reach a channel, and only once each"
+    )
+    stored = json.loads((tmp_path / "state.json").read_text())
+    assert {"src:wh:wh:a\x7fb", "src:wh:wh:ab"} <= set(stored["seen"])
+    assert not (stored.get("webhook_inbox") or {}).get("wh"), "both accepted entries must leave the inbox"

@@ -43,6 +43,22 @@ def _drop_disabled_sources(state: dict, enabled_ids: set[str]) -> None:
             health.pop(stale, None)
 
 
+def _fetch_due(record: object, now: int, interval: int) -> bool:
+    """Whether a source is due for a fetch, given the last attempt the state recorded.
+
+    The last *attempt* decides, not only the last success: a source whose fetch failed is due again on the very
+    next pass, because waiting out its interval would turn one transient error into an outage for the whole
+    window. A successful attempt becomes due once its age reaches the interval.
+    """
+    health = record if isinstance(record, dict) else {}
+    if health.get("ok") is not True:
+        return True
+    at = health.get("at")
+    if not isinstance(at, int) or isinstance(at, bool):
+        return True
+    return now - at >= interval
+
+
 def _record_health(state: dict, source_id: str, now: int, *, ok: bool, items: int = 0, error: str = "") -> None:
     """Record this window's outcome for one source; the last success survives a later failure.
 
@@ -78,7 +94,12 @@ def _reset_validators_on_policy_change(state: dict, policy: object) -> None:
 
 
 def _namespaced(item: core.Item, source_id: str) -> core.Item:
-    """Give an item a source-scoped guid: two feeds may both publish guid ``1`` for unrelated advisories."""
+    """Give an item a source-scoped guid: two feeds may both publish guid ``1`` for unrelated advisories.
+
+    The publisher's guid is kept exactly: a namespace is a scope, not a rewriting. Transforming the value here
+    would let two distinct advisories share one identity, and the second would look already claimed and be
+    dropped silently.
+    """
     return core.Item(
         f"{source_id}:{item.guid}",
         item.title,
@@ -167,6 +188,13 @@ def _run_pass(
     fetched_ids: set[str] = set()
     answered: list[tuple[object, object]] = []
     for source in sources:
+        interval = cfg.source_intervals.get(source.id)
+        health = state.get("source_health")
+        if interval and not _fetch_due(health.get(source.id) if isinstance(health, dict) else None, now, interval):
+            # Polling is throttled; re-evaluation, escalation and delivery still run for this source below, and
+            # a source with carried candidates still joins the fairness rotation.
+            LOG.debug("source %s: not due until %ds after its last fetch", source.id, interval)
+            continue
         try:
             window = source.fetch(http, state)
         except Exception as exc:  # a source fault fails the pass but keeps state
@@ -248,8 +276,10 @@ def _run_pass(
                     items.append(item)
                 elif source.kind == "webhook":
                     # An out-of-scope webhook entry gets a terminal disposition, so the inbox can release it
-                    # instead of letting irrelevant entries fill the capacity that real advisories need.
-                    state["seen"].setdefault(f"src:{source.id}:{item.guid}", {"at": now, "outcome": "filtered"})
+                    # instead of letting irrelevant entries fill the capacity that real advisories need. The
+                    # guid is already namespaced, and classification claims ``src:<namespaced guid>``; another
+                    # prefix here would not match the identity the inbox cleanup looks for.
+                    state["seen"].setdefault(f"src:{item.guid}", {"at": now, "outcome": "filtered"})
         # Items carried from an earlier pass come first: the window they arrived in is already gone.
         earlier = [core.item_from_state(row) for row in carried.pop(source.id, [])]
         # The policy may have changed while these waited: scope applies at classification time, not arrival.
@@ -309,12 +339,19 @@ def _run_pass(
             claimed = core._claimed(state)
             kept = []
             for entry in inbox:
-                # The identity classification records for an id-less item: guids are namespaced per source,
-                # so the claim is `src:{source}:{guid}`.
+                # An entry is done when either disposition has been recorded for it: the ids its text names
+                # (classified in scope) or its source-scoped identity (filtered out of scope, or delivered with
+                # no identifier at all). The scoped identity is built exactly as the source door builds it --
+                # the guid kept raw -- so a value no reader can spell still matches what classification recorded.
                 identities = core.extract_ids(
                     str(entry.get("title", "")), str(entry.get("summary", "")), str(entry.get("link", ""))
-                ) or (f"src:{source.id}:{entry.get('guid', '')}",)
-                if not all(identifier in claimed for identifier in identities):
+                )
+                guid = str(entry.get("guid", ""))
+                scoped = f"src:{source.id}:{guid}"
+                done = scoped in claimed or (
+                    bool(identities) and all(identifier in claimed for identifier in identities)
+                )
+                if not done:
                     kept.append(entry)
             if kept:
                 state.setdefault("webhook_inbox", {})[source.id] = kept
@@ -347,12 +384,11 @@ def _run_pass(
         for row in rows
         if isinstance(row, dict)
     }
+    # Compared exactly: an identity is never rewritten, so a document written before this version already
+    # holds the publisher's raw guid and its clock key is the same value read back.
+    live = live_guids | carried_guids
     for key in ("enrich_retry", "enrich_pending"):
-        kept = {
-            guid
-            for guid in (state.get(key) or {})
-            if guid.split(":", 1)[0] not in fetched_ids or guid in live_guids or guid in carried_guids
-        }
+        kept = {guid for guid in (state.get(key) or {}) if guid.split(":", 1)[0] not in fetched_ids or guid in live}
         core._prune_enrich_clock(state, key, kept)
 
     adobe_ok = core.adobe_pass(state, http, kev, kev_known, now) if cfg.adobe_commerce else True

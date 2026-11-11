@@ -704,6 +704,40 @@ def test_a_malformed_source_url_does_not_leak_its_token():
     assert "a/b+c&d" not in record.getMessage()
 
 
+def test_a_credential_escaped_for_the_log_is_still_redacted():
+    """``_log_id`` escapes the argument before the filter sees it, so the filter must know that spelling too."""
+    import logging
+
+    from advisory_radar.core import _log_id
+    from advisory_radar.http import RedactFilter
+
+    for secret in ("demo\\credential", "pässwörd"):
+        escaped = _log_id(secret)
+        assert escaped != secret, "each case must actually reach the escaped spelling"
+        record = logging.LogRecord("t", logging.ERROR, __file__, 1, "bad identity %s", (escaped,), None)
+        RedactFilter([secret]).filter(record)
+        text = record.getMessage()
+        assert secret not in text, "the raw credential must not survive"
+        assert escaped not in text, "nor the escaped spelling the logger emitted"
+        assert "[redacted]" in text
+
+
+def test_a_finished_log_record_is_bounded_after_redaction():
+    """A feed can supply a multi-megabyte identifier; the bound must not cut a credential into a prefix."""
+    import logging
+
+    from advisory_radar.http import LOG_RECORD_LIMIT, RedactFilter
+
+    secret = "SECRET-TOKEN"
+    # The secret starts four characters before the bound, so truncating first would leave "SECR" behind, which
+    # the redactor can no longer match.
+    record = logging.LogRecord("t", logging.INFO, __file__, 1, "%s%s", ("x" * (LOG_RECORD_LIMIT - 4), secret), None)
+    RedactFilter([secret]).filter(record)
+    text = record.getMessage()
+    assert len(text) == LOG_RECORD_LIMIT
+    assert secret[:4] not in text
+
+
 def test_two_ids_that_expand_to_one_value_are_refused(tmp_path):
     from advisory_radar.config import ConfigError
 

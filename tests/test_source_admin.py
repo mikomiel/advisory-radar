@@ -1681,3 +1681,179 @@ def test_the_sources_form_keeps_a_source_threshold_override(tmp_path):
     stored = overlay(tmp_path)["sources"]["vendor"]
     assert stored["thresholds"] == {"critical_cvss": 7.5}
     assert stored["enabled"] is True and stored["tag"] == "security"
+
+
+# --- a per-source poll interval, edited on the same page -----------------------------------------
+
+
+def test_a_source_interval_is_saved_from_the_config_page(tmp_path):
+    client, runtime, _ = make_client(tmp_path)
+    csrf, fingerprint = signed_in(client)
+    response = client.post(
+        "/config/sources",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "enabled:vendor": "1",
+            "tag:vendor": "",
+            "interval:vendor": "30m",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert overlay(tmp_path)["sources"] == {"vendor": {"enabled": True, "tag": "", "interval": "30m"}}
+    runtime.reload(blocking=True)
+    assert runtime.cfg.source_intervals == {"vendor": 1800}
+
+
+def test_an_added_source_can_carry_an_interval(tmp_path):
+    client, runtime, _ = make_client(tmp_path)
+    response = new_source(
+        client,
+        **{"new:type": "rss", "new:url": "https://nodejs.org/feed/vulnerability.xml", "new:interval": "1h"},
+    )
+    assert response.status_code == 303
+    assert overlay(tmp_path)["sources_added"][0]["interval"] == "1h"
+    runtime.reload(blocking=True)
+    assert runtime.cfg.source_intervals == {"nodejs-org": 3600}
+
+
+# --- importing an OPML subscription list ---------------------------------------------------------
+
+
+def opml(*urls: str) -> str:
+    """An OPML 2.0 document with one folder holding one outline per URL."""
+    outlines = "".join(f'<outline text="{urlsplit(url).hostname or "feed"}" xmlUrl="{url}"/>' for url in urls)
+    return f'<?xml version="1.0"?><opml version="2.0"><body><outline text="Vendors">{outlines}</outline></body></opml>'
+
+
+def import_opml(client: TestClient, document: str):
+    csrf, fingerprint = signed_in(client)
+    return client.post(
+        "/config/sources/opml",
+        data={"csrf": csrf, "fingerprint": fingerprint, "opml": document},
+        follow_redirects=False,
+    )
+
+
+def test_opml_import_adds_every_feed_as_an_rss_source(tmp_path):
+    client, runtime, _ = make_client(tmp_path)
+    response = import_opml(client, opml("https://a.example.net/feed.xml", "https://b.example.net/security.xml"))
+    assert response.status_code == 200
+    assert "added 2, skipped 0" in response.text
+    added = overlay(tmp_path)["sources_added"]
+    assert added == [
+        {"id": "a-example-net", "type": "rss", "url": "https://a.example.net/feed.xml"},
+        {"id": "b-example-net", "type": "rss", "url": "https://b.example.net/security.xml"},
+    ]
+    # The outline title is a label, not a watch tag: the tag column is meaningful for changedetection only.
+    assert all("tag" not in entry for entry in added)
+    runtime.reload(blocking=True)
+    assert [source.id for source in runtime.sources] == ["vendor", "a-example-net", "b-example-net"]
+
+
+def test_opml_import_skips_a_feed_already_configured(tmp_path):
+    client, _, _ = make_client(tmp_path)
+    response = import_opml(
+        client,
+        opml("https://feeds.example.net/security.xml", "https://a.example.net/feed.xml"),
+    )
+    assert response.status_code == 200
+    assert "added 1, skipped 1" in response.text
+    assert "already configured" in response.text
+    assert [entry["id"] for entry in overlay(tmp_path)["sources_added"]] == ["a-example-net"]
+
+
+def test_opml_import_skips_a_feed_repeated_in_the_document(tmp_path):
+    client, _, _ = make_client(tmp_path)
+    response = import_opml(
+        client,
+        opml(
+            "https://a.example.net/feed.xml",
+            "https://a.example.net/feed.xml",
+            "https://b.example.net/security.xml",
+        ),
+    )
+    assert response.status_code == 200
+    assert "added 2, skipped 1" in response.text
+    assert [entry["id"] for entry in overlay(tmp_path)["sources_added"]] == [
+        "a-example-net",
+        "b-example-net",
+    ]
+
+
+def test_opml_import_of_the_same_document_again_adds_nothing(tmp_path):
+    client, _, _ = make_client(tmp_path)
+    assert import_opml(client, opml("https://a.example.net/feed.xml")).status_code == 200
+    response = import_opml(client, opml("https://a.example.net/feed.xml"))
+    assert response.status_code == 200
+    assert "added 0, skipped 1" in response.text
+    assert [entry["id"] for entry in overlay(tmp_path)["sources_added"]] == ["a-example-net"]
+
+
+def test_opml_import_refuses_a_document_with_no_feed(tmp_path):
+    client, _, _ = make_client(tmp_path)
+    response = import_opml(
+        client,
+        '<?xml version="1.0"?><opml version="2.0"><body><outline text="Empty folder"/></body></opml>',
+    )
+    assert response.status_code == 400
+    assert "contains no feed" in response.text
+    assert not (tmp_path / "data" / "settings.json").exists()
+
+
+def test_opml_import_refuses_a_document_that_does_not_parse(tmp_path):
+    client, _, _ = make_client(tmp_path)
+    response = import_opml(client, "not an OPML document")
+    assert response.status_code == 400
+    assert "could not be read" in response.text
+    assert not (tmp_path / "data" / "settings.json").exists()
+
+
+def test_opml_import_checks_every_url_before_writing(tmp_path):
+    client, _, _ = make_client(tmp_path)
+    response = import_opml(
+        client,
+        opml("https://a.example.net/feed.xml", "ftp://b.example.net/security.xml"),
+    )
+    assert response.status_code == 400
+    assert "not an http or https url" in response.text
+    assert not (tmp_path / "data" / "settings.json").exists(), "one unusable feed refuses the whole batch"
+
+
+def test_opml_import_refuses_a_private_destination(tmp_path):
+    client, _, _ = make_client(tmp_path, resolve=lambda host: ("172.16.0.9",))
+    response = import_opml(client, opml("https://nas.example.net/feed.xml"))
+    assert response.status_code == 400
+    assert "private network" in response.text
+    assert not (tmp_path / "data" / "settings.json").exists()
+
+
+def test_opml_import_expands_an_imported_reference_when_skipping_a_configured_feed(tmp_path):
+    client, _, _ = make_client(
+        tmp_path,
+        sources=[{"id": "vendor", "type": "rss", "url": "https://feeds.example.net/security.xml"}],
+        environment={"FEED_URL": "https://feeds.example.net/security.xml"},
+    )
+    response = import_opml(client, opml("${FEED_URL}"))
+    assert response.status_code == 200
+    assert "added 0, skipped 1" in response.text
+    assert not (tmp_path / "data" / "settings.json").exists(), "an already-configured feed writes nothing"
+
+
+def test_opml_import_treats_a_reference_and_its_literal_as_one_subscription(tmp_path):
+    client, _, _ = make_client(tmp_path, environment={"FEED_URL": "https://a.example.net/feed.xml"})
+    response = import_opml(client, opml("https://a.example.net/feed.xml", "${FEED_URL}"))
+    assert response.status_code == 200
+    assert "added 1, skipped 1" in response.text
+    assert [entry["url"] for entry in overlay(tmp_path)["sources_added"]] == ["https://a.example.net/feed.xml"]
+
+
+def test_opml_import_stores_an_imported_reference_as_written(tmp_path):
+    client, runtime, _ = make_client(tmp_path, environment={"FEED_URL": "https://b.example.net/feed.xml"})
+    response = import_opml(client, opml("${FEED_URL}"))
+    assert response.status_code == 200
+    assert "added 1, skipped 0" in response.text
+    assert overlay(tmp_path)["sources_added"][0]["url"] == "${FEED_URL}"
+    runtime.reload(blocking=True)
+    assert "https://b.example.net/feed.xml" in [source.url for source in runtime.sources]

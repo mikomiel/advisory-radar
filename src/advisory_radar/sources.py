@@ -7,7 +7,7 @@ import hashlib
 from . import feeds
 from .catalogue import SOURCE_SPECS
 from .core import Item, _host, dsa_id, extract_ids
-from .http import Http, parse_json
+from .http import Http, json_text, parse_json
 from .plugins import Source, SourceWindow
 
 
@@ -43,11 +43,12 @@ def _items(export: feeds.FeedExport) -> tuple[Item, ...]:
 
 
 class RssSource:
-    """Any RSS 2.0 / Atom feed URL; the whole feed is read in one GET.
+    """Any feed URL: RSS 2.0, Atom, RSS 1.0 (RDF), JSON Feed, or a page that advertises one.
 
-    The publisher's ``ETag``/``Last-Modified`` are kept per source, so an unchanged feed answers ``304`` - the
-    common case for a feed polled every 15 minutes, and the one that keeps a free publisher's bandwidth ours
-    rather than theirs.
+    The format is sniffed from the document rather than configured, so an existing ``rss`` source gains a
+    format without a new key. The publisher's ``ETag``/``Last-Modified`` are kept per source, so an unchanged
+    feed answers ``304`` - the common case for a feed polled every 15 minutes, and the one that keeps a free
+    publisher's bandwidth ours rather than theirs.
     """
 
     kind = "feed"
@@ -69,9 +70,10 @@ class RssSource:
                 validators["If-None-Match"] = stored["etag"]
             if isinstance(stored.get("last_modified"), str):
                 validators["If-Modified-Since"] = stored["last_modified"]
-        export, fresh = feeds.fetch_rss(http, self.url, validators)
-        # ``None`` is a 304: keep what is stored. Anything else is this window's validators -- held until
-        # ``commit``, because a window whose candidates never reached pending or carry must be read in full again.
+        export, fresh = feeds.fetch_any(http, self.url, validators)
+        # ``None`` is a 304: keep what is stored. ``{}`` is a 200 that issued no validator -- including a page
+        # whose autodiscovery hop found the feed, because that validator describes the feed, not the page the
+        # next poll requests. Both are held until ``commit``; see there for why the empty answer must clear.
         self._store = fresh
         return SourceWindow(self.id, _items(export), export.truncated, _host(self.url))
 
@@ -88,7 +90,9 @@ class RssSource:
             state.setdefault("feeds", {})[self.id] = {"url_digest": _url_digest(self.url), **fresh}
         elif state.get("feeds"):
             # A 200 without validators replaces the stored ones with nothing: keeping them would send a stale
-            # If-None-Match for a feed that has stopped offering one.
+            # If-None-Match for a feed that has stopped offering one. An autodiscovered page is the important
+            # case: the stored validator belonged to the feed the URL used to answer directly, and the page
+            # would answer 304 for a feed whose changes are now behind the hop -- hiding every later advisory.
             state["feeds"].pop(self.id, None)
 
 
@@ -131,7 +135,10 @@ class ChangedetectionSource:
             raise RuntimeError(
                 f"changedetection.io answered HTTP {status}" if status else "changedetection.io is unreachable"
             )
-        document = parse_json(body)
+        text = json_text(body)
+        if text is None:
+            raise RuntimeError("changedetection.io response is not valid UTF-8")
+        document = parse_json(text)
         watches = document if isinstance(document, dict) else None
         if watches is None:
             raise RuntimeError("changedetection.io response is not a watch map")

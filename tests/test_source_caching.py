@@ -33,6 +33,23 @@ ETAG = '"v1"'
 MODIFIED = "Wed, 21 Oct 2026 10:00:00 GMT"
 URL = "https://vendor.example.com/feed.xml"
 
+JSON_FEED = b"""{
+  "version": "https://jsonfeed.org/version/1.1",
+  "title": "Vendor",
+  "home_page_url": "https://vendor.example.com/",
+  "items": [
+    {"id": "adv-1", "url": "https://vendor.example.com/adv/1",
+     "title": "DSA-6558-1 curl - security update",
+     "content_text": "Fixes CVE-2026-1111.",
+     "date_published": "2026-10-21T10:00:00Z"}
+  ]
+}"""
+
+PAGE_URL = "https://vendor.example.com/security"
+PAGE = b"""<!DOCTYPE html><html><head>
+<link rel="alternate" type="application/rss+xml" href="/feed.xml">
+</head><body>vendor security</body></html>"""
+
 
 def http_with(calls: list[dict[str, str]], statuses: list[int]):
     def http(method, request_url, headers, body):
@@ -181,6 +198,66 @@ def test_the_stored_validators_never_contain_the_feed_url():
     assert "super-secret-token" not in persisted
     assert secret_url not in persisted
     assert state["feeds"]["paid"]["url_digest"] == hashlib.sha256(secret_url.encode()).hexdigest()
+
+
+def test_an_rss_source_reads_a_json_feed():
+    """The format is sniffed, not configured: an existing ``rss`` source gains JSON Feed without a new key."""
+
+    def http(method, url, headers, body):
+        assert headers["Accept"].startswith("application/rss+xml")
+        return 200, {"ETag": ETAG}, JSON_FEED
+
+    source = RssSource("vendor", URL)
+    state: dict = {}
+    window = source.fetch(http, state)
+    (item,) = window.items
+    assert item.guid == "adv-1"
+    assert item.title.startswith("DSA-6558-1")
+    source.commit(state)
+    assert state["feeds"]["vendor"]["etag"] == ETAG
+
+
+def test_an_rss_source_follows_a_page_to_the_feed_it_advertises():
+    calls: list[tuple[str, dict[str, str]]] = []
+
+    def http(method, url, headers, body):
+        calls.append((url, dict(headers)))
+        if url == PAGE_URL:
+            return 200, {"ETag": '"page"'}, PAGE
+        assert url == URL
+        return 200, {"ETag": '"feed"'}, FEED
+
+    source = RssSource("vendor", PAGE_URL)
+    state: dict = {}
+    window = source.fetch(http, state)
+    assert [item.guid for item in window.items] == ["https://lists.debian.org/dsa-6558"]
+    assert [url for url, _ in calls] == [PAGE_URL, URL]
+    source.commit(state)
+    # A page's ETag says nothing about the feed it advertises, so no validator is armed for the next poll.
+    assert "feeds" not in state
+
+
+def test_an_autodiscovered_page_clears_the_validator_of_the_feed_it_replaced():
+    """The URL used to answer the feed directly and now answers a page.
+
+    Keeping the stored ETag would send ``If-None-Match`` to the page: a 304 would then hide every change behind
+    the autodiscovery hop for as long as the page stayed unchanged, which is exactly the silence this source
+    exists to break.
+    """
+    calls: list[dict[str, str]] = []
+    state = {"feeds": {"vendor": {"url_digest": hashlib.sha256(PAGE_URL.encode()).hexdigest(), "etag": '"old"'}}}
+
+    def http(method, url, headers, body):
+        calls.append(dict(headers))
+        if url == PAGE_URL:
+            return 200, {"ETag": '"page"'}, PAGE
+        return 200, {}, FEED
+
+    source = RssSource("vendor", PAGE_URL)
+    source.fetch(http, state)
+    assert calls[0]["If-None-Match"] == '"old"', "the stored validator belongs to this URL and is sent"
+    source.commit(state)
+    assert "vendor" not in state["feeds"], "a page answer must clear it before it hides the feed"
 
 
 def _policy(product: str) -> Policy:

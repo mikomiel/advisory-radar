@@ -40,7 +40,7 @@ from . import adobe, routing
 from .config import DEFAULT_THRESHOLDS, Thresholds
 from .feeds import FeedExport
 from .feeds import parse_feed as parse_greader
-from .http import MESSAGE_LIMIT, Http, inert, parse_json
+from .http import MESSAGE_LIMIT, Http, inert, log_safe, parse_json
 from .state import SourceError, load_state_document, save_state
 from .watchlist import Policy, Product
 
@@ -1501,10 +1501,31 @@ def _suppressed(
 
 
 def _claimed(state: dict) -> set[str]:
-    """Every id the worker already answers for: seen, queued, or parked (a parked message is not lost)."""
-    return set(state["seen"]) | {
+    """Every id the worker already answers for: seen, queued, or parked (a parked message is not lost).
+
+    Compared exactly as stored. An identity is never rewritten, so a document written before this version --
+    which already holds the publisher's raw guid -- matches that same raw guid read again, and no claim can
+    be moved onto a different advisory by a normalisation that happened to agree.
+    """
+    stored = set(state["seen"]) | {
         identifier for entry in (*state["pending"], *state.get("parked", ())) for identifier in entry["ids"]
     }
+    return {value for value in stored if isinstance(value, str)}
+
+
+def _log_id(value: str) -> str:
+    """An untrusted identifier made safe for one log record without losing a character of it.
+
+    A control character would end the record and let a publisher write what looks like an application log
+    line; a string that is not a Unicode scalar value (an escaped unpaired surrogate) cannot be encoded by a
+    log handler at all. Both are escaped rather than dropped, because the log may spell an identity
+    differently but must not change which advisory it names. Nothing is shortened here either: redaction runs
+    on the finished record and replaces a whole configured credential, so shortening first would leave its
+    prefix in the log where the redactor could no longer recognise it. The length bound therefore lives in
+    ``http.RedactFilter.filter``, after the replacements. The spelling itself is ``http.log_safe``, which the
+    redactor also knows, so escaping the argument first cannot hide a credential from it.
+    """
+    return log_safe(value)
 
 
 def classify_new(
@@ -1638,7 +1659,8 @@ def classify_new(
                 found = None if page is None else page.cves or None
                 if page is not None or item.guid in waiting:
                     clock, limit = waiting, NODEJS_PENDING_SECONDS
-                    retry.pop(item.guid, None)  # one clock per item: the day replaces an earlier fault's 2 h
+                    # One clock per item: the day replaces an earlier fault's 2 h.
+                    retry.pop(item.guid, None)
             else:
                 release = intel.php_cves_on(day) if day else intel.php_cves(php) if php else None
                 found = None if release is None else list(dict.fromkeys([*release.cves, *release.ghsas]))
@@ -1767,7 +1789,7 @@ def classify_new(
                 }
             )
         claimed.update(ids)
-        LOG.info("classified %s as %s", item.guid if not item.explicit else item.explicit[0], verdict.tag)
+        LOG.info("classified %s as %s", _log_id(item.guid if not item.explicit else item.explicit[0]), verdict.tag)
     if backlog:
         LOG.info("recorded %d item(s) older than %d days as backlog, not alerted", backlog, BACKLOG_AGE // DAY)
     if not retry:
@@ -1783,20 +1805,21 @@ def _enrichment_wait(retry: dict[str, int], guid: str, now: int, limit: int = EN
     The first fault starts the clock. Once it has run out the entry is removed and the item goes out once as unknown
     severity; the claim then keeps it from being fetched or sent again.
     """
-    first = retry.setdefault(guid, now)
+    key = guid
+    first = retry.setdefault(key, now)
     if now - first < limit:
         LOG.warning(
             "enrichment: item %s waits for its CVE list or source page (first missing %d s ago); retried next pass",
-            guid,
+            _log_id(guid),
             now - first,
         )
         return True
     LOG.warning(
         "enrichment: item %s has no CVE list or readable source page after %d s; sent once with unknown severity",
-        guid,
+        _log_id(guid),
         now - first,
     )
-    del retry[guid]
+    del retry[key]
     return False
 
 
@@ -2528,8 +2551,8 @@ def manage_parked_entry(state_path: Path, index: int, release: bool, now: int, *
 
 
 def _audit_ids(entry: dict) -> str:
-    shown = [identifier for identifier in entry["ids"] if not identifier.startswith("src:")][:MAX_SHOWN_IDS]
-    return ",".join(shown) or "no-id"
+    shown = [_log_id(identifier) for identifier in entry["ids"] if not identifier.startswith("src:")]
+    return ",".join(shown[:MAX_SHOWN_IDS]) or "no-id"
 
 
 def seed(state: dict, items: Sequence[Item], now: int) -> list[Item]:

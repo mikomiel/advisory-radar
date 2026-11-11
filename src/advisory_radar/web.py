@@ -26,10 +26,10 @@ from datetime import UTC, datetime
 
 import yaml
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from itsdangerous import BadSignature, URLSafeSerializer
 
-from . import __version__, pipeline
+from . import __version__, feeds, pipeline
 from .catalogue import SOURCE_SPECS
 from .config import (
     DEFAULT_THRESHOLDS,
@@ -41,7 +41,7 @@ from .config import (
     load_document,
     secret_values,
 )
-from .http import Http, private_destination, resolve_host, urllib_http
+from .http import Http, json_text, private_destination, resolve_host, urllib_http
 from .notifiers import NOTIFIER_BUILDERS
 from .runtime import Runtime
 from .settings import (
@@ -231,8 +231,13 @@ _NAV = (
 )
 
 
+def _response_text(value: str) -> str:
+    """``value`` made UTF-8 encodable: one legacy surrogate in state must not fail the whole page."""
+    return value.encode("utf-8", "replace").decode("utf-8")
+
+
 def esc(value: object) -> str:
-    return html.escape(str(value))
+    return html.escape(_response_text(str(value)))
 
 
 def _nav(active: str) -> str:
@@ -378,14 +383,26 @@ SEEN_OUTCOMES = ("delivered", "dropped", "filtered", "suppressed", "backlog", "a
 
 
 def _advisory_token(identifier: str) -> str:
-    """A slash-free path segment for an identifier, which may itself be (or contain) a URL."""
-    return base64.urlsafe_b64encode(identifier.encode("utf-8")).decode("ascii").rstrip("=")
+    """A slash-free path segment that resolves this exact record, which may itself be (or contain) a URL.
+
+    The token is an address, not display text: it must be lossless and injective. Replacing a character that
+    UTF-8 cannot encode makes two identities share one token, so following one advisory's row opens another's
+    record. ``surrogatepass`` encodes the exact code points instead; the value is a stored identity, and the
+    matching decoder reads it back the same way.
+    """
+    return base64.urlsafe_b64encode(identifier.encode("utf-8", "surrogatepass")).decode("ascii").rstrip("=")
 
 
 def _advisory_identifier(token: str) -> str:
-    """The identifier an advisory link names; a 400 page when the segment was not produced by the list."""
+    """The identifier an advisory link names; a 400 page when the segment was not produced by the list.
+
+    Decoded with the same ``surrogatepass`` the token encoder uses, so an identity that is not a Unicode
+    scalar value names its own record rather than becoming a 400 page.
+    """
     try:
-        identifier = base64.b64decode(token + "=" * (-len(token) % 4), altchars=b"-_", validate=True).decode("utf-8")
+        identifier = base64.b64decode(token + "=" * (-len(token) % 4), altchars=b"-_", validate=True).decode(
+            "utf-8", "surrogatepass"
+        )
     except (binascii.Error, ValueError):
         raise HTTPException(status_code=400, detail="malformed advisory link; open /alerts and follow a row") from None
     if not identifier:
@@ -408,15 +425,22 @@ def _day_start(value: str, where: str) -> int:
 
 
 def _cursor_encode(at: int, identifier: str) -> str:
-    """A page position as URL-safe base64 of ``at:identifier``, without padding."""
-    return base64.urlsafe_b64encode(f"{at}:{identifier}".encode()).decode("ascii").rstrip("=")
+    """A page position as URL-safe base64 of ``[at, identifier]``, without padding.
+
+    JSON with ``ensure_ascii`` escapes a legacy identifier that is not a Unicode scalar value instead of
+    replacing it, because the cursor must name the exact record it stopped after: a substituted character
+    would sort before the original and the next page would repeat the same rows forever.
+    """
+    payload = json.dumps([at, identifier], ensure_ascii=True).encode("ascii")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
 
 
 def _cursor_decode(value: str) -> tuple[int, str]:
     """The position a ``cursor``/``before`` parameter names; a 400 page when it is not one.
 
-    ``identifier`` is split off at the first colon, because a stored identifier may contain one
-    (``src:<guid>``). Nothing else about the value is trusted: it comes from the URL.
+    The value is the JSON pair :func:`_cursor_encode` produced, decoded losslessly: an identifier may contain
+    a colon (``src:<guid>``) or a character that is not a Unicode scalar value. Nothing about it is trusted:
+    it comes from the URL, and anything that is not that pair is refused.
     """
     malformed = HTTPException(status_code=400, detail="malformed page cursor; open /alerts again")
     try:
@@ -425,12 +449,10 @@ def _cursor_decode(value: str) -> tuple[int, str]:
         raw = base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True).decode("utf-8")
     except (binascii.Error, ValueError):
         raise malformed from None
-    at, separator, identifier = raw.partition(":")
-    if not separator or not identifier:
-        raise malformed
     try:
-        return int(at), identifier
-    except ValueError:
+        at, identifier = json.loads(raw)
+        return int(at), str(identifier)
+    except (ValueError, TypeError):
         raise malformed from None
 
 
@@ -794,6 +816,9 @@ SOURCE_FORM_KEYS = tuple(
         - {"id", "type", "enabled", "tag"}
     )
 )
+#: Keys every source kind accepts, whether or not the catalogue names them: a per-source poll pace is not a
+#: property of a kind, so it is offered once rather than repeated in every ``SourceSpec``.
+SOURCE_UNIVERSAL_KEYS = ("interval",)
 #: The one secret-bearing key the "new notifier" row fills, per type. ``apprise`` (url+password) and
 #: ``gotify`` (url+token) need two references each, so they are added by editing the YAML.
 NEW_NOTIFIER_REFERENCE = {
@@ -1280,7 +1305,9 @@ def create_app(
                 if isinstance(entry, dict) and identifier in (entry.get("ids") or ()):
                     body = _queued_advisory(label, entry)
                     return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
-        raise HTTPException(status_code=404, detail=f"no advisory {identifier} is recorded")
+        # The detail is display text and a JSON encoder cannot write a raw surrogate, so it is escaped here;
+        # the identifier itself was already compared exactly above.
+        raise HTTPException(status_code=404, detail=f"no advisory {_response_text(identifier)} is recorded")
 
     @app.get("/parked", response_class=HTMLResponse)
     def parked_page(request: Request):
@@ -1622,6 +1649,10 @@ def create_app(
             value = first(form, f"new:{key}").strip()
             if value:
                 entry[key] = value
+        for key in SOURCE_UNIVERSAL_KEYS:
+            value = first(form, f"new:{key}").strip()
+            if value:
+                entry[key] = value
         identifier = first(form, "new:id").strip()
         if not identifier and "url" in entry:
             identifier = derive_source_id(entry["url"], kind, effective_plugin_ids(saved_overlay()[0]))
@@ -1639,7 +1670,10 @@ def create_app(
 
     def new_source_used(form: dict[str, list[str]]) -> bool:
         """Whether anything was typed into the "new source" block at all."""
-        return any(first(form, name).strip() for name in ("new:id", *(f"new:{key}" for key in SOURCE_FORM_KEYS)))
+        return any(
+            first(form, name).strip()
+            for name in ("new:id", *(f"new:{key}" for key in (*SOURCE_FORM_KEYS, *SOURCE_UNIVERSAL_KEYS)))
+        )
 
     def added_source_fields(entry: dict, spec) -> str:
         """The editable keys of one added source, as inline inputs.
@@ -1693,6 +1727,9 @@ def create_app(
             f"aria-label='Enabled {esc(identifier)}'></td>"
             f"<td><input type='text' name='tag:{esc(identifier)}' value='{esc(str(entry.get('tag') or ''))}' "
             f"aria-label='Watch tag for {esc(identifier)}'></td>"
+            f"<td><input type='text' name='interval:{esc(identifier)}' "
+            f"value='{esc(str(entry.get('interval') or ''))}' placeholder='15m' "
+            f"aria-label='Poll interval for {esc(identifier)}'></td>"
             f"{editable}{remove}"
             f"<td><button class='btn' type='submit' formaction='/config/sources/probe' "
             f"name='id' value='{esc(identifier)}' title='fetches the saved values, not unsaved edits'>"
@@ -1716,7 +1753,12 @@ def create_app(
                 readers.setdefault(key, []).append(spec.kind)
                 if key in spec.secret_keys:
                     secret.add(key)
-        return "".join(
+        universal = "".join(
+            f"<label>{esc(key)} <span class='muted small'>(every kind, optional)</span>"
+            f"<input type='text' name='new:{esc(key)}' placeholder='15m'></label>"
+            for key in SOURCE_UNIVERSAL_KEYS
+        )
+        return universal + "".join(
             f"<label>{esc(key)} <span class='muted small'>({esc(', '.join(sorted(readers[key])))})</span>"
             f"<input type='text' name='new:{esc(key)}'{' placeholder=${{NAME}}' if key in secret else ''}></label>"
             for key in sorted(readers)
@@ -2024,12 +2066,14 @@ def create_app(
             "measured: an advisory with no score never satisfies one.</p>"
         )
 
-    def commit_overlay(request: Request, overlay: dict):
+    def commit_overlay(request: Request, overlay: dict, *, notice: str = ""):
         """Validate, build, save and apply one overlay; nothing is written when any step refuses.
 
         Building the plugins here is what makes a saved overlay safe: it is the same build the next
         start and the reload perform, so a value that would fail then is refused now, while the live
-        configuration and the file on disk are still untouched.
+        configuration and the file on disk are still untouched. ``notice`` turns a save that has something
+        to report -- an OPML import counted what it added and skipped -- into a rendered page; every other
+        caller keeps the redirect that leaves a reloadable form.
         """
         if runtime.config_path is None or runtime.overlay_path is None:
             return page(
@@ -2075,6 +2119,13 @@ def create_app(
                 "settings revision %d saved but not applied: %s",
                 stored["revision"],
                 pipeline.redact(str(exc), values),
+            )
+        if notice:
+            return page(
+                "Sources imported",
+                notice + "<p><a href='/config'>Back to configuration</a></p>",
+                active="/config",
+                actions=sign_out_form(request),
             )
         return RedirectResponse(f"/config?saved={stored['revision']}", status_code=303)
 
@@ -2207,7 +2258,7 @@ def create_app(
             # field, even when the box is unchecked and the text is cleared. The probe result page's "Add this
             # source" form carries only the new block, and reconciling from it would read every row's absence as
             # a deliberate disable and clear.
-            whole = any(name.startswith(("enabled:", "tag:", "remove:", "added_")) for name in form)
+            whole = any(name.startswith(("enabled:", "tag:", "interval:", "remove:", "added_")) for name in form)
             owned = added_source_ids(overlay)
             if whole:
                 changes = {}
@@ -2217,12 +2268,21 @@ def create_app(
                     identifier = entry["id"]
                     if identifier in owned:
                         continue  # an added source is stored whole, below; two owners for one row would drift
-                    # The row owns enablement and the watch tag; a threshold block saved by the thresholds form
-                    # lives in the same entry and must survive this one, or editing a checkbox would silently
-                    # drop the source's own numbers.
+                    # The row owns enablement, the watch tag and the polling interval; a threshold block saved
+                    # by the thresholds form lives in the same entry and must survive this one, or editing a
+                    # checkbox would silently drop the source's own numbers.
                     change = dict((overlay.get("sources") or {}).get(identifier) or {})
                     change["enabled"] = f"enabled:{identifier}" in form
                     change["tag"] = first(form, f"tag:{identifier}").strip()
+                    interval = first(form, f"interval:{identifier}").strip()
+                    if interval:
+                        # An empty field means "use the YAML value", so the key is omitted rather than stored
+                        # empty: a rebuilt overlay that omits it restores whatever the file says.
+                        change["interval"] = interval
+                    else:
+                        # The form is authoritative for this field: clearing it must stop overriding the file,
+                        # not leave the previous save in force.
+                        change.pop("interval", None)
                     changes[identifier] = change
                 overlay["sources"] = changes
             added: list[dict] = []
@@ -2244,6 +2304,11 @@ def create_app(
                         updated["tag"] = tag
                     else:
                         updated.pop("tag", None)
+                    interval = first(form, f"interval:{identifier}").strip()
+                    if interval:
+                        updated["interval"] = interval
+                    else:
+                        updated.pop("interval", None)
                     spec = source_spec(updated)
                     if spec is not None:
                         for key in source_keys(spec):
@@ -2294,6 +2359,97 @@ def create_app(
             else:
                 overlay.pop("sources_added", None)
             return commit_overlay(request, overlay)
+
+    @app.post("/config/sources/opml", dependencies=[Depends(require_csrf)])
+    def import_opml(request: Request):
+        """Add every feed a pasted OPML document names as an ``rss`` source.
+
+        The destination check a single add performs is run on every feed *before* anything is written, so one
+        unusable feed refuses the batch rather than half-importing it. A feed whose URL is already configured,
+        or that appears twice in the document, is skipped and counted. Only the URL and the type are stored:
+        the catalogue's id derivation reads the URL host, and an OPML title is a label, not a watch tag.
+        """
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        form = form_body(request)
+        with SETTINGS_LOCK:
+            overlay, _ = saved_overlay()
+            base, _ = form_document(overlay)
+            stale = stale_form(request, form, base)
+            if stale is not None:
+                return stale
+            back = "<p><a href='/config'>Back to configuration</a></p>"
+            try:
+                importable = feeds.parse_opml(first(form, "opml").encode("utf-8"))
+            except feeds.FeedError as exc:
+                return page(
+                    "Not added",
+                    _notice(f"The OPML document could not be read: {esc(str(exc))}", "critical") + back,
+                    active="/config",
+                    actions=sign_out_form(request),
+                    status_code=400,
+                )
+            if not importable:
+                return page(
+                    "Not added",
+                    _notice("The OPML document contains no feed, so nothing was added.", "warning") + back,
+                    active="/config",
+                    actions=sign_out_form(request),
+                    status_code=400,
+                )
+            values = list(secret_values(runtime.cfg))
+            # Expanded so a configured ``url: ${FEED_URL}`` is recognised as the same feed the document names.
+            configured = {
+                expand_text(entry.get("url")).strip()
+                for entry in saved_source_entries(overlay)
+                if isinstance(entry.get("url"), str)
+            }
+            taken = effective_plugin_ids(overlay)
+            seen: set[str] = set()
+            candidates: list[dict] = []
+            skipped: list[str] = []
+            for title, xml_url, _html_url in importable:
+                # An imported URL may be a ``${NAME}`` reference. Compare what it resolves to, or the same
+                # subscription is added twice: once literal in the YAML and once by reference here. The entry
+                # still stores the reference as written, exactly as a single add would.
+                effective = expand_text(xml_url).strip()
+                # A second occurrence in one document is the same subscription, not a second source; the same
+                # URL already configured must not gain a suffixed id and be polled twice.
+                if effective in seen or effective in configured:
+                    skipped.append(
+                        pipeline.redact(title, values).strip() if title else redacted_origin(xml_url, values)
+                    )
+                    continue
+                seen.add(effective)
+                entry = {"id": derive_source_id(xml_url, "rss", taken), "type": "rss", "url": xml_url}
+                problem = added_source_error(entry)
+                if problem:
+                    return page(
+                        "Not added",
+                        _notice(
+                            f"{esc(redacted_origin(xml_url, values))}: {esc(problem)}; nothing was added.", "critical"
+                        )
+                        + back,
+                        active="/config",
+                        actions=sign_out_form(request),
+                        status_code=400,
+                    )
+                taken.add(entry["id"])
+                candidates.append(entry)
+            report = f"added {len(candidates)}, skipped {len(skipped)}"
+            report += " — already configured: " + (", ".join(dict.fromkeys(esc(item) for item in skipped)) or "none")
+            notice = _notice(report + ".", "ok" if candidates else "warning")
+            if not candidates:
+                return page(
+                    "Sources imported",
+                    notice + back,
+                    active="/config",
+                    actions=sign_out_form(request),
+                )
+            overlay["sources_added"] = [
+                entry for entry in (overlay.get("sources_added") or []) if isinstance(entry, dict)
+            ] + candidates
+            return commit_overlay(request, overlay, notice=notice)
 
     @app.post("/config/sources/probe", dependencies=[Depends(require_csrf)])
     def probe_config_source(request: Request):
@@ -2675,13 +2831,15 @@ def create_app(
             "<a class='btn btn-quiet' href='/thresholds'>Preview a decision</a></form>"
             "<h2><span class='sec-num'>03</span>Sources</h2>"
             "<p class='muted small'>A source defined in the YAML keeps its keys there: this page edits its enable "
-            "flag and its watch tag, and can test it. A source added here is stored whole in the settings overlay, "
-            "so it needs no edit to a read-only config mount. The watch tag scopes a changedetection.io poll and "
-            "is ignored by the other kinds.</p>"
+            "flag, its watch tag and its poll interval, and can test it. A source added here is stored whole in "
+            "the settings overlay, so it needs no edit to a read-only config mount. The watch tag scopes a "
+            "changedetection.io poll and is ignored by the other kinds. An interval of 30m thins this source's "
+            "polling; an empty field uses the global poll interval, and alerts are never delayed by it.</p>"
             f'<form method="post" action="/config/sources">{csrf}{fingerprint_field}'
             "<div class='scroll'><table><tr><th scope='col'>Source</th>"
             "<th scope='col' class='narrow'>Enabled</th>"
             "<th scope='col' class='tag-col'>Watch tag</th>"
+            "<th scope='col' class='narrow'>Interval</th>"
             "<th scope='col'>Keys</th>"
             "<th scope='col' class='narrow'>Remove</th>"
             "<th scope='col' class='narrow'>Test</th>"
@@ -2697,6 +2855,14 @@ def create_app(
             "<button class='btn btn-primary'>Save sources</button> "
             "<button class='btn' type='submit' formaction='/config/sources/probe'>Test the new source</button>"
             "</form>"
+            "<h3>Import OPML</h3>"
+            f'<form method="post" action="/config/sources/opml">{csrf}{fingerprint_field}'
+            "<label>Paste an OPML subscription list"
+            "<textarea name='opml' rows='6'></textarea></label>"
+            "<p class='muted small'>Every outline with an <code>xmlUrl</code> becomes an <code>rss</code> source. "
+            "A feed already configured, or repeated in the document, is skipped and counted. A feed URL is "
+            "checked exactly as a single add is, and nothing is written when the document cannot be read.</p>"
+            "<button class='btn'>Add feeds from OPML</button></form>"
             "<h2><span class='sec-num'>04</span>Notifiers</h2>"
             f'<form method="post" action="/config/notifiers">{csrf}{fingerprint_field}'
             f"{notifier_form_entries(notifiers)}"
@@ -3222,8 +3388,11 @@ def create_app(
             body = await _body(request, WEBHOOK_BODY_LIMIT)
         except BodyTooLarge:
             return JSONResponse({"error": "payload too large"}, status_code=413)
+        text = json_text(body) if body else "null"
+        if text is None:
+            return JSONResponse({"error": "payload is not JSON"}, status_code=400)
         try:
-            payload = json.loads(body or b"null")
+            payload = json.loads(text)
         except ValueError:
             return JSONResponse({"error": "payload is not JSON"}, status_code=400)
         entry = webhook_item_from_payload(payload)
@@ -3252,12 +3421,18 @@ def create_app(
             return JSONResponse(
                 {"error": "inbox full, retry after the next pass"}, status_code=429, headers={"Retry-After": "60"}
             )
-        return JSONResponse({"queued": entry["guid"]})
+        # ``JSONResponse`` encodes with ``ensure_ascii=False``, so a guid that is not a Unicode scalar value
+        # failed to encode after the entry was already persisted: the sender got a 500 for an accepted request.
+        # Escaping it the way /api/state does preserves the value and answers 2xx.
+        return Response(json.dumps({"queued": entry["guid"]}, ensure_ascii=True), media_type="application/json")
 
-    @app.get("/api/state", response_class=JSONResponse)
+    @app.get("/api/state")
     def api_state(request: Request):
         if not require_auth(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return JSONResponse(load_state())
+        # ``ensure_ascii`` escapes a legacy identity that is not a Unicode scalar value instead of failing to
+        # encode the whole response, so one bad record in state cannot take the endpoint down. The values are
+        # preserved, only their JSON spelling changes.
+        return Response(json.dumps(load_state(), ensure_ascii=True), media_type="application/json")
 
     return app

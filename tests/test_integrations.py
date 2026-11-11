@@ -74,6 +74,17 @@ def test_changedetection_source_emits_only_new_changes():
     assert second.items[0].link == "https://shop.example.com/item"
 
 
+def test_a_changedetection_response_that_is_not_valid_utf8_is_refused():
+    """A watch uuid is part of an item identity; raw WTF-8 would be rewritten by the next state save."""
+    source = ChangedetectionSource("cd", "https://cd.example.com", "KEY")
+
+    def http(method, url, headers, body):
+        return 200, {}, b'{"' + b"\xed\xa0\x80\xed\xb0\x80" + b'": {"last_changed": 1}}'
+
+    with pytest.raises(RuntimeError, match="not valid UTF-8"):
+        source.fetch(http, {})
+
+
 def test_webhook_payload_mapping():
     entry = webhook_item_from_payload(
         {"watch_uuid": "u1", "watch_title": "Shop", "watch_url": "https://x.example", "diff": "price changed"}
@@ -109,6 +120,42 @@ def test_webhook_intake_and_source_roundtrip(tmp_path):
     window = source.fetch(lambda *a: (0, {}, b""), state)
     assert len(window.items) == 1
     assert window.items[0].explicit == ("CVE-2026-7777",)
+
+
+def test_a_webhook_guid_that_cannot_be_encoded_is_still_accepted(tmp_path):
+    """The entry is persisted first; its guid must not then turn an accepted request into a 500."""
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_WEBHOOK_SECRET": "s3cret"}
+    app = create_app(Runtime.build(cfg_path, environment), environment)
+    client = TestClient(app)
+    # An escaped unpaired surrogate is valid JSON but not a Unicode scalar value, so a response that encodes it
+    # verbatim fails after the entry is already on disk. The sender escapes JSON by default, as here.
+    response = client.post(
+        "/webhooks/wh",
+        content=b'{"title": "Vendor advisory", "guid": "\\ud800legacy"}',
+        headers={"Authorization": "Bearer s3cret", "Content-Type": "application/json"},
+    )
+    assert response.status_code == 200
+    assert response.json()["queued"] == "wh:\ud800legacy"
+    state = json.loads((tmp_path / "state.json").read_text())
+    assert state["webhook_inbox"]["wh"][0]["guid"] == "wh:\ud800legacy"
+
+
+def test_a_webhook_body_that_is_not_valid_utf8_is_refused(tmp_path):
+    """The guid is an identity; ``json.loads`` on bytes would accept WTF-8 that a save then rewrites."""
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_WEBHOOK_SECRET": "s3cret"}
+    app = create_app(Runtime.build(cfg_path, environment), environment)
+    client = TestClient(app)
+    response = client.post(
+        "/webhooks/wh",
+        content=b'{"title": "Vendor advisory", "guid": "' + b"\xed\xa0\x80\xed\xb0\x80" + b'"}',
+        headers={"Authorization": "Bearer s3cret", "Content-Type": "application/json"},
+    )
+    assert response.status_code == 400
+    assert not (tmp_path / "state.json").exists(), "a refused intake writes nothing"
 
 
 def test_notifier_payload_shapes():
@@ -379,3 +426,42 @@ def test_a_partial_smtp_refusal_is_not_a_delivery():
         )
     finally:
         smtplib.SMTP = original
+
+
+def test_a_webhook_guid_carrying_a_newline_is_released_and_sent_once(tmp_path):
+    """The inbox is released on the identity classification records, so the same entry is not re-sent."""
+    from advisory_radar import core, pipeline
+    from advisory_radar.config import load_config
+    from advisory_radar.sources import WebhookSource
+    from advisory_radar.state import load_state_document
+
+    path = tmp_path / "c.yml"
+    path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
+    cfg = load_config(path, {})
+    state = core.new_state()
+    state["webhook_inbox"] = {
+        "wh": [{"guid": "a\nb", "title": "routine maintenance", "summary": "", "link": "https://v.example/b"}]
+    }
+    core.save_state(cfg.state_path, state)
+
+    sent = []
+
+    class Recorder:
+        id = "rec"
+
+        def send(self, entry, http):
+            sent.append(entry)
+            return 200
+
+    # Two passes: a second delivery would mean the inbox never recognised the claim it recorded.
+    for _ in range(2):
+        pipeline.run_pass(
+            cfg,
+            [WebhookSource("wh")],
+            [Recorder()],
+            http=lambda *a: (404, {}, b""),
+            clock=lambda: 1_700_000_000.0,
+            sleep=lambda s: None,
+        )
+    assert not (load_state_document(cfg.state_path, core.STATE_SCHEMA, "state").get("webhook_inbox") or {}).get("wh")
+    assert len(sent) == 1, "the same inbox entry must not be classified and sent on every pass"

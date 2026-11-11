@@ -1,7 +1,7 @@
 # advisory-radar
 
 Self-hostable security advisory watcher. Point it at the sources you care about
-(vendor RSS/Atom feeds, FreshRSS, changedetection.io, generic webhooks), let it
+(vendor RSS/Atom/JSON feeds, FreshRSS, changedetection.io, generic webhooks), let it
 enrich every finding with CVE.org / NVD CVSS, EPSS, CISA KEV and OSV, decide a
 severity per CVE, and deliver one deduplicated alert per new advisory to the
 channels you configure (Discord, Matrix, ntfy, Gotify, Apprise, generic webhook,
@@ -188,7 +188,9 @@ case-insensitive text search (identifier and title) and an inclusive UTC day ran
 filter lives in the URL query string, so a reload or a shared link keeps it. The list is
 paged with a keyset cursor (50 rows, newest first by time then identifier) instead of a
 fixed cap, and each row links to the advisory's page (the identifier is encoded in the path,
-so a stored GUID or URL containing slashes still opens). `/advisories/<id>` shows the stored
+so a stored GUID or URL containing slashes still opens). An advisory's identity is kept
+exactly as the publisher sent it — only its log and display spelling is escaped — because
+transforming an identity can merge two advisories into one. `/advisories/<id>` shows the stored
 classification — tag, source, title, the identifiers and CVEs, whether any was KEV-only,
 the watchlist products the item matched, the per-CVE levels and CVSS, and the notifiers
 that accepted the message — for a delivered message, a pending one or a parked one. It never
@@ -204,8 +206,8 @@ paging.
 ### Settings without a restart
 
 The `/config` page changes eight things without editing the YAML or restarting the
-container: `notifiers`, each source's `enabled` flag, watch `tag` and threshold block, the
-sources the overlay itself adds, `poll_interval`, `hidden_source_hosts`, the routing
+container: `notifiers`, each source's `enabled` flag, watch `tag`, threshold block and poll
+`interval`, the sources the overlay itself adds, `poll_interval`, `hidden_source_hosts`, the routing
 `routes`/`default` block, and the risk thresholds. The notifier form manages
 the whole list — that is how a channel
 is added, edited or disabled — and while the overlay holds a notifier list, that list
@@ -253,8 +255,8 @@ returns to the YAML: the empty overlay is applied as revision 0.
 
 A source that knows its own page size (a FreshRSS export) reports a truncated
 window, and the pass fails loudly when a full window shares nothing with the
-previous one — that is how silently missed advisories surface. An RSS/Atom feed
-is bounded by its publisher, and the changedetection.io source reports no
+previous one — that is how silently missed advisories surface. An `rss` source is
+bounded by its publisher, and the changedetection.io source reports no
 truncation at all, so a skipped item there cannot be detected; poll those sources
 often enough that rotation is unlikely.
 
@@ -267,7 +269,7 @@ turns critical, and never re-sends what you already received.
 
 ## Features
 
-- Configurable source plugins: RSS/Atom, FreshRSS (GReader API), changedetection.io (API poll + inbound webhook), generic inbound webhook; vendor enrichment for Debian DSA, php.net ChangeLog, Node.js security blog, Adobe APSB bulletins
+- Configurable source plugins: RSS/Atom/JSON Feed, FreshRSS (GReader API), changedetection.io (API poll + inbound webhook), generic inbound webhook; vendor enrichment for Debian DSA, php.net ChangeLog, Node.js security blog, Adobe APSB bulletins
 - Enrichment plugins: CVE.org, NVD, FIRST EPSS, CISA KEV, OSV, Debian security tracker
 - Notifier plugins: Discord webhook, Matrix (Hookshot), ntfy, Gotify, Apprise, generic webhook, SMTP
 - Severity decision per CVE with re-evaluation window and one escalation per level; the
@@ -326,6 +328,37 @@ line per enabled source — the last attempt, the last success, the entries in t
 window and the error that attempt reported — with the same numbers exported as
 metrics (see `docs/deployment.md`).
 
+An `rss` source is one URL and needs no format key. RSS 2.0, Atom, RSS 1.0 (RDF) and
+JSON Feed are recognised from the document itself, and JSON Feed is told apart from the
+FreshRSS GReader export by its `version` URL rather than by having an items list. A URL
+that answers an HTML page instead is followed through that page's
+`<link rel="alternate">` autodiscovery exactly once; the page is not crawled, and no
+validator is stored for it, because a page's `ETag` says nothing about the feed behind
+it. Conditional GET still applies to a feed that answers directly. The advertised feed
+is held to two rules, both checked **before** it is fetched and neither relaxed by
+`allow_private_sources`: it must share the page's own origin — the same scheme, host and
+port — and it must not resolve to a loopback or private address. The first is the
+containment: the page's own host is the one the operator already chose, so discovery
+cannot redirect the reader to a host an attacker picked, and a feed genuinely served from
+another host is configured directly. The second keeps the existing guard rail against a
+router page or the metadata service, because the page — not the operator — chose that URL.
+
+Every source may carry `interval: 30m` (the same `<n><s|m|h>` spelling as
+`poll_interval`) to be fetched at its own pace; without one it follows the global
+interval. The interval throttles the fetch only: re-evaluation, escalation and delivery
+still run for every source on every pass, so a slow feed never delays an alert. A fetch
+that fails is retried on the next pass instead of waiting out the interval, so one
+transient error cannot become an outage. `interval` is accepted by every kind in
+addition to the keys in the table.
+
+A pasted OPML 2.0 subscription list is imported with **Add feeds from OPML** in the same
+section: every `<outline>` with an `xmlUrl` becomes an `rss` source, folders are
+descended into, and a feed already configured or repeated in the document is skipped and
+counted. Each URL is checked exactly as a single add is, and a document that cannot be
+read, holds no feed, or names one unusable address is refused without writing anything.
+The outline title is not stored: the existing URL-host id derivation and the watch tag
+keep the meanings they already have.
+
 A source added on that page may not point into a private network: the form refuses
 an address that resolves to loopback or to an internal range, unless the YAML sets
 `allow_private_sources: true`. A configured YAML source is never subject to the
@@ -356,17 +389,18 @@ from.
 
 | Kind | Summary | Required keys | Optional keys |
 |---|---|---|---|
-| `rss` | Any RSS 2.0 or Atom feed URL, read in one conditional GET. | `url` | `tag`, `enabled` |
+| `rss` | Any RSS 2.0, Atom, RSS 1.0 or JSON Feed URL, or a page that advertises one, read in one conditional GET. | `url` | `tag`, `enabled` |
 | `freshrss` | A FreshRSS shared query, read through its GReader JSON export. | `url`, `token` | `user`, `enabled` |
 | `changedetection` | Poll a changedetection.io instance; every watch whose page changed becomes one item. | `url`, `api_key` | `tag`, `enabled` |
 | `webhook` | Items pushed to this instance's `/webhooks/<id>` endpoint, read from the state inbox. | — | `tag`, `enabled` |
 
 An accepted key is not always read by every kind: `tag` scopes a
 changedetection.io poll to one watch tag and the other kinds ignore it, so the
-column is only meaningful there; `user` names the FreshRSS account; and
-`enabled: false` keeps an entry in the file without building it. An RSS/Atom feed
-and a changedetection.io poll return the whole response, so the FreshRSS GReader
-export is the only built-in that reports a truncated window.
+column is only meaningful there; `user` names the FreshRSS account; `interval`
+thins that source's polling; and `enabled: false` keeps an entry in the file
+without building it. An RSS/Atom/JSON Feed and a changedetection.io poll return
+the whole response, so the FreshRSS GReader export is the only built-in that
+reports a truncated window.
 
 ## Review and merge automation
 

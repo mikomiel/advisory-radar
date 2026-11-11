@@ -50,9 +50,10 @@ def test_every_builder_has_exactly_one_spec():
 
 def test_config_allows_the_registry_keys():
     documented = {key for spec in SOURCE_SPECS.values() for key in (*spec.required, *spec.optional)}
-    # ``thresholds`` is structural like ``enabled``: it never reaches a builder, and the catalogue owns only
-    # the keys a kind reads.
-    assert {"id", "type", "enabled", "thresholds"} | documented == config._SOURCE_KEYS
+    # ``thresholds`` and ``interval`` are structural like ``enabled``: neither ever reaches a builder, and the
+    # catalogue owns only the keys a kind reads. ``thresholds`` changes how an item is judged and ``interval``
+    # how often its source is polled; both apply to every kind, so no spec declares either.
+    assert {"id", "type", "enabled", "thresholds", "interval"} | documented == config._SOURCE_KEYS
 
 
 def test_every_example_validates_and_builds(tmp_path):
