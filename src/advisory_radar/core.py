@@ -352,11 +352,13 @@ def matched_products(item: Item, policy: Policy) -> tuple[str, ...]:
     return tuple(sorted(product.id for product in policy.products if _matches_product(text, host, product)))
 
 
-def passes_filter(item: Item, policy: Policy) -> bool:
-    """Debian publishes every package; nginx.org mixes news with security notes.
+def filter_reason(item: Item, policy: Policy) -> str:
+    """Why this item is outside the configured scope, or ``""`` when it is inside it.
 
-    A configured watchlist is a scope, not a label: an item that matches no configured product is
-    dropped, and an item that matches an excluded product is dropped even without a product list.
+    Debian publishes every package; nginx.org mixes news with security notes. A configured watchlist is a
+    scope, not a label: an item that matches no configured product is dropped, and an item that matches an
+    excluded product is dropped even without a product list. The one implementation of the decision, so the
+    page that explains a scope cannot disagree with the pass that applies it.
     """
     host = _host(item.link)
     text = f"{item.title} {item.summary} {item.source_title}"
@@ -366,19 +368,28 @@ def passes_filter(item: Item, policy: Policy) -> bool:
         if product is None:  # an exclusion may name a product the scope does not define
             product = Product(excluded, (), (), False)
         if _matches_product(text, host, product):
-            return False
+            return "excluded-product"
     if policy.products and not matched_products(item, policy):
-        return False
+        return "no-product-match"
     if host == "lists.debian.org" or item.title.startswith("DSA-"):
         match = DSA_RE.match(item.title)
         if not match:
-            return False
+            return "debian-package"
         package = match.group(2).lower()
-        return any(fnmatch.fnmatchcase(package, pattern) for pattern in policy.debian_source_packages)
+        if not any(fnmatch.fnmatchcase(package, pattern) for pattern in policy.debian_source_packages):
+            return "debian-package"
+        return ""
     if host == "nginx.org" or host.endswith(".nginx.org"):
         text = f"{item.title} {item.summary}".lower()
-        return any(keyword in text for keyword in NGINX_KEYWORDS)
-    return True
+        if not any(keyword in text for keyword in NGINX_KEYWORDS):
+            return "nginx-keyword"
+        return ""
+    return ""
+
+
+def passes_filter(item: Item, policy: Policy) -> bool:
+    """Whether the item is inside the configured scope; the decision itself is :func:`filter_reason`."""
+    return filter_reason(item, policy) == ""
 
 
 # --------------------------------------------------------------------------
