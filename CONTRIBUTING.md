@@ -64,9 +64,9 @@ separate change that must go through the guard and its tests.
   mocks where practical.
 - A new source plugin takes four edits: a builder (and its `SOURCE_BUILDERS`
   entry) in `advisory_radar/sources.py`, one `SourceSpec` in
-  `advisory_radar/catalogue.py`, one row in the README `## Sources` table, and a
+  `advisory_radar/catalogue.py`, one row in the `docs/sources.md` catalogue table, and a
   fixture test in `tests/`. The config key allowlist, the `/sources` page and
-  `advisory-radar sources list` are derived from the catalogue; the README row is
+  `advisory-radar sources list` are derived from the catalogue; the docs row is
   written by hand, and `tests/test_catalogue.py` fails if any kind, summary or key
   differs, so the registry stays the one owner of those facts.
   `advisory-radar sources test <id>` fetches a configured source and prints its
