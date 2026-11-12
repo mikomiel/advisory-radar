@@ -231,7 +231,7 @@ def _run_pass(
         previous = stored_windows.get(source.id)
         # Only a source that knows its own page size can prove it returned a complete window (a FreshRSS
         # export, a changedetection watch). An RSS/Atom feed is bounded by its publisher, so a rotation
-        # there is undetectable; see README, "Sources".
+        # there is undetectable; see docs/configuration.md#gap-detection.
         # An empty previous window proves nothing: the source had no entries, so "no overlap" is expected and a
         # gap there would reject every later full window forever.
         if window.truncated and previous and not set(previous) & {item.guid for item in window.items}:
