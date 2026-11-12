@@ -1333,7 +1333,7 @@ def _source_value(source_title: str, source_url: str, feed_host: str) -> str:
 #: RFC3339 date-time grammar: seconds are required, the offset is ``Z`` or numeric, and RFC3339 allows a
 #: lower-case ``t``/``z``. ``datetime.fromisoformat`` alone is too permissive -- it takes an arbitrary
 #: single-character separator and a date-time without seconds -- so the shape is checked before the values are.
-_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})")
+_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-](?:[01]\d|2[0-3]):[0-5]\d)")
 
 
 def _is_rfc3339(value: object) -> bool:
@@ -1341,7 +1341,8 @@ def _is_rfc3339(value: object) -> bool:
 
     The grammar is enforced first and the calendar values are then validated by the parser, because
     ``fromisoformat`` accepts far more than RFC3339: a bare date, an offset-less date-time, an arbitrary
-    single-character separator or a missing seconds field would all pass it. A caller reads a lifecycle field
+    single-character separator, a missing seconds field or an out-of-range offset minute would all pass it.
+    A caller reads a lifecycle field
     with this, where a non-empty but malformed spelling must not be mistaken for the fact: a value this parser
     rejects is not evidence of a withdrawal.
     """

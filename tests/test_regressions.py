@@ -2844,6 +2844,8 @@ def test_a_withdrawn_osv_record_keeps_its_lifecycle_without_current_severity():
         "2026-01-02T25:00:00Z",  # an impossible hour
         "2026-01-02X00:00:00Z",  # an arbitrary separator: ISO 8601 accepts it, RFC3339 does not
         "2026-01-02T00:00+00:00",  # missing seconds: ISO 8601 accepts it, RFC3339 does not
+        "2026-01-02T00:00:00+00:60",  # offset minute out of range: the parser would normalise it
+        "2026-01-02T00:00:00+24:00",  # offset hour out of range
     ):
         intel = _osv_intel({**withdrawn, "withdrawn": malformed})
         first = intel.ghsa(ghsa)
