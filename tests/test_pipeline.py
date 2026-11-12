@@ -156,8 +156,68 @@ def test_old_items_seeded_not_alerted(tmp_path):
     assert code == 0
     assert notifier.sent == []
     state = json.loads((tmp_path / "state.json").read_text())
-    # first run seeds old items as delivered (history, not news); later passes mark them backlog
-    assert state["seen"]["CVE-2026-4242"]["outcome"] == "delivered"
+    # A bootstrap records history, it does not deliver it: the outcome is backlog, never "delivered".
+    assert state["seen"]["CVE-2026-4242"]["outcome"] == "backlog"
+
+
+def test_seeding_a_second_source_preserves_existing_records_and_claims_no_delivery(tmp_path):
+    """A bootstrap must not rewrite what earlier passes recorded, nor claim it sent anything (#69)."""
+    cfg = _sources_config(
+        tmp_path,
+        "  - id: s1\n    type: rss\n    url: https://feeds.example.com/a\n",
+        "  - id: s2\n    type: rss\n    url: https://feeds.example.com/b\n",
+    )
+    old = NOW - 30 * 86400  # well outside the seed window, so every item below is history
+    bodies = {
+        "https://feeds.example.com/a": _rss_document(),
+        "https://feeds.example.com/b": _rss_document(
+            _rss_item("Historical advisory CVE-2026-1001", "old-1", old),
+            _rss_item("Historical advisory CVE-2026-1002", "old-2", old),
+            _rss_item("Historical advisory CVE-2026-1003", "old-3", old),
+            _rss_item("Historical advisory CVE-2026-1009", "old-9", old),
+        ),
+    }
+    kev = {"catalogVersion": "1", "vulnerabilities": [{"cveID": "CVE-2020-0001"}]}
+
+    def http(method, url, headers, payload):
+        if url in bodies:
+            return 200, {}, bodies[url]
+        if _is_kev_request(url):
+            return 200, {}, json.dumps(kev).encode()
+        return 404, {}, b""
+
+    state = core.new_state()
+    state["seeded"] = {"s1": True}  # s1 bootstrapped on an earlier pass; only s2 seeds here
+    state["seen"] = {
+        "CVE-2026-1001": {"at": NOW - 5000, "outcome": "suppressed"},
+        "CVE-2026-1002": {"at": NOW - 4000, "outcome": "dropped", "delivery": "snap-2"},
+        "CVE-2026-1003": {"at": NOW - 3000, "outcome": "delivered", "delivery": "snap-1"},
+    }
+    state["deliveries"] = {"snap-1": {"tag": "critical", "ids": ["CVE-2026-1003"]}}
+    cfg.store().save(state)
+
+    notifier = FakeNotifier(200)
+    assert (
+        pipeline.run_pass(
+            cfg,
+            [RssSource("s1", "https://feeds.example.com/a"), RssSource("s2", "https://feeds.example.com/b")],
+            [notifier],
+            http=http,
+            clock=lambda: float(NOW),
+            sleep=lambda seconds: None,
+        )
+        == 0
+    )
+    stored = cfg.store().load()
+    assert stored["seen"]["CVE-2026-1001"] == {"at": NOW - 5000, "outcome": "suppressed"}
+    assert stored["seen"]["CVE-2026-1002"] == {"at": NOW - 4000, "outcome": "dropped", "delivery": "snap-2"}
+    assert stored["seen"]["CVE-2026-1003"] == {"at": NOW - 3000, "outcome": "delivered", "delivery": "snap-1"}
+    assert stored["seen"]["CVE-2026-1009"] == {"at": NOW, "outcome": "backlog"}, (
+        "a bootstrap record states history, it must not claim a notification was sent"
+    )
+    assert "delivery" not in stored["seen"]["CVE-2026-1009"], "nothing was delivered for a bootstrap record"
+    assert stored["deliveries"] == {"snap-1": {"tag": "critical", "ids": ["CVE-2026-1003"]}}
+    assert notifier.sent == [], "seeded history is never delivered"
 
 
 def test_source_fault_fails_pass_but_keeps_state(tmp_path):

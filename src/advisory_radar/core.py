@@ -2817,7 +2817,13 @@ def _audit_ids(entry: dict) -> str:
 
 
 def seed(state: dict, items: Sequence[Item], now: int) -> list[Item]:
-    """First run: everything older than the seed window is marked delivered; the rest is returned to be queued."""
+    """First run: everything older than the seed window is recorded as ``backlog``; the rest is returned to be queued.
+
+    A bootstrap reveals history, it never delivers it, so a fresh record says ``backlog`` -- the same outcome an
+    old item seen for the first time gets during classification -- and carries no delivery reference. An
+    identifier already recorded keeps its first record, including when another source's history names it: the
+    first record wins, as it does for every other write to ``seen``.
+    """
     recent = []
     for item in items:
         # An undated item is unknown, not old: a valid RSS feed may omit dates, and consuming its current
@@ -2826,5 +2832,5 @@ def seed(state: dict, items: Sequence[Item], now: int) -> list[Item]:
             recent.append(item)
             continue
         for identifier in item.explicit or (f"src:{item.guid}",):
-            state["seen"][identifier] = {"at": now, "outcome": "delivered"}
+            state["seen"].setdefault(identifier, {"at": now, "outcome": "backlog"})
     return recent

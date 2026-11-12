@@ -328,7 +328,7 @@ def _run_pass(
             candidates = core.seed(state, items, now)
             seeded[source.id] = True
             LOG.info(
-                "first run on %s: %d older item(s) marked delivered, %d recent item(s) queued",
+                "first run on %s: %d older item(s) recorded as backlog, %d recent item(s) queued",
                 source.id,
                 len(items) - len(candidates),
                 len(candidates),
