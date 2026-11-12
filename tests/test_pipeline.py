@@ -6,6 +6,7 @@ import json
 import logging
 import sys
 import types
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -1047,6 +1048,11 @@ def test_the_default_scope_is_in_force_beside_a_state_path_that_cannot_be_walked
 # --- classification admission during quiet hours --------------------------------------------------
 
 
+def _is_kev_request(url: str) -> bool:
+    """Whether this is the product's CISA KEV request, matched on the parsed host rather than a substring."""
+    return urllib.parse.urlsplit(url).hostname == "www.cisa.gov"
+
+
 def _rss_item(title: str, guid: str, published: int) -> str:
     from email.utils import formatdate
 
@@ -1095,7 +1101,7 @@ def test_a_quiet_held_queue_does_not_block_a_new_critical(tmp_path):
     def http(method, url, headers, payload):
         if url == "https://feeds.example.com/rss":
             return 200, {}, body
-        if "cisa.gov" in url:
+        if _is_kev_request(url):
             return 200, {}, json.dumps(kev).encode()
         return 404, {}, b""
 
@@ -1160,7 +1166,7 @@ def _watches_http(last_changed: int):
                 }
             }
             return 200, {}, json.dumps(watches).encode()
-        if "cisa.gov" in url:
+        if _is_kev_request(url):
             catalog = {"catalogVersion": "1", "vulnerabilities": [{"cveID": "CVE-2020-0001"}]}
             return 200, {}, json.dumps(catalog).encode()
         return 404, {}, b""
@@ -1308,7 +1314,7 @@ def test_a_disabled_source_capture_waits_and_another_source_is_unaffected(tmp_pa
 
     def http(method, url, headers, payload):
         fetched.append(url)
-        if "cisa.gov" in url:
+        if _is_kev_request(url):
             catalog = {"catalogVersion": "1", "vulnerabilities": [{"cveID": "CVE-2020-0001"}]}
             return 200, {}, json.dumps(catalog).encode()
         return 404, {}, b""
