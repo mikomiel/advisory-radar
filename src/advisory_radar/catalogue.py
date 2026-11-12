@@ -3,7 +3,7 @@
 Standard library only, deliberately: ``config.py`` derives the keys a source entry may carry from this
 registry and ``sources.py`` owns the builders, so importing anything from the package here would close the
 cycle ``config -> catalogue -> config``. This module is the single owner of a kind's summary, keys, example
-and docs anchor; ``tests/test_catalogue.py`` pins the builders, the config allowlist, the README table and
+and docs anchor; ``tests/test_catalogue.py`` pins the builders, the config allowlist, the docs/sources.md table and
 the ``/sources`` page to it.
 """
 
@@ -48,7 +48,7 @@ SOURCE_SPECS: dict[str, SourceSpec] = {
             "type": "rss",
             "url": "https://vendor.example.net/security.xml",
         },
-        docs_anchor="README.md#sources",
+        docs_anchor="docs/sources.md",
     ),
     "freshrss": SourceSpec(
         kind="freshrss",
@@ -62,7 +62,7 @@ SOURCE_SPECS: dict[str, SourceSpec] = {
             "token": "${FRESHRSS_TOKEN}",
             "user": "advisory-radar",
         },
-        docs_anchor="README.md#sources",
+        docs_anchor="docs/sources.md",
         secret_keys=("token",),
     ),
     "changedetection": SourceSpec(
@@ -77,7 +77,7 @@ SOURCE_SPECS: dict[str, SourceSpec] = {
             "api_key": "${CHANGEDETECTION_API_KEY}",
             "tag": "advisories",
         },
-        docs_anchor="README.md#sources",
+        docs_anchor="docs/sources.md",
         secret_keys=("api_key",),
     ),
     "webhook": SourceSpec(
@@ -86,7 +86,7 @@ SOURCE_SPECS: dict[str, SourceSpec] = {
         required=(),
         optional=("tag", "enabled"),
         example={"id": "vendor-webhook", "type": "webhook"},
-        docs_anchor="README.md#sources",
+        docs_anchor="docs/sources.md",
     ),
 }
 
