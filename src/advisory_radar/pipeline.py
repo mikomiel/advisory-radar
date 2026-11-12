@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 
 from . import core, watchlist
 from .config import Config, secret_values
@@ -22,20 +22,26 @@ LOG = logging.getLogger("advisory_radar")
 KEV_CACHE_NAME = "kev.json"
 
 
-def _drop_disabled_sources(state: dict, enabled_ids: set[str]) -> None:
-    """Discard a removed source's unclassified work, its stored validators and its health record.
+def _drop_removed_sources(state: dict, declared_ids: Collection[str], enabled_ids: Collection[str]) -> None:
+    """Discard a removed source's unclassified work, validators, cursors and health record.
 
-    The first two have to go together. Dropping the carry while keeping the validators lets a re-enabled source
+    The first three have to go together. Dropping the carry while keeping the validators lets a re-added source
     with an unchanged feed answer ``304`` on its next read, so the candidates just discarded could not be
-    recovered from the feed at all. ``carry`` is the source of truth for what is still owed. Health is kept for
-    a configured source only: a record for a source nobody configured would outlive the reason it existed.
+    recovered from the feed at all; a kept changedetection cursor does the same to a page whose
+    ``last_changed`` has not moved again. ``carry`` is the source of truth for what is still owed.
+
+    Removal is not disablement: a source still declared in the configuration with ``enabled: false`` is simply
+    not polled, so its carry, validators and cursors stay. Only a source missing from ``declared_ids`` was
+    discarded. Health is kept for a source that still runs only: a record for a source nobody polls would
+    outlive the reason it existed.
     """
     carried = state.setdefault("carry", {})
-    feeds = state.get("feeds")
-    for stale in [source_id for source_id in carried if source_id not in enabled_ids]:
+    for stale in [source_id for source_id in carried if source_id not in declared_ids]:
         carried.pop(stale, None)
-        if isinstance(feeds, dict):
-            feeds.pop(stale, None)
+    for stored in (state.get("feeds"), state.get("changedetection")):
+        if isinstance(stored, dict):
+            for stale in [source_id for source_id in stored if source_id not in declared_ids]:
+                stored.pop(stale, None)
     health = state.get("source_health")
     if isinstance(health, dict):
         for stale in [source_id for source_id in health if source_id not in enabled_ids]:
@@ -264,8 +270,9 @@ def _run_pass(
     carried = state.setdefault("carry", {})
     enabled_ids = {source.id for source in sources}
     answered_now = {source.id for source, _ in answered}
-    # Only a source that still exists may push work through carry, or keep a cached answer to it.
-    _drop_disabled_sources(state, enabled_ids)
+    # Only a source removed from the configuration may have its stored work discarded; one that is merely
+    # disabled is not polled, but it keeps its carry, validators and cursors for when it comes back.
+    _drop_removed_sources(state, cfg.declared_source_ids, enabled_ids)
     carried = state["carry"]
 
     # One work list for fairness: freshly fetched sources and sources whose only remaining work is carried

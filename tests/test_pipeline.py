@@ -13,7 +13,7 @@ import pytest
 from advisory_radar import core, pipeline, storage
 from advisory_radar.config import Config, ConfigError, load_config
 from advisory_radar.plugins import SourceWindow
-from advisory_radar.sources import RssSource, WebhookSource
+from advisory_radar.sources import ChangedetectionSource, RssSource, WebhookSource
 from advisory_radar.state import save_state
 from advisory_radar.watchlist import load_policy
 
@@ -1117,3 +1117,215 @@ def test_a_quiet_held_queue_does_not_block_a_new_critical(tmp_path):
     assert [entry["ids"][0] for entry in stored["pending"]] == [f"CVE-2026-{number}" for number in range(1, 6)]
     assert [entry["attempts"] for entry in stored["pending"]] == [1] * 5, "a held message is not an attempt"
     assert stored["seen"]["CVE-2026-7777"]["outcome"] == "delivered"
+
+
+# --- a disabled source is not a removed source ----------------------------------------------------
+
+
+CD_URL = "https://changes.example.net"
+CD_SOURCE = f"  - id: cd\n    type: changedetection\n    url: {CD_URL}\n    api_key: k\n"
+CD_DISABLED_SOURCE = CD_SOURCE + "    enabled: false\n"
+#: The watch's ``last_changed``, recent enough that the item it produces is news, not history.
+CD_CHANGED = NOW - 3600
+RSS_SOURCE = "  - id: vendor\n    type: rss\n    url: https://feeds.example.com/rss\n"
+WEBHOOK_SOURCE = "  - id: wh\n    type: webhook\n"
+
+
+def _sources_config(tmp_path: Path, *blocks: str) -> Config:
+    """A configuration whose declared sources are exactly ``blocks`` (YAML entries, no ``sources:`` key)."""
+    declared = "sources:\n" + "".join(blocks) if blocks else "sources: []\n"
+    path = tmp_path / "sources.yml"
+    path.write_text(
+        declared
+        + "notifiers:\n  - id: fake\n    type: webhook\n    url: https://hooks.example.com/x\n"
+        + f"state_path: {tmp_path}/state.json\n"
+    )
+    return load_config(path, {})
+
+
+def _watches_http(last_changed: int):
+    """changedetection.io answering one watch whose ``last_changed`` does not move."""
+
+    def http(method, url, headers, payload):
+        if url.startswith(f"{CD_URL}/api/v1/watch"):
+            watches = {
+                "uuid-1": {
+                    "uuid": "uuid-1",
+                    "title": "Shop item",
+                    "link": "https://shop.example.com/item",
+                    "page_title": "Shop",
+                    "paused": False,
+                    "notification_muted": False,
+                    "last_changed": last_changed,
+                }
+            }
+            return 200, {}, json.dumps(watches).encode()
+        if "cisa.gov" in url:
+            catalog = {"catalogVersion": "1", "vulnerabilities": [{"cveID": "CVE-2020-0001"}]}
+            return 200, {}, json.dumps(catalog).encode()
+        return 404, {}, b""
+
+    return http
+
+
+def _captured_page_change() -> dict:
+    """A changedetection candidate the pipeline had already captured into ``carry``."""
+    return core.item_to_state(
+        core.Item(
+            guid=f"cd:cd:uuid-1:{CD_CHANGED}",
+            title="Shop item — changedetection.io",
+            link="https://shop.example.com/item",
+            summary=f"Page changed (last_changed={CD_CHANGED}).",
+            published=CD_CHANGED,
+            explicit=(),
+        )
+    )
+
+
+def test_a_disabled_changedetection_source_keeps_its_capture_and_cursor(tmp_path):
+    """A source merely turned off is not removed: its captured candidate and cursor must survive (#68)."""
+    cfg_enabled = _sources_config(tmp_path, CD_SOURCE)
+    state = core.new_state()
+    state["seeded"] = {"cd": True}
+    state["carry"] = {"cd": [_captured_page_change()]}
+    state["changedetection"] = {"cd": {"uuid-1": CD_CHANGED}}
+    cfg_enabled.store().save(state)
+
+    quiet = FakeNotifier(200)
+    cfg_disabled = _sources_config(tmp_path, CD_DISABLED_SOURCE)
+    assert (
+        pipeline.run_pass(
+            cfg_disabled,
+            [],
+            [quiet],
+            http=_watches_http(CD_CHANGED),
+            clock=lambda: float(NOW),
+            sleep=lambda seconds: None,
+        )
+        == 0
+    )
+    stored = cfg_enabled.store().load()
+    assert [row["guid"] for row in (stored.get("carry") or {}).get("cd", [])] == [f"cd:cd:uuid-1:{CD_CHANGED}"], (
+        "disabling a source must not discard work it already captured"
+    )
+    assert (stored.get("changedetection") or {}).get("cd") == {"uuid-1": CD_CHANGED}, (
+        "a disabled source keeps its cursor"
+    )
+    assert not quiet.sent, "a disabled source is not polled and its capture is not processed"
+
+    notifier = FakeNotifier(200)
+    cfg_re_enabled = _sources_config(tmp_path, CD_SOURCE)
+    assert (
+        pipeline.run_pass(
+            cfg_re_enabled,
+            [ChangedetectionSource("cd", CD_URL, "k")],
+            [notifier],
+            http=_watches_http(CD_CHANGED),  # the page has not changed again
+            clock=lambda: float(NOW),
+            sleep=lambda seconds: None,
+        )
+        == 0
+    )
+    assert len(notifier.sent) == 1 and "Shop item" in notifier.sent[0]["title"], (
+        "the candidate captured before the disablement must still be classified and delivered"
+    )
+    final = cfg_enabled.store().load()
+    assert not (final.get("carry") or {}).get("cd")
+    assert final["changedetection"]["cd"] == {"uuid-1": CD_CHANGED}, "nothing changed while it was disabled"
+
+
+def test_removing_a_source_discards_its_cursors_with_its_carry_and_validators(tmp_path):
+    """Removal is an explicit discard, so the cursor goes with the carry it can no longer recover (#68)."""
+    cfg_declared = _sources_config(tmp_path, CD_SOURCE, RSS_SOURCE)
+    state = core.new_state()
+    state["seeded"] = {"cd": True, "vendor": True}
+    state["carry"] = {"cd": [_captured_page_change()]}
+    state["changedetection"] = {"cd": {"uuid-1": CD_CHANGED}}
+    state["feeds"] = {"vendor": {"etag": '"v1"'}}
+    state["source_health"] = {
+        "cd": {"at": 1, "ok": True, "ok_at": 1, "items": 1, "error": ""},
+        "vendor": {"at": 1, "ok": True, "ok_at": 1, "items": 1, "error": ""},
+    }
+    cfg_declared.store().save(state)
+
+    cfg_removed = _sources_config(tmp_path)  # both sources removed from the configuration
+    assert (
+        pipeline.run_pass(
+            cfg_removed,
+            [],
+            [FakeNotifier()],
+            http=_watches_http(CD_CHANGED),
+            clock=lambda: float(NOW),
+            sleep=lambda s: None,
+        )
+        == 0
+    )
+    stored = cfg_declared.store().load()
+    assert not (stored.get("carry") or {}), "a removed source's captured work is discarded"
+    assert not (stored.get("feeds") or {}), "a removed source's validators are discarded with its carry"
+    assert not (stored.get("changedetection") or {}), "a removed source's cursors are discarded with its carry"
+    assert not (stored.get("source_health") or {}), "a health record never outlives its source"
+
+    notifier = FakeNotifier(200)
+    cfg_readded = _sources_config(tmp_path, CD_SOURCE)
+    assert (
+        pipeline.run_pass(
+            cfg_readded,
+            [ChangedetectionSource("cd", CD_URL, "k")],
+            [notifier],
+            http=_watches_http(CD_CHANGED),
+            clock=lambda: float(NOW),
+            sleep=lambda seconds: None,
+        )
+        == 0
+    )
+    assert len(notifier.sent) == 1 and "Shop item" in notifier.sent[0]["title"], (
+        "re-adding the source must notice the page again instead of trusting the discarded cursor"
+    )
+    assert cfg_readded.store().load()["changedetection"]["cd"] == {"uuid-1": CD_CHANGED}
+
+
+def test_a_disabled_source_capture_waits_and_another_source_is_unaffected(tmp_path):
+    """Only polling stops while a source is disabled; other sources keep classifying and delivering (#68)."""
+    cfg = _sources_config(tmp_path, CD_DISABLED_SOURCE, WEBHOOK_SOURCE)
+    state = core.new_state()
+    state["seeded"] = {"cd": True, "wh": True}
+    state["carry"] = {"cd": [_captured_page_change()]}
+    state["changedetection"] = {"cd": {"uuid-1": CD_CHANGED}}
+    state["webhook_inbox"] = {
+        "wh": [
+            {
+                "guid": "news",
+                "title": "Unrelated vendor advisory",
+                "summary": "",
+                "link": "https://vendor.example/a",
+            }
+        ]
+    }
+    cfg.store().save(state)
+
+    fetched = []
+
+    def http(method, url, headers, payload):
+        fetched.append(url)
+        if "cisa.gov" in url:
+            catalog = {"catalogVersion": "1", "vulnerabilities": [{"cveID": "CVE-2020-0001"}]}
+            return 200, {}, json.dumps(catalog).encode()
+        return 404, {}, b""
+
+    notifier = FakeNotifier(200)
+    assert (
+        pipeline.run_pass(
+            cfg, [WebhookSource("wh")], [notifier], http=http, clock=lambda: float(NOW), sleep=lambda seconds: None
+        )
+        == 0
+    )
+    assert not [url for url in fetched if CD_URL in url], "a disabled source must not be polled"
+    assert [message["tag"] for message in notifier.sent] == ["warning"] and (
+        "Unrelated vendor advisory" in notifier.sent[0]["title"]
+    ), "an unrelated source must be classified and delivered as usual"
+    stored = cfg.store().load()
+    assert [row["guid"] for row in (stored.get("carry") or {}).get("cd", [])] == [f"cd:cd:uuid-1:{CD_CHANGED}"], (
+        "a disabled source's capture waits instead of being processed or discarded"
+    )
+    assert (stored.get("changedetection") or {}).get("cd") == {"uuid-1": CD_CHANGED}
