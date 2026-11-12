@@ -4092,13 +4092,18 @@ def create_app(
             return JSONResponse({"error": "payload is not JSON"}, status_code=400)
         try:
             payload = json.loads(text)
+        except RecursionError:
+            # A few thousand nested arrays defeat the decoder with a tiny body; that is a refused request,
+            # not a server fault. ``http.parse_json`` guards the same failure, but its None answer cannot be
+            # told apart from a literal ``null``, which this route maps to a different status below.
+            return JSONResponse({"error": "payload is nested too deeply"}, status_code=400)
         except ValueError:
             return JSONResponse({"error": "payload is not JSON"}, status_code=400)
         try:
             entry = webhook_item_from_payload(payload)
         except ValueError as exc:
-            # An unsupported structured ``ids`` value is refused before the state transaction: only an entry
-            # the payload contract maps may be queued.
+            # Unsupported structured ids and text that is not UTF-8 representable are refused before the
+            # state transaction: an accepted entry must be storable, and its default guid is a hash of the text.
             return JSONResponse({"error": str(exc)}, status_code=400)
         if entry is None:
             return JSONResponse({"error": "payload has no title"}, status_code=422)

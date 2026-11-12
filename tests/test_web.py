@@ -1433,6 +1433,46 @@ def test_changedetection_native_ids_are_honoured(tmp_path):
     assert item.explicit == ("GHSA-aaaa-bbbb-cccc",)
 
 
+def test_a_deeply_nested_webhook_payload_is_refused_without_state(tmp_path):
+    """#75: a few thousand nested arrays defeat ``json.loads`` with a RecursionError, which is a client error."""
+    response = post_webhook(tmp_path, content=b"[" * 10000 + b"]" * 10000)
+    assert response.status_code == 400
+    assert "nested" in response.json()["error"]
+    assert not (tmp_path / "state.json").exists()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'{"title": "Vendor \\ud800 advisory"}',
+        b'{"watch_uuid": "u1", "watch_title": "Shop", "diff": "\\ud800 change"}',
+        b'{"title": "Vendor advisory", "summary": "\\udfff text"}',
+    ],
+)
+def test_surrogate_webhook_text_is_refused_before_hashing(tmp_path, content):
+    """#75: an escaped lone surrogate is valid JSON, but encoding it to hash the item raises."""
+    response = post_webhook(tmp_path, content=content)
+    assert response.status_code == 400
+    assert "Unicode" in response.json()["error"]
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_a_refused_webhook_payload_leaves_the_state_document_untouched(tmp_path):
+    """Every refusal happens before the state transaction, so no inbox entry and no seen change is written."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-9999"] = {"at": 1792600000, "outcome": "delivered"}
+    save_state(tmp_path / "state.json", state)
+    before = (tmp_path / "state.json").read_bytes()
+    refused = [
+        b"[" * 10000 + b"]" * 10000,
+        b'{"title": "Vendor \\ud800 advisory"}',
+        json.dumps({"title": "advisory", "ids": ["not-an-identifier"]}).encode(),
+    ]
+    for content in refused:
+        assert post_webhook(tmp_path, content=content).status_code == 400
+    assert (tmp_path / "state.json").read_bytes() == before
+
+
 class _RecordingNotifier:
     id = "recording"
 

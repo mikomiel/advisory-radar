@@ -225,8 +225,18 @@ def webhook_item_from_payload(payload: object) -> dict | None:
     """Map a generic or changedetection.io-native webhook JSON body to an inbox entry.
 
     ``ValueError`` is the refused-payload signal the intake turns into a 400: an ``ids`` value must be a list
-    of identifiers the text extractor understands.
+    of identifiers the text extractor understands, and a text field must be UTF-8 representable because it is
+    hashed to derive a default guid. A lone surrogate is valid JSON but not a Unicode scalar value, so encoding
+    it would raise after the request was accepted.
     """
+
+    def checked(value: object) -> str:
+        text = str(value)
+        try:
+            text.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("payload text is not valid Unicode") from None
+        return text
 
     def declared_ids(value: object) -> tuple[str, ...]:
         """The supported structured ids, normalised and deduplicated; anything else is refused."""
@@ -253,10 +263,10 @@ def webhook_item_from_payload(payload: object) -> dict | None:
     if not isinstance(payload, dict):
         return None
     if "watch_uuid" in payload or "watch_url" in payload:  # changedetection.io native shape
-        diff = str(payload.get("diff") or "")
-        watch_uuid = str(payload.get("watch_uuid"))
-        watch_url = str(payload.get("watch_url") or "")
-        title = str(payload.get("watch_title") or payload.get("watch_url") or "change")
+        diff = checked(payload.get("diff") or "")
+        watch_uuid = checked(payload.get("watch_uuid"))
+        watch_url = checked(payload.get("watch_url") or "")
+        title = checked(payload.get("watch_title") or payload.get("watch_url") or "change")
         summary = diff or "page changed"
         entry = {
             "guid": "wh:cd:" + hashlib.sha1((watch_uuid + diff).encode()).hexdigest()[:16],
@@ -273,9 +283,10 @@ def webhook_item_from_payload(payload: object) -> dict | None:
     title = payload.get("title")
     if not isinstance(title, str) or not title.strip():
         return None
-    summary = str(payload.get("summary") or payload.get("text") or payload.get("body") or "")
-    link = str(payload.get("link") or payload.get("url") or "")
-    source = str(payload.get("source") or "webhook")
+    title = checked(title)
+    summary = checked(payload.get("summary") or payload.get("text") or payload.get("body") or "")
+    link = checked(payload.get("link") or payload.get("url") or "")
+    source = checked(payload.get("source") or "webhook")
     ids = merged(title, summary, link, payload.get("ids"))
     guid = str(payload.get("guid") or hashlib.sha1((title + summary + link).encode()).hexdigest()[:16])
     entry = {
