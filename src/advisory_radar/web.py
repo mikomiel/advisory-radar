@@ -4094,10 +4094,14 @@ def create_app(
             payload = json.loads(text)
         except ValueError:
             return JSONResponse({"error": "payload is not JSON"}, status_code=400)
-        entry = webhook_item_from_payload(payload)
+        try:
+            entry = webhook_item_from_payload(payload)
+        except ValueError as exc:
+            # An unsupported structured ``ids`` value is refused before the state transaction: only an entry
+            # the payload contract maps may be queued.
+            return JSONResponse({"error": str(exc)}, status_code=400)
         if entry is None:
             return JSONResponse({"error": "payload has no title"}, status_code=422)
-        entry.pop("explicit_ids", None)  # ids are re-extracted from text at classify time
 
         store = runtime.cfg.store()
 

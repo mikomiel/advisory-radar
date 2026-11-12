@@ -99,3 +99,31 @@ cannot tell which stored source the entry stands for. An RSS/Atom/JSON Feed and 
 the whole response, so the FreshRSS GReader export is the only built-in that
 reports a truncated window.
 
+## Inbound webhook payloads
+
+`/webhooks/<id>` accepts a JSON object in the generic form (`title`, plus
+`summary`/`text`/`body`, `link`/`url`, `guid`, `source`, `ids`) or the
+changedetection.io native form, recognised by `watch_uuid` or `watch_url`
+(`watch_title`, `watch_url`, `diff`, `ids`). The generic form requires a
+non-empty `title`; the native form titles itself from `watch_title`, then
+`watch_url`, then `change`.
+
+`ids` is optional in both forms and may be omitted, `null` or empty. A non-empty
+value must be a list of strings, and each element must be exactly one identifier
+in the grammar the text extractor already applies: a CVE (`CVE-<year>-<number>`),
+a GitHub advisory (`GHSA-xxxx-xxxx-xxxx`) or a Proxmox advisory
+(`PSA-<year>-<number>-<revision>`). Case is ignored and the value is normalised;
+duplicates and ids already present in the text are dropped. The validated ids are
+merged with the ids extracted from the title, summary/diff and link, and the
+queued entry carries the union in `explicit_ids`. The pass reads that field as
+the item's identifiers, so a CVE declared only in `ids` receives the same
+enrichment, scoring and ID routing as one written in the text.
+
+The endpoint refuses, with a `{"error": ...}` body and before it reads or writes
+the state document: a body that is not UTF-8 JSON (400), and an `ids` value that
+is not a list of strings, holds a string that is not exactly one supported
+identifier, or holds a non-string (400). A mapped object with no `title` is 422,
+and so is a body that is not a JSON object. `guid` is kept verbatim and escaped
+when rendered. The bearer secret, the 64 KiB body bound and the inbox limit are
+unchanged.
+

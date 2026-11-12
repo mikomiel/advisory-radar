@@ -375,13 +375,22 @@ def _run_pass(
             claimed = core._claimed(state)
             kept = []
             for entry in inbox:
-                # An entry is done when either disposition has been recorded for it: the ids its text names
-                # (classified in scope) or its source-scoped identity (filtered out of scope, or delivered with
-                # no identifier at all). The scoped identity is built exactly as the source door builds it --
-                # the guid kept raw -- so a value no reader can spell still matches what classification recorded.
-                identities = core.extract_ids(
-                    str(entry.get("title", "")), str(entry.get("summary", "")), str(entry.get("link", ""))
+                # An entry is done when every identity it can be known by has been claimed: the ids its text
+                # names, the structured ids it queued, or its source-scoped identity (filtered out of scope, or
+                # delivered with no identifier at all). The scoped identity is built exactly as the source door
+                # builds it -- the guid kept raw -- so a value no reader can spell still matches what
+                # classification recorded.
+                identities = list(
+                    core.extract_ids(
+                        str(entry.get("title", "")), str(entry.get("summary", "")), str(entry.get("link", ""))
+                    )
                 )
+                structured = entry.get("explicit_ids")
+                if isinstance(structured, list):
+                    # Validated and normalised at intake by the payload mapper; classification claims an item's
+                    # explicit ids when it has any, so the text-only set would never match a structured entry.
+                    identities.extend(str(identifier) for identifier in structured if isinstance(identifier, str))
+                identities = list(dict.fromkeys(identities))
                 guid = str(entry.get("guid", ""))
                 scoped = f"src:{source.id}:{guid}"
                 done = scoped in claimed or (

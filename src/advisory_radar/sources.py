@@ -196,6 +196,13 @@ class WebhookSource:
         self.id = source_id
 
     def fetch(self, http: Http, state: dict) -> SourceWindow:
+        def identities(entry: dict) -> tuple[str, ...]:
+            """The validated structured ids first, then the ones the entry's own text names: one union."""
+            stored = entry.get("explicit_ids")
+            structured = (str(value) for value in stored if isinstance(value, str)) if isinstance(stored, list) else ()
+            prose = extract_ids(str(entry.get("title", "")), str(entry.get("summary", "")), str(entry.get("link", "")))
+            return tuple(dict.fromkeys((*structured, *prose)))
+
         inbox = state.get("webhook_inbox", {}).get(self.id, [])
         items = tuple(
             Item(
@@ -204,7 +211,7 @@ class WebhookSource:
                 str(entry.get("link", "")),
                 str(entry.get("summary", "")),
                 entry.get("published") if isinstance(entry.get("published"), int) else None,
-                extract_ids(str(entry.get("title", "")), str(entry.get("summary", "")), str(entry.get("link", ""))),
+                identities(entry),
                 str(entry.get("source_title", "")),
                 str(entry.get("source_url", "")),
             )
@@ -215,36 +222,71 @@ class WebhookSource:
 
 
 def webhook_item_from_payload(payload: object) -> dict | None:
-    """Map a generic or changedetection.io-native webhook JSON body to an inbox entry."""
+    """Map a generic or changedetection.io-native webhook JSON body to an inbox entry.
+
+    ``ValueError`` is the refused-payload signal the intake turns into a 400: an ``ids`` value must be a list
+    of identifiers the text extractor understands.
+    """
+
+    def declared_ids(value: object) -> tuple[str, ...]:
+        """The supported structured ids, normalised and deduplicated; anything else is refused."""
+        if value is None:
+            return ()
+        if not isinstance(value, list):
+            raise ValueError("ids must be a list of identifier strings")
+        found: dict[str, None] = {}
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("ids must be a list of identifier strings")
+            text = item.strip()
+            extracted = extract_ids(text)
+            if len(extracted) != 1 or extracted[0].casefold() != text.casefold():
+                raise ValueError("ids may contain only CVE, GHSA or PSA identifiers")
+            found[extracted[0]] = None
+        return tuple(found)
+
+    def merged(title: str, summary: str, link: str, value: object) -> list[str] | None:
+        """The union of the ids the text names and the structured ones; None when the entry names none."""
+        union = tuple(dict.fromkeys((*extract_ids(title, summary, link), *declared_ids(value))))
+        return list(union) if union else None
+
     if not isinstance(payload, dict):
         return None
     if "watch_uuid" in payload or "watch_url" in payload:  # changedetection.io native shape
         diff = str(payload.get("diff") or "")
-        guid = "wh:cd:" + hashlib.sha1((str(payload.get("watch_uuid")) + diff).encode()).hexdigest()[:16]
-        return {
-            "guid": guid,
-            "title": str(payload.get("watch_title") or payload.get("watch_url") or "change"),
-            "link": str(payload.get("watch_url") or ""),
-            "summary": diff or "page changed",
+        watch_uuid = str(payload.get("watch_uuid"))
+        watch_url = str(payload.get("watch_url") or "")
+        title = str(payload.get("watch_title") or payload.get("watch_url") or "change")
+        summary = diff or "page changed"
+        entry = {
+            "guid": "wh:cd:" + hashlib.sha1((watch_uuid + diff).encode()).hexdigest()[:16],
+            "title": title,
+            "link": watch_url,
+            "summary": summary,
             "source_title": "changedetection.io",
-            "source_url": str(payload.get("watch_url") or ""),
+            "source_url": watch_url,
         }
+        ids = merged(title, summary, watch_url, payload.get("ids"))
+        if ids:
+            entry["explicit_ids"] = ids
+        return entry
     title = payload.get("title")
     if not isinstance(title, str) or not title.strip():
         return None
     summary = str(payload.get("summary") or payload.get("text") or payload.get("body") or "")
     link = str(payload.get("link") or payload.get("url") or "")
-    ids = payload.get("ids")
+    source = str(payload.get("source") or "webhook")
+    ids = merged(title, summary, link, payload.get("ids"))
     guid = str(payload.get("guid") or hashlib.sha1((title + summary + link).encode()).hexdigest()[:16])
     entry = {
         "guid": f"wh:{guid}",
         "title": title,
         "link": link,
         "summary": summary,
-        "source_title": str(payload.get("source") or "webhook"),
+        "source_title": source,
         "source_url": "",
     }
-    if isinstance(ids, list) and all(isinstance(i, str) for i in ids):
+    if ids:
         entry["explicit_ids"] = ids
     return entry
 
