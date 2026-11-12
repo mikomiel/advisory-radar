@@ -55,7 +55,7 @@ sources:
 # Scope alerts to what you run. With no key the document is `watchlist.json`
 # beside `state_path`, on the writable volume, and /watchlist edits it; with
 # one, the path named here (a path on the read-only /config mount can be read
-# but not saved from the browser). Format in the README; without a document
+# but not saved from the browser). Format in docs/configuration.md#watchlist; without a document
 # every advisory that arrives is judged.
 # watchlist: /data/watchlist.json
 

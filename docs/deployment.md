@@ -290,7 +290,7 @@ when it loads; `release-parked` and `drop-parked` read the YAML alone and do not
 route to an overlay-only channel cannot block queue recovery. With no `routes` block every message still goes
 to every enabled notifier. Delivery records on the message which channels already accepted it, so when one routed channel fails
 a retry re-sends the message only to the channels that have not had it — the failed channel is retried, the
-others are not repeated. The README's [Routing](../README.md#routing) section lists the match keys and an
+others are not repeated. The [routing](configuration.md#routing) section lists the match keys and an
 example.
 
 ### Delivery policy and signed webhooks
@@ -341,7 +341,7 @@ points at it, so a message naming thousands of identifiers does not multiply it.
 `/runs` filters by exit code and day; the state keeps only the last 200 passes, so the page
 states that cap instead of paging.
 
-The README screenshots are written by an opt-in script, never by the application:
+The UI screenshots are written by an opt-in script, never by the application:
 `uv run --with playwright python scripts/capture_screenshots.py` (add
 `--output-dir` to write elsewhere) builds a demo configuration and state in a temporary
 directory, serves the app on `127.0.0.1` with a throwaway token and captures the five pages

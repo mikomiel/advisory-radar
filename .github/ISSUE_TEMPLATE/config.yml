@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a vulnerability
+    url: https://github.com/mikomiel/advisory-radar/security/advisories/new
+    about: Report vulnerabilities privately; never in a public issue.
+  - name: Discussions
+    url: https://github.com/mikomiel/advisory-radar/discussions
+    about: Ask questions and discuss ideas that are not yet a bug or a proposal.
+  - name: Contributing guide
+    url: https://github.com/mikomiel/advisory-radar/blob/main/CONTRIBUTING.md
+    about: Read the contribution and review workflow before opening a pull request.
