@@ -1042,3 +1042,78 @@ def test_the_default_scope_is_in_force_beside_a_state_path_that_cannot_be_walked
     )
     assert code == 0
     assert store.load()["seen"]["src:wh:noise"]["outcome"] == "filtered", "the saved scope was in force"
+
+
+# --- classification admission during quiet hours --------------------------------------------------
+
+
+def _rss_item(title: str, guid: str, published: int) -> str:
+    from email.utils import formatdate
+
+    return (
+        f"<item><title>{title}</title><link>https://vendor.example.com/{guid}</link>"
+        f"<guid>{guid}</guid><description>Fixes things.</description>"
+        f"<pubDate>{formatdate(published, usegmt=True)}</pubDate></item>"
+    )
+
+
+def _rss_document(*items: str) -> bytes:
+    return (
+        '<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>'
+        "<link>https://feeds.example.com/</link>" + "".join(items) + "</channel></rss>"
+    ).encode()
+
+
+def test_a_quiet_held_queue_does_not_block_a_new_critical(tmp_path):
+    """Five warnings held by quiet hours must not stop a newly arrived critical advisory (#67).
+
+    Holding is a delivery-time decision (``delivery.is_held``), so counting the raw pending length here let a
+    queue of held warnings take the whole admission window and leave a critical advisory in carry.
+    """
+    night = local_epoch(23)
+    path = tmp_path / "quiet.yml"
+    path.write_text(
+        "sources:\n  - id: vendor\n    type: rss\n    url: https://feeds.example.com/rss\n"
+        "notifiers:\n  - id: fake\n    type: webhook\n    url: https://hooks.example.com/x\n"
+        "quiet_hours: 22:00-07:00\n"
+        f"state_path: {tmp_path}/state.json\n"
+    )
+    cfg = load_config(path, {})
+    state = core.new_state()
+    state["seeded"] = {"vendor": True}
+    held = []
+    for number in range(1, 6):
+        entry = queued_message(f"CVE-2026-{number}")
+        entry["attempts"] = 1  # not a first attempt: the pass must leave it exactly as it found it
+        held.append(entry)
+    state["pending"] = held
+    cfg.store().save(state)
+
+    body = _rss_document(_rss_item("Vendor advisory CVE-2026-7777", "g1", night - 3600))
+    kev = {"catalogVersion": "1", "vulnerabilities": [{"cveID": "CVE-2026-7777"}]}
+
+    def http(method, url, headers, payload):
+        if url == "https://feeds.example.com/rss":
+            return 200, {}, body
+        if "cisa.gov" in url:
+            return 200, {}, json.dumps(kev).encode()
+        return 404, {}, b""
+
+    notifier = FakeNotifier(200)
+    code = pipeline.run_pass(
+        cfg,
+        [RssSource("vendor", "https://feeds.example.com/rss")],
+        [notifier],
+        http=http,
+        clock=lambda: float(night),
+        sleep=lambda seconds: None,
+    )
+    assert code == 0
+    assert [message["ids"] for message in notifier.sent] == [["CVE-2026-7777"]], (
+        "a critical advisory whose CVE is in the KEV catalog must be classified and delivered in the same pass"
+    )
+    assert notifier.sent[0]["tag"] == "critical"
+    stored = cfg.store().load()
+    assert [entry["ids"][0] for entry in stored["pending"]] == [f"CVE-2026-{number}" for number in range(1, 6)]
+    assert [entry["attempts"] for entry in stored["pending"]] == [1] * 5, "a held message is not an attempt"
+    assert stored["seen"]["CVE-2026-7777"]["outcome"] == "delivered"

@@ -1554,11 +1554,17 @@ def classify_new(
     trusted: Collection[str] = (),
     source_id: str = "",
     thresholds: Thresholds,
+    quiet_hours: delivery.QuietHours | None = None,
 ) -> list[Item]:
     """Queue the items nobody has seen, oldest first, until the delivery cap or the lookup budget is reached.
 
     ``share`` bounds how much of the pending room one source may take, so a busy first source cannot fill the
     queue and leave later sources unclassified pass after pass.
+
+    ``quiet_hours`` is the window in which delivery holds everything but a critical message. Only entries
+    delivery would send now count towards the cap: a queue held by the window must not take the room a newly
+    arrived critical advisory needs, and a message queued below is counted by the same rule, so a warning
+    queued during the window still consumes none of it. ``delivery.is_held`` is the one owner of "held".
 
     ``source_id`` is the configured ``source.id`` the items came from, and each queued message records it with
     the watchlist products the item matched. Routing reads both; a message queued elsewhere (an escalation, an
@@ -1570,7 +1576,15 @@ def classify_new(
     """
     seen: dict = state["seen"]
     pending: list[dict] = state["pending"]
-    start = len(pending)
+
+    def sendable(entry: dict) -> bool:
+        """Whether delivery would offer this entry to a channel now, rather than hold it for the window."""
+        return not delivery.is_held(now, entry, quiet_hours)
+
+    # The delivery cap bounds what this pass may send, so only sendable entries fill it; held ones stay durable
+    # and keep their attempts. ``room`` is fixed for the pass: entries queued below do not widen it.
+    sendable_pending = sum(1 for entry in pending if sendable(entry))
+    room = min(DELIVERY_CAP, sendable_pending + share) if share else DELIVERY_CAP
     claimed = _claimed(state)
     # Item guid -> epoch of its first enrichment fault (``_enrichment_wait``); ``_prune_enrich_clock`` keeps it clean.
     retry: dict[str, int] = state.setdefault("enrich_retry", {})
@@ -1581,7 +1595,6 @@ def classify_new(
     deferred: list[Item] = []
     ordered = sorted(items, key=lambda candidate: candidate.published or 0)
     for position, item in enumerate(ordered):
-        room = min(DELIVERY_CAP, start + share) if share else DELIVERY_CAP
         if item.published is not None and now - item.published > BACKLOG_AGE and item.guid not in trusted:
             # History is decided before capacity: a full queue must not push an old item into carry, where
             # the next pass would treat it as recent.
@@ -1592,7 +1605,7 @@ def classify_new(
             claimed.update(unclaimed)
             backlog += bool(unclaimed)
             continue
-        if len(pending) >= room or classified >= MAX_CLASSIFY:
+        if sendable_pending >= room or classified >= MAX_CLASSIFY:
             # The tail still gets the history decision: carrying an old item would make the next pass treat
             # it as recent merely because it came from carry.
             carryable: list[Item] = []
@@ -1780,26 +1793,29 @@ def classify_new(
                 item.source_title,
                 item.source_url,
             )
-            pending.append(
-                {
-                    "kind": "new",
-                    "tag": verdict.tag,
-                    "title": title,
-                    "body": body,
-                    "ids": ids,
-                    "cves": new_cves,
-                    "levels": dict(verdict.levels),
-                    "kev_only": list(verdict.skipped),
-                    "scores": scores,
-                    "epss": epss,
-                    "kev": kev_membership,
-                    "thresholds": thresholds.snapshot(),
-                    "source": heading,
-                    "link": item.link,
-                    "source_id": source_id,
-                    "products": list(matched_products(item, policy)),
-                }
-            )
+            queued = {
+                "kind": "new",
+                "tag": verdict.tag,
+                "title": title,
+                "body": body,
+                "ids": ids,
+                "cves": new_cves,
+                "levels": dict(verdict.levels),
+                "kev_only": list(verdict.skipped),
+                "scores": scores,
+                "epss": epss,
+                "kev": kev_membership,
+                "thresholds": thresholds.snapshot(),
+                "source": heading,
+                "link": item.link,
+                "source_id": source_id,
+                "products": list(matched_products(item, policy)),
+            }
+            pending.append(queued)
+            # Counted by the same rule as the entries already there: a warning queued inside the window is
+            # held and leaves the room free, while a critical queued now consumes it.
+            if sendable(queued):
+                sendable_pending += 1
         claimed.update(ids)
         LOG.info("classified %s as %s", _log_id(item.guid if not item.explicit else item.explicit[0]), verdict.tag)
     if backlog:

@@ -331,6 +331,9 @@ def _run_pass(
             source_id=source.id,
             # One source is classified at a time, so its own block is the whole rule set for these items.
             thresholds=cfg.thresholds_for(source.id),
+            # Admission counts only what delivery may send now, so a queue held by quiet hours cannot block a
+            # newly arrived critical advisory.
+            quiet_hours=cfg.quiet_hours,
         )
         if left:
             carried[source.id] = [core.item_to_state(item) for item in left]
