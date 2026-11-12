@@ -17,7 +17,12 @@ from advisory_radar.config import load_config
 from advisory_radar.http import RedactFilter
 from advisory_radar.runtime import Runtime
 from advisory_radar.settings import load_settings, load_settings_document, save_settings, settings_path
-from advisory_radar.sources import WebhookSource, webhook_item_from_payload
+from advisory_radar.sources import (
+    WebhookIdsUnsupported,
+    WebhookSource,
+    WebhookTextNotEncodable,
+    webhook_item_from_payload,
+)
 from advisory_radar.state import load_state_document, save_state, state_lock
 from advisory_radar.web import LoginThrottle, _epoch, _when, create_app, readiness
 
@@ -1413,8 +1418,16 @@ def test_an_unsupported_ids_value_is_refused_without_state(tmp_path, ids):
     """#74: unsupported structured ids fail closed instead of being accepted and silently discarded."""
     response = post_webhook(tmp_path, {"title": "Security update", "guid": "stable", "ids": ids})
     assert response.status_code == 400
-    assert "ids" in response.json()["error"]
+    assert response.json()["error"] == "ids must be a list of CVE, GHSA or PSA identifier strings"
     assert not (tmp_path / "state.json").exists(), "a refused payload writes no state"
+
+
+@pytest.mark.parametrize("ids", ["CVE-2026-1234", ["not-an-identifier"], [7], [None]])
+def test_the_payload_mapper_names_its_ids_refusal(ids):
+    """The refusal type carries the fixed contract message the intake answers with."""
+    with pytest.raises(WebhookIdsUnsupported) as refused:
+        webhook_item_from_payload({"title": "Security update", "ids": ids})
+    assert str(refused.value) == "ids must be a list of CVE, GHSA or PSA identifier strings"
 
 
 def test_changedetection_native_ids_are_honoured(tmp_path):
@@ -1431,6 +1444,15 @@ def test_changedetection_native_ids_are_honoured(tmp_path):
     )
     assert entry["explicit_ids"] == ["GHSA-aaaa-bbbb-cccc"]
     assert item.explicit == ("GHSA-aaaa-bbbb-cccc",)
+
+
+def test_the_native_webhook_guid_fingerprint_is_pinned(tmp_path):
+    """The digest is an identity, not a security primitive; marking it non-security must not move a guid."""
+    entry, _ = queued_webhook_item(
+        tmp_path,
+        {"watch_uuid": "u1", "watch_title": "Shop", "watch_url": "https://x.example", "diff": "price changed"},
+    )
+    assert entry["guid"] == "wh:cd:25bc42ff2f579075"
 
 
 def test_a_deeply_nested_webhook_payload_is_refused_without_state(tmp_path):
@@ -1453,7 +1475,31 @@ def test_surrogate_webhook_text_is_refused_before_hashing(tmp_path, content):
     """#75: an escaped lone surrogate is valid JSON, but encoding it to hash the item raises."""
     response = post_webhook(tmp_path, content=content)
     assert response.status_code == 400
-    assert "Unicode" in response.json()["error"]
+    assert response.json()["error"] == "payload text is not valid Unicode"
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_the_payload_mapper_names_its_text_refusal():
+    """The refusal type carries the fixed contract message the intake answers with."""
+    with pytest.raises(WebhookTextNotEncodable) as refused:
+        webhook_item_from_payload({"title": "Vendor \ud800 advisory"})
+    assert str(refused.value) == "payload text is not valid Unicode"
+
+
+def test_an_unknown_payload_refusal_does_not_echo_its_text(tmp_path, monkeypatch):
+    """A refusal the intake does not know by name is a fixed 400, not a 500 and never exception text."""
+    import advisory_radar.sources as sources_module
+
+    class LeakyRefusal(sources_module.WebhookPayloadRefused):
+        message = "internal detail that must not reach the client"
+
+    def refuse(payload):
+        raise LeakyRefusal()
+
+    monkeypatch.setattr(sources_module, "webhook_item_from_payload", refuse)
+    response = post_webhook(tmp_path, {"title": "Security update"})
+    assert response.status_code == 400
+    assert response.json() == {"error": "payload is not acceptable"}
     assert not (tmp_path / "state.json").exists()
 
 

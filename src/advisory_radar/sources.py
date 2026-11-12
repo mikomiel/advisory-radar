@@ -221,13 +221,38 @@ class WebhookSource:
         return SourceWindow(self.id, items, False, "")
 
 
+class WebhookPayloadRefused(ValueError):
+    """A webhook payload the intake contract refuses.
+
+    The intake answers one with a fixed 400 and never with exception text. The class carries the reason, not
+    an interpolated value, so a response cannot leak what a future caller puts into a message.
+    """
+
+    message = "payload is not acceptable"
+
+    def __init__(self) -> None:
+        super().__init__(self.message)
+
+
+class WebhookIdsUnsupported(WebhookPayloadRefused):
+    """``ids`` is not a list of the identifiers the text extractor understands."""
+
+    message = "ids must be a list of CVE, GHSA or PSA identifier strings"
+
+
+class WebhookTextNotEncodable(WebhookPayloadRefused):
+    """A text field is not UTF-8 representable, so it cannot be hashed or stored as JSON text."""
+
+    message = "payload text is not valid Unicode"
+
+
 def webhook_item_from_payload(payload: object) -> dict | None:
     """Map a generic or changedetection.io-native webhook JSON body to an inbox entry.
 
-    ``ValueError`` is the refused-payload signal the intake turns into a 400: an ``ids`` value must be a list
-    of identifiers the text extractor understands, and a text field must be UTF-8 representable because it is
-    hashed to derive a default guid. A lone surrogate is valid JSON but not a Unicode scalar value, so encoding
-    it would raise after the request was accepted.
+    ``WebhookPayloadRefused`` (a ``ValueError``) is the refused-payload signal the intake turns into a 400: an
+    ``ids`` value must be a list of identifiers the text extractor understands, and a text field must be UTF-8
+    representable because it is hashed to derive a default guid. A lone surrogate is valid JSON but not a
+    Unicode scalar value, so encoding it would raise after the request was accepted.
     """
 
     def checked(value: object) -> str:
@@ -235,7 +260,7 @@ def webhook_item_from_payload(payload: object) -> dict | None:
         try:
             text.encode("utf-8")
         except UnicodeEncodeError:
-            raise ValueError("payload text is not valid Unicode") from None
+            raise WebhookTextNotEncodable() from None
         return text
 
     def declared_ids(value: object) -> tuple[str, ...]:
@@ -243,15 +268,15 @@ def webhook_item_from_payload(payload: object) -> dict | None:
         if value is None:
             return ()
         if not isinstance(value, list):
-            raise ValueError("ids must be a list of identifier strings")
+            raise WebhookIdsUnsupported()
         found: dict[str, None] = {}
         for item in value:
             if not isinstance(item, str):
-                raise ValueError("ids must be a list of identifier strings")
+                raise WebhookIdsUnsupported()
             text = item.strip()
             extracted = extract_ids(text)
             if len(extracted) != 1 or extracted[0].casefold() != text.casefold():
-                raise ValueError("ids may contain only CVE, GHSA or PSA identifiers")
+                raise WebhookIdsUnsupported()
             found[extracted[0]] = None
         return tuple(found)
 
@@ -268,8 +293,10 @@ def webhook_item_from_payload(payload: object) -> dict | None:
         watch_url = checked(payload.get("watch_url") or "")
         title = checked(payload.get("watch_title") or payload.get("watch_url") or "change")
         summary = diff or "page changed"
+        # An identity fingerprint, not a security primitive: the digest is unchanged, so guids already derived
+        # from a watch's uuid and diff stay the same.
         entry = {
-            "guid": "wh:cd:" + hashlib.sha1((watch_uuid + diff).encode()).hexdigest()[:16],
+            "guid": "wh:cd:" + hashlib.sha1((watch_uuid + diff).encode(), usedforsecurity=False).hexdigest()[:16],
             "title": title,
             "link": watch_url,
             "summary": summary,
@@ -329,7 +356,10 @@ __all__ = [
     "RssSource",
     "SOURCE_BUILDERS",
     "SOURCE_SPECS",
+    "WebhookIdsUnsupported",
+    "WebhookPayloadRefused",
     "WebhookSource",
+    "WebhookTextNotEncodable",
     "build_source",
     "webhook_item_from_payload",
 ]
