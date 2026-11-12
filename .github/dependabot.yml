@@ -1,8 +1,9 @@
 version: 2
 # Weekly dependency updates for the image's Python dependencies and for the Actions
-# this repository runs. Both open at most five pull requests, so the queue stays
-# reviewable; every one of them is a `.github/` or packaging change and therefore
-# waits for a human merge under the automerge policy.
+# this repository runs. Both open at most five pull requests, grouped per
+# ecosystem, so the queue stays reviewable; every one of them is a `.github/` or
+# packaging change and therefore waits for a human merge under the automerge
+# policy.
 updates:
   - package-ecosystem: "uv"
     directory: "/"
@@ -11,6 +12,10 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - "dependencies"
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
@@ -18,3 +23,7 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - "dependencies"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
