@@ -1332,9 +1332,9 @@ def _source_value(source_title: str, source_url: str, feed_host: str) -> str:
 
 #: RFC3339 date-time grammar, ASCII only: seconds are required, the offset is ``Z`` or a numeric offset whose
 #: hours are 00-23 and minutes 00-59, and RFC3339 allows a lower-case ``t``/``z``. The classes are written out
-#: rather than ``\d`` because ``\d`` matches non-ASCII digits, and the calendar values are checked by
-#: constructing a ``datetime`` below: ``fromisoformat`` also accepts a bare date, an arbitrary single-character
-#: separator, a missing seconds field and an out-of-range offset, none of which RFC3339 allows.
+#: rather than ``\d`` because ``\d`` matches non-ASCII digits. The calendar values are checked by constructing a
+#: ``datetime``: ``fromisoformat`` would also accept a bare date, an arbitrary single-character separator, a
+#: missing seconds field and an out-of-range offset, none of which RFC3339 allows.
 _RFC3339 = re.compile(
     r"([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.[0-9]+)?"
     r"(?:[Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
@@ -1344,9 +1344,11 @@ _RFC3339 = re.compile(
 def _is_rfc3339(value: object) -> bool:
     """Whether ``value`` is a valid RFC3339 timestamp.
 
-    The grammar is matched ASCII-only and the calendar values are then validated by constructing the moment, so a
-    malformed spelling cannot be mistaken for the fact. A caller reads a lifecycle field with this: a value this
-    parser rejects is not evidence of a withdrawal, and the caller must keep the record active.
+    The grammar is matched ASCII-only and the calendar values are validated by constructing the moment, so a
+    malformed spelling cannot be mistaken for the fact. A leap second (``:60``) is deliberately not supported:
+    RFC 3339 permits an application to leave leap seconds out, and refusing one can only keep the record active,
+    never strip its severity. A caller reads a lifecycle field with this: a value this parser rejects is not
+    evidence of a withdrawal, and the caller must keep the record active.
     """
     if not isinstance(value, str):
         return False
@@ -1356,8 +1358,6 @@ def _is_rfc3339(value: object) -> bool:
     if match is None:
         return False
     year, month, day, hour, minute, second = (int(part) for part in match.groups())
-    if second == 60:  # RFC3339 permits a leap second; ``datetime`` does not, so the second is capped.
-        second = 59
     try:
         datetime.datetime(year, month, day, hour, minute, second)
     except ValueError:
