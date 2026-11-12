@@ -1,3 +1,10 @@
+---
+name: Feature request
+about: Propose a source, notifier, enricher or behaviour change
+title: "[feature] "
+labels: enhancement
+---
+
 # Feature request
 
 **Problem** — what is missing and why it matters.

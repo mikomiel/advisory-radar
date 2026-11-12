@@ -1,3 +1,10 @@
+---
+name: Bug report
+about: Report a defect in advisory-radar
+title: "[bug] "
+labels: bug
+---
+
 # Bug report
 
 **Describe the bug** — what happened vs what you expected.

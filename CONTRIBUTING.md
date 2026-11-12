@@ -9,13 +9,28 @@ contribution-friendly; the rules below keep it safe for everyone.
 2. Commit with [Conventional Commits](https://www.conventionalcommits.org/)
    (`feat:`, `fix:`, `docs:`, `test:`, `chore:`, ...). One logical change per
    commit; no force-push after review starts.
-3. Open a pull request against `main`. Describe the change, the reason, and how
-   you tested it. `main` is protected: CI must be green and the `review` status
-   must be green — an approving review at the exact head commit, or (for a
-   Dependabot dependency update that touches only manifests) no review required,
-   as `README.md` describes under "Review and merge automation".
+3. For a behaviour change, open an issue first; a small fix can go straight to a
+   pull request. Describe the change, the reason and how you tested it. `main` is
+   protected: the required checks must be green and the `review` status must
+   approve the exact head commit — or, for a Dependabot update that touches only
+   manifests, no review is required. The full policy is in
+   [docs/review-and-merge.md](docs/review-and-merge.md).
 4. Keep PRs small and focused; a reviewer should be able to judge the whole
    diff in one read.
+
+## Required checks
+
+`main` requires these contexts on the pull request's head, all strict:
+
+| Context | What it proves |
+| --- | --- |
+| `ci` | Lint, tests, the image smoke test and the secret scan passed. |
+| `gate` | The trusted default-branch workflow published the gate status. |
+| `review` | An approving review exists at this exact commit, or the update is an exempt Dependabot manifest change. |
+| `dependency-review` | The change does not add a dependency with a known vulnerability. |
+
+If you rename a job, update the required contexts in the same change: renaming a
+context blocks every pull request until the protection is updated.
 
 ## Checks (run locally before pushing)
 
@@ -30,6 +45,14 @@ uv run python scripts/check_no_estate_identifiers.py   # CI guard, must pass
 CI additionally runs a secret scan (gitleaks). Never commit secrets, tokens,
 webhook URLs, internal hostnames or IPs — the CI guard and the secret scan
 both fail the build on them.
+
+## Review automation
+
+The merge automation, the review-status rule and the sensitive-path guard live
+in this repository. `ci-burst` and `agent-chat` carry adapted copies of parts of
+this policy; they are separate implementations because each repository's guard
+and allowlist differ, not a shared library. Consolidation, if ever wanted, is a
+separate change that must go through the guard and its tests.
 
 ## Code style
 
