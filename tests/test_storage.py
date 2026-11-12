@@ -340,12 +340,13 @@ def test_a_sqlite_target_at_an_auxiliary_file_beside_state_path_is_refused(tmp_p
     data = tmp_path / "data"
     data.mkdir()
     state_path = data / "state.json"
-    kev, overlay = data / "kev.json", data / "settings.json"
+    kev, overlay, scope = data / "kev.json", data / "settings.json", data / "watchlist.json"
     kev.write_text('{"schema": "advisory-radar-kev.v1", "cves": ["CVE-2026-1"]}', encoding="utf-8")
     overlay.write_text('{"schema": "advisory-radar-settings.v1", "settings": {}}', encoding="utf-8")
-    before = (kev.read_bytes(), overlay.read_bytes())
+    scope.write_text('{"schema": "security-watchlist.v1"}', encoding="utf-8")
+    before = (kev.read_bytes(), overlay.read_bytes(), scope.read_bytes())
 
-    for target, role in ((kev, "KEV cache"), (overlay, "settings overlay")):
+    for target, role in ((kev, "KEV cache"), (overlay, "settings overlay"), (scope, "default watchlist")):
         with pytest.raises(ValueError) as caught:
             storage.store_for(f"sqlite:///{target}", state_path)
         message = str(caught.value)
@@ -359,19 +360,20 @@ def test_a_sqlite_target_at_an_auxiliary_file_beside_state_path_is_refused(tmp_p
 
     # A SQLite document beside those files is exactly what a store is for.
     assert isinstance(storage.store_for(f"sqlite:///{data}/state.db", state_path), storage.SqliteStore)
-    assert (kev.read_bytes(), overlay.read_bytes()) == before, "a refused target must not touch either file"
+    assert (kev.read_bytes(), overlay.read_bytes(), scope.read_bytes()) == before, "a refused target writes nothing"
 
 
 def test_a_configured_sqlite_store_at_an_auxiliary_file_is_refused(tmp_path):
     data = tmp_path / "data"
     data.mkdir()
-    kev, overlay = data / "kev.json", data / "settings.json"
+    kev, overlay, scope = data / "kev.json", data / "settings.json", data / "watchlist.json"
     kev.write_text('{"schema": "advisory-radar-kev.v1", "cves": ["CVE-2026-1"]}', encoding="utf-8")
     overlay.write_text('{"schema": "advisory-radar-settings.v1", "settings": {}}', encoding="utf-8")
-    before = (kev.read_bytes(), overlay.read_bytes())
+    scope.write_text('{"schema": "security-watchlist.v1"}', encoding="utf-8")
+    before = (kev.read_bytes(), overlay.read_bytes(), scope.read_bytes())
     config_path = tmp_path / "config.yml"
 
-    for target, role in ((kev, "KEV cache"), (overlay, "settings overlay")):
+    for target, role in ((kev, "KEV cache"), (overlay, "settings overlay"), (scope, "default watchlist")):
         config_path.write_text(
             f"sources: []\nnotifiers: []\nstate_path: {data}/state.json\nstorage: sqlite:///{target}\n"
         )
@@ -379,7 +381,7 @@ def test_a_configured_sqlite_store_at_an_auxiliary_file_is_refused(tmp_path):
             load_config(config_path, {})
         assert role in str(caught.value)
         assert str(target) not in str(caught.value)
-    assert (kev.read_bytes(), overlay.read_bytes()) == before, "a refused configuration must not touch either file"
+    assert (kev.read_bytes(), overlay.read_bytes(), scope.read_bytes()) == before, "a refused target writes nothing"
 
 
 # --------------------------------------------------------------------------
