@@ -15,7 +15,8 @@ repository as the list endpoint reported them. Flattening renames is this script
 
 Two entries may be published as ``success`` without an independent approval, and only by their exact shape: a
 Dependabot update that touches nothing but dependency manifests, and the release pull request release-please
-generates from merged commits. Neither can be auto-merged -- the merge workflow still asks
+generates from merged commits -- recognised by its branch, author, the four files it manages *and* a patch that is
+only the version bump those files carry. Neither can be auto-merged: the merge workflow still asks
 :mod:`review_state` for an eligible approval at the exact head, and both always change a path
 ``guard_sensitive_paths.py`` reserves for a person.
 
@@ -30,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -54,18 +56,31 @@ EXEMPT_AUTHORS = frozenset({"app/dependabot", "dependabot[bot]"})
 DEPENDENCY_FILES = frozenset({"pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml"})
 DEPENDENCY_DIRECTORIES = (".github/workflows/",)
 #: The generated release pull request, recognised by its exact shape: release-please names the branch after the
-#: package, opens it with the token owner's account, and only ever modifies the files the release manages. Three
-#: facts together, because any one alone is too broad -- a fixed branch name alone would let a maintainer reuse
-#: it, an author alone would exempt anything that account opens, and those paths alone are an ordinary changelog
-#: edit. No authoring session exists to request the App review, and the human merge of this pull request is the
-#: release decision. Update the four together if the token owner, package name or release-managed files change;
-#: a drift fails closed, because the pull request then needs the normal review.
+#: package, opens it with the token owner's account, and only ever changes the release-managed files. Every fact
+#: together, because any one alone is too broad -- a fixed branch name would let a maintainer reuse it, an author
+#: would exempt anything that account opens, and those paths alone are an ordinary changelog edit. No authoring
+#: session exists to request the App review, and the human merge of this pull request is the release decision.
+#: Update them together if the token owner, package name or release-managed files change; a drift fails closed,
+#: because the pull request then needs the normal review. The branch name is the one release-please produced for
+#: mikomiel/ci-burst at the same pinned action version and the same configuration shape.
 RELEASE_BRANCH = "release-please--branches--main--components--advisory-radar"
 RELEASE_AUTHOR = "mikomiel"
 RELEASE_REPOSITORY = "mikomiel/advisory-radar"
-RELEASE_PATHS = frozenset(
-    {".release-please-manifest.json", "CHANGELOG.md", "pyproject.toml", "src/advisory_radar/__init__.py"}
-)
+#: The one line a generated release writes in each file that carries the version, matched against the patch's
+#: added *and* removed line. The identity facts say who opened the pull request; only the patch says what it
+#: changed inside a path the release manages. A dependency added beside the version, an import on the same line,
+#: two changed lines or no patch at all is not the generator's output and keeps the review requirement, and the
+#: captured version must agree across all three files.
+RELEASE_VERSION_FILES = {
+    ".release-please-manifest.json": r'\s*"\.": "(\d+\.\d+\.\d+)"',
+    "pyproject.toml": r'version = "(\d+\.\d+\.\d+)"',
+    "src/advisory_radar/__init__.py": r'__version__ = "(\d+\.\d+\.\d+)"',
+}
+#: The changelog must gain its generated section. Its prose is documentation, not something this automation can
+#: reach, so "present, with additions" is all that is asked. Every one of these four files must appear, and no
+#: other path may.
+RELEASE_CHANGELOG = "CHANGELOG.md"
+RELEASE_PATHS = frozenset(RELEASE_VERSION_FILES) | {RELEASE_CHANGELOG}
 
 
 def _changed_names(entry: dict) -> list[str]:
@@ -144,12 +159,63 @@ def release_candidate(entry: dict) -> bool:
     )
 
 
+def _changed_file(entry: dict, path: str) -> dict | None:
+    """The comparison's entry for one path, or None when the list does not carry it."""
+    files = entry.get("files")
+    for item in files if isinstance(files, list) else []:
+        if isinstance(item, dict) and item.get("filename") == path:
+            return item
+    return None
+
+
+def _bumped_version(entry: dict, path: str, pattern: str) -> str | None:
+    """The version one version-carrying file writes, or None when its diff is not exactly that one line replaced.
+
+    The identity facts only say who opened the pull request; the patch is what proves the change inside an allowed
+    path is the generator's. A generated release replaces one line per file -- ``-version = "0.1.0"`` becomes
+    ``+version = "0.2.0"`` -- so an added dependency (two added lines), an import appended to the version line (the
+    added line no longer matches the pattern), a file left untouched, or a patch the compare omitted all fail here.
+    """
+    item = _changed_file(entry, path)
+    if item is None or item.get("additions") != 1 or item.get("deletions") != 1:
+        return None
+    patch = item.get("patch")
+    if not isinstance(patch, str):
+        return None
+    added: list[str] = []
+    removed: list[str] = []
+    for line in patch.splitlines():
+        if line.startswith(("+++", "---")):
+            continue  # the file headers, not a changed line
+        if line.startswith("+"):
+            added.append(line[1:])
+        elif line.startswith("-"):
+            removed.append(line[1:])
+    if len(added) != 1 or len(removed) != 1:
+        return None
+    new = re.fullmatch(pattern, added[0])
+    old = re.fullmatch(pattern, removed[0])
+    if new is None or old is None or new.group(1) == old.group(1):
+        return None
+    return new.group(1)
+
+
 def release_scope(entry: dict) -> bool:
-    """Whether this entry is a generated release pull request that changes only release-managed files."""
+    """Whether this entry is the generator's output: its identity, all four release files, and one version bump.
+
+    Fails closed everywhere: an unreadable or incomplete file list, a path outside the release-managed set, a
+    missing release file, a changelog that gained nothing, a version file whose diff is not the one line, versions
+    that disagree, or a patch the compare did not carry.
+    """
     if not release_candidate(entry) or not _complete(entry):
         return False
-    names = _changed_names(entry)
-    return bool(names) and all(name in RELEASE_PATHS for name in names)
+    if set(_changed_names(entry)) != RELEASE_PATHS:
+        return False
+    changelog = _changed_file(entry, RELEASE_CHANGELOG)
+    if changelog is None or not isinstance(changelog.get("additions"), int) or changelog["additions"] < 1:
+        return False
+    versions = {_bumped_version(entry, path, pattern) for path, pattern in RELEASE_VERSION_FILES.items()}
+    return None not in versions and len(versions) == 1
 
 
 def merge(

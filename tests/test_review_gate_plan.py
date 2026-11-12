@@ -76,27 +76,65 @@ def entry(
     }
 
 
-#: The files release-please manages in its release pull request: the version in two places, the changelog and the
-#: manifest it bumps from. A test that adds one here without adding it to ``RELEASE_PATHS`` fails, on purpose.
-RELEASE_FILES = [
-    {"filename": ".release-please-manifest.json", "previous_filename": None},
-    {"filename": "CHANGELOG.md", "previous_filename": None},
-    {"filename": "pyproject.toml", "previous_filename": None},
-    {"filename": "src/advisory_radar/__init__.py", "previous_filename": None},
-]
+#: The repository root: the release configuration beside the scripts is what the exemption must keep matching.
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def release_files(new: str = "0.2.0", old: str = "0.1.0") -> list[dict]:
+    """The four files a generated release changes, with the one-line diff release-please writes in each.
+
+    Captured from the estate's own generated release pull request (mikomiel/ci-burst #102, same pinned action and
+    the same configuration shape): each version-carrying file replaces exactly one line, the changelog only gains
+    its new section, and all three versions agree.
+    """
+    return [
+        {
+            "filename": ".release-please-manifest.json",
+            "previous_filename": None,
+            "additions": 1,
+            "deletions": 1,
+            "patch": f'@@ -1,3 +1,3 @@\n {{\n-  ".": "{old}"\n+  ".": "{new}"\n }}',
+        },
+        {
+            "filename": "CHANGELOG.md",
+            "previous_filename": None,
+            "additions": 3,
+            "deletions": 0,
+            "patch": f"@@ -9,3 +9,6 @@\n \n+## [{new}](https://example) (2026-11-13)\n+\n+* a change\n",
+        },
+        {
+            "filename": "pyproject.toml",
+            "previous_filename": None,
+            "additions": 1,
+            "deletions": 1,
+            "patch": f'@@ -4,7 +4,7 @@\n [project]\n name = "advisory-radar"\n-version = "{old}"\n+version = "{new}"\n',
+        },
+        {
+            "filename": "src/advisory_radar/__init__.py",
+            "previous_filename": None,
+            "additions": 1,
+            "deletions": 1,
+            "patch": f'@@ -1,3 +1,3 @@\n """advisory-radar."""\n \n-__version__ = "{old}"\n+__version__ = "{new}"\n',
+        },
+    ]
 
 
 def release_entry(number: int = 40, **changes) -> dict:
-    """The generated release pull request: release-please's branch, the token owner, release-managed files only."""
+    """The generated release pull request: the generator's branch, author, paths and version diff."""
     options = {
         "reviews": [],
         "author": plan.RELEASE_AUTHOR,
-        "files": RELEASE_FILES,
+        "files": release_files(),
         "branch": plan.RELEASE_BRANCH,
         "head_repo": plan.RELEASE_REPOSITORY,
     }
     options.update(changes)
     return entry(number, **options)
+
+
+def with_file(files: list[dict], name: str, **changes) -> list[dict]:
+    """The release file list with one entry changed, for the negative cases."""
+    return [{**item, **changes} if item["filename"] == name else item for item in files]
 
 
 def decisions(entries: list[dict]) -> dict[str, tuple[str, str]]:
@@ -332,10 +370,6 @@ def test_a_comment_holds_a_dependency_update():
     assert commented[0] == "pending"
 
 
-#: The repository root: the release configuration beside the scripts is what the exemption must keep matching.
-ROOT = Path(__file__).resolve().parents[1]
-
-
 def test_the_generated_release_pull_request_needs_no_app_review():
     state, description = decisions([release_entry()])[HEAD]
     assert state == "success"
@@ -360,30 +394,57 @@ def test_a_stale_approval_or_a_dismissal_does_not_block_the_generated_release():
         assert got[0] == "success" and "not required" in got[1]
 
 
-OTHER_RELEASE_FILE = {"filename": "src/advisory_radar/web.py", "previous_filename": None}
-
-
-def test_every_other_release_like_shape_keeps_the_review_requirement():
+def test_every_other_identity_keeps_the_review_requirement():
     cases = {
         "another branch": {"branch": "release-please--branches--main--components--other"},
+        "a consolidated branch": {"branch": "release-please--branches--main"},
         "a fork's head": {"head_repo": "someone/advisory-radar"},
         "another author": {"author": "contributor"},
         "a draft": {"draft": True},
         "no file list": {"files": []},
-        "an unexpected path": {"files": RELEASE_FILES + [OTHER_RELEASE_FILE]},
-        "a truncated list": {"files": RELEASE_FILES[:1], "changed": len(RELEASE_FILES)},
+        "a truncated list": {"files": release_files()[:1], "changed": len(release_files())},
         "a count from another commit pair": {"count_head": OTHER},
     }
     for label, change in cases.items():
         assert decisions([release_entry(**change)])[HEAD][0] == "pending", label
 
 
-def test_a_rename_out_of_a_release_managed_file_is_not_a_release():
-    renamed = [
-        {"filename": "CHANGELOG.md", "previous_filename": "src/advisory_radar/web.py"},
-        {"filename": "pyproject.toml", "previous_filename": None},
-    ]
-    assert decisions([release_entry(files=renamed, changed=2)])[HEAD][0] == "pending"
+def test_a_release_that_is_not_only_the_version_bump_keeps_the_review_requirement():
+    """The exemption proves the content, not just the names: a hand-written edit inside an allowed file fails."""
+    files = release_files()
+    cases = {
+        "a dependency beside the version": with_file(
+            files,
+            "pyproject.toml",
+            additions=2,
+            patch=(
+                '@@ -4,8 +4,9 @@\n [project]\n name = "advisory-radar"\n-version = "0.1.0"\n'
+                '+version = "0.2.0"\n+    "evil-package>=1.0",\n'
+            ),
+        ),
+        "an import on the version line": with_file(
+            files,
+            "src/advisory_radar/__init__.py",
+            patch=(
+                '@@ -1,3 +1,3 @@\n """advisory-radar."""\n \n-__version__ = "0.1.0"\n'
+                '+__version__ = "0.2.0"; __import__("os").system("id")\n'
+            ),
+        ),
+        "two changed lines": with_file(files, "pyproject.toml", additions=2, deletions=2),
+        "no patch carried": with_file(files, "pyproject.toml", patch=None),
+        "the version unchanged": release_files(new="0.1.0"),
+        "versions that disagree": with_file(
+            files,
+            "pyproject.toml",
+            patch='@@ -4,7 +4,7 @@\n [project]\n name = "advisory-radar"\n-version = "0.1.0"\n+version = "0.9.9"\n',
+        ),
+        "no changelog section": [item for item in files if item["filename"] != "CHANGELOG.md"],
+        "an extra path": files + [{"filename": "docs/sources.md", "previous_filename": None}],
+        "a renamed file": with_file(files, "pyproject.toml", previous_filename="docs/pyproject.toml"),
+        "a changelog that gained nothing": with_file(files, "CHANGELOG.md", additions=0),
+    }
+    for label, changed in cases.items():
+        assert decisions([release_entry(files=changed, changed=len(changed))])[HEAD][0] == "pending", label
 
 
 def test_the_release_shape_follows_the_release_configuration():
@@ -399,8 +460,9 @@ def test_the_release_shape_follows_the_release_configuration():
     assert {"pyproject.toml", "src/advisory_radar/__init__.py", "CHANGELOG.md"} <= plan.RELEASE_PATHS
 
 
-def test_the_release_exemption_names_the_token_owner():
-    # The pull request's author is the account behind RELEASE_PLEASE_TOKEN; if that account changes, this and
-    # RELEASE_AUTHOR change together or the release pull request falls back to needing the normal review.
+def test_the_release_exemption_names_the_token_owner_and_the_observed_generator_branch():
+    # Literals on purpose: the branch is what release-please produced for this estate at the pinned action version
+    # (mikomiel/ci-burst #102, same configuration shape), and the author is the account behind the token.
+    assert plan.RELEASE_BRANCH == "release-please--branches--main--components--advisory-radar"
     assert plan.RELEASE_AUTHOR == "mikomiel"
     assert plan.RELEASE_REPOSITORY == "mikomiel/advisory-radar"

@@ -12,9 +12,10 @@ contribution-friendly; the rules below keep it safe for everyone.
 3. For a behaviour change, open an issue first; a small fix can go straight to a
    pull request. Describe the change, the reason and how you tested it. `main` is
    protected: the required checks must be green and the `review` status must
-   approve the exact head commit — or, for a Dependabot update that touches only
-   manifests, no review is required. The full policy is in
-   [docs/review-and-merge.md](docs/review-and-merge.md).
+   approve the exact head commit — or the pull request is one of the two shapes
+   that need no review: a Dependabot update that touches only manifests, or the
+   release pull request release-please generates (see [Releases](#releases)). The
+   full policy is in [docs/review-and-merge.md](docs/review-and-merge.md).
 4. Keep PRs small and focused; a reviewer should be able to judge the whole
    diff in one read.
 
@@ -71,8 +72,9 @@ and `src/advisory_radar/__init__.py`, the generated `CHANGELOG.md` section, and
   `pyproject.toml` and the manifest, so the merge automation never takes it: a
   person merges it. Its `review` status is published as `success` without an
   independent App review, because release-please opens it from the token owner's
-  account and no authoring session exists to request one; that exemption is
-  recognised by shape and described in
+  account and no authoring session exists to request one. That exemption is
+  recognised by the generator's exact output — branch, author, the four release
+  files and a diff that is only the version bump — and is described in
   [docs/review-and-merge.md](docs/review-and-merge.md).
 - The merge creates the `vX.Y.Z` tag and the GitHub Release. The tag starts the
   `release` workflow, which pushes `linux/amd64` and `linux/arm64` to

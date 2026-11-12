@@ -294,10 +294,34 @@ def test_a_generated_release_pull_request_is_published_as_success(tmp_path):
     """The seven-field row and the release exemption together: this proves the wiring, not the rule."""
     comparison = json.dumps(
         [
-            {"filename": ".release-please-manifest.json", "previous_filename": None},
-            {"filename": "CHANGELOG.md", "previous_filename": None},
-            {"filename": "pyproject.toml", "previous_filename": None},
-            {"filename": "src/advisory_radar/__init__.py", "previous_filename": None},
+            {
+                "filename": ".release-please-manifest.json",
+                "previous_filename": None,
+                "additions": 1,
+                "deletions": 1,
+                "patch": '@@ -1,3 +1,3 @@\n {\n-  ".": "0.1.0"\n+  ".": "0.2.0"\n }',
+            },
+            {
+                "filename": "CHANGELOG.md",
+                "previous_filename": None,
+                "additions": 1,
+                "deletions": 0,
+                "patch": "@@ -9,3 +9,4 @@\n \n+## [0.2.0](https://example)\n",
+            },
+            {
+                "filename": "pyproject.toml",
+                "previous_filename": None,
+                "additions": 1,
+                "deletions": 1,
+                "patch": '@@ -4,7 +4,7 @@\n [project]\n-version = "0.1.0"\n+version = "0.2.0"\n',
+            },
+            {
+                "filename": "src/advisory_radar/__init__.py",
+                "previous_filename": None,
+                "additions": 1,
+                "deletions": 1,
+                "patch": '@@ -1,3 +1,3 @@\n """advisory-radar."""\n-__version__ = "0.1.0"\n+__version__ = "0.2.0"\n',
+            },
         ]
     )
     code, posted = _gate(

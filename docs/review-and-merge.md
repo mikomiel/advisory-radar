@@ -65,18 +65,23 @@ as a status:
 - A green `review` means "not required" rather than "approved" in two cases: an exempt
   dependency update and the generated release pull request. The description says which, and
   each exemption applies only while every changed path is one it covers — a bump that
-  reached into `src/` would not be exempt, and neither would a release branch that carried
-  one.
+  changed `src/advisory_radar/web.py` would not be exempt, and neither would a release
+  branch that carried one.
 - **The generated release pull request is the second exemption.** Merging that pull request
   is the release decision, and no authoring session exists to request the App review, so the
-  gate publishes `review: success` for it — but only for its exact shape: the head branch
+  gate publishes `review: success` for it — but only for the generator's output, which is
+  more than a branch name. The identity: the head branch
   `release-please--branches--main--components--advisory-radar` in this repository, the
-  `RELEASE_PLEASE_TOKEN` owner as author, the pull request not a draft, and *every* path the
-  immutable `base...head` comparison names among the files the release manages
+  `RELEASE_PLEASE_TOKEN` owner as author, not a draft. The changes: every path the immutable
+  `base...head` comparison names is one of the four files the release manages
   (`.release-please-manifest.json`, `CHANGELOG.md`, `pyproject.toml`,
-  `src/advisory_radar/__init__.py`) with the changed-file count proving that list complete
-  for the same two commits. Any other branch, repository, author or path keeps the normal
-  requirement, and an unreadable list or count fails closed. An approval at the exact head
+  `src/advisory_radar/__init__.py`) and all four are present; the changelog gains its section;
+  and each version-carrying file's patch is *exactly* its one `version` line replaced, with
+  the three versions agreeing and the version actually changing. The changed-file count must
+  also prove the list complete for the same two commits. A dependency added beside the
+  version, an import appended to the version line, a second changed line, a path outside the
+  set, a missing patch (the gate carries one only for a change of at most four lines) or an
+  unreadable list keeps the normal requirement and fails closed. An approval at the exact head
   is still reported as that approval, a change request still makes the status a `failure`,
   and `.github/workflows/automerge.yml` still never takes the pull request: it changes
   `pyproject.toml`, a sensitive path, so a person merges it. The shape is recognised in

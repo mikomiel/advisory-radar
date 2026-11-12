@@ -166,12 +166,18 @@ jobs:
               echo "::warning::#${pr}: cannot read the changed-file count; not exempt from review"
             fi
             # Both review exemptions are decided by scripts/review_gate_plan.py from this entry: a Dependabot bump
-            # (author and path) and the generated release pull request (fixed branch, author and path). The paths
-            # come from the immutable two-SHA comparison, never from /pulls/{n}/files (which follows the branch: a
-            # head that moved A -> B -> A could show B's harmless files while A is evaluated). Both sides of a
-            # rename count. A failed read is not exempt.
+            # (author and path) and the generated release pull request (fixed branch, author, paths and the one-line
+            # version diff). The paths and patches come from the immutable two-SHA comparison, never from
+            # /pulls/{n}/files (which follows the branch: a head that moved A -> B -> A could show B's harmless
+            # files while A is evaluated). Both sides of a rename count. A failed read is not exempt.
+            #
+            # A small change carries its patch so the planner can prove the release exemption's *content*; a larger
+            # one does not, and any rule that needs a patch fails closed. The bound is transport, not policy: no
+            # path is named here, so this file cannot become a second copy of the rule.
             if ! files=$(gh api "repos/$REPO/compare/$base...$head" \
-                --jq '[.files[]? | {filename: .filename, previous_filename: .previous_filename}]'); then
+                --jq '[.files[]? | {filename: .filename, previous_filename: .previous_filename,
+                  additions: (.additions // 0), deletions: (.deletions // 0),
+                  patch: (if ((.additions // 0) + (.deletions // 0)) <= 4 then .patch else null end)}]'); then
               files='[]'
               echo "::warning::#${pr}: cannot read the comparison; not exempt from review"
             fi
