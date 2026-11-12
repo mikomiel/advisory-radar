@@ -994,3 +994,44 @@ def test_the_preview_matches_what_a_webhook_entry_is_judged_on(tmp_path):
     assert core.matched_products(feed_item, policy) == ("vendor",), "the entry matched through its feed title"
     assert core.filter_reason(feed_item, policy) == ""
     assert "In scope" in page.text and "judged exactly as typed" in page.text
+
+
+def test_a_database_left_at_the_default_document_name_fails_closed(tmp_path):
+    """An upgrade where a store already sits at that name must be reported, never rewritten as a watchlist."""
+    import sqlite3
+
+    data = tmp_path / "data"
+    data.mkdir()
+    database = data / "watchlist.json"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE document (body TEXT)")
+    connection.commit()
+    connection.close()
+    before = database.read_bytes()
+
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(f"sources: []\nnotifiers: []\nstate_path: {data}/state.json\n")
+    env = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN}
+    runtime = Runtime.build(config_path, env)
+    client = TestClient(create_app(runtime, env))
+    sign_in(client)
+
+    page = client.get("/watchlist")
+    assert page.status_code == 200 and "cannot be read" in page.text
+    assert "name='fingerprint'" not in page.text, "there is nothing safe to edit against"
+    csrf = CSRF_RE.search(client.get("/").text).group(1)
+    response = client.post(
+        "/watchlist",
+        data={
+            "csrf": csrf,
+            "fingerprint": "",
+            "debian_packages": "*",
+            "excluded_products": "",
+            "new:id": "php",
+            "new:aliases": "php",
+            "new:domains": "",
+        },
+    )
+    assert response.status_code == 200 and "cannot be read" in response.text
+    assert database.read_bytes() == before, "the database is not replaced by a document"
+    assert pipeline.run_pass(runtime.cfg, [], []) == 1, "and every pass fails until it is moved or removed"
