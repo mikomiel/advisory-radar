@@ -2784,3 +2784,185 @@ def test_parked_queue_recovery_survives_an_unbuildable_plugin(tmp_path):
     code = cli.main(["--config", str(path), "drop-parked"], env={})
     assert code == 0
     assert not load_state_document(state_path, core.STATE_SCHEMA, "state").get("parked")
+
+
+# ---------------------------------------------------------------------------
+# Audit R04: a withdrawn OSV record is lifecycle, not current severity
+
+
+def _osv_intel(document, cache=None):
+    """An ``Intel`` whose only answer is this OSV document (or a pre-filled cache)."""
+
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {} if cache is None else cache, lambda: 0.0, lambda seconds: None)
+
+        def _get(self, url):
+            return 200, document
+
+    return Intel()
+
+
+def test_a_withdrawn_osv_record_keeps_its_lifecycle_without_current_severity():
+    """OSV still serves withdrawn records; the lifecycle is kept, but it is not current severity evidence."""
+    ghsa = "GHSA-aaaa-bbbb-cccc"
+    withdrawn = {
+        "id": ghsa,
+        "aliases": ["CVE-2026-1234"],
+        "database_specific": {"severity": "CRITICAL"},
+        "withdrawn": "2026-01-02T00:00:00Z",
+    }
+    intel = _osv_intel(withdrawn)
+    facts = intel.ghsa(ghsa)
+    assert facts.withdrawn is True, "the withdrawn lifecycle must be retained"
+    assert facts.cvss is None, "a withdrawn record supplies no current CVSS"
+    assert facts.complete is False, "a withdrawn record makes no complete-measurement claim"
+    cached = intel._cache[ghsa]
+    assert cached["withdrawn"] is True and cached["cvss"] is None and cached["complete"] is False
+    assert intel.ghsa(ghsa) == facts, "the cached answer keeps the lifecycle fact"
+
+    active = _osv_intel({key: value for key, value in withdrawn.items() if key != "withdrawn"}).ghsa(ghsa)
+    assert active.withdrawn is False and active.complete is True
+    assert active.cvss == core.OSV_SEVERITY_SCORE["CRITICAL"]
+
+    legacy = _osv_intel(withdrawn, cache={ghsa: {"at": 0, "cves": ["CVE-2026-1234"], "cvss": 9.0, "complete": True}})
+    assert legacy.ghsa(ghsa).withdrawn is False, "a cache entry written before the field existed is not withdrawn"
+
+    for shape in (None, "", 0, {"at": "2026-01-02T00:00:00Z"}, ["2026-01-02T00:00:00Z"]):
+        relaxed = _osv_intel({**withdrawn, "withdrawn": shape}).ghsa(ghsa)
+        assert relaxed.withdrawn is False, f"an unreadable withdrawn shape must not claim the lifecycle: {shape!r}"
+        assert relaxed.cvss == core.OSV_SEVERITY_SCORE["CRITICAL"], "and it is not current severity evidence"
+
+
+def test_a_withdrawn_alias_free_ghsa_is_not_a_current_critical():
+    """A withdrawn CRITICAL label must not produce a current critical verdict, and never a suppression."""
+    document = {
+        "id": "GHSA-aaaa-bbbb-cccc",
+        "aliases": [],
+        "database_specific": {"severity": "CRITICAL"},
+        "withdrawn": "2026-01-02T00:00:00Z",
+    }
+    state = core.new_state()
+    item = core.Item(
+        "g1",
+        "GHSA-aaaa-bbbb-cccc advisory",
+        "https://vendor.example/x",
+        "notes",
+        NOW - 60,
+        ("GHSA-aaaa-bbbb-cccc",),
+    )
+    core.classify_new(
+        state,
+        [item],
+        _osv_intel(document),
+        frozenset(),
+        True,
+        NOW,
+        "",
+        core.Policy((), (), ()),
+        thresholds=DEFAULT_THRESHOLDS,
+    )
+    assert [entry["tag"] for entry in state["pending"]] == ["warning"], (
+        "a withdrawn advisory is history, not a current critical finding"
+    )
+    assert state["pending"][0]["levels"] == {}, "no CVE was measured"
+    assert "treated as unknown" in state["pending"][0]["body"]
+
+
+def test_a_withdrawn_ghsa_does_not_decide_a_mixed_item():
+    """Withdrawing one advisory must not suppress unrelated CVEs: their own evidence still decides."""
+    document = {
+        "id": "GHSA-aaaa-bbbb-cccc",
+        "aliases": [],
+        "database_specific": {"severity": "CRITICAL"},
+        "withdrawn": "2026-01-02T00:00:00Z",
+    }
+
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda seconds: None)
+
+        def _get(self, url):
+            return 200, document
+
+        def cves(self, cves, **ignored):
+            return {cve: core.CveFacts(9.8, None, 0.5, 0.99, True, remote_unauth=True) for cve in cves}
+
+    state = core.new_state()
+    item = core.Item(
+        "g2",
+        "GHSA-aaaa-bbbb-cccc and CVE-2026-5555",
+        "https://vendor.example/x",
+        "notes",
+        NOW - 60,
+        ("GHSA-aaaa-bbbb-cccc", "CVE-2026-5555"),
+    )
+    core.classify_new(
+        state,
+        [item],
+        Intel(),
+        frozenset({"CVE-2026-5555"}),
+        True,
+        NOW,
+        "",
+        core.Policy((), (), ()),
+        thresholds=DEFAULT_THRESHOLDS,
+    )
+    entry = state["pending"][0]
+    assert entry["tag"] == "critical"
+    assert entry["levels"] == {"CVE-2026-5555": "critical"}, "the active CVE decides on its own evidence"
+    assert "OSV GHSA severity" not in entry["body"], "the withdrawn advisory supplies no deciding score"
+    assert "without a CVE id decides the severity" not in entry["body"]
+
+
+def test_withdrawal_does_not_rewrite_delivered_history():
+    """The lifecycle fact changes the current verdict only; seen, deliveries and watch keep what happened."""
+    document = {
+        "id": "GHSA-aaaa-bbbb-cccc",
+        "aliases": [],
+        "database_specific": {"severity": "CRITICAL"},
+        "withdrawn": "2026-01-02T00:00:00Z",
+    }
+    seen = {"CVE-2026-5555": {"at": NOW - 9000, "outcome": "delivered", "delivery": "snap-1"}}
+    deliveries = {"snap-1": {"tag": "critical", "ids": ["CVE-2026-5555"], "delivered_to": ["fake"]}}
+    watch = {
+        "CVE-2026-5555": {
+            "since": NOW - 9000,
+            "last_eval": NOW - 9000,
+            "level": "critical",
+            "judged": "critical",
+            "title": "vendor widget",
+            "link": "https://vendor.example/x",
+            "cvss": 9.8,
+            "thresholds": [9.0, 0.10, 4.0],
+        }
+    }
+    state = core.new_state()
+    state["seen"] = dict(seen)
+    state["deliveries"] = dict(deliveries)
+    state["watch"] = dict(watch)
+    item = core.Item(
+        "g2",
+        "GHSA-aaaa-bbbb-cccc and CVE-2026-5555",
+        "https://vendor.example/x",
+        "notes",
+        NOW - 60,
+        ("GHSA-aaaa-bbbb-cccc", "CVE-2026-5555"),
+    )
+    core.classify_new(
+        state,
+        [item],
+        _osv_intel(document),
+        frozenset(),
+        True,
+        NOW,
+        "",
+        core.Policy((), (), ()),
+        thresholds=DEFAULT_THRESHOLDS,
+    )
+    assert state["seen"] == seen, "a delivered record keeps its time, outcome and snapshot"
+    assert state["deliveries"] == deliveries
+    assert state["watch"] == watch
+    assert [entry["tag"] for entry in state["pending"]] == ["warning"], (
+        "the withdrawn advisory is not current critical evidence"
+    )

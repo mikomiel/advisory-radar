@@ -415,6 +415,9 @@ class OsvFacts:
     cves: tuple[str, ...]
     cvss: float | None
     complete: bool
+    #: OSV keeps serving a withdrawn record. The lifecycle is retained, but that record is not evidence of a
+    #: current severity: it carries no ``cvss`` and makes no completeness claim.
+    withdrawn: bool = False
 
 
 @dataclass(frozen=True)
@@ -955,7 +958,12 @@ class Intel:
     def ghsa(self, ghsa: str) -> OsvFacts:
         entry = self._fresh(ghsa, False)
         if entry is not None:
-            return OsvFacts(tuple(entry["cves"]), entry["cvss"], bool(entry.get("complete", True)))
+            return OsvFacts(
+                tuple(entry["cves"]),
+                entry["cvss"],
+                bool(entry.get("complete", True)),
+                bool(entry.get("withdrawn", False)),
+            )
         status, document = self._get(OSV_URL + ghsa)
         if status == 404:
             # OSV does not know this advisory. That is not a measurement of zero severity: a LOW sibling must
@@ -974,14 +982,26 @@ class Intel:
                 if isinstance(alias, str) and CVE_RE.fullmatch(alias)
             )
         )
+        # A withdrawn record keeps an RFC3339 ``withdrawn`` timestamp; OSV omits the member otherwise. The
+        # lifecycle is kept, but it is not current severity evidence: another shape is tolerated and is not
+        # read as withdrawn, so this parser never raises on it.
+        raw_withdrawn = document.get("withdrawn")
+        withdrawn = isinstance(raw_withdrawn, str) and bool(raw_withdrawn.strip())
         specific = document.get("database_specific")
         label = specific.get("severity") if isinstance(specific, dict) else None
-        cvss = OSV_SEVERITY_SCORE.get(label.upper()) if isinstance(label, str) else None
+        cvss = None if withdrawn else (OSV_SEVERITY_SCORE.get(label.upper()) if isinstance(label, str) else None)
         # An advisory with neither a CVE alias nor a usable severity label was not measured: its severity is
-        # unknown, and it must not be suppressed by a LOW sibling.
-        complete = bool(cves) or cvss is not None
-        self._cache[ghsa] = {"at": int(self._clock()), "cves": list(cves), "cvss": cvss, "complete": complete}
-        return OsvFacts(cves, cvss, complete)
+        # unknown, and it must not be suppressed by a LOW sibling. A withdrawn record also makes no completeness
+        # claim, so an item naming it is never suppressed while its lifecycle is unknown to the verdict.
+        complete = not withdrawn and (bool(cves) or cvss is not None)
+        self._cache[ghsa] = {
+            "at": int(self._clock()),
+            "cves": list(cves),
+            "cvss": cvss,
+            "complete": complete,
+            "withdrawn": withdrawn,
+        }
+        return OsvFacts(cves, cvss, complete, withdrawn)
 
 
 # --------------------------------------------------------------------------
