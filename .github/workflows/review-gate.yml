@@ -112,8 +112,11 @@ jobs:
 
           # Complete enumeration over the REST API: `gh pr list --limit N` truncates silently, and a pull request
           # pushed out of the window would keep an old success that no sweep ever revisits.
+          # The head branch and its repository travel with the snapshot because the generated release pull request
+          # is recognised by them: a fixed branch name in this repository, not a fork's copy of it.
           if ! prs=$(gh api --paginate "repos/$REPO/pulls?state=open&base=main&per_page=100" \
-              --jq '.[] | [.number, .head.sha, .base.sha, (.draft|tostring), .user.login] | @tsv'); then
+              --jq '.[] | [.number, .head.sha, .base.sha, (.draft|tostring), .user.login, .head.ref,
+                (.head.repo.full_name // "")] | @tsv'); then
             echo "::error::cannot enumerate open pull requests; no status can be re-confirmed"
             exit 1
           fi
@@ -133,12 +136,12 @@ jobs:
             exit 0
           fi
 
-          while IFS=$'\t' read -r pr head base draft author; do
+          while IFS=$'\t' read -r pr head base draft author branch headrepo; do
             [ -n "$pr" ] || continue
             if ! reviews=$(gh api --paginate "repos/$REPO/pulls/$pr/reviews?per_page=100" | jq -s -c 'add'); then
               # An incomplete snapshot must not leave a success standing: revoke every head we were about to
               # re-confirm, then fail. The next sweep republishes what is true.
-              while IFS=$'\t' read -r _other revoke_head _base _draft _author; do
+              while IFS=$'\t' read -r _other revoke_head _base _draft _author _branch _head_repo; do
                 if [ -n "$revoke_head" ]; then
                   publish "$revoke_head" pending "could not read the reviews; the next run decides" || true
                 fi
@@ -162,9 +165,11 @@ jobs:
             else
               echo "::warning::#${pr}: cannot read the changed-file count; not exempt from review"
             fi
-            # The exemption is author *and* path, and the paths come from the immutable two-SHA comparison, never
-            # from /pulls/{n}/files (which follows the branch: a head that moved A -> B -> A could show B's
-            # harmless files while A is evaluated). Both sides of a rename count. A failed read is not exempt.
+            # Both review exemptions are decided by scripts/review_gate_plan.py from this entry: a Dependabot bump
+            # (author and path) and the generated release pull request (fixed branch, author and path). The paths
+            # come from the immutable two-SHA comparison, never from /pulls/{n}/files (which follows the branch: a
+            # head that moved A -> B -> A could show B's harmless files while A is evaluated). Both sides of a
+            # rename count. A failed read is not exempt.
             if ! files=$(gh api "repos/$REPO/compare/$base...$head" \
                 --jq '[.files[]? | {filename: .filename, previous_filename: .previous_filename}]'); then
               files='[]'
@@ -173,9 +178,10 @@ jobs:
             jq -c -n --argjson number "$pr" --arg head "$head" --arg base "$base" \
               --argjson draft "$draft" --arg author "$author" --argjson changed "$changed" \
               --arg count_head "$count_head" --arg count_base "$count_base" \
+              --arg branch "$branch" --arg head_repo "$headrepo" \
               --argjson reviews "$reviews" --argjson files "$files" \
               '{number: $number, head: $head, base: $base, draft: $draft, author: $author, changed: $changed,
-                count_head: $count_head, count_base: $count_base,
+                count_head: $count_head, count_base: $count_base, branch: $branch, head_repo: $head_repo,
                 reviews: $reviews, files: $files}' >> "$snapshot"
           done <<<"$prs"
 

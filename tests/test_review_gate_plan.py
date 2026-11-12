@@ -55,6 +55,8 @@ def entry(
     base: str = BASE,
     count_head: str | None = None,
     count_base: str | None = None,
+    branch: str = "feat/example",
+    head_repo: str = "mikomiel/advisory-radar",
 ) -> dict:
     chosen = FILES if files is None else files
     return {
@@ -63,6 +65,8 @@ def entry(
         "base": base,
         "draft": draft,
         "author": author,
+        "branch": branch,
+        "head_repo": head_repo,
         "reviews": list(reviews),
         "files": chosen,
         "changed": len(chosen) if changed is None else changed,
@@ -70,6 +74,29 @@ def entry(
         "count_head": head if count_head is None else count_head,
         "count_base": base if count_base is None else count_base,
     }
+
+
+#: The files release-please manages in its release pull request: the version in two places, the changelog and the
+#: manifest it bumps from. A test that adds one here without adding it to ``RELEASE_PATHS`` fails, on purpose.
+RELEASE_FILES = [
+    {"filename": ".release-please-manifest.json", "previous_filename": None},
+    {"filename": "CHANGELOG.md", "previous_filename": None},
+    {"filename": "pyproject.toml", "previous_filename": None},
+    {"filename": "src/advisory_radar/__init__.py", "previous_filename": None},
+]
+
+
+def release_entry(number: int = 40, **changes) -> dict:
+    """The generated release pull request: release-please's branch, the token owner, release-managed files only."""
+    options = {
+        "reviews": [],
+        "author": plan.RELEASE_AUTHOR,
+        "files": RELEASE_FILES,
+        "branch": plan.RELEASE_BRANCH,
+        "head_repo": plan.RELEASE_REPOSITORY,
+    }
+    options.update(changes)
+    return entry(number, **options)
 
 
 def decisions(entries: list[dict]) -> dict[str, tuple[str, str]]:
@@ -303,3 +330,77 @@ def test_a_comment_holds_a_dependency_update():
     # any review at all is used as-is; a comment is not an approval
     commented = decisions([entry(17, reviews=[review("COMMENTED")], author="app/dependabot")])[HEAD]
     assert commented[0] == "pending"
+
+
+#: The repository root: the release configuration beside the scripts is what the exemption must keep matching.
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_the_generated_release_pull_request_needs_no_app_review():
+    state, description = decisions([release_entry()])[HEAD]
+    assert state == "success"
+    assert "release" in description and "not required" in description
+
+
+def test_a_change_request_still_blocks_the_generated_release_pull_request():
+    # the exemption removes the approval requirement, not a veto
+    assert decisions([release_entry(reviews=[review("CHANGES_REQUESTED")])])[HEAD][0] == "failure"
+
+
+def test_an_approval_at_the_head_is_reported_as_that_approval():
+    # the exemption fills the gap; it does not rewrite a verdict that is already there
+    state, description = decisions([release_entry(reviews=[review("APPROVED")])])[HEAD]
+    assert state == "success" and "approved at" in description
+
+
+def test_a_stale_approval_or_a_dismissal_does_not_block_the_generated_release():
+    # release-please rewrites its branch on every run, so a review left on the previous head must not park it
+    for reviews in ([review("APPROVED", commit="0" * 40)], [review("DISMISSED")], [review("COMMENTED")]):
+        got = decisions([release_entry(reviews=reviews)])[HEAD]
+        assert got[0] == "success" and "not required" in got[1]
+
+
+OTHER_RELEASE_FILE = {"filename": "src/advisory_radar/web.py", "previous_filename": None}
+
+
+def test_every_other_release_like_shape_keeps_the_review_requirement():
+    cases = {
+        "another branch": {"branch": "release-please--branches--main--components--other"},
+        "a fork's head": {"head_repo": "someone/advisory-radar"},
+        "another author": {"author": "contributor"},
+        "a draft": {"draft": True},
+        "no file list": {"files": []},
+        "an unexpected path": {"files": RELEASE_FILES + [OTHER_RELEASE_FILE]},
+        "a truncated list": {"files": RELEASE_FILES[:1], "changed": len(RELEASE_FILES)},
+        "a count from another commit pair": {"count_head": OTHER},
+    }
+    for label, change in cases.items():
+        assert decisions([release_entry(**change)])[HEAD][0] == "pending", label
+
+
+def test_a_rename_out_of_a_release_managed_file_is_not_a_release():
+    renamed = [
+        {"filename": "CHANGELOG.md", "previous_filename": "src/advisory_radar/web.py"},
+        {"filename": "pyproject.toml", "previous_filename": None},
+    ]
+    assert decisions([release_entry(files=renamed, changed=2)])[HEAD][0] == "pending"
+
+
+def test_the_release_shape_follows_the_release_configuration():
+    """The exemption's literals mirror two files; a drift in either must fail here, not silently stop matching."""
+    config = json.loads((ROOT / "release-please-config.json").read_text(encoding="utf-8"))
+    package = config["packages"]["."]["package-name"]
+    assert f"release-please--branches--main--components--{package}" == plan.RELEASE_BRANCH
+    # The tag is `vX.Y.Z` because release.yml triggers on that and ignores a component prefix.
+    assert config["include-v-in-tag"] is True
+    assert config["include-component-in-tag"] is False
+    # One root package, so the release pull request changes the root files the exemption names.
+    assert list(json.loads((ROOT / ".release-please-manifest.json").read_text(encoding="utf-8"))) == ["."]
+    assert {"pyproject.toml", "src/advisory_radar/__init__.py", "CHANGELOG.md"} <= plan.RELEASE_PATHS
+
+
+def test_the_release_exemption_names_the_token_owner():
+    # The pull request's author is the account behind RELEASE_PLEASE_TOKEN; if that account changes, this and
+    # RELEASE_AUTHOR change together or the release pull request falls back to needing the normal review.
+    assert plan.RELEASE_AUTHOR == "mikomiel"
+    assert plan.RELEASE_REPOSITORY == "mikomiel/advisory-radar"

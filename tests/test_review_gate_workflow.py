@@ -7,6 +7,7 @@ stale lifecycle event must not block the snapshot that superseded it.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -20,6 +21,23 @@ HEAD = "a" * 40
 BASE = "b" * 40
 OTHER = "c" * 40
 MOVED = "d" * 40
+REPOSITORY = "mikomiel/advisory-radar"
+RELEASE_BRANCH = "release-please--branches--main--components--advisory-radar"
+
+
+def pull_line(
+    number: int,
+    head: str,
+    base: str,
+    *,
+    draft: bool = False,
+    author: str = "mikomiel",
+    branch: str = "feat/example",
+    repository: str = REPOSITORY,
+) -> str:
+    """One `pulls?state=open` row as the gate's jq emits it: seven tab-separated fields."""
+    return f"{number}\t{head}\t{base}\t{str(draft).lower()}\t{author}\t{branch}\t{repository}\n"
+
 
 STUB = """#!/usr/bin/env bash
 set -u
@@ -65,6 +83,7 @@ def _gate(
     live: str = f"open\t{HEAD}",
     live_fails_for: str = "",
     reviews: str = "[]",
+    compare: str = "[]",
     event_head: str = "",
     event_action: str = "",
     event_pr: str = "",
@@ -74,7 +93,7 @@ def _gate(
     files = {
         "FAKE_PULLS": pulls,
         "FAKE_REVIEWS": reviews,
-        "FAKE_COMPARE": "[]",
+        "FAKE_COMPARE": compare,
         "FAKE_PREVIOUS": "",
         "FAKE_LIVE": live,
     }
@@ -132,7 +151,7 @@ def test_a_nonempty_snapshot_missing_the_event_head_fails_before_publishing(tmp_
     """Publishing the other heads would leave this one's old verdict standing with no signal."""
     code, posted = _gate(
         tmp_path,
-        pulls=f"17\t{OTHER}\t{BASE}\tfalse\tmikomiel\n",
+        pulls=pull_line(17, OTHER, BASE),
         event_head=HEAD,
         event_action="synchronize",
         event_pr="27",
@@ -145,7 +164,7 @@ def test_a_nonempty_snapshot_missing_the_event_head_fails_before_publishing(tmp_
 def test_a_stale_event_does_not_block_the_snapshot(tmp_path):
     code, posted = _gate(
         tmp_path,
-        pulls=f"17\t{OTHER}\t{BASE}\tfalse\tmikomiel\n",
+        pulls=pull_line(17, OTHER, BASE),
         event_head=HEAD,
         event_action="synchronize",
         event_pr="27",
@@ -156,7 +175,7 @@ def test_a_stale_event_does_not_block_the_snapshot(tmp_path):
 
 
 def test_a_schedule_writes_one_verdict_per_head(tmp_path):
-    code, posted = _gate(tmp_path, pulls=f"17\t{OTHER}\t{BASE}\tfalse\tmikomiel\n")
+    code, posted = _gate(tmp_path, pulls=pull_line(17, OTHER, BASE))
     assert code == 0
     assert posted == [(OTHER, "pending")]
 
@@ -173,7 +192,7 @@ def test_a_lookup_failure_refuses_to_publish(tmp_path):
     output: list[str] = []
     code, posted = _gate(
         tmp_path,
-        pulls=f"17\t{OTHER}\t{BASE}\tfalse\tmikomiel\n",
+        pulls=pull_line(17, OTHER, BASE),
         event_head=HEAD,
         event_action="synchronize",
         event_pr="27",
@@ -190,7 +209,7 @@ def test_a_stale_event_head_moved_to_a_planned_head_does_not_block_the_snapshot(
     """The pull request moved to another head the snapshot carries: stale event, snapshot decides."""
     code, posted = _gate(
         tmp_path,
-        pulls=f"17\t{OTHER}\t{BASE}\tfalse\tmikomiel\n",
+        pulls=pull_line(17, OTHER, BASE),
         event_head=HEAD,
         event_action="synchronize",
         event_pr="27",
@@ -205,7 +224,7 @@ def test_a_head_that_moved_out_of_the_snapshot_fails_before_publishing(tmp_path)
     output: list[str] = []
     code, posted = _gate(
         tmp_path,
-        pulls=f"17\t{OTHER}\t{BASE}\tfalse\tmikomiel\n",
+        pulls=pull_line(17, OTHER, BASE),
         event_head=HEAD,
         event_action="synchronize",
         event_pr="27",
@@ -221,7 +240,7 @@ def test_an_unreadable_live_state_refuses_to_publish(tmp_path):
     """An answer that names neither a state nor a head cannot be told from an incomplete snapshot."""
     code, posted = _gate(
         tmp_path,
-        pulls=f"17\t{OTHER}\t{BASE}\tfalse\tmikomiel\n",
+        pulls=pull_line(17, OTHER, BASE),
         event_head=HEAD,
         event_action="synchronize",
         event_pr="27",
@@ -235,7 +254,7 @@ def test_a_closed_head_absent_from_a_nonempty_plan_is_revoked(tmp_path):
     """The positive path: a close names a head the plan omits, so that head's old verdict must go."""
     code, posted = _gate(
         tmp_path,
-        pulls=f"17\t{OTHER}\t{BASE}\tfalse\tmikomiel\n",
+        pulls=pull_line(17, OTHER, BASE),
         event_head=HEAD,
         event_action="closed",
         event_pr="27",
@@ -248,7 +267,7 @@ def test_a_closed_head_carried_by_another_open_pull_request_is_not_revoked(tmp_p
     """The reused-head exception: the plan's verdict stands and nothing revokes it."""
     code, posted = _gate(
         tmp_path,
-        pulls=f"19\t{HEAD}\t{BASE}\tfalse\tmikomiel\n",
+        pulls=pull_line(19, HEAD, BASE),
         reviews=_approval(),
         event_head=HEAD,
         event_action="closed",
@@ -261,7 +280,7 @@ def test_a_closed_head_carried_by_another_open_pull_request_is_not_revoked(tmp_p
 def test_an_approval_on_the_event_head_is_published(tmp_path):
     code, posted = _gate(
         tmp_path,
-        pulls=f"18\t{HEAD}\t{BASE}\tfalse\tmikomiel\n",
+        pulls=pull_line(18, HEAD, BASE),
         reviews=_approval(),
         event_head=HEAD,
         event_action="synchronize",
@@ -269,3 +288,34 @@ def test_an_approval_on_the_event_head_is_published(tmp_path):
     )
     assert code == 0
     assert posted == [(HEAD, "success")]
+
+
+def test_a_generated_release_pull_request_is_published_as_success(tmp_path):
+    """The seven-field row and the release exemption together: this proves the wiring, not the rule."""
+    comparison = json.dumps(
+        [
+            {"filename": ".release-please-manifest.json", "previous_filename": None},
+            {"filename": "CHANGELOG.md", "previous_filename": None},
+            {"filename": "pyproject.toml", "previous_filename": None},
+            {"filename": "src/advisory_radar/__init__.py", "previous_filename": None},
+        ]
+    )
+    code, posted = _gate(
+        tmp_path,
+        pulls=pull_line(40, HEAD, BASE, branch=RELEASE_BRANCH),
+        live=f"{HEAD}\t{BASE}\t4",
+        compare=comparison,
+    )
+    assert code == 0
+    assert posted == [(HEAD, "success")]
+
+
+def test_the_same_row_on_an_ordinary_branch_still_needs_a_review(tmp_path):
+    code, posted = _gate(
+        tmp_path,
+        pulls=pull_line(40, HEAD, BASE),
+        live=f"{HEAD}\t{BASE}\t4",
+        compare=json.dumps([{"filename": "pyproject.toml", "previous_filename": None}]),
+    )
+    assert code == 0
+    assert posted == [(HEAD, "pending")]

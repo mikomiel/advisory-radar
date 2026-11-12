@@ -54,6 +54,32 @@ this policy; they are separate implementations because each repository's guard
 and allowlist differ, not a shared library. Consolidation, if ever wanted, is a
 separate change that must go through the guard and its tests.
 
+## Releases
+
+Releases are automated by
+[release-please](https://github.com/googleapis/release-please). It keeps one
+release pull request open against `main`: the next version in `pyproject.toml`
+and `src/advisory_radar/__init__.py`, the generated `CHANGELOG.md` section, and
+`.release-please-manifest.json`.
+
+- Write conventional commit subjects. They become the changelog, and while the
+  project is `0.x` a `feat` bumps the minor version (`bump-minor-pre-major`).
+- Do not bump a version or edit `CHANGELOG.md` by hand; the release pull request
+  owns both. A change to `release-please-config.json` or
+  `.release-please-manifest.json` is release policy and is merged by a person.
+- Merging the release pull request is the release decision. It always changes
+  `pyproject.toml` and the manifest, so the merge automation never takes it: a
+  person merges it. Its `review` status is published as `success` without an
+  independent App review, because release-please opens it from the token owner's
+  account and no authoring session exists to request one; that exemption is
+  recognised by shape and described in
+  [docs/review-and-merge.md](docs/review-and-merge.md).
+- The merge creates the `vX.Y.Z` tag and the GitHub Release. The tag starts the
+  `release` workflow, which pushes `linux/amd64` and `linux/arm64` to
+  `ghcr.io/mikomiel/advisory-radar` under the version tag and, for a stable
+  `vX.Y.Z`, `latest`, with build provenance and an SBOM attestation bound to the
+  pushed digest.
+
 ## Code style
 
 - Python 3.13+, standard-library-first for the core pipeline (HTTP via
