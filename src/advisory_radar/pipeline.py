@@ -6,9 +6,8 @@ import hashlib
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
-from pathlib import Path
 
-from . import core
+from . import core, watchlist
 from .config import Config, secret_values
 from .http import Http, RedactFilter, urllib_http
 from .kev import load_kev
@@ -17,7 +16,6 @@ from .plugins import Source, SourceWindow
 from .sources import build_source
 from .state import LockBusy, SourceError
 from .storage import Store, StoreUnavailable
-from .watchlist import load_policy
 
 LOG = logging.getLogger("advisory_radar")
 
@@ -170,7 +168,13 @@ def _run_pass(
         # as absent would re-seed the state and replay history the moment the server came back.
         LOG.error("%s; not re-seeding", exc)
         return 1
-    policy = load_policy(cfg.watchlist_path) if cfg.watchlist_path else _default_policy()
+    try:
+        policy = watchlist.load_policy(watchlist.active_path(cfg.watchlist_path, cfg.state_path))
+    except SourceError as exc:
+        # /watchlist writes this document, so an unreadable one is a state the program can reach on its own. A
+        # failed pass that says so, like an unreadable state document, beats an exception out of the scheduler.
+        LOG.error("%s; the pass did not run", exc)
+        return 1
     core.HIDDEN_SOURCE_HOSTS = cfg.hidden_source_hosts
 
     state = core.new_state() if stored is None else stored
@@ -460,11 +464,6 @@ def _run_pass(
 
 def state_cache(stored: dict | None) -> dict:
     return stored["cache"] if stored is not None else {}
-
-
-def _default_policy():
-    """The packaged default watchlist (allow every Debian package, no product scope)."""
-    return load_policy(Path(__file__).with_name("watchlist.default.json"))
 
 
 def build_plugins(cfg: Config, env: Mapping[str, str]):
