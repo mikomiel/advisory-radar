@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import urllib.parse
 
 from . import feeds
 from .catalogue import SOURCE_SPECS
@@ -129,7 +130,7 @@ class ChangedetectionSource:
         self.tag = tag
 
     def fetch(self, http: Http, state: dict) -> SourceWindow:
-        query = f"?tag={self.tag}" if self.tag else ""
+        query = f"?{urllib.parse.urlencode({'tag': self.tag})}" if self.tag else ""
         status, _, body = http("GET", f"{self.url}/api/v1/watch{query}", {"x-api-key": self.api_key}, None)
         if status != 200:
             raise RuntimeError(
