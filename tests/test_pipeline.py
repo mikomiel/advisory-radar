@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from advisory_radar import core, pipeline, storage
-from advisory_radar.config import Config, ConfigError, load_config
+from advisory_radar.config import DEFAULT_THRESHOLDS, Config, ConfigError, load_config
 from advisory_radar.plugins import SourceWindow
 from advisory_radar.sources import ChangedetectionSource, RssSource, WebhookSource
 from advisory_radar.state import save_state
@@ -1449,3 +1449,157 @@ def test_a_resolved_composed_id_removal_still_discards_its_stored_work(tmp_path)
     assert not (stored.get("carry") or {}), "a resolved removal still discards the carry"
     assert not (stored.get("feeds") or {}), "a resolved removal still discards the validators"
     assert not (stored.get("changedetection") or {}), "a resolved removal still discards the cursors"
+
+
+# --- admission keeps its independent bounds --------------------------------------------------------
+
+
+def test_a_warning_queued_in_the_quiet_window_leaves_the_room_for_a_critical(tmp_path):
+    """A warning classified inside the window is held, so the critical that follows fits in the same pass."""
+    night = local_epoch(23)
+    path = tmp_path / "quiet-two.yml"
+    path.write_text(
+        "sources:\n  - id: vendor\n    type: rss\n    url: https://feeds.example.com/rss\n"
+        "notifiers:\n  - id: fake\n    type: webhook\n    url: https://hooks.example.com/x\n"
+        "quiet_hours: 22:00-07:00\n"
+        f"state_path: {tmp_path}/state.json\n"
+    )
+    cfg = load_config(path, {})
+    state = core.new_state()
+    state["seeded"] = {"vendor": True}
+    cfg.store().save(state)
+    body = _rss_document(
+        _rss_item("Vendor advisory with no identifier", "warning-1", night - 7200),
+        _rss_item("Vendor advisory CVE-2026-7777", "critical-1", night - 3600),
+    )
+    kev = {"catalogVersion": "1", "vulnerabilities": [{"cveID": "CVE-2026-7777"}]}
+
+    def http(method, url, headers, payload):
+        if url == "https://feeds.example.com/rss":
+            return 200, {}, body
+        if _is_kev_request(url):
+            return 200, {}, json.dumps(kev).encode()
+        return 404, {}, b""
+
+    notifier = FakeNotifier(200)
+    assert (
+        pipeline.run_pass(
+            cfg,
+            [RssSource("vendor", "https://feeds.example.com/rss")],
+            [notifier],
+            http=http,
+            clock=lambda: float(night),
+            sleep=lambda seconds: None,
+        )
+        == 0
+    )
+    assert [message["ids"] for message in notifier.sent] == [["CVE-2026-7777"]], (
+        "the warning queued during the window must not take the room the critical needs"
+    )
+    stored = cfg.store().load()
+    assert [(entry["tag"], entry["ids"]) for entry in stored["pending"]] == [("warning", ["src:vendor:warning-1"])]
+    assert "attempts" not in stored["pending"][0], "the held warning was never attempted"
+
+
+def test_a_full_sendable_queue_still_leaves_new_items_in_carry(tmp_path):
+    """DELIVERY_CAP still bounds admission: five sendable messages leave no room for a sixth."""
+    policy = make_policy(tmp_path)
+    state = core.new_state()
+    state["pending"] = [queued_message(f"CVE-2026-{number}") for number in range(1, 6)]
+    fresh = core.Item(
+        "vendor:new",
+        "Vendor advisory CVE-2026-9999",
+        "https://vendor.example/new",
+        "",
+        NOW - 60,
+        ("CVE-2026-9999",),
+    )
+    left = core.classify_new(
+        state,
+        [fresh],
+        core.Intel(None, {}, lambda: 0.0, lambda seconds: None),
+        frozenset(),
+        True,
+        NOW,
+        "",
+        policy,
+        share=core.DELIVERY_CAP,
+        thresholds=DEFAULT_THRESHOLDS,
+    )
+    assert [item.guid for item in left] == ["vendor:new"], "the sixth message must be carried, not queued"
+    assert len(state["pending"]) == core.DELIVERY_CAP, "the sendable queue is still bounded by the delivery cap"
+
+
+def test_admission_keeps_parking_and_the_lookup_budget_independent(tmp_path):
+    """Admission counts delivery room only: parking is untouched and MAX_CLASSIFY still bounds lookups."""
+    policy = make_policy(tmp_path)
+    parked = {
+        "kind": "new",
+        "tag": "warning",
+        "title": "WARNING: parked advisory",
+        "body": "",
+        "ids": ["CVE-2026-2"],
+        "cves": ["CVE-2026-2"],
+        "levels": {"CVE-2026-2": "warning"},
+        "kev_only": [],
+        "scores": {"CVE-2026-2": 7.5},
+        "thresholds": [9.0, 0.10, 4.0],
+        "source": "Vendor",
+        "link": "https://vendor.example/2",
+        "source_id": "vendor",
+        "attempts": core.MAX_DELIVERY_ATTEMPTS,
+        "first_attempt_at": NOW - 7200,
+        "last_status": 500,
+    }
+
+    class LowIntel(core.Intel):
+        """A complete, low measurement for any CVE: each item is suppressed, so nothing is queued."""
+
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda seconds: None)
+
+        def cves(self, cves, **ignored):
+            return {cve: core.CveFacts(2.0, None, None, None, True) for cve in cves}
+
+    state = core.new_state()
+    state["parked"] = [dict(parked)]
+    warning = core.Item("vendor:w", "Vendor advisory", "https://vendor.example/w", "", NOW - 60, ())
+    assert (
+        core.classify_new(
+            state,
+            [warning],
+            LowIntel(),
+            frozenset(),
+            True,
+            NOW,
+            "",
+            policy,
+            share=core.DELIVERY_CAP,
+            thresholds=DEFAULT_THRESHOLDS,
+        )
+        == []
+    )
+    assert state["parked"] == [parked], "classification admission must not touch a parked entry"
+
+    bounded = core.new_state()
+    items = [
+        core.Item(
+            f"vendor:{number}", f"Advisory CVE-2026-{1000 + number}", "", "", None, (f"CVE-2026-{1000 + number}",)
+        )
+        for number in range(core.MAX_CLASSIFY + 5)
+    ]
+    left = core.classify_new(
+        bounded,
+        items,
+        LowIntel(),
+        frozenset(),
+        True,
+        NOW,
+        "",
+        policy,
+        share=core.DELIVERY_CAP,
+        thresholds=DEFAULT_THRESHOLDS,
+    )
+    assert len(bounded["watch"]) == core.MAX_CLASSIFY, "MAX_CLASSIFY is still the independent lookup bound"
+    assert len(left) == 5, "the items past the lookup budget are carried, not classified"
+    assert bounded["pending"] == [], "a suppressed advisory is never queued"
