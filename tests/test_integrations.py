@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import logging
+import urllib.parse
 
 import pytest
 from fastapi.testclient import TestClient
@@ -74,6 +75,44 @@ def test_changedetection_source_emits_only_new_changes():
     second = source.fetch(cd_http_factory(WATCHES_V2), state)
     assert [i.guid for i in second.items] == ["cd:uuid-1:2000"]  # paused uuid-2 skipped
     assert second.items[0].link == "https://shop.example.com/item"
+
+
+def _requested_watch_url(tag: str | None) -> str:
+    """The URL the source hands the transport, which is the only place the query is observable."""
+    requested: list[str] = []
+
+    def http(method, url, headers, body):
+        requested.append(url)
+        return 200, {}, b"{}"
+
+    ChangedetectionSource("cd", "https://cd.example.com", "KEY", tag).fetch(http, {})
+    assert len(requested) == 1
+    return requested[0]
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [
+        pytest.param("critical security", id="space"),
+        pytest.param("advisories&news", id="ampersand"),
+        pytest.param("C++", id="plus"),
+        pytest.param("pricing#section", id="hash"),
+        pytest.param("bezpieczeństwo", id="non-ascii"),
+    ],
+)
+def test_a_changedetection_tag_reaches_the_request_encoded(tag):
+    """A tag is one query parameter: the server must receive it verbatim, not truncated or reinterpreted."""
+    url = _requested_watch_url(tag)
+    parts = urllib.parse.urlsplit(url)
+    assert parts.path == "/api/v1/watch"
+    assert parts.fragment == "", "a '#' in the tag must not start a URL fragment"
+    assert url.isascii(), "the request target must be ASCII, so a non-ASCII tag has to be percent-encoded"
+    assert " " not in url, "a raw space is not a valid request target"
+    assert urllib.parse.parse_qs(parts.query) == {"tag": [tag]}
+
+
+def test_a_changedetection_source_without_a_tag_sends_no_query():
+    assert _requested_watch_url(None) == "https://cd.example.com/api/v1/watch"
 
 
 def test_a_changedetection_response_that_is_not_valid_utf8_is_refused():
