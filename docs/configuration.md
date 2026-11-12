@@ -88,10 +88,11 @@ thresholds:                 # these are the defaults
 
 An OSV advisory can be withdrawn, and OSV keeps serving that record. Its lifecycle is kept
 rather than ignored, but a withdrawn record is not current severity evidence: it supplies no
-CVSS and no complete measurement, so an item naming it alone is an unmeasured warning (never
-critical and never suppressed). The CVEs the item's own text or its other advisories name are
-still judged on their own evidence, and a withdrawal changes nothing about what was already
-delivered.
+CVSS and no complete measurement, so an advisory whose only evidence is a withdrawn record is an
+unmeasured warning, never suppressed. The record's aliases are kept: a CVE it aliases is still
+looked up and judged on its own CVE.org/NVD evidence, and the CVEs the item's own text names are
+judged on theirs, so an item carrying active evidence can still be critical through it. A
+withdrawal changes nothing about what was already delivered.
 
 A single source may raise or lower the bar for its own items with its own `thresholds`
 block. It states only the numbers that differ; the rest are the global block's, key by key,
