@@ -114,7 +114,7 @@ def test_unusable_input_fails_closed():
 
 
 def test_the_policy_is_the_documented_one():
-    """A new sensitive path is a policy change: it belongs in the list *and* in the README paragraph."""
+    """A new sensitive path is a policy change: it belongs in the list *and* in the docs paragraph."""
     assert guard.SENSITIVE_PATTERNS == (
         r"^\.github/",
         r"^Dockerfile$",
@@ -128,9 +128,9 @@ def test_the_policy_is_the_documented_one():
         r"^tests/",
         r"^scripts/",
     )
-    # The docstring promises the README too, so check it: every guarded pattern reads as a literal path once
+    # The docstring promises the docs page too, so check it: every guarded pattern reads as a literal path once
     # the anchors and regex escapes are gone, and the paragraph that lists them must name all of them.
-    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
-    paragraph = readme.split("**A person merges anything that widens", 1)[1].split("\n\n", 1)[0]
+    docs = (Path(__file__).resolve().parents[1] / "docs" / "review-and-merge.md").read_text()
+    paragraph = docs.split("**A person merges anything that widens", 1)[1].split("\n\n", 1)[0]
     for pattern in guard.SENSITIVE_PATTERNS:
         assert pattern.strip("^$").replace("\\", "") in paragraph, f"{pattern} is guarded but not documented"
