@@ -341,7 +341,8 @@ def _json_feed_export(document: object) -> FeedExport:
     entries = document.get("items")
     if not isinstance(entries, list):
         raise FeedError("feed has no items list")
-    feed_title = _text(document.get("title"))
+    # The feed ``title`` is plain text too, so it keeps a literal "<" the HTML parser would drop.
+    feed_title = _plain(document.get("title"))
     feed_link = _encodable(_string(document.get("home_page_url")))
     items = []
     for node in entries:
@@ -354,7 +355,9 @@ def _json_feed_export(document: object) -> FeedExport:
         guid = _identity(node.get("id")) or _identity(node.get("url")) or _identity(node.get("external_url"))
         if not guid:
             raise FeedError("feed entry has no usable id")
-        title = _text(node.get("title"))
+        # ``title`` is specification-defined plain text, so it is not HTML-parsed: a literal "<libfoo>" is
+        # part of the title, and the HTML parser would drop it as a tag.
+        title = _plain(node.get("title"))
         if not title:
             # ``title`` is optional in JSON Feed 1.0/1.1, so one untitled item must not make the whole
             # document unreadable; the content's first line, then the item id, stand in for it.
@@ -420,6 +423,11 @@ _XHTML_BLOCKS = frozenset(
 )
 
 
+#: Atom text constructs declare their escaping in ``type`` (RFC 4287 §3.1). The attribute defaults to ``text``,
+#: and only these values carry markup; the MIME spellings are the same two renderings written out.
+_ATOM_MARKUP_TYPES = frozenset({"html", "xhtml", "text/html", "application/xhtml+xml"})
+
+
 def _text_of(node: ET.Element | None) -> str:
     if node is None:
         return ""
@@ -446,6 +454,24 @@ def _text_of(node: ET.Element | None) -> str:
 def _raw_text(node: ET.Element | None) -> str:
     """An element's own text, unaltered, for a value that is an identity rather than display prose."""
     return "".join(node.itertext()) if node is not None else ""
+
+
+def _atom_text(node: ET.Element | None) -> str:
+    """An Atom text construct, read as the ``type`` it declares.
+
+    The attribute defaults to ``text``, so an undeclared construct is plain text: HTML-parsing it would take a
+    literal ``<libfoo>`` for a tag and drop the product name the source was added for. ``html`` and ``xhtml``
+    carry markup and keep the existing extraction, including its block and inline rules.
+    """
+    if node is None:
+        return ""
+    declared = (node.get("type") or "").split(";", 1)[0].strip().lower()
+    # A text construct carries no child elements. One that does is malformed, and its markup is then the only
+    # structure that keeps a block element's neighbours apart, so the extraction that knows the difference
+    # between block and inline stays in charge of it.
+    if declared in _ATOM_MARKUP_TYPES or len(node):
+        return _text_of(node)
+    return _plain(_raw_text(node))
 
 
 def _published_of(node: ET.Element | None) -> int | None:
@@ -496,7 +522,7 @@ def _rss_2_export(root: ET.Element) -> FeedExport:
 
 
 def _atom_export(root: ET.Element) -> FeedExport:
-    channel_title = _text_of(root.find(f"{_ATOM}title"))
+    channel_title = _atom_text(root.find(f"{_ATOM}title"))
     # Only an alternate link is a public site. A rel="self" link is the subscription URL and can carry a
     # feed credential, which must never reach a notification.
     channel_link = ""
@@ -512,11 +538,13 @@ def _atom_export(root: ET.Element) -> FeedExport:
                 link = candidate.get("href", "")
                 break
         guid = _raw_text(node.find(f"{_ATOM}id")) or link
-        title = _text_of(node.find(f"{_ATOM}title"))
+        title = _atom_text(node.find(f"{_ATOM}title"))
         if not guid or not title:
             raise RssError("feed entry has no usable id or title")
         summary = " ".join(
-            text for text in (_text_of(node.find(f"{_ATOM}summary")), _text_of(node.find(f"{_ATOM}content"))) if text
+            text
+            for text in (_atom_text(node.find(f"{_ATOM}summary")), _atom_text(node.find(f"{_ATOM}content")))
+            if text
         )
         published = _published_of(node.find(f"{_ATOM}published")) or _published_of(node.find(f"{_ATOM}updated"))
         items.append(FeedEntry(guid, title, link, summary, published, channel_title, channel_link))

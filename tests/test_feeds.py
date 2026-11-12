@@ -124,6 +124,37 @@ def test_parse_atom():
     assert entry.published is not None
 
 
+def test_atom_honours_the_declared_text_type():
+    """Atom ``type`` defaults to ``text``: an undeclared or text-typed construct is not markup."""
+    atom = (
+        b'<feed xmlns="http://www.w3.org/2005/Atom">'
+        b"<title>Vendor &lt;security&gt;</title>"
+        b"<entry><id>urn:uuid:1</id>"
+        b"<title>Security update for &lt;libfoo&gt; 2.0</title>"
+        b'<summary type="text">Fixes &lt;libfoo&gt; 2.0.</summary>'
+        b'<content type="html">&lt;p&gt;Fixes &lt;b&gt;CVE-2026-2222&lt;/b&gt;.&lt;/p&gt;</content>'
+        b"</entry></feed>"
+    )
+    (entry,) = feeds.parse_rss(atom).items
+    assert entry.source_title == "Vendor <security>"
+    assert entry.title == "Security update for <libfoo> 2.0"
+    assert entry.summary == "Fixes <libfoo> 2.0. Fixes CVE-2026-2222."
+
+
+def test_an_atom_text_title_still_matches_the_watchlist():
+    """The product name sits inside a literal tag-like run that the HTML parser would drop."""
+    from advisory_radar import core, watchlist
+
+    policy = watchlist.Policy((), (), (watchlist.Product("libfoo", (), (), False),))
+    atom = (
+        b'<feed xmlns="http://www.w3.org/2005/Atom"><link rel="alternate" href="https://vendor.example.com/"/>'
+        b"<entry><id>urn:uuid:1</id><title>Security update for &lt;libfoo&gt; 2.0</title>"
+        b'<summary type="text">No package name here.</summary></entry></feed>'
+    )
+    (entry,) = feeds.parse_rss(atom).items
+    assert core.matched_products(entry, policy) == ("libfoo",)
+
+
 def test_parse_rss_rejects_garbage():
     with pytest.raises(feeds.RssError):
         feeds.parse_rss(b"<html>not a feed</html>")
@@ -143,6 +174,45 @@ def test_parse_json_feed():
     assert second.guid == "apsb26-3"
     assert second.link == "https://vendor.example.com/apsb26-3"  # external_url when url is absent
     assert second.published == 1792663200  # date_modified when date_published is absent
+
+
+def test_json_feed_titles_are_plain_text_and_keep_literal_angle_brackets():
+    """JSON Feed ``title`` and ``summary`` are specification-defined plain text, not markup."""
+    body = b"""{
+      "version": "https://jsonfeed.org/version/1.1",
+      "title": "Vendor <security> advisories",
+      "items": [
+        {"id": "a1", "title": "Security update for <libfoo> 2.0", "summary": "Fixes <libfoo> 2.0."},
+        {"id": "a2", "title": "fixed in <2.0", "content_text": "Security update."}
+      ]
+    }"""
+    first, second = feeds.parse_json_feed(body).items
+    assert first.source_title == "Vendor <security> advisories"
+    assert first.title == "Security update for <libfoo> 2.0"
+    assert first.summary == "Fixes <libfoo> 2.0."
+    assert second.title == "fixed in <2.0"
+
+
+def test_a_json_feed_plain_text_title_still_matches_the_watchlist():
+    """A product name that only occurs inside a literal tag-like run is still evidence, not markup."""
+    from advisory_radar import core, watchlist
+
+    policy = watchlist.Policy((), (), (watchlist.Product("libfoo", (), (), False),))
+    body = (
+        b'{"version": "https://jsonfeed.org/version/1.1", "items": ['
+        b'{"id": "a1", "title": "Security update for <libfoo> 2.0", "content_text": "No package name here."}]}'
+    )
+    (entry,) = feeds.parse_json_feed(body).items
+    assert entry.title == "Security update for <libfoo> 2.0"
+    assert core.matched_products(entry, policy) == ("libfoo",)
+
+
+def test_a_json_feed_content_html_is_still_normalised():
+    body = (
+        b'{"version": "https://jsonfeed.org/version/1.1", "items": ['
+        b'{"id": "a1", "title": "t", "content_html": "<p>Fixes CVE-2026-1111 in <b>libfoo</b>.</p>"}]}'
+    )
+    assert feeds.parse_json_feed(body).items[0].summary == "Fixes CVE-2026-1111 in libfoo."
 
 
 def test_a_json_feed_item_without_a_title_derives_a_usable_one():
