@@ -90,9 +90,18 @@ container needs:
 | `ADVISORY_RADAR_INSECURE_COOKIES` | `1` only for a plain-HTTP development instance: stops marking the session cookie `Secure` |
 | plus one per referenced secret | e.g. `DISCORD_WEBHOOK_URL`, `APPRISE_PASSWORD`, `FRESHRSS_TOKEN` |
 
-Volumes: `/config` (read-only) and `/data` (the state file, `settings.json` and the KEV cache). An
+Volumes: `/config` (read-only) and `/data` (the state file, `settings.json`, the KEV cache and, with no
+`watchlist:` key, `watchlist.json`). An
 advisory's identity is kept exactly as the publisher sent it — only its log and display spelling
 is escaped — because transforming an identity can merge two advisories into one.
+
+`/watchlist` edits the scope document where it lives. With no `watchlist:` key that is
+`watchlist.json` beside `state_path`, which is writable: a document on the `/config` mount can be
+read but not saved, so a deployment that wants the browser editor keeps it on `/data`. The
+document is replaced atomically with mode `0600` under a lock on `watchlist.json.lock` (the same
+sidecar-lock mechanism the state file uses), and a save is refused when the file changed under the
+page, so two tabs or two processes cannot silently overwrite each other. A save needs no reload:
+the pass reads the policy on every run.
 
 `advisory-radar sources list` prints every built-in source kind with its required
 and optional keys and needs no config file. `advisory-radar sources test <id>
@@ -128,8 +137,9 @@ that is, `/data/data/state.db`.
 
 The key is YAML-only. The overlay cannot move the store, and a reload refuses a changed
 `storage:` as it refuses a changed `state_path`, so moving it is a restart.
-`settings.json` and the KEV cache stay beside `state_path` and are not part of the
-document, which is why `state_path` is still required when the document lives elsewhere.
+`settings.json`, the KEV cache and the default `watchlist.json` stay beside `state_path` and are
+not part of the document, which is why `state_path` is still required when the document lives
+elsewhere.
 
 `advisory-radar migrate --config /config/config.yml --to sqlite:////data/state.db` copies
 the document read through the configured store into another one. It refuses a target that
