@@ -23,6 +23,7 @@ from .catalogue import SOURCE_SPECS
 from .delivery import QuietHours, parse_quiet_hours
 from .routing import MATCH_KEYS, SEVERITY_TAGS
 from .storage import Store, store_for
+from .watchlist import WATCHLIST_NAME
 
 _ENV_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?:_FILE)?\}")
 
@@ -751,6 +752,11 @@ def config_from_document(
         state_path.name != "settings.json",
         "state_path must not be named settings.json: that is the settings overlay's filename beside the state file",
     )
+    _require(
+        state_path.name != WATCHLIST_NAME,
+        f"state_path must not be named {WATCHLIST_NAME}: that is the default watchlist's filename beside the "
+        "state file",
+    )
     # A malformed value must fail here with every other bad key, not at the first pass: ``store_for`` is the
     # one parser, and its refusal names the accepted forms without quoting the value (a URL can carry a
     # password). The store itself is built later, from an already validated value.
@@ -764,6 +770,12 @@ def config_from_document(
     _require(
         watchlist is None or isinstance(watchlist, str),
         f"watchlist must be a path to a watchlist file, got {type(watchlist).__name__}",
+    )
+    # An embedded NUL is not a path any call can take: refusing it here fails at start with a message, instead of
+    # a ValueError from the first inspection.
+    _require(
+        not isinstance(watchlist, str) or "\x00" not in watchlist,
+        "watchlist must not contain a NUL byte",
     )
     watchlist_path = Path(watchlist) if isinstance(watchlist, str) else None
     raw_hidden = document.get("hidden_source_hosts")

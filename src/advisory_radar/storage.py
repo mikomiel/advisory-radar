@@ -76,19 +76,22 @@ _RESERVED_NEIGHBOUR_REFUSAL = (
 
 
 def _refuse_reserved_neighbour(path: Path, state_path: Path) -> None:
-    """Refuse a SQLite document at the KEV cache or the settings overlay beside ``state_path``.
+    """Refuse a SQLite document at a file another owner keeps beside ``state_path``.
 
-    The comparison is on resolved absolute paths, because ``sqlite:///data/kev.json`` is relative to the
-    working directory while ``sqlite:////data/kev.json`` is absolute and both can name the same file. The
-    neighbour names come from the owners that write those files, so a rename cannot leave this check behind;
-    they are imported here because both modules reach ``storage`` through ``config``.
+    That is the KEV cache, the settings overlay and the default watchlist: each is written by its own owner, so a
+    document there destroys one of them -- and a watchlist that is really a SQLite database would be read as an
+    unreadable scope, failing every pass. The comparison is on resolved absolute paths, because
+    ``sqlite:///data/kev.json`` is relative to the working directory while ``sqlite:////data/kev.json`` is absolute
+    and both can name the same file. The neighbour names come from the owners that write those files, so a rename
+    cannot leave this check behind; they are imported here because two of them reach ``storage`` through ``config``.
     """
-    from . import pipeline, settings  # lazy: pipeline and settings import storage (through config)
+    from . import pipeline, settings, watchlist  # lazy: two of them import storage (through config)
 
     resolved = path.resolve()
     for role, neighbour in (
         ("KEV cache", state_path.with_name(pipeline.KEV_CACHE_NAME)),
         ("settings overlay", settings.settings_path(state_path)),
+        ("default watchlist", state_path.with_name(watchlist.WATCHLIST_NAME)),
     ):
         if resolved == neighbour.resolve():
             raise ValueError(_RESERVED_NEIGHBOUR_REFUSAL.format(role=role))

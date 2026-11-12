@@ -23,13 +23,14 @@ import time
 import urllib.parse
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 
 import yaml
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from itsdangerous import BadSignature, URLSafeSerializer
 
-from . import __version__, feeds, pipeline
+from . import __version__, feeds, pipeline, watchlist
 from .catalogue import SOURCE_SPECS
 from .config import (
     DEFAULT_THRESHOLDS,
@@ -228,6 +229,7 @@ _NAV = (
     ("/parked", "Parked"),
     ("/config", "Config"),
     ("/sources", "Sources"),
+    ("/watchlist", "Watchlist"),
     ("/runs", "Runs"),
 )
 
@@ -928,6 +930,319 @@ class InboxFull(Exception):
     """A webhook source's inbox is at capacity; the sender must retry, nothing is discarded."""
 
 
+#: Why an item is outside the scope, as the sentence the watchlist page shows. ``core.filter_reason`` returns
+#: the key, so the explanation and the pass's decision are the same decision.
+_SCOPE_REASONS = {
+    "excluded-product": "it matches an excluded product",
+    "no-product-match": "it matches none of the configured products",
+    "debian-package": "it is a Debian item whose package matches no debian_source_packages pattern",
+    "nginx-keyword": "it is an nginx.org item with no security keyword",
+}
+#: A product row's field widths in characters, so an alias or a domain is readable without widening the table.
+_ALIASES_SIZE = 34
+_DOMAINS_SIZE = 24
+#: What the watchlist page says a product needs; repeated wherever a save is refused, so the reason and the
+#: rule are one text.
+_WATCHLIST_HELP = (
+    "An id is lowercase letters, digits and hyphens, at least two characters and unique; a product needs at "
+    "least one alias; a domain looks like <code>nodejs.org</code>; the package list needs at least one pattern "
+    "(<code>*</code> allows every package)."
+)
+
+
+def _form_value(form: Mapping[str, list[str]], name: str) -> str:
+    """The one value a submitted form carries for ``name``; no python-multipart, no repeated fields."""
+    return (form.get(name) or [""])[0]
+
+
+def _form_words(value: str) -> list[str]:
+    """A comma-separated field as a set of words, trimmed and de-duplicated, in the order it was typed."""
+    return list(dict.fromkeys(part.strip() for part in value.split(",") if part.strip()))
+
+
+def _form_lines(value: str) -> list[str]:
+    """A one-entry-per-line textarea as a set of entries, trimmed and de-duplicated, in the order typed."""
+    return list(dict.fromkeys(line.strip() for line in value.splitlines() if line.strip()))
+
+
+def _representable(value: str) -> bool:
+    """Whether a form control can carry this value at all.
+
+    A control character does not survive a form, and a lone surrogate cannot be rendered, so a value holding one
+    would come back changed from a save nobody meant to change. It is offered as text instead.
+    """
+    if any(character < " " or character == "\x7f" for character in value):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _alias_holds(alias: str) -> bool:
+    """Whether the comma-separated aliases field can round-trip this alias unchanged: the field's own answer."""
+    return _representable(alias) and _form_words(alias) == [alias]
+
+
+def _line_holds(entry: str) -> bool:
+    """Whether a one-entry-per-line textarea can round-trip this entry unchanged: the field's own answer."""
+    return _representable(entry) and _form_lines(entry) == [entry]
+
+
+def _list_field(name: str, label: str, entries: Sequence[str]) -> str:
+    """One one-entry-per-line field: editable, or read-only with the exact list beside it.
+
+    Read-only is the same rule a product row follows: an entry the textarea would split or rewrite (a line break,
+    a control character) is carried exactly in a hidden field instead of being changed by a save nobody meant to
+    make.
+    """
+    text = "\n".join(entries)
+    if all(_line_holds(entry) for entry in entries):
+        return f"<label>{esc(label)} (one per line)<textarea name='{name}' rows='4'>{esc(text)}</textarea></label>"
+    return (
+        f"<label>{esc(label)} (one per line, read-only)"
+        f"<textarea rows='4' readonly>{esc(text)}</textarea>"
+        f"<input type='hidden' name='{name}_json' value='{esc(json.dumps(list(entries)))}'>"
+        "<span class='muted small'>kept exactly: this field cannot hold one of these entries</span></label>"
+    )
+
+
+def _product_rows(products: Sequence[Mapping[str, object]]) -> str:
+    """One editable row per product: its aliases, its domains, and whether it is being removed.
+
+    The id is rendered as text, not as an editable field: it is what a routing rule and an exclusion name, so
+    a rename would silently change both. Renaming is a remove and an add.
+
+    A row holding an alias its field cannot carry (see :func:`_alias_holds`) is rendered read-only, with the exact
+    list in a hidden field so the row still submits as one row; the save keeps the value from the document
+    (``metadata_only`` too, which has no control here), because a hidden field is not a promise the page keeps.
+    """
+    rows = []
+    for product in products:
+        identifier = str(product.get("id", ""))
+        aliases = [str(alias) for alias in product.get("aliases") or ()]
+        domains = ", ".join(str(domain) for domain in product.get("domains") or ())
+        removed = " checked" if product.get("remove") is True else ""
+        if all(_alias_holds(alias) for alias in aliases):
+            aliases_cell = (
+                f"<td><input type='text' size='{_ALIASES_SIZE}' name='product:{esc(identifier)}:aliases' "
+                f"value='{esc(', '.join(aliases))}' aria-label='aliases for {esc(identifier)}'></td>"
+            )
+        else:
+            aliases_cell = (
+                f"<td><input type='text' size='{_ALIASES_SIZE}' value='{esc(', '.join(aliases))}' readonly "
+                f"aria-label='aliases for {esc(identifier)}, read-only'>"
+                f"<input type='hidden' name='product:{esc(identifier)}:aliases_json' "
+                f"value='{esc(json.dumps(aliases))}'>"
+                "<br><span class='muted small'>kept exactly: this field cannot hold an alias here</span></td>"
+            )
+        rows.append(
+            f"<tr><td><b>{esc(identifier)}</b></td>"
+            f"{aliases_cell}"
+            f"<td><input type='text' size='{_DOMAINS_SIZE}' name='product:{esc(identifier)}:domains' "
+            f"value='{esc(domains)}' aria-label='domains for {esc(identifier)}'></td>"
+            f"<td><input type='checkbox' name='remove:{esc(identifier)}' value='1'{removed} "
+            f"aria-label='remove {esc(identifier)}'></td></tr>"
+        )
+    return "".join(rows)
+
+
+class _BadForm(ValueError):
+    """A submitted form this page did not issue: refused with a message rather than guessed at."""
+
+
+#: The fields one watchlist submission carries besides its per-row ones.
+_WATCHLIST_FIELDS = frozenset(
+    {
+        "csrf",
+        "fingerprint",
+        "debian_packages",
+        "excluded_products",
+        "debian_packages_json",
+        "excluded_products_json",
+        "new:id",
+        "new:aliases",
+        "new:domains",
+    }
+)
+#: What a product id in a field name must look like: the shape the document itself accepts.
+_PRODUCT_ID = re.compile(r"[a-z][a-z0-9-]+")
+
+
+def _one(form: Mapping[str, list[str]], name: str) -> str | None:
+    """The single value a field carries, ``None`` when it is absent; a repeated field is refused."""
+    values = form.get(name)
+    if not values:
+        return None
+    if len(values) != 1:
+        raise _BadForm(f"{name} was submitted {len(values)} times")
+    return values[0]
+
+
+def _json_list(name: str, raw: str) -> list[str]:
+    """A hidden exact list: readable JSON, a list, and strings only. Anything else is refused."""
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, RecursionError):  # a deep enough nesting raises before it is a value
+        raise _BadForm(f"{name} is not readable") from None
+    if not isinstance(parsed, list) or any(not isinstance(item, str) for item in parsed):
+        raise _BadForm(f"{name} is not a list of entries")
+    return parsed
+
+
+def _lists(form: Mapping[str, list[str]], name: str, split: Callable[[str], list[str]]) -> list[str]:
+    """Exactly one of a list's two representations: the visible field, or the exact hidden one.
+
+    Never both and never neither. The page renders one of them, so a payload with both says two things at once
+    and a payload with neither is a submission that never came from the page.
+    """
+    plain, exact = _one(form, name), _one(form, f"{name}_json")
+    if (plain is None) == (exact is None):
+        raise _BadForm(f"{name} must be submitted once")
+    if exact is not None:
+        return _json_list(name, exact)
+    return split(plain)
+
+
+def _row_field(name: str) -> tuple[str, str] | None:
+    """``(id, leaf)`` for a per-product field name, or ``None`` when the name is not one."""
+    prefix, _, rest = name.partition(":")
+    if prefix == "product":
+        identifier, _, leaf = rest.rpartition(":")
+        return (identifier, leaf) if leaf in {"aliases", "aliases_json", "domains"} else None
+    if prefix == "remove":
+        return (rest, prefix) if rest and ":" not in rest else None
+    return None
+
+
+def _parse_watchlist_form(
+    form: Mapping[str, list[str]],
+) -> tuple[list[dict], list[str], list[str], dict[str, str]]:
+    """The rows, the two lists and the pending new row one submission carries, or a refusal.
+
+    The shape is checked whole before any of it is interpreted. An unknown field, a repeated field, a row field
+    whose row is missing its aliases or its domains, a flag that is not the value the page sends, an id the
+    document could not hold, or two representations of one list are all payloads this page never emits -- and
+    guessing at one is how a malformed request clears a scope instead of being refused.
+    """
+    _one(form, "csrf")  # cardinality only: the CSRF dependency judged the value
+    _one(form, "fingerprint")
+    identifiers = []
+    for name in form:
+        if name in _WATCHLIST_FIELDS:
+            continue
+        field = _row_field(name)
+        if field is None:
+            raise _BadForm(f"{name} is not a field of this form")
+        identifier, _ = field
+        if not _PRODUCT_ID.fullmatch(identifier):
+            raise _BadForm(f"{identifier!r} is not a product id")
+        if identifier not in identifiers:
+            identifiers.append(identifier)
+    rows = []
+    for identifier in identifiers:
+        aliases = _lists(form, f"product:{identifier}:aliases", _form_words)
+        domains, remove = _one(form, f"product:{identifier}:domains"), _one(form, f"remove:{identifier}")
+        if domains is None:
+            raise _BadForm(f"the row {identifier!r} is incomplete")
+        if remove not in (None, "1"):
+            raise _BadForm(f"remove:{identifier} is not a flag: {remove!r}")
+        rows.append(
+            {
+                "id": identifier,
+                "aliases": aliases,
+                "domains": _form_words(domains),
+                "remove": remove == "1",
+            }
+        )
+    pending = {name: (_one(form, f"new:{name}") or "").strip() for name in ("id", "aliases", "domains")}
+    return (
+        rows,
+        _lists(form, "debian_packages", _form_lines),
+        _lists(form, "excluded_products", _form_lines),
+        pending,
+    )
+
+
+def _watchlist_document(
+    rows: Sequence[Mapping[str, object]],
+    packages: Sequence[str],
+    excluded: Sequence[str],
+    new_row: Mapping[str, str],
+    base: Mapping[str, object] | None,
+) -> dict:
+    """The document a submission describes, merged with the document the page was rendered from.
+
+    ``base`` is that document (``None`` before the first save). It is what makes the submission speak about the
+    document it saw rather than about whatever a request claims: the rows it rendered are the only rows a save may
+    touch, so omitting one can no longer delete a product, and the values the page does not offer for editing --
+    ``metadata_only``, and a control it rendered read-only -- come from it rather than from the form.
+
+    Every list field is a set: a blank entry is dropped and a repeated one keeps its first place, so a pasted list
+    saves once instead of being refused. The shape -- which ids, domains and package patterns are acceptable --
+    stays ``watchlist.parse_policy``'s answer, the same one a pass gets from the file.
+    """
+    previous = {
+        str(product["id"]): product
+        for product in (base or {}).get("products", [])
+        if isinstance(product, dict) and isinstance(product.get("id"), str)
+    }
+    submitted = [str(row["id"]) for row in rows]
+    missing = sorted(set(previous) - set(submitted))
+    unknown = sorted(set(submitted) - set(previous))
+    if missing or unknown:
+        raise _BadForm(
+            "the rows do not match the document this page was loaded from"
+            + (f"; missing {', '.join(missing)}" if missing else "")
+            + (f"; unknown {', '.join(unknown)}" if unknown else "")
+        )
+    products = []
+    for row in rows:
+        if row["remove"]:
+            continue
+        was = previous[str(row["id"])]
+        kept = [str(alias) for alias in was.get("aliases") or ()]
+        # A row the page rendered read-only holds the document's aliases, not the submission's; an editable row is
+        # the edit the operator made.
+        products.append(
+            {
+                "id": row["id"],
+                "aliases": [str(alias) for alias in row["aliases"]] if all(map(_alias_holds, kept)) else kept,
+                "domains": row["domains"],
+                "metadata_only": was.get("metadata_only") is True,
+            }
+        )
+    identifier = new_row.get("id", "")
+    if identifier:
+        products.append(
+            {
+                "id": identifier,
+                "aliases": _form_words(new_row.get("aliases", "")),
+                "domains": _form_words(new_row.get("domains", "")),
+                "metadata_only": False,
+            }
+        )
+    return {
+        "schema": watchlist.SCHEMA,
+        "debian_source_packages": _kept_or_submitted(packages, (base or {}).get("debian_source_packages"), _line_holds),
+        "excluded_products": _kept_or_submitted(excluded, (base or {}).get("excluded_products"), _line_holds),
+        "products": products,
+    }
+
+
+def _kept_or_submitted(submitted: Sequence[str], kept: object, holds: Callable[[str], bool]) -> list[str]:
+    """A list field: the document's entries when the page rendered them read-only, else the submission's.
+
+    The page renders a whole field read-only when one of its entries cannot survive the control, so the field's
+    value is then the document's, and a hidden field that disagrees with it changes nothing.
+    """
+    entries = [entry for entry in kept if isinstance(entry, str)] if isinstance(kept, list) else None
+    if entries is not None and not all(holds(entry) for entry in entries):
+        return entries
+    return list(submitted)
+
+
 def _insecure_cookies(env: Mapping[str, str]) -> bool:
     """Whether the plaintext-cookie opt-out is set (development only; the default is a Secure cookie)."""
     return env.get("ADVISORY_RADAR_INSECURE_COOKIES", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -1435,7 +1750,7 @@ def create_app(
         return urllib.parse.parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True)
 
     def first(form: dict[str, list[str]], name: str) -> str:
-        return (form.get(name) or [""])[0]
+        return _form_value(form, name)
 
     def saved_overlay() -> tuple[dict, int]:
         """The overlay as saved and its revision.
@@ -2830,10 +3145,17 @@ def create_app(
         csrf = csrf_field(request)
         fingerprint = form_fingerprint(document)
         fingerprint_field = f"<input type='hidden' name='fingerprint' value='{fingerprint}'>"
+        try:
+            scope_name = watchlist.display_path(cfg.watchlist_path, cfg.state_path)
+            scope_link = f"<a href='/watchlist'><code>{esc(scope_name)}</code></a>"
+        except SourceError as exc:
+            # The document cannot even be inspected. Naming why is better than failing the whole page: every other
+            # setting here still has to be editable, and the message is the one /watchlist and a pass would show.
+            scope_link = f"<a href='/watchlist'>unavailable</a> ({esc(exc)})"
         body = (
             f"<div class='strip'><p class='muted small'>Live poll interval <b>{cfg.poll_interval_seconds}s</b> · "
-            f"state <code>{esc(cfg.state_path)}</code> · "
-            f"watchlist <code>{esc(cfg.watchlist_path or 'built-in default')}</code></p>"
+            f"state <code>{esc(cfg.state_path)}</code> · scope {scope_link}"
+            f"</p>"
             f'<form method="post" action="/reload">{csrf}<button class="btn">Reload configuration</button></form>'
             "</div>"
             f"<p class='notice notice-{status_tone}'>Settings overlay: {status}</p>{banner}"
@@ -2937,6 +3259,331 @@ def create_app(
             "still need a restart.</p>"
         )
         return page("Configuration", body, active="/config", actions=sign_out_form(request))
+
+    # --- the watchlist: the scope document, edited where it lives ------------------------------------------
+
+    def watchlist_preview_form(values: Mapping[str, str]) -> str:
+        """The read-only check: would the current scope keep this advisory, and which product matched it."""
+        fields = "".join(
+            f"<label>{esc(label)}<input type='text' name='{name}' value='{esc(values.get(name, ''))}'></label>"
+            for name, label in (
+                ("title", "Title"),
+                ("link", "Link"),
+                ("source_title", "Feed title"),
+                ("summary", "Summary"),
+            )
+        )
+        return (
+            "<h2>Check an advisory</h2>"
+            "<p class='muted small'>Paste an advisory's title and link to see whether the scope document keeps "
+            "it, and which product matched. The fields are judged exactly as typed, because they stand in for "
+            "what a pass sees after it fetches an entry; a feed normalises its own titles before that, so a "
+            "copied title may differ by spacing. It checks the scope document this page shows, not edits you "
+            "have not saved.</p>"
+            "<form method='get' action='/watchlist'>"
+            "<input type='hidden' name='preview' value='1'>"
+            f"<div class='fields'>{fields}</div>"
+            "<button class='btn'>Check it</button></form>"
+        )
+
+    def watchlist_preview_verdict(document: dict, values: Mapping[str, str]) -> str:
+        """What the scope does with one advisory: ``core``'s own match and rule, so the answer cannot drift."""
+        if not (values["title"].strip() or values["link"].strip()):
+            return _notice("Give the advisory a title or a link to check.", "warning")
+        from . import core  # lazy, like the other core use here: this module is imported before both
+
+        policy = watchlist.parse_policy(document)
+        item = core.Item(
+            "preview",
+            values["title"],
+            values["link"],
+            values["summary"],
+            None,
+            (),
+            source_title=values["source_title"],
+        )
+        matched = core.matched_products(item, policy)
+        reason = core.filter_reason(item, policy)
+        shown = f"<code>{esc(', '.join(matched))}</code>" if matched else "<span class='muted'>none</span>"
+        configured = ", ".join(product.id for product in policy.products)
+        facts = _facts(
+            [
+                ("Matched products", shown),
+                ("Configured products", esc(configured) if configured else "<span class='muted'>none</span>"),
+            ]
+        )
+        if reason:
+            verdict = _notice(f"<b>Out of scope</b>: {esc(_SCOPE_REASONS[reason])}.", "warning")
+        elif not policy.products:
+            verdict = _notice(
+                "<b>In scope</b>: no products are configured, so every advisory is judged (the Debian package "
+                "patterns and the nginx.org keyword rule still apply).",
+                "ok",
+            )
+        else:
+            verdict = _notice(f"<b>In scope</b>: it matched {shown}.", "ok")
+        return f"{verdict}{facts}"
+
+    def watchlist_scope_page(
+        request: Request,
+        target: Path,
+        *,
+        exists: bool,
+        rows: Sequence[Mapping[str, object]] | None = None,
+        packages: Sequence[str] = (),
+        excluded: Sequence[str] = (),
+        new_row: Mapping[str, str] | None = None,
+        expected: str = "",
+        notices: str = "",
+        extra: str = "",
+    ):
+        """The scope page: one form for the document, and whatever the caller renders below it.
+
+        Shared by the read and by a refused save, so a refusal shows the rows exactly as they were submitted
+        instead of the file they were edited from. ``rows=None`` is the unreadable-document answer: the strip
+        and the reason, and no form, because there is nothing to edit against. ``exists`` is the caller's answer
+        from :func:`watchlist.present`, so a path that cannot be inspected is decided once, where it can become a
+        message, instead of inside a renderer.
+        """
+        strip = (
+            "<div class='strip'><p class='muted small'>"
+            f"Document <code>{esc(target)}</code>"
+            + ("" if exists else " (not created yet)")
+            + f" · {len(rows or ())} product{'s' if len(rows or ()) != 1 else ''} · read at the start of every "
+            "pass, so a save applies to the next one</p>"
+            "<a class='btn' href='/config'>Configuration</a></div>"
+        )
+        if rows is None:
+            return page("Watchlist", f"{strip}{notices}", active="/watchlist", actions=sign_out_form(request))
+        pending = new_row or {}
+        new_cells = "".join(
+            f"<td><input type='text' size='{size}' name='new:{name}' value='{esc(pending.get(name, ''))}' "
+            f"placeholder='{esc(hint)}' aria-label='new product {name}'></td>"
+            for name, hint, size in (
+                ("id", "nodejs", 16),
+                ("aliases", "node.js, nodejs", _ALIASES_SIZE),
+                ("domains", "nodejs.org", _DOMAINS_SIZE),
+            )
+        )
+        body = (
+            f"{strip}{notices}"
+            "<h2>Products in scope</h2>"
+            "<form method='post' action='/watchlist'>"
+            f"{csrf_field(request)}<input type='hidden' name='fingerprint' value='{esc(expected)}'>"
+            "<div class='scroll'><table><tr><th scope='col'>Product</th><th scope='col'>Aliases</th>"
+            "<th scope='col'>Domains</th><th scope='col' class='narrow'>Remove</th></tr>"
+            f"{_product_rows(rows)}<tr>{new_cells}<td class='muted small'>new</td></tr></table></div>"
+            "<div class='fields'>"
+            f"{_list_field('debian_packages', 'Debian source packages', packages)}"
+            f"{_list_field('excluded_products', 'Excluded products', excluded)}"
+            "</div>"
+            "<p class='muted small'>A product matches when one of its aliases appears as a whole word in the "
+            "advisory's title, summary or feed title, or when a link points at one of its domains or a "
+            "subdomain. Aliases are comma-separated and may contain spaces and dots. With no products every "
+            "advisory is judged, so a scope is what makes this instance quiet; an excluded product is dropped "
+            "even when it also matches a product above, and a DSA title's package must match one of the package "
+            "patterns. A save that changes the scope makes each source be read in full once, so nothing newly "
+            f"in scope stays hidden behind a conditional request. {_WATCHLIST_HELP}</p>"
+            "<button class='btn btn-primary'>Save watchlist</button></form>"
+            f"{extra}"
+        )
+        return page("Watchlist", body, active="/watchlist", actions=sign_out_form(request))
+
+    @app.get("/watchlist", response_class=HTMLResponse)
+    def watchlist_page(request: Request, saved: str | None = None):
+        """The product scope, read and edited where the document lives.
+
+        One document, so a hand edit and this page cannot disagree, and a pass picks a save up on its next run
+        because it loads the policy every pass. Its path is the YAML's ``watchlist:`` or the file beside the
+        state file: ``/config`` is mounted read-only, so an installation that names no document is edited on
+        the writable volume.
+        """
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        cfg = runtime.cfg
+        target = watchlist.editable_path(cfg.watchlist_path, cfg.state_path)
+        params = request.query_params
+        # As typed, not trimmed: the pass reads an advisory's own text, and the Debian rule anchors its title, so a
+        # preview that tidied the input would answer for an advisory the pass would judge differently.
+        values = {name: params.get(name) or "" for name in ("title", "link", "source_title", "summary")}
+        notices = ""
+        if saved is not None:
+            notices += _notice(f"Scope <code>{esc(saved)}</code> saved. The next pass reads it.", "ok")
+        try:
+            # Read at the resolved name: it is the file a save creates, so the page and the pass agree on which
+            # document they are talking about even when the configured name has a ``..`` the filesystem cannot walk.
+            read_at, exists = watchlist.resolve_document(target)
+        except SourceError as exc:
+            # The path cannot even be inspected (a directory without the search bit, an I/O error). Answering
+            # "absent" here would show the permissive default while the pass failed on the same path.
+            notices += _notice(
+                f"The scope cannot be inspected: {esc(exc)}. Nothing is judged by it and every pass fails until "
+                "the path is readable; no document is created over it.",
+                "critical",
+            )
+            return watchlist_scope_page(request, target, exists=True, notices=notices)
+        if exists:
+            try:
+                document = watchlist.read_watchlist(read_at)
+            except SourceError as exc:
+                # A document that exists but does not read as a watchlist: naming it is the only honest answer,
+                # and an editor over it would rewrite a file this program does not understand.
+                notices += _notice(
+                    f"The scope cannot be read: {esc(exc)}. Nothing is judged by it until the file is fixed, so "
+                    "every pass fails; correct it by hand, or point <code>watchlist:</code> at another document.",
+                    "critical",
+                )
+                return watchlist_scope_page(request, target, exists=exists, notices=notices)
+            expected = watchlist.digest(document)
+        else:
+            expected = ""
+            notices += _notice(
+                "The configured watchlist file does not exist yet, so every pass fails until this is saved; "
+                f"saving writes <code>{esc(target)}</code>."
+                if cfg.watchlist_path is not None
+                else "No scope is saved, so every advisory that arrives is judged. The fields below start from "
+                f"the built-in default; saving writes <code>{esc(target)}</code>.",
+                "warning",
+            )
+            try:
+                document = watchlist.read_watchlist(watchlist.DEFAULT_DOCUMENT)
+            except SourceError as exc:  # a packaging fault: the document shipped with the build is unreadable
+                notices += _notice(
+                    f"The built-in default cannot be read ({esc(exc)}), so this installation cannot show a scope. "
+                    "Nothing is judged until it is fixed.",
+                    "critical",
+                )
+                return watchlist_scope_page(request, target, exists=exists, notices=notices)
+        if not exists and cfg.watchlist_path is not None:
+            # A configured document that has not been created yet fails every pass, so checking an advisory
+            # against the built-in default would answer for a scope the pass never applies.
+            extra = _notice(
+                f"There is nothing to check an advisory against: <code>{esc(target)}</code> does not exist, so "
+                "every pass fails until it is saved.",
+                "warning",
+            )
+        else:
+            extra = watchlist_preview_form(values)
+            if "preview" in params:
+                extra += watchlist_preview_verdict(document, values)
+        return watchlist_scope_page(
+            request,
+            target,
+            exists=exists,
+            rows=list(document["products"]),
+            packages=document["debian_source_packages"],
+            excluded=document["excluded_products"],
+            new_row={},
+            expected=expected,
+            notices=notices,
+            extra=extra,
+        )
+
+    @app.post("/watchlist", dependencies=[Depends(require_csrf)])
+    def save_watchlist_form(request: Request):
+        """Write the scope the form describes, unless the document or the page has moved on since.
+
+        A refusal writes nothing and re-renders the rows as they were submitted, so a typo in one domain does
+        not cost the whole edit. A save needs no reload: the pass reads the policy on every run.
+        """
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        cfg = runtime.cfg
+        target = watchlist.editable_path(cfg.watchlist_path, cfg.state_path)
+        try:
+            exists = watchlist.present(watchlist.document_path(target))
+        except SourceError:
+            # Uninspectable: the save below answers with the same message, and this page must not also claim the
+            # document is missing.
+            exists = True
+        form = form_body(request)
+        try:
+            submitted, packages, excluded, new_row = _parse_watchlist_form(form)
+        except _BadForm as exc:
+            # A payload this page never emits: there is no edit to preserve, and guessing what it meant is how a
+            # malformed request clears a scope instead of being refused.
+            return page(
+                "Not saved",
+                f"<p>{esc(exc)}; reload <a href='/watchlist'>the watchlist</a> and make the change again.</p>",
+                active="/watchlist",
+                actions=sign_out_form(request),
+                status_code=400,
+            )
+        expected = first(form, "fingerprint")
+        # A row being removed in this same save does not collide with the new one: the id is freed first.
+        duplicate = (
+            any(row["id"] == new_row["id"] and not row["remove"] for row in submitted) if new_row["id"] else False
+        )
+        # A new row is only ignored when nothing was typed in it: aliases without an id would otherwise be saved
+        # away as a success, leaving an installation that thinks it has a scope with none.
+        partial = bool(any(new_row.values())) and not new_row["id"]
+        notice = ""
+        if partial:
+            notice = _notice(
+                "Not saved: the new product needs an id; the aliases and domains you typed are kept below. An id "
+                "is lowercase letters, digits and hyphens, at least two characters.",
+                "critical",
+            )
+        elif duplicate:
+            # Refused before the document is built: ``parse_policy`` would call this an invalid identity,
+            # which says nothing about the real mistake -- adding a product that already has a row.
+            notice = _notice(
+                f"A product <code>{esc(new_row['id'])}</code> already exists; edit it in its own row instead of "
+                "adding it again.",
+                "critical",
+            )
+        else:
+
+            def build(current: dict | None) -> dict:
+                """Merge the submission with the document it was rendered from, inside the save's lock."""
+                base = current if current is not None else watchlist.read_watchlist(watchlist.DEFAULT_DOCUMENT)
+                return _watchlist_document(submitted, packages, excluded, new_row, base)
+
+            try:
+                written = watchlist.save_watchlist(target, build, expected=expected)
+            except _BadForm as exc:
+                # The rows do not match the document this page was loaded from: the page rendered other rows, so
+                # the submission is not an edit of it.
+                return page(
+                    "Not saved",
+                    f"<p>{esc(exc)}; reload <a href='/watchlist'>the watchlist</a> and make the change again.</p>",
+                    active="/watchlist",
+                    actions=sign_out_form(request),
+                    status_code=400,
+                )
+            except watchlist.StaleDocument:
+                return page(
+                    "Not saved",
+                    "<p>The watchlist changed since this page was loaded. Reload "
+                    "<a href='/watchlist'>the watchlist</a> and make the change again.</p>",
+                    active="/watchlist",
+                    actions=sign_out_form(request),
+                    status_code=409,
+                )
+            except SourceError as exc:
+                notice = _notice(f"Not saved: {esc(exc)}. {_WATCHLIST_HELP}", "critical")
+            except OSError as exc:
+                notice = _notice(
+                    f"Not saved: <code>{esc(target)}</code> cannot be written ({esc(exc)}). Point "
+                    "<code>watchlist:</code> at a file on the writable data volume, such as "
+                    "<code>/data/watchlist.json</code>.",
+                    "critical",
+                )
+            else:
+                return RedirectResponse(f"/watchlist?saved={written[:8]}", status_code=303)
+        return watchlist_scope_page(
+            request,
+            target,
+            exists=exists,
+            rows=submitted,
+            packages=packages,
+            excluded=excluded,
+            new_row=new_row,
+            expected=expected,
+            notices=notice,
+            # The page keeps its read-only check, empty: a refusal is a page, not a dead end.
+            extra=watchlist_preview_form({}),
+        )
 
     #: The preview's numeric fields and the range each accepts, so a hand-written URL cannot raise a 500.
     PREVIEW_RANGES = {"cvss": (0.0, 10.0), "epss": (0.0, 1.0)}
@@ -3239,7 +3886,8 @@ def create_app(
         body = (
             "<div class='strip'><p class='muted small'>Every enabled source, when it last answered, and the error "
             "it reported when it did not. A probe reads the source now and delivers nothing.</p>"
-            "<a class='btn' href='/config'>Add or edit a source</a></div>"
+            "<div class='row-actions'><a class='btn' href='/config'>Add or edit a source</a>"
+            "<a class='btn' href='/watchlist'>Set the product scope</a></div></div>"
             f"<h2>Configured sources</h2>{configured}"
             "<h2>Built-in types</h2>"
             "<p class='muted'>Every built-in source type, its keys and an example. Required keys have no default.</p>"
