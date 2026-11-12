@@ -70,7 +70,7 @@ jobs:
       # multi-arch index digest, which is what a deployment pulls. Verify a published image with:
       #   gh attestation verify oci://ghcr.io/<owner>/<repo>:<tag> --repo <owner>/<repo>
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be  # v2
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
         with:
           subject-name: ghcr.io/${{ github.repository }}
           subject-digest: ${{ steps.build.outputs.digest }}
