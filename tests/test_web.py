@@ -1468,6 +1468,7 @@ def test_a_deeply_nested_webhook_payload_is_refused_without_state(tmp_path):
     [
         b'{"title": "Vendor \\ud800 advisory"}',
         b'{"watch_uuid": "u1", "watch_title": "Shop", "diff": "\\ud800 change"}',
+        b'{"watch_uuid": "\\ud800", "watch_title": "Shop", "diff": "change"}',
         b'{"title": "Vendor advisory", "summary": "\\udfff text"}',
     ],
 )
