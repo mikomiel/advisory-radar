@@ -287,6 +287,6 @@ def test_removing_a_source_drops_its_validators_with_its_carry():
         "feeds": {"feed": {"url_digest": "d", "etag": "e"}, "other": {"url_digest": "x"}},
     }
     # ``feed`` is no longer declared at all, while ``other`` is both declared and enabled.
-    pipeline._drop_removed_sources(state, {"other"}, {"other"})
+    pipeline._drop_removed_sources(state, {"other"}, {"other"}, complete=True)
     assert state["carry"] == {"other": [{"guid": "h"}]}
     assert state["feeds"] == {"other": {"url_digest": "x"}}

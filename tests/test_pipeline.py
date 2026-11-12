@@ -1131,7 +1131,7 @@ RSS_SOURCE = "  - id: vendor\n    type: rss\n    url: https://feeds.example.com/
 WEBHOOK_SOURCE = "  - id: wh\n    type: webhook\n"
 
 
-def _sources_config(tmp_path: Path, *blocks: str) -> Config:
+def _sources_config(tmp_path: Path, *blocks: str, env: dict[str, str] | None = None) -> Config:
     """A configuration whose declared sources are exactly ``blocks`` (YAML entries, no ``sources:`` key)."""
     declared = "sources:\n" + "".join(blocks) if blocks else "sources: []\n"
     path = tmp_path / "sources.yml"
@@ -1140,7 +1140,7 @@ def _sources_config(tmp_path: Path, *blocks: str) -> Config:
         + "notifiers:\n  - id: fake\n    type: webhook\n    url: https://hooks.example.com/x\n"
         + f"state_path: {tmp_path}/state.json\n"
     )
-    return load_config(path, {})
+    return load_config(path, env or {})
 
 
 def _watches_http(last_changed: int):
@@ -1168,11 +1168,11 @@ def _watches_http(last_changed: int):
     return http
 
 
-def _captured_page_change() -> dict:
+def _captured_page_change(source_id: str = "cd") -> dict:
     """A changedetection candidate the pipeline had already captured into ``carry``."""
     return core.item_to_state(
         core.Item(
-            guid=f"cd:cd:uuid-1:{CD_CHANGED}",
+            guid=f"{source_id}:cd:uuid-1:{CD_CHANGED}",
             title="Shop item — changedetection.io",
             link="https://shop.example.com/item",
             summary=f"Page changed (last_changed={CD_CHANGED}).",
@@ -1329,3 +1329,117 @@ def test_a_disabled_source_capture_waits_and_another_source_is_unaffected(tmp_pa
         "a disabled source's capture waits instead of being processed or discarded"
     )
     assert (stored.get("changedetection") or {}).get("cd") == {"uuid-1": CD_CHANGED}
+
+
+# --- a declared source id that cannot be resolved --------------------------------------------------
+
+COMPOSED_SOURCE = "  - id: feed-${TENANT}\n    type: changedetection\n    url: " + CD_URL + "\n    api_key: k\n"
+COMPOSED_DISABLED_SOURCE = COMPOSED_SOURCE + "    enabled: false\n"
+
+
+def test_an_unresolvable_declared_id_keeps_its_stored_work(tmp_path, caplog):
+    """A declared id that cannot be resolved leaves a removal undecidable, so stored work is kept (#68 review).
+
+    ``feed-${TENANT}`` with ``TENANT`` unset still declares a source, but the pass cannot tell its stored id
+    ``feed-acme`` apart from a source that was deleted. Pruning on that guess would lose exactly the work a
+    temporary disablement protects, so an incomplete set keeps everything.
+    """
+    cfg_disabled = _sources_config(tmp_path, COMPOSED_DISABLED_SOURCE)  # TENANT is not in the environment
+    assert cfg_disabled.declared_source_ids == {"feed-${TENANT}"}
+    assert cfg_disabled.sources == ()
+
+    captured = _captured_page_change("feed-acme")
+    state = core.new_state()
+    # Record the pass's policy digest first, so the first-run validator reset is not what the assertion below
+    # observes: only the drop path may decide the validators' fate here.
+    policy = load_policy(pipeline.watchlist.active_path(None, cfg_disabled.state_path))
+    pipeline._reset_validators_on_policy_change(state, policy)
+    state["seeded"] = {"feed-acme": True}
+    state["carry"] = {"feed-acme": [captured]}
+    state["feeds"] = {"feed-acme": {"url_digest": "d", "etag": "e"}}
+    state["changedetection"] = {"feed-acme": {"uuid-1": CD_CHANGED}}
+    cfg_disabled.store().save(state)
+
+    with caplog.at_level(logging.INFO, logger="advisory_radar"):
+        assert (
+            pipeline.run_pass(
+                cfg_disabled,
+                [],
+                [FakeNotifier()],
+                http=_watches_http(CD_CHANGED),
+                clock=lambda: float(NOW),
+                sleep=lambda seconds: None,
+            )
+            == 0
+        )
+    stored = cfg_disabled.store().load()
+    assert (stored.get("carry") or {}) == {"feed-acme": [captured]}, (
+        "a declared id that cannot be resolved must not discard stored carry"
+    )
+    assert (stored.get("feeds") or {}) == {"feed-acme": {"url_digest": "d", "etag": "e"}}, (
+        "validators are kept with the carry"
+    )
+    assert (stored.get("changedetection") or {}) == {"feed-acme": {"uuid-1": CD_CHANGED}}, (
+        "cursors are kept with the carry"
+    )
+    assert cfg_disabled.declared_source_ids_complete is False
+    assert "a declared source id cannot be resolved" in caplog.text, "the retention must be logged"
+
+    cfg_enabled = _sources_config(tmp_path, COMPOSED_SOURCE, env={"TENANT": "acme"})
+    assert cfg_enabled.declared_source_ids == {"feed-acme"}
+    assert cfg_enabled.declared_source_ids_complete is True
+    sources, _ = pipeline.build_plugins(cfg_enabled, {"TENANT": "acme"})
+    assert [source.id for source in sources] == ["feed-acme"]
+    notifier = FakeNotifier(200)
+    assert (
+        pipeline.run_pass(
+            cfg_enabled,
+            sources,
+            [notifier],
+            http=_watches_http(CD_CHANGED),  # the page has not changed again
+            clock=lambda: float(NOW),
+            sleep=lambda seconds: None,
+        )
+        == 0
+    )
+    assert len(notifier.sent) == 1 and "Shop item" in notifier.sent[0]["title"], (
+        "the captured work kept through the unresolved id must be delivered when it resolves"
+    )
+    final = cfg_enabled.store().load()
+    assert not (final.get("carry") or {}).get("feed-acme")
+    assert final["changedetection"]["feed-acme"] == {"uuid-1": CD_CHANGED}
+
+
+def test_a_resolved_composed_id_removal_still_discards_its_stored_work(tmp_path):
+    """With every declared id resolved, removal is decidable and still drops carry, validators and cursors."""
+    env = {"TENANT": "acme"}
+    cfg_declared = _sources_config(tmp_path, COMPOSED_SOURCE, env=env)
+    assert cfg_declared.declared_source_ids == {"feed-acme"}
+    assert cfg_declared.declared_source_ids_complete is True
+    state = core.new_state()
+    # Pin the policy digest so the pass keeps the stored validators, which only the removal may drop.
+    policy = load_policy(pipeline.watchlist.active_path(None, cfg_declared.state_path))
+    pipeline._reset_validators_on_policy_change(state, policy)
+    state["carry"] = {"feed-acme": [_captured_page_change("feed-acme")]}
+    state["feeds"] = {"feed-acme": {"url_digest": "d", "etag": "e"}}
+    state["changedetection"] = {"feed-acme": {"uuid-1": CD_CHANGED}}
+    cfg_declared.store().save(state)
+
+    cfg_removed = _sources_config(tmp_path, env=env)  # the entry was deleted from the configuration
+    assert cfg_removed.declared_source_ids == frozenset()
+    assert cfg_removed.declared_source_ids_complete is True
+    assert (
+        pipeline.run_pass(
+            cfg_removed,
+            [],
+            [FakeNotifier()],
+            http=_watches_http(CD_CHANGED),
+            clock=lambda: float(NOW),
+            sleep=lambda seconds: None,
+        )
+        == 0
+    )
+    stored = cfg_declared.store().load()
+    assert not (stored.get("carry") or {}), "a resolved removal still discards the carry"
+    assert not (stored.get("feeds") or {}), "a resolved removal still discards the validators"
+    assert not (stored.get("changedetection") or {}), "a resolved removal still discards the cursors"

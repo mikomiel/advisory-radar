@@ -22,7 +22,9 @@ LOG = logging.getLogger("advisory_radar")
 KEV_CACHE_NAME = "kev.json"
 
 
-def _drop_removed_sources(state: dict, declared_ids: Collection[str], enabled_ids: Collection[str]) -> None:
+def _drop_removed_sources(
+    state: dict, declared_ids: Collection[str], enabled_ids: Collection[str], *, complete: bool
+) -> None:
     """Discard a removed source's unclassified work, validators, cursors and health record.
 
     The first three have to go together. Dropping the carry while keeping the validators lets a re-added source
@@ -34,14 +36,24 @@ def _drop_removed_sources(state: dict, declared_ids: Collection[str], enabled_id
     not polled, so its carry, validators and cursors stay. Only a source missing from ``declared_ids`` was
     discarded. Health is kept for a source that still runs only: a record for a source nobody polls would
     outlive the reason it existed.
+
+    ``complete`` says every declared id could be resolved. When it is False one declared id is still an
+    ``${NAME}`` reference, so the set cannot tell a removed source from stored work under the id that reference
+    previously expanded to; nothing is pruned then, because removal is undecidable and keeping stored work is
+    the safe direction. Health still follows the enabled sources.
     """
     carried = state.setdefault("carry", {})
-    for stale in [source_id for source_id in carried if source_id not in declared_ids]:
-        carried.pop(stale, None)
-    for stored in (state.get("feeds"), state.get("changedetection")):
-        if isinstance(stored, dict):
-            for stale in [source_id for source_id in stored if source_id not in declared_ids]:
-                stored.pop(stale, None)
+    if not complete:
+        LOG.info(
+            "a declared source id cannot be resolved; keeping stored source work until the configuration resolves it"
+        )
+    else:
+        for stale in [source_id for source_id in carried if source_id not in declared_ids]:
+            carried.pop(stale, None)
+        for stored in (state.get("feeds"), state.get("changedetection")):
+            if isinstance(stored, dict):
+                for stale in [source_id for source_id in stored if source_id not in declared_ids]:
+                    stored.pop(stale, None)
     health = state.get("source_health")
     if isinstance(health, dict):
         for stale in [source_id for source_id in health if source_id not in enabled_ids]:
@@ -272,7 +284,7 @@ def _run_pass(
     answered_now = {source.id for source, _ in answered}
     # Only a source removed from the configuration may have its stored work discarded; one that is merely
     # disabled is not polled, but it keeps its carry, validators and cursors for when it comes back.
-    _drop_removed_sources(state, cfg.declared_source_ids, enabled_ids)
+    _drop_removed_sources(state, cfg.declared_source_ids, enabled_ids, complete=cfg.declared_source_ids_complete)
     carried = state["carry"]
 
     # One work list for fairness: freshly fetched sources and sources whose only remaining work is carried
