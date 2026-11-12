@@ -6,14 +6,15 @@ import json
 import logging
 import sys
 import types
+import urllib.parse
 from pathlib import Path
 
 import pytest
 
 from advisory_radar import core, pipeline, storage
-from advisory_radar.config import Config, ConfigError, load_config
+from advisory_radar.config import DEFAULT_THRESHOLDS, Config, ConfigError, load_config
 from advisory_radar.plugins import SourceWindow
-from advisory_radar.sources import RssSource, WebhookSource
+from advisory_radar.sources import ChangedetectionSource, RssSource, WebhookSource
 from advisory_radar.state import save_state
 from advisory_radar.watchlist import load_policy
 
@@ -1042,3 +1043,563 @@ def test_the_default_scope_is_in_force_beside_a_state_path_that_cannot_be_walked
     )
     assert code == 0
     assert store.load()["seen"]["src:wh:noise"]["outcome"] == "filtered", "the saved scope was in force"
+
+
+# --- classification admission during quiet hours --------------------------------------------------
+
+
+def _is_kev_request(url: str) -> bool:
+    """Whether this is the product's CISA KEV request, matched on the parsed host rather than a substring."""
+    return urllib.parse.urlsplit(url).hostname == "www.cisa.gov"
+
+
+def _rss_item(title: str, guid: str, published: int) -> str:
+    from email.utils import formatdate
+
+    return (
+        f"<item><title>{title}</title><link>https://vendor.example.com/{guid}</link>"
+        f"<guid>{guid}</guid><description>Fixes things.</description>"
+        f"<pubDate>{formatdate(published, usegmt=True)}</pubDate></item>"
+    )
+
+
+def _rss_document(*items: str) -> bytes:
+    return (
+        '<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>'
+        "<link>https://feeds.example.com/</link>" + "".join(items) + "</channel></rss>"
+    ).encode()
+
+
+def test_a_quiet_held_queue_does_not_block_a_new_critical(tmp_path):
+    """Five warnings held by quiet hours must not stop a newly arrived critical advisory (#67).
+
+    Holding is a delivery-time decision (``delivery.is_held``), so counting the raw pending length here let a
+    queue of held warnings take the whole admission window and leave a critical advisory in carry.
+    """
+    night = local_epoch(23)
+    path = tmp_path / "quiet.yml"
+    path.write_text(
+        "sources:\n  - id: vendor\n    type: rss\n    url: https://feeds.example.com/rss\n"
+        "notifiers:\n  - id: fake\n    type: webhook\n    url: https://hooks.example.com/x\n"
+        "quiet_hours: 22:00-07:00\n"
+        f"state_path: {tmp_path}/state.json\n"
+    )
+    cfg = load_config(path, {})
+    state = core.new_state()
+    state["seeded"] = {"vendor": True}
+    held = []
+    for number in range(1, 6):
+        entry = queued_message(f"CVE-2026-{number}")
+        entry["attempts"] = 1  # not a first attempt: the pass must leave it exactly as it found it
+        held.append(entry)
+    state["pending"] = held
+    cfg.store().save(state)
+
+    body = _rss_document(_rss_item("Vendor advisory CVE-2026-7777", "g1", night - 3600))
+    kev = {"catalogVersion": "1", "vulnerabilities": [{"cveID": "CVE-2026-7777"}]}
+
+    def http(method, url, headers, payload):
+        if url == "https://feeds.example.com/rss":
+            return 200, {}, body
+        if _is_kev_request(url):
+            return 200, {}, json.dumps(kev).encode()
+        return 404, {}, b""
+
+    notifier = FakeNotifier(200)
+    code = pipeline.run_pass(
+        cfg,
+        [RssSource("vendor", "https://feeds.example.com/rss")],
+        [notifier],
+        http=http,
+        clock=lambda: float(night),
+        sleep=lambda seconds: None,
+    )
+    assert code == 0
+    assert [message["ids"] for message in notifier.sent] == [["CVE-2026-7777"]], (
+        "a critical advisory whose CVE is in the KEV catalog must be classified and delivered in the same pass"
+    )
+    assert notifier.sent[0]["tag"] == "critical"
+    stored = cfg.store().load()
+    assert [entry["ids"][0] for entry in stored["pending"]] == [f"CVE-2026-{number}" for number in range(1, 6)]
+    assert [entry["attempts"] for entry in stored["pending"]] == [1] * 5, "a held message is not an attempt"
+    assert stored["seen"]["CVE-2026-7777"]["outcome"] == "delivered"
+
+
+# --- a disabled source is not a removed source ----------------------------------------------------
+
+
+CD_URL = "https://changes.example.net"
+CD_SOURCE = f"  - id: cd\n    type: changedetection\n    url: {CD_URL}\n    api_key: k\n"
+CD_DISABLED_SOURCE = CD_SOURCE + "    enabled: false\n"
+#: The watch's ``last_changed``, recent enough that the item it produces is news, not history.
+CD_CHANGED = NOW - 3600
+RSS_SOURCE = "  - id: vendor\n    type: rss\n    url: https://feeds.example.com/rss\n"
+WEBHOOK_SOURCE = "  - id: wh\n    type: webhook\n"
+
+
+def _sources_config(tmp_path: Path, *blocks: str, env: dict[str, str] | None = None) -> Config:
+    """A configuration whose declared sources are exactly ``blocks`` (YAML entries, no ``sources:`` key)."""
+    declared = "sources:\n" + "".join(blocks) if blocks else "sources: []\n"
+    path = tmp_path / "sources.yml"
+    path.write_text(
+        declared
+        + "notifiers:\n  - id: fake\n    type: webhook\n    url: https://hooks.example.com/x\n"
+        + f"state_path: {tmp_path}/state.json\n"
+    )
+    return load_config(path, env or {})
+
+
+def _watches_http(last_changed: int):
+    """changedetection.io answering one watch whose ``last_changed`` does not move."""
+
+    def http(method, url, headers, payload):
+        if url.startswith(f"{CD_URL}/api/v1/watch"):
+            watches = {
+                "uuid-1": {
+                    "uuid": "uuid-1",
+                    "title": "Shop item",
+                    "link": "https://shop.example.com/item",
+                    "page_title": "Shop",
+                    "paused": False,
+                    "notification_muted": False,
+                    "last_changed": last_changed,
+                }
+            }
+            return 200, {}, json.dumps(watches).encode()
+        if _is_kev_request(url):
+            catalog = {"catalogVersion": "1", "vulnerabilities": [{"cveID": "CVE-2020-0001"}]}
+            return 200, {}, json.dumps(catalog).encode()
+        return 404, {}, b""
+
+    return http
+
+
+def _captured_page_change(source_id: str = "cd") -> dict:
+    """A changedetection candidate the pipeline had already captured into ``carry``."""
+    return core.item_to_state(
+        core.Item(
+            guid=f"{source_id}:cd:uuid-1:{CD_CHANGED}",
+            title="Shop item — changedetection.io",
+            link="https://shop.example.com/item",
+            summary=f"Page changed (last_changed={CD_CHANGED}).",
+            published=CD_CHANGED,
+            explicit=(),
+        )
+    )
+
+
+def test_a_disabled_changedetection_source_keeps_its_capture_and_cursor(tmp_path):
+    """A source merely turned off is not removed: its captured candidate and cursor must survive (#68)."""
+    cfg_enabled = _sources_config(tmp_path, CD_SOURCE)
+    state = core.new_state()
+    state["seeded"] = {"cd": True}
+    state["carry"] = {"cd": [_captured_page_change()]}
+    state["changedetection"] = {"cd": {"uuid-1": CD_CHANGED}}
+    cfg_enabled.store().save(state)
+
+    quiet = FakeNotifier(200)
+    cfg_disabled = _sources_config(tmp_path, CD_DISABLED_SOURCE)
+    assert (
+        pipeline.run_pass(
+            cfg_disabled,
+            [],
+            [quiet],
+            http=_watches_http(CD_CHANGED),
+            clock=lambda: float(NOW),
+            sleep=lambda seconds: None,
+        )
+        == 0
+    )
+    stored = cfg_enabled.store().load()
+    assert [row["guid"] for row in (stored.get("carry") or {}).get("cd", [])] == [f"cd:cd:uuid-1:{CD_CHANGED}"], (
+        "disabling a source must not discard work it already captured"
+    )
+    assert (stored.get("changedetection") or {}).get("cd") == {"uuid-1": CD_CHANGED}, (
+        "a disabled source keeps its cursor"
+    )
+    assert not quiet.sent, "a disabled source is not polled and its capture is not processed"
+
+    notifier = FakeNotifier(200)
+    cfg_re_enabled = _sources_config(tmp_path, CD_SOURCE)
+    assert (
+        pipeline.run_pass(
+            cfg_re_enabled,
+            [ChangedetectionSource("cd", CD_URL, "k")],
+            [notifier],
+            http=_watches_http(CD_CHANGED),  # the page has not changed again
+            clock=lambda: float(NOW),
+            sleep=lambda seconds: None,
+        )
+        == 0
+    )
+    assert len(notifier.sent) == 1 and "Shop item" in notifier.sent[0]["title"], (
+        "the candidate captured before the disablement must still be classified and delivered"
+    )
+    final = cfg_enabled.store().load()
+    assert not (final.get("carry") or {}).get("cd")
+    assert final["changedetection"]["cd"] == {"uuid-1": CD_CHANGED}, "nothing changed while it was disabled"
+
+
+def test_removing_a_source_discards_its_cursors_with_its_carry_and_validators(tmp_path):
+    """Removal is an explicit discard, so the cursor goes with the carry it can no longer recover (#68)."""
+    cfg_declared = _sources_config(tmp_path, CD_SOURCE, RSS_SOURCE)
+    state = core.new_state()
+    state["seeded"] = {"cd": True, "vendor": True}
+    state["carry"] = {"cd": [_captured_page_change()]}
+    state["changedetection"] = {"cd": {"uuid-1": CD_CHANGED}}
+    state["feeds"] = {"vendor": {"etag": '"v1"'}}
+    state["source_health"] = {
+        "cd": {"at": 1, "ok": True, "ok_at": 1, "items": 1, "error": ""},
+        "vendor": {"at": 1, "ok": True, "ok_at": 1, "items": 1, "error": ""},
+    }
+    cfg_declared.store().save(state)
+
+    cfg_removed = _sources_config(tmp_path)  # both sources removed from the configuration
+    assert (
+        pipeline.run_pass(
+            cfg_removed,
+            [],
+            [FakeNotifier()],
+            http=_watches_http(CD_CHANGED),
+            clock=lambda: float(NOW),
+            sleep=lambda s: None,
+        )
+        == 0
+    )
+    stored = cfg_declared.store().load()
+    assert not (stored.get("carry") or {}), "a removed source's captured work is discarded"
+    assert not (stored.get("feeds") or {}), "a removed source's validators are discarded with its carry"
+    assert not (stored.get("changedetection") or {}), "a removed source's cursors are discarded with its carry"
+    assert not (stored.get("source_health") or {}), "a health record never outlives its source"
+
+    notifier = FakeNotifier(200)
+    cfg_readded = _sources_config(tmp_path, CD_SOURCE)
+    assert (
+        pipeline.run_pass(
+            cfg_readded,
+            [ChangedetectionSource("cd", CD_URL, "k")],
+            [notifier],
+            http=_watches_http(CD_CHANGED),
+            clock=lambda: float(NOW),
+            sleep=lambda seconds: None,
+        )
+        == 0
+    )
+    assert len(notifier.sent) == 1 and "Shop item" in notifier.sent[0]["title"], (
+        "re-adding the source must notice the page again instead of trusting the discarded cursor"
+    )
+    assert cfg_readded.store().load()["changedetection"]["cd"] == {"uuid-1": CD_CHANGED}
+
+
+def test_a_disabled_source_capture_waits_and_another_source_is_unaffected(tmp_path):
+    """Only polling stops while a source is disabled; other sources keep classifying and delivering (#68)."""
+    cfg = _sources_config(tmp_path, CD_DISABLED_SOURCE, WEBHOOK_SOURCE)
+    state = core.new_state()
+    state["seeded"] = {"cd": True, "wh": True}
+    state["carry"] = {"cd": [_captured_page_change()]}
+    state["changedetection"] = {"cd": {"uuid-1": CD_CHANGED}}
+    state["webhook_inbox"] = {
+        "wh": [
+            {
+                "guid": "news",
+                "title": "Unrelated vendor advisory",
+                "summary": "",
+                "link": "https://vendor.example/a",
+            }
+        ]
+    }
+    cfg.store().save(state)
+
+    fetched = []
+
+    def http(method, url, headers, payload):
+        fetched.append(url)
+        if _is_kev_request(url):
+            catalog = {"catalogVersion": "1", "vulnerabilities": [{"cveID": "CVE-2020-0001"}]}
+            return 200, {}, json.dumps(catalog).encode()
+        return 404, {}, b""
+
+    notifier = FakeNotifier(200)
+    assert (
+        pipeline.run_pass(
+            cfg, [WebhookSource("wh")], [notifier], http=http, clock=lambda: float(NOW), sleep=lambda seconds: None
+        )
+        == 0
+    )
+    assert not [url for url in fetched if CD_URL in url], "a disabled source must not be polled"
+    assert [message["tag"] for message in notifier.sent] == ["warning"] and (
+        "Unrelated vendor advisory" in notifier.sent[0]["title"]
+    ), "an unrelated source must be classified and delivered as usual"
+    stored = cfg.store().load()
+    assert [row["guid"] for row in (stored.get("carry") or {}).get("cd", [])] == [f"cd:cd:uuid-1:{CD_CHANGED}"], (
+        "a disabled source's capture waits instead of being processed or discarded"
+    )
+    assert (stored.get("changedetection") or {}).get("cd") == {"uuid-1": CD_CHANGED}
+
+
+# --- a declared source id that cannot be resolved --------------------------------------------------
+
+COMPOSED_SOURCE = "  - id: feed-${TENANT}\n    type: changedetection\n    url: " + CD_URL + "\n    api_key: k\n"
+COMPOSED_DISABLED_SOURCE = COMPOSED_SOURCE + "    enabled: false\n"
+
+
+def test_an_unresolvable_declared_id_keeps_its_stored_work(tmp_path, caplog):
+    """A declared id that cannot be resolved leaves a removal undecidable, so stored work is kept (#68 review).
+
+    ``feed-${TENANT}`` with ``TENANT`` unset still declares a source, but the pass cannot tell its stored id
+    ``feed-acme`` apart from a source that was deleted. Pruning on that guess would lose exactly the work a
+    temporary disablement protects, so an incomplete set keeps everything.
+    """
+    cfg_disabled = _sources_config(tmp_path, COMPOSED_DISABLED_SOURCE)  # TENANT is not in the environment
+    assert cfg_disabled.declared_source_ids == {"feed-${TENANT}"}
+    assert cfg_disabled.sources == ()
+
+    captured = _captured_page_change("feed-acme")
+    state = core.new_state()
+    # Record the pass's policy digest first, so the first-run validator reset is not what the assertion below
+    # observes: only the drop path may decide the validators' fate here.
+    policy = load_policy(pipeline.watchlist.active_path(None, cfg_disabled.state_path))
+    pipeline._reset_validators_on_policy_change(state, policy)
+    state["seeded"] = {"feed-acme": True}
+    state["carry"] = {"feed-acme": [captured]}
+    state["feeds"] = {"feed-acme": {"url_digest": "d", "etag": "e"}}
+    state["changedetection"] = {"feed-acme": {"uuid-1": CD_CHANGED}}
+    cfg_disabled.store().save(state)
+
+    with caplog.at_level(logging.INFO, logger="advisory_radar"):
+        assert (
+            pipeline.run_pass(
+                cfg_disabled,
+                [],
+                [FakeNotifier()],
+                http=_watches_http(CD_CHANGED),
+                clock=lambda: float(NOW),
+                sleep=lambda seconds: None,
+            )
+            == 0
+        )
+    stored = cfg_disabled.store().load()
+    assert (stored.get("carry") or {}) == {"feed-acme": [captured]}, (
+        "a declared id that cannot be resolved must not discard stored carry"
+    )
+    assert (stored.get("feeds") or {}) == {"feed-acme": {"url_digest": "d", "etag": "e"}}, (
+        "validators are kept with the carry"
+    )
+    assert (stored.get("changedetection") or {}) == {"feed-acme": {"uuid-1": CD_CHANGED}}, (
+        "cursors are kept with the carry"
+    )
+    assert cfg_disabled.declared_source_ids_complete is False
+    assert "a declared source id cannot be resolved" in caplog.text, "the retention must be logged"
+
+    cfg_enabled = _sources_config(tmp_path, COMPOSED_SOURCE, env={"TENANT": "acme"})
+    assert cfg_enabled.declared_source_ids == {"feed-acme"}
+    assert cfg_enabled.declared_source_ids_complete is True
+    sources, _ = pipeline.build_plugins(cfg_enabled, {"TENANT": "acme"})
+    assert [source.id for source in sources] == ["feed-acme"]
+    notifier = FakeNotifier(200)
+    assert (
+        pipeline.run_pass(
+            cfg_enabled,
+            sources,
+            [notifier],
+            http=_watches_http(CD_CHANGED),  # the page has not changed again
+            clock=lambda: float(NOW),
+            sleep=lambda seconds: None,
+        )
+        == 0
+    )
+    assert len(notifier.sent) == 1 and "Shop item" in notifier.sent[0]["title"], (
+        "the captured work kept through the unresolved id must be delivered when it resolves"
+    )
+    final = cfg_enabled.store().load()
+    assert not (final.get("carry") or {}).get("feed-acme")
+    assert final["changedetection"]["feed-acme"] == {"uuid-1": CD_CHANGED}
+
+
+def test_a_resolved_composed_id_removal_still_discards_its_stored_work(tmp_path):
+    """With every declared id resolved, removal is decidable and still drops carry, validators and cursors."""
+    env = {"TENANT": "acme"}
+    cfg_declared = _sources_config(tmp_path, COMPOSED_SOURCE, env=env)
+    assert cfg_declared.declared_source_ids == {"feed-acme"}
+    assert cfg_declared.declared_source_ids_complete is True
+    state = core.new_state()
+    # Pin the policy digest so the pass keeps the stored validators, which only the removal may drop.
+    policy = load_policy(pipeline.watchlist.active_path(None, cfg_declared.state_path))
+    pipeline._reset_validators_on_policy_change(state, policy)
+    state["carry"] = {"feed-acme": [_captured_page_change("feed-acme")]}
+    state["feeds"] = {"feed-acme": {"url_digest": "d", "etag": "e"}}
+    state["changedetection"] = {"feed-acme": {"uuid-1": CD_CHANGED}}
+    cfg_declared.store().save(state)
+
+    cfg_removed = _sources_config(tmp_path, env=env)  # the entry was deleted from the configuration
+    assert cfg_removed.declared_source_ids == frozenset()
+    assert cfg_removed.declared_source_ids_complete is True
+    assert (
+        pipeline.run_pass(
+            cfg_removed,
+            [],
+            [FakeNotifier()],
+            http=_watches_http(CD_CHANGED),
+            clock=lambda: float(NOW),
+            sleep=lambda seconds: None,
+        )
+        == 0
+    )
+    stored = cfg_declared.store().load()
+    assert not (stored.get("carry") or {}), "a resolved removal still discards the carry"
+    assert not (stored.get("feeds") or {}), "a resolved removal still discards the validators"
+    assert not (stored.get("changedetection") or {}), "a resolved removal still discards the cursors"
+
+
+# --- admission keeps its independent bounds --------------------------------------------------------
+
+
+def test_a_warning_queued_in_the_quiet_window_leaves_the_room_for_a_critical(tmp_path):
+    """A warning classified inside the window is held, so the critical that follows fits in the same pass."""
+    night = local_epoch(23)
+    path = tmp_path / "quiet-two.yml"
+    path.write_text(
+        "sources:\n  - id: vendor\n    type: rss\n    url: https://feeds.example.com/rss\n"
+        "notifiers:\n  - id: fake\n    type: webhook\n    url: https://hooks.example.com/x\n"
+        "quiet_hours: 22:00-07:00\n"
+        f"state_path: {tmp_path}/state.json\n"
+    )
+    cfg = load_config(path, {})
+    state = core.new_state()
+    state["seeded"] = {"vendor": True}
+    cfg.store().save(state)
+    body = _rss_document(
+        _rss_item("Vendor advisory with no identifier", "warning-1", night - 7200),
+        _rss_item("Vendor advisory CVE-2026-7777", "critical-1", night - 3600),
+    )
+    kev = {"catalogVersion": "1", "vulnerabilities": [{"cveID": "CVE-2026-7777"}]}
+
+    def http(method, url, headers, payload):
+        if url == "https://feeds.example.com/rss":
+            return 200, {}, body
+        if _is_kev_request(url):
+            return 200, {}, json.dumps(kev).encode()
+        return 404, {}, b""
+
+    notifier = FakeNotifier(200)
+    assert (
+        pipeline.run_pass(
+            cfg,
+            [RssSource("vendor", "https://feeds.example.com/rss")],
+            [notifier],
+            http=http,
+            clock=lambda: float(night),
+            sleep=lambda seconds: None,
+        )
+        == 0
+    )
+    assert [message["ids"] for message in notifier.sent] == [["CVE-2026-7777"]], (
+        "the warning queued during the window must not take the room the critical needs"
+    )
+    stored = cfg.store().load()
+    assert [(entry["tag"], entry["ids"]) for entry in stored["pending"]] == [("warning", ["src:vendor:warning-1"])]
+    assert "attempts" not in stored["pending"][0], "the held warning was never attempted"
+
+
+def test_a_full_sendable_queue_still_leaves_new_items_in_carry(tmp_path):
+    """DELIVERY_CAP still bounds admission: five sendable messages leave no room for a sixth."""
+    policy = make_policy(tmp_path)
+    state = core.new_state()
+    state["pending"] = [queued_message(f"CVE-2026-{number}") for number in range(1, 6)]
+    fresh = core.Item(
+        "vendor:new",
+        "Vendor advisory CVE-2026-9999",
+        "https://vendor.example/new",
+        "",
+        NOW - 60,
+        ("CVE-2026-9999",),
+    )
+    left = core.classify_new(
+        state,
+        [fresh],
+        core.Intel(None, {}, lambda: 0.0, lambda seconds: None),
+        frozenset(),
+        True,
+        NOW,
+        "",
+        policy,
+        share=core.DELIVERY_CAP,
+        thresholds=DEFAULT_THRESHOLDS,
+    )
+    assert [item.guid for item in left] == ["vendor:new"], "the sixth message must be carried, not queued"
+    assert len(state["pending"]) == core.DELIVERY_CAP, "the sendable queue is still bounded by the delivery cap"
+
+
+def test_admission_keeps_parking_and_the_lookup_budget_independent(tmp_path):
+    """Admission counts delivery room only: parking is untouched and MAX_CLASSIFY still bounds lookups."""
+    policy = make_policy(tmp_path)
+    parked = {
+        "kind": "new",
+        "tag": "warning",
+        "title": "WARNING: parked advisory",
+        "body": "",
+        "ids": ["CVE-2026-2"],
+        "cves": ["CVE-2026-2"],
+        "levels": {"CVE-2026-2": "warning"},
+        "kev_only": [],
+        "scores": {"CVE-2026-2": 7.5},
+        "thresholds": [9.0, 0.10, 4.0],
+        "source": "Vendor",
+        "link": "https://vendor.example/2",
+        "source_id": "vendor",
+        "attempts": core.MAX_DELIVERY_ATTEMPTS,
+        "first_attempt_at": NOW - 7200,
+        "last_status": 500,
+    }
+
+    class LowIntel(core.Intel):
+        """A complete, low measurement for any CVE: each item is suppressed, so nothing is queued."""
+
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda seconds: None)
+
+        def cves(self, cves, **ignored):
+            return {cve: core.CveFacts(2.0, None, None, None, True) for cve in cves}
+
+    state = core.new_state()
+    state["parked"] = [dict(parked)]
+    warning = core.Item("vendor:w", "Vendor advisory", "https://vendor.example/w", "", NOW - 60, ())
+    assert (
+        core.classify_new(
+            state,
+            [warning],
+            LowIntel(),
+            frozenset(),
+            True,
+            NOW,
+            "",
+            policy,
+            share=core.DELIVERY_CAP,
+            thresholds=DEFAULT_THRESHOLDS,
+        )
+        == []
+    )
+    assert state["parked"] == [parked], "classification admission must not touch a parked entry"
+
+    bounded = core.new_state()
+    items = [
+        core.Item(
+            f"vendor:{number}", f"Advisory CVE-2026-{1000 + number}", "", "", None, (f"CVE-2026-{1000 + number}",)
+        )
+        for number in range(core.MAX_CLASSIFY + 5)
+    ]
+    left = core.classify_new(
+        bounded,
+        items,
+        LowIntel(),
+        frozenset(),
+        True,
+        NOW,
+        "",
+        policy,
+        share=core.DELIVERY_CAP,
+        thresholds=DEFAULT_THRESHOLDS,
+    )
+    assert len(bounded["watch"]) == core.MAX_CLASSIFY, "MAX_CLASSIFY is still the independent lookup bound"
+    assert len(left) == 5, "the items past the lookup budget are carried, not classified"
+    assert bounded["pending"] == [], "a suppressed advisory is never queued"

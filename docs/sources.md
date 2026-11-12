@@ -90,7 +90,12 @@ An accepted key is not always read by every kind: `tag` scopes a
 changedetection.io poll to one watch tag and the other kinds ignore it, so the
 column is only meaningful there; `user` names the FreshRSS account; `interval`
 thins that source's polling; and `enabled: false` keeps an entry in the file
-without building it. An RSS/Atom/JSON Feed and a changedetection.io poll return
+without building it. Disabling is not removing: a disabled source keeps the work it already
+captured -- carried candidates, feed validators and changedetection.io cursors -- and resumes from
+them when it is enabled again, while deleting the entry discards that stored work deliberately,
+cursors included, so a re-added source is read afresh. A declared id that cannot be resolved (its
+`${NAME}` reference has no value) keeps stored work rather than assuming removal, because the pass
+cannot tell which stored source the entry stands for. An RSS/Atom/JSON Feed and a changedetection.io poll return
 the whole response, so the FreshRSS GReader export is the only built-in that
 reports a truncated window.
 

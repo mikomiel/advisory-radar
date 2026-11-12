@@ -168,6 +168,14 @@ class Config:
     sources: tuple[dict, ...]
     notifiers: tuple[dict, ...]
     watchlist_path: Path | None
+    #: Every source id the configuration declares, including an entry with ``enabled: false``. The pipeline
+    #: keeps a disabled source's carry, validators and cursors because it was not discarded -- only a source
+    #: missing from this set was removed from the configuration, and its stored work goes with it.
+    declared_source_ids: frozenset[str] = frozenset()
+    #: Whether every declared id could be resolved. False means at least one still spells an ``${NAME}``
+    #: reference the lenient expansion could not fill, so the set cannot say whether stored work under another
+    #: spelling belongs to a removed source: the pipeline then keeps every source's stored work.
+    declared_source_ids_complete: bool = True
     poll_interval_seconds: int = 900
     #: Per-source poll intervals in seconds, keyed by source id. A source absent from this map is polled at
     #: ``poll_interval_seconds``. The pipeline throttles the fetch only: re-evaluation, escalation and delivery
@@ -671,6 +679,17 @@ def config_from_document(
         _require(isinstance(entry.get("enabled", True), bool), f"{entry['id']}: enabled must be a bool")
     ids = [entry["id"] for entry in (*sources, *notifiers)]
     _require(len(ids) == len(set(ids)), f"duplicate plugin ids: {ids}")
+    # Every declared source id, enabled or not: only a source missing from this set was *removed* from the
+    # configuration, and a removed source's stored work is discarded. A merely disabled one keeps its carry,
+    # validators and cursors. Read before the disabled entries are dropped below. A composed id is expanded as
+    # an enabled one is, while an unresolvable reference on a disabled entry stays literal: its references are
+    # deliberately not resolved (see below), and that must not become a configuration error.
+    declared = [_expand(entry["id"], env, lenient=True) for entry in sources]
+    declared_source_ids = frozenset(declared)
+    # An unresolved reference leaves a declared id unknown: stored work under the id it previously expanded to
+    # cannot be told apart from a removed source's, so the pipeline keeps every source's stored work instead of
+    # discarding it on a guess. Health follows the enabled sources either way.
+    declared_source_ids_complete = not any(_ENV_RE.search(identifier) for identifier in declared)
     # A disabled plugin is not built, so its ${...} references are not resolved either: turning a channel
     # off must be enough to drop its credential requirement.
     enabled = {
@@ -793,6 +812,8 @@ def config_from_document(
         sources=tuple(entry for entry in sources if entry.get("enabled", True)),
         notifiers=tuple(entry for entry in notifiers if entry.get("enabled", True)),
         watchlist_path=watchlist_path,
+        declared_source_ids=declared_source_ids,
+        declared_source_ids_complete=declared_source_ids_complete,
         poll_interval_seconds=seconds,
         source_intervals=source_intervals,
         state_path=state_path,

@@ -280,12 +280,13 @@ def test_a_policy_change_drops_the_conditional_request_state():
     assert state["feeds"] == {}
 
 
-def test_disabling_a_source_drops_its_validators_with_its_carry():
-    # keeping the validators would let a re-enabled, unchanged feed answer 304 for work just discarded
+def test_removing_a_source_drops_its_validators_with_its_carry():
+    # keeping the validators would let a re-added, unchanged feed answer 304 for work just discarded
     state = {
         "carry": {"feed": [{"guid": "g"}], "other": [{"guid": "h"}]},
         "feeds": {"feed": {"url_digest": "d", "etag": "e"}, "other": {"url_digest": "x"}},
     }
-    pipeline._drop_disabled_sources(state, {"other"})
+    # ``feed`` is no longer declared at all, while ``other`` is both declared and enabled.
+    pipeline._drop_removed_sources(state, {"other"}, {"other"}, complete=True)
     assert state["carry"] == {"other": [{"guid": "h"}]}
     assert state["feeds"] == {"other": {"url_digest": "x"}}
