@@ -1346,13 +1346,13 @@ def _is_rfc3339(value: object) -> bool:
     with this, where a non-empty but malformed spelling must not be mistaken for the fact: a value this parser
     rejects is not evidence of a withdrawal.
     """
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not value:
         return False
-    text = value.strip()
-    if _RFC3339.fullmatch(text) is None:
+    # Validated exactly as sent: RFC3339 has no surrounding whitespace, and a padded value must not be read as
+    # the fact either -- the field is evidence, not user input to tidy.
+    if _RFC3339.fullmatch(value) is None:
         return False
-    if text[-1] in "Zz":
-        text = text[:-1] + "+00:00"
+    text = value[:-1] + "+00:00" if value[-1] in "Zz" else value
     try:
         moment = datetime.datetime.fromisoformat(text)
     except ValueError:

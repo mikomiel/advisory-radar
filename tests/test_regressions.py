@@ -2846,6 +2846,8 @@ def test_a_withdrawn_osv_record_keeps_its_lifecycle_without_current_severity():
         "2026-01-02T00:00+00:00",  # missing seconds: ISO 8601 accepts it, RFC3339 does not
         "2026-01-02T00:00:00+00:60",  # offset minute out of range: the parser would normalise it
         "2026-01-02T00:00:00+24:00",  # offset hour out of range
+        " 2026-01-02T00:00:00Z",  # surrounding whitespace is not part of the field
+        "2026-01-02T00:00:00Z\n",
     ):
         intel = _osv_intel({**withdrawn, "withdrawn": malformed})
         first = intel.ghsa(ghsa)
@@ -2855,8 +2857,14 @@ def test_a_withdrawn_osv_record_keeps_its_lifecycle_without_current_severity():
         assert intel._cache[ghsa]["withdrawn"] is False, "the cache must not persist a malformed withdrawal"
         assert intel.ghsa(ghsa) == first, "a cache hit reads the malformed value as active too"
 
-    # RFC3339 allows a lower-case "t" and "z"; such a value is still a withdrawal.
-    assert _osv_intel({**withdrawn, "withdrawn": "2026-01-02t00:00:00z"}).ghsa(ghsa).withdrawn is True
+    # RFC3339 allows a lower-case "t" and "z", and a numeric offset in place of "Z"; all are withdrawals.
+    for valid in (
+        "2026-01-02t00:00:00z",
+        "2026-01-02T00:00:00+01:00",
+        "2026-01-02T00:00:00-23:59",
+        "2026-01-02T00:00:00.5+23:59",
+    ):
+        assert _osv_intel({**withdrawn, "withdrawn": valid}).ghsa(ghsa).withdrawn is True, valid
 
 
 def test_a_withdrawn_alias_free_ghsa_is_not_a_current_critical():
