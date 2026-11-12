@@ -1,6 +1,6 @@
 """The source catalogue is the single owner of a kind's metadata.
 
-Four consumers could drift apart: the builders, the config key allowlist, the README table and the
+Four consumers could drift apart: the builders, the config key allowlist, the docs/sources.md table and the
 ``/sources`` page. Every test here pins one of them to ``SOURCE_SPECS``, and every example is loaded and
 built, so a catalogue snippet is a config a user could actually run.
 """
@@ -25,7 +25,7 @@ from advisory_radar.sources import SOURCE_BUILDERS, _url_digest, build_source
 from advisory_radar.state import state_lock
 from advisory_radar.web import create_app
 
-README = Path(__file__).parent.parent / "README.md"
+SOURCES = Path(__file__).parent.parent / "docs" / "sources.md"
 ENV_PLACEHOLDER = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 RSS = b"""<?xml version="1.0"?>
 <rss version="2.0"><channel><title>Vendor</title><link>https://vendor.example.net/</link>
@@ -59,7 +59,7 @@ def test_config_allows_the_registry_keys():
 def test_every_example_validates_and_builds(tmp_path):
     for kind, spec in SOURCE_SPECS.items():
         assert spec.kind == kind
-        assert spec.docs_anchor == "README.md#sources"
+        assert spec.docs_anchor == "docs/sources.md"
         assert set(spec.required) <= set(spec.example), f"{kind}: the example must show every required key"
         assert set(spec.example) <= {"id", "type"} | set(spec.required) | set(spec.optional)
         for credential in ("token", "api_key"):
@@ -294,15 +294,15 @@ def _keys(cell: str) -> tuple[str, ...]:
     return tuple(part.strip().strip("`") for part in cell.split(","))
 
 
-def _readme_rows() -> dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]]:
+def _source_rows() -> dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]]:
     """Parse the catalogue table into kind -> (summary, required, optional).
 
     A duplicate kind is a failure, not a silently overwritten row: the table is the only place a user reads a
     summary, and two rows for one kind would make one of them invisible to this check.
     """
-    text = README.read_text(encoding="utf-8")
-    assert "\n## Sources\n" in text, "README must document the sources in its own section"
-    section = text.split("\n## Sources\n", 1)[1].split("\n## ", 1)[0]
+    text = SOURCES.read_text(encoding="utf-8")
+    assert text.startswith("# Sources\n"), "docs/sources.md must document the sources"
+    section = text.split("# Sources\n", 1)[1]
     rows: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {}
     for line in section.splitlines():
         if not line.startswith("|"):
@@ -311,22 +311,22 @@ def _readme_rows() -> dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]]:
         if not cells or cells[0].lower() == "kind" or set(cells[0]) <= {"-", ":", " "}:
             continue
         kind = cells[0].strip("`")
-        assert kind not in rows, f"README has two rows for {kind}"
+        assert kind not in rows, f"docs/sources.md has two rows for {kind}"
         rows[kind] = (cells[1], _keys(cells[2]), _keys(cells[3]))
     return rows
 
 
-def test_the_readme_table_matches_the_registry():
-    rows = _readme_rows()
+def test_the_sources_doc_table_matches_the_registry():
+    rows = _source_rows()
     assert set(rows) == set(SOURCE_SPECS)
     for kind, spec in SOURCE_SPECS.items():
         summary, required, optional = rows[kind]
         # The summary is user-facing prose, not a key list: it has to be the same sentence the catalogue and the
-        # /sources page carry, or the README describes a kind differently from the page next to it.
+        # /sources page carry, or docs/sources.md describes a kind differently from the page next to it.
         # The table renders the endpoint path as code, so compare the prose with the markdown removed.
-        assert summary.replace("`", "") == spec.summary, f"README summary drifted for {kind}"
-        assert required == spec.required, f"README required keys drifted for {kind}"
-        assert optional == spec.optional, f"README optional keys drifted for {kind}"
+        assert summary.replace("`", "") == spec.summary, f"sources summary drifted for {kind}"
+        assert required == spec.required, f"sources required keys drifted for {kind}"
+        assert optional == spec.optional, f"sources optional keys drifted for {kind}"
 
 
 def sources_client(tmp_path: Path) -> TestClient:
