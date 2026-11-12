@@ -2848,6 +2848,7 @@ def test_a_withdrawn_osv_record_keeps_its_lifecycle_without_current_severity():
         "2026-01-02T00:00:00+24:00",  # offset hour out of range
         " 2026-01-02T00:00:00Z",  # surrounding whitespace is not part of the field
         "2026-01-02T00:00:00Z\n",
+        "2026-01-02T00:00:00.123456\u0661Z",  # an Arabic-Indic digit: \d would match it, RFC3339 does not
     ):
         intel = _osv_intel({**withdrawn, "withdrawn": malformed})
         first = intel.ghsa(ghsa)
@@ -2863,6 +2864,7 @@ def test_a_withdrawn_osv_record_keeps_its_lifecycle_without_current_severity():
         "2026-01-02T00:00:00+01:00",
         "2026-01-02T00:00:00-23:59",
         "2026-01-02T00:00:00.5+23:59",
+        "2016-12-31T23:59:60Z",  # a leap second is a valid RFC3339 timestamp
     ):
         assert _osv_intel({**withdrawn, "withdrawn": valid}).ghsa(ghsa).withdrawn is True, valid
 

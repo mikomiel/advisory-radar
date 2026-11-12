@@ -1330,34 +1330,39 @@ def _source_value(source_title: str, source_url: str, feed_host: str) -> str:
     return f"{title} — {site}" if title and site else title or site
 
 
-#: RFC3339 date-time grammar: seconds are required, the offset is ``Z`` or numeric, and RFC3339 allows a
-#: lower-case ``t``/``z``. ``datetime.fromisoformat`` alone is too permissive -- it takes an arbitrary
-#: single-character separator and a date-time without seconds -- so the shape is checked before the values are.
-_RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-](?:[01]\d|2[0-3]):[0-5]\d)")
+#: RFC3339 date-time grammar, ASCII only: seconds are required, the offset is ``Z`` or a numeric offset whose
+#: hours are 00-23 and minutes 00-59, and RFC3339 allows a lower-case ``t``/``z``. The classes are written out
+#: rather than ``\d`` because ``\d`` matches non-ASCII digits, and the calendar values are checked by
+#: constructing a ``datetime`` below: ``fromisoformat`` also accepts a bare date, an arbitrary single-character
+#: separator, a missing seconds field and an out-of-range offset, none of which RFC3339 allows.
+_RFC3339 = re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.[0-9]+)?"
+    r"(?:[Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
+)
 
 
 def _is_rfc3339(value: object) -> bool:
     """Whether ``value`` is a valid RFC3339 timestamp.
 
-    The grammar is enforced first and the calendar values are then validated by the parser, because
-    ``fromisoformat`` accepts far more than RFC3339: a bare date, an offset-less date-time, an arbitrary
-    single-character separator, a missing seconds field or an out-of-range offset minute would all pass it.
-    A caller reads a lifecycle field
-    with this, where a non-empty but malformed spelling must not be mistaken for the fact: a value this parser
-    rejects is not evidence of a withdrawal.
+    The grammar is matched ASCII-only and the calendar values are then validated by constructing the moment, so a
+    malformed spelling cannot be mistaken for the fact. A caller reads a lifecycle field with this: a value this
+    parser rejects is not evidence of a withdrawal, and the caller must keep the record active.
     """
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str):
         return False
     # Validated exactly as sent: RFC3339 has no surrounding whitespace, and a padded value must not be read as
     # the fact either -- the field is evidence, not user input to tidy.
-    if _RFC3339.fullmatch(value) is None:
+    match = _RFC3339.fullmatch(value)
+    if match is None:
         return False
-    text = value[:-1] + "+00:00" if value[-1] in "Zz" else value
+    year, month, day, hour, minute, second = (int(part) for part in match.groups())
+    if second == 60:  # RFC3339 permits a leap second; ``datetime`` does not, so the second is capped.
+        second = 59
     try:
-        moment = datetime.datetime.fromisoformat(text)
+        datetime.datetime(year, month, day, hour, minute, second)
     except ValueError:
         return False
-    return moment.tzinfo is not None
+    return True
 
 
 def _day(epoch: float) -> str:
