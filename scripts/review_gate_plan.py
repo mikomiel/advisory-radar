@@ -184,9 +184,13 @@ def _bumped_version(entry: dict, path: str, pattern: str) -> str | None:
         return None
     added: list[str] = []
     removed: list[str] = []
-    for line in patch.splitlines():
-        if line.startswith(("+++", "---")):
-            continue  # the file headers, not a changed line
+    # Split on LF alone. ``str.splitlines`` also breaks on a bare carriage return, and a Python parser reads that
+    # as a newline: ``+__version__ = "0.2.0"\rprint(...)`` would then look like the version line plus a fragment
+    # this loop ignores, while the file really gained a statement. The whole content line must be validated, so
+    # the separator is the one git writes.
+    for line in patch.split("\n"):
+        if line.startswith("--- ") or line.startswith("+++ "):
+            continue  # the file headers, which carry a path after the marker
         if line.startswith("+"):
             added.append(line[1:])
         elif line.startswith("-"):

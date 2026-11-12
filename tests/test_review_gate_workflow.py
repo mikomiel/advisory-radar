@@ -43,7 +43,11 @@ STUB = """#!/usr/bin/env bash
 set -u
 url=""
 post=""
+jqfilter=""
+previous=""
 for arg in "$@"; do
+  [ "$previous" = "--jq" ] && jqfilter=$arg
+  previous=$arg
   case "$arg" in repos/*) url=$arg ;; esac
   [ "$arg" = "POST" ] && post=1
 done
@@ -54,7 +58,10 @@ fi
 case "$url" in
   *"pulls?state=open"*) cat "$FAKE_PULLS" ;;
   *"/reviews"*) cat "$FAKE_REVIEWS" ;;
-  *"/compare/"*) cat "$FAKE_COMPARE" ;;
+  *"/compare/"*)
+    # A raw comparison body is projected with the workflow's own --jq, so a test can cover the transport itself.
+    if [ -n "${FAKE_COMPARE_RAW:-}" ] && [ -n "$jqfilter" ]; then jq -c "$jqfilter" "$FAKE_COMPARE"
+    else cat "$FAKE_COMPARE"; fi ;;
   *"/statuses"*) cat "$FAKE_PREVIOUS" ;;
   *"/pulls/"*)
     # Only the named pull request's read fails: the changed-file count for a snapshot pull request is a
@@ -84,6 +91,7 @@ def _gate(
     live_fails_for: str = "",
     reviews: str = "[]",
     compare: str = "[]",
+    raw_compare: dict | None = None,
     event_head: str = "",
     event_action: str = "",
     event_pr: str = "",
@@ -93,7 +101,7 @@ def _gate(
     files = {
         "FAKE_PULLS": pulls,
         "FAKE_REVIEWS": reviews,
-        "FAKE_COMPARE": compare,
+        "FAKE_COMPARE": json.dumps(raw_compare) if raw_compare is not None else compare,
         "FAKE_PREVIOUS": "",
         "FAKE_LIVE": live,
     }
@@ -119,6 +127,7 @@ def _gate(
         "FAKE_POSTS": str(tmp_path / "posts"),
         "FAKE_LIVE_FAIL": str(tmp_path / "fake_live_fail"),
         "FAKE_LIVE_FAIL_PR": live_fails_for,
+        "FAKE_COMPARE_RAW": "1" if raw_compare is not None else "",
         **{name: str(tmp_path / name.lower()) for name in files},
     }
     proc = subprocess.run(["bash", str(tmp_path / "gate.sh")], cwd=ROOT, env=env, capture_output=True, text=True)
@@ -343,3 +352,59 @@ def test_the_same_row_on_an_ordinary_branch_still_needs_a_review(tmp_path):
     )
     assert code == 0
     assert posted == [(HEAD, "pending")]
+
+
+def raw_comparison() -> dict:
+    """A `compare` response body, before the workflow's --jq projection.
+
+    The changelog is deliberately large: the projection drops a patch above four changed lines, so a successful
+    release proof from this body also shows the proof does not depend on a patch it does not need.
+    """
+    return {
+        "files": [
+            {
+                "filename": ".release-please-manifest.json",
+                "previous_filename": None,
+                "status": "modified",
+                "additions": 1,
+                "deletions": 1,
+                "patch": '@@ -1,3 +1,3 @@\n {\n-  ".": "0.1.0"\n+  ".": "0.2.0"\n }',
+            },
+            {
+                "filename": "CHANGELOG.md",
+                "previous_filename": None,
+                "status": "modified",
+                "additions": 21,
+                "deletions": 0,
+                "patch": "@@ -9,3 +9,24 @@\n \n+## [0.2.0](https://example) (2026-11-13)\n",
+            },
+            {
+                "filename": "pyproject.toml",
+                "previous_filename": None,
+                "status": "modified",
+                "additions": 1,
+                "deletions": 1,
+                "patch": '@@ -4,7 +4,7 @@\n [project]\n-version = "0.1.0"\n+version = "0.2.0"\n',
+            },
+            {
+                "filename": "src/advisory_radar/__init__.py",
+                "previous_filename": None,
+                "status": "modified",
+                "additions": 1,
+                "deletions": 1,
+                "patch": '@@ -1,3 +1,3 @@\n """advisory-radar."""\n-__version__ = "0.1.0"\n+__version__ = "0.2.0"\n',
+            },
+        ]
+    }
+
+
+def test_the_real_comparison_projection_feeds_the_release_proof(tmp_path):
+    """The stub applies the workflow's own --jq here, so the counts and the patch cut-off are exercised too."""
+    code, posted = _gate(
+        tmp_path,
+        pulls=pull_line(40, HEAD, BASE, branch=RELEASE_BRANCH),
+        live=f"{HEAD}\t{BASE}\t4",
+        raw_compare=raw_comparison(),
+    )
+    assert code == 0
+    assert posted == [(HEAD, "success")]

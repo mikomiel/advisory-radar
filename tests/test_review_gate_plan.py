@@ -430,6 +430,16 @@ def test_a_release_that_is_not_only_the_version_bump_keeps_the_review_requiremen
                 '+__version__ = "0.2.0"; __import__("os").system("id")\n'
             ),
         ),
+        "a carriage return in the version line": with_file(
+            files,
+            "src/advisory_radar/__init__.py",
+            # A Python parser reads a bare carriage return as a newline, but str.splitlines would hide the second
+            # statement from the content check: the patch must be split on LF only.
+            patch=(
+                '@@ -1,3 +1,3 @@\n """advisory-radar."""\n \n-__version__ = "0.1.0"\n'
+                '+__version__ = "0.2.0"\rprint("unexpected executable code")\n'
+            ),
+        ),
         "two changed lines": with_file(files, "pyproject.toml", additions=2, deletions=2),
         "no patch carried": with_file(files, "pyproject.toml", patch=None),
         "the version unchanged": release_files(new="0.1.0"),
