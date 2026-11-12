@@ -7,6 +7,7 @@ per-source enrichment clocks, secret collection and the persisted run record.
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -2833,6 +2834,23 @@ def test_a_withdrawn_osv_record_keeps_its_lifecycle_without_current_severity():
         assert relaxed.withdrawn is False, f"an unreadable withdrawn shape must not claim the lifecycle: {shape!r}"
         assert relaxed.cvss == core.OSV_SEVERITY_SCORE["CRITICAL"], "and it is not current severity evidence"
 
+    # A non-empty string is not a withdrawal unless it is a valid RFC3339 timestamp: malformed text must not
+    # strip an active record's severity, and the cache must not remember it as withdrawn either.
+    for malformed in (
+        "not-a-timestamp",
+        "2026-99-99T00:00:00Z",
+        "2026-01-02",  # a date only: no time and no offset
+        "2026-01-02T00:00:00",  # no offset: RFC3339 requires one
+        "2026-01-02T25:00:00Z",  # an impossible hour
+    ):
+        intel = _osv_intel({**withdrawn, "withdrawn": malformed})
+        first = intel.ghsa(ghsa)
+        assert first.withdrawn is False, f"malformed withdrawal text must not claim the lifecycle: {malformed!r}"
+        assert first.cvss == core.OSV_SEVERITY_SCORE["CRITICAL"], "malformed withdrawal text must not strip severity"
+        assert first.complete is True, "and it leaves the record a complete measurement"
+        assert intel._cache[ghsa]["withdrawn"] is False, "the cache must not persist a malformed withdrawal"
+        assert intel.ghsa(ghsa) == first, "a cache hit reads the malformed value as active too"
+
 
 def test_a_withdrawn_alias_free_ghsa_is_not_a_current_critical():
     """A withdrawn CRITICAL label must not produce a current critical verdict, and never a suppression."""
@@ -2915,6 +2933,54 @@ def test_a_withdrawn_ghsa_does_not_decide_a_mixed_item():
     assert "without a CVE id decides the severity" not in entry["body"]
 
 
+def test_a_withdrawn_ghsas_alias_is_judged_on_its_own_cve_evidence():
+    """The advisory's lifecycle must not hide its alias: the CVE is looked up and its own facts decide."""
+    document = {
+        "id": "GHSA-aaaa-bbbb-cccc",
+        "aliases": ["CVE-2026-7777"],  # the CVE does not appear in the item's own text
+        "database_specific": {"severity": "CRITICAL"},
+        "withdrawn": "2026-01-02T00:00:00Z",
+    }
+    looked_up = []
+
+    class Intel(core.Intel):
+        def __init__(self):
+            super().__init__(None, {}, lambda: 0.0, lambda seconds: None)
+
+        def _get(self, url):
+            return 200, document
+
+        def cves(self, cves, **ignored):
+            looked_up.extend(cves)
+            return {cve: core.CveFacts(9.8, None, 0.5, 0.99, True, remote_unauth=True) for cve in cves}
+
+    state = core.new_state()
+    item = core.Item(
+        "g3",
+        "GHSA-aaaa-bbbb-cccc advisory",
+        "https://vendor.example/x",
+        "notes",
+        NOW - 60,
+        ("GHSA-aaaa-bbbb-cccc",),
+    )
+    core.classify_new(
+        state,
+        [item],
+        Intel(),
+        frozenset(),
+        True,
+        NOW,
+        "",
+        core.Policy((), (), ()),
+        thresholds=DEFAULT_THRESHOLDS,
+    )
+    assert looked_up == ["CVE-2026-7777"], "the withdrawn advisory's alias is still looked up"
+    entry = state["pending"][0]
+    assert entry["tag"] == "critical", "the aliased CVE's own CVE.org/NVD evidence still decides"
+    assert entry["levels"] == {"CVE-2026-7777": "critical"}
+    assert "CVE-2026-7777" in entry["ids"], "the alias stays in the queued identity"
+
+
 def test_withdrawal_does_not_rewrite_delivered_history():
     """The lifecycle fact changes the current verdict only; seen, deliveries and watch keep what happened."""
     document = {
@@ -2938,9 +3004,9 @@ def test_withdrawal_does_not_rewrite_delivered_history():
         }
     }
     state = core.new_state()
-    state["seen"] = dict(seen)
-    state["deliveries"] = dict(deliveries)
-    state["watch"] = dict(watch)
+    state["seen"] = copy.deepcopy(seen)
+    state["deliveries"] = copy.deepcopy(deliveries)
+    state["watch"] = copy.deepcopy(watch)
     item = core.Item(
         "g2",
         "GHSA-aaaa-bbbb-cccc and CVE-2026-5555",

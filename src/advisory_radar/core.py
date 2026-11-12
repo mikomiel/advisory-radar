@@ -982,11 +982,10 @@ class Intel:
                 if isinstance(alias, str) and CVE_RE.fullmatch(alias)
             )
         )
-        # A withdrawn record keeps an RFC3339 ``withdrawn`` timestamp; OSV omits the member otherwise. The
-        # lifecycle is kept, but it is not current severity evidence: another shape is tolerated and is not
-        # read as withdrawn, so this parser never raises on it.
-        raw_withdrawn = document.get("withdrawn")
-        withdrawn = isinstance(raw_withdrawn, str) and bool(raw_withdrawn.strip())
+        # A withdrawn record keeps an RFC3339 ``withdrawn`` timestamp; OSV omits the member otherwise. Only a
+        # valid timestamp is evidence of a withdrawal: a malformed non-empty value is tolerated and read as
+        # active, so it can neither strip this record's severity nor be cached as withdrawn.
+        withdrawn = _is_rfc3339(document.get("withdrawn"))
         specific = document.get("database_specific")
         label = specific.get("severity") if isinstance(specific, dict) else None
         cvss = None if withdrawn else (OSV_SEVERITY_SCORE.get(label.upper()) if isinstance(label, str) else None)
@@ -1329,6 +1328,22 @@ def _source_value(source_title: str, source_url: str, feed_host: str) -> str:
     public = _public_https(source_url) and _host(source_url) not in HIDDEN_SOURCE_HOSTS
     site = _autolink(source_url) if public else ""
     return f"{title} — {site}" if title and site else title or site
+
+
+def _is_rfc3339(value: object) -> bool:
+    """Whether ``value`` is a valid RFC3339 timestamp: an ISO 8601 string that carries an offset.
+
+    RFC3339 requires an offset, so a bare date or an offset-less date-time is not accepted. A caller reads a
+    lifecycle field with this, where a non-empty but malformed spelling must not be mistaken for the fact: a
+    value this parser rejects is not evidence of a withdrawal.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        moment = datetime.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return moment.tzinfo is not None
 
 
 def _day(epoch: float) -> str:
