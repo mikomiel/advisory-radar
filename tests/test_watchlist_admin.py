@@ -977,8 +977,20 @@ def test_the_preview_matches_what_a_webhook_entry_is_judged_on(tmp_path):
     assert core.filter_reason(item, policy) == "", "this entry is in scope through its summary"
     assert "In scope" in page.text and "matched <code>acme</code>" in page.text
 
-    # The feed title is part of the text a product matches, so it reaches the preview as well.
-    feed_item = core.Item("h", "notes", "", "", None, (), source_title="Vendor Feed")
+    # The feed title is part of the text a product matches, so it reaches the preview as well -- through the same
+    # parser, whose ``source`` field becomes the entry's feed title.
+    feed_entry = webhook_item_from_payload({"title": "notes", "source": "Vendor Feed", "guid": "h"})
+    assert feed_entry is not None and feed_entry["source_title"] == "Vendor Feed"
+    feed_item = core.Item(
+        feed_entry["guid"],
+        feed_entry["title"],
+        feed_entry["link"],
+        feed_entry["summary"],
+        None,
+        (),
+        source_title=feed_entry["source_title"],
+    )
     page = client.get("/watchlist", params={"preview": "1", "title": "notes", "source_title": "Vendor Feed"})
+    assert core.matched_products(feed_item, policy) == ("vendor",), "the entry matched through its feed title"
     assert core.filter_reason(feed_item, policy) == ""
     assert "In scope" in page.text and "judged exactly as typed" in page.text
