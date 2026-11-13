@@ -1583,6 +1583,7 @@ def test_a_warning_queued_in_the_quiet_window_leaves_the_room_for_a_critical(tmp
     stored = cfg.store().load()
     assert [(entry["tag"], entry["ids"]) for entry in stored["pending"]] == [("warning", ["src:vendor:warning-1"])]
     assert "attempts" not in stored["pending"][0], "the held warning was never attempted"
+    assert stored["pending"][0]["queued_at"] == night, "an unattempted entry still carries when it was queued"
 
 
 def test_a_full_sendable_queue_still_leaves_new_items_in_carry(tmp_path):

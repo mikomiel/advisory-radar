@@ -1603,6 +1603,9 @@ def test_the_screenshot_demo_data_names_no_estate_identifier():
     for queue in ("pending", "parked"):
         for entry in state[queue]:
             identifiers |= set(entry["ids"])
+    for items in state.get("carry", {}).values():
+        for item in items:
+            identifiers |= set(item.get("explicit") or ())
     assert identifiers == set(capture.DEMO_ADVISORIES) | {capture.DEMO_LEGACY}
     assert all(
         re.fullmatch(r"(CVE|GHSA|DSA|PSA|APSB)[A-Za-z0-9]*[-:][A-Za-z0-9.: -]+", identifier)
@@ -1689,6 +1692,7 @@ def test_every_page_carries_the_same_shell(tmp_path):
     assert csrf
     pages = {
         "/": "/",
+        "/inbox": "/inbox",
         "/alerts": "/alerts",
         "/parked": "/parked",
         "/config": "/config",
@@ -1793,3 +1797,251 @@ def test_a_stored_value_is_data_not_a_lookup_key(tmp_path):
     # An unusable exit code is unknown, not a recorded failure.
     assert "<span class='badge badge-neutral'>?</span>" in client.get("/runs").text
     assert "<span class='badge badge-neutral'>?</span>" in client.get("/").text
+
+
+# --- the unified inbox and the actionable dashboard ---------------------------------------------
+
+
+def quiet_window_around(epoch: int) -> str:
+    """A quiet window that contains ``epoch`` in the process's local time, whatever the host's zone is.
+
+    ``delivery.is_held`` reads the window in local time, so a test that hard-coded 22:00-07:00 would only
+    hold when the machine happened to be at night. Centring the window on the tested moment makes the answer
+    a property of the code, not of the host clock.
+    """
+    moment = datetime.fromtimestamp(epoch)
+    minutes = moment.hour * 60 + moment.minute
+    start, end = (minutes - 30) % 1440, (minutes + 30) % 1440
+    return f"{start // 60:02d}:{start % 60:02d}-{end // 60:02d}:{end % 60:02d}"
+
+
+def test_the_inbox_lists_a_queued_advisory_and_its_alias_before_and_after_delivery(tmp_path):
+    """Both identifiers of one message are discoverable in the queue and in the history, and neither is merged."""
+    queued = core.new_state()
+    entry = pending_entry("CVE-2026-7000")
+    entry["ids"] = ["CVE-2026-7000", "GHSA-aaaa-bbbb-cccc"]
+    entry["cves"] = ["CVE-2026-7000"]
+    entry["source_id"] = "vendor-feed"
+    entry["queued_at"] = NOW - 3600
+    queued["pending"] = [entry]
+
+    client, token, _ = make_client(tmp_path, state=queued)
+    sign_in(client, token)
+    page = client.get("/inbox").text
+    assert "CVE-2026-7000" in page and "GHSA-aaaa-bbbb-cccc" in page
+    assert "held by the quiet window" not in page, "no window is configured, so nothing is held"
+    assert "queued, not yet sent" in page
+    assert "Related:" in page, "the alias of the same message is shown beside its own row"
+    assert "not tracked" in page, "remediation is named as untracked, never inferred from transport"
+
+    delivered = core.new_state()
+    for identifier in ("CVE-2026-7000", "GHSA-aaaa-bbbb-cccc"):
+        delivered["seen"][identifier] = {
+            "at": NOW,
+            "outcome": "delivered",
+            "tag": "warning",
+            "title": "WARNING: CVE-2026-7000 in nginx",
+            "ids": ["CVE-2026-7000", "GHSA-aaaa-bbbb-cccc"],
+            "link": "https://vendor.example.net/advisories/CVE-2026-7000",
+            "source_id": "vendor-feed",
+        }
+    client, token, _ = make_client(tmp_path, state=delivered)
+    sign_in(client, token)
+    page = client.get("/inbox").text
+    assert "CVE-2026-7000" in page and "GHSA-aaaa-bbbb-cccc" in page
+    assert "delivered" in page and "accepted by a channel" in page
+    assert "Related:" in page
+    assert "not tracked" in page
+    assert "remediated" not in page, "a delivered message must never read as a fixed vulnerability"
+
+
+def test_inbox_filters_persist_through_pagination(tmp_path):
+    """The held/queued filters stay on the page and on the Older link, and the second page keeps them."""
+    window = quiet_window_around(NOW)
+    body = f"sources: []\nnotifiers: []\nquiet_hours: {window}\n"
+    state = core.new_state()
+    for number in range(60):
+        entry = pending_entry(f"CVE-2026-8{number:03d}")
+        entry["queued_at"] = NOW - 60 * (number + 1)
+        entry["source_id"] = "vendor-feed"
+        state["pending"].append(entry)
+    client, token, _ = make_client(tmp_path, body=body, state=state)
+    sign_in(client, token)
+
+    first = client.get("/inbox?state=held&tag=warning").text
+    assert first.count("held by the quiet window") == 50, "one page of held rows, not the whole queue"
+    assert "queued, not yet sent" not in first
+    links = [html.unescape(link) for link in re.findall(r"href='(/inbox\?[^']*)'", first)]
+    older = [link for link in links if "cursor=" in link]
+    assert older, "a second page exists and the pager must link to it"
+    assert "state=held" in older[0] and "tag=warning" in older[0]
+
+    second = client.get(older[0]).text
+    assert second.count("held by the quiet window") == 10
+    assert "queued, not yet sent" not in second
+
+
+def test_the_inbox_keeps_each_cve_of_one_message_on_its_own_row(tmp_path):
+    """Grouping stops at the identifier: a multi-CVE message must not merge unrelated advisories."""
+    state = core.new_state()
+    entry = pending_entry("CVE-2026-9100")
+    entry["ids"] = ["CVE-2026-9100", "CVE-2026-9101"]
+    entry["cves"] = ["CVE-2026-9100", "CVE-2026-9101"]
+    entry["levels"] = {"CVE-2026-9100": "critical", "CVE-2026-9101": "warning"}
+    state["pending"] = [entry]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get("/inbox").text
+    assert page.count("<tr>") == 3, "a header and one row per CVE, never one merged row"
+    # Two advisory links and two related links: each identifier keeps its own row and names the other.
+    assert page.count("href='/advisories/") == 4
+    assert "CVE-2026-9100" in page and "CVE-2026-9101" in page
+
+
+def test_the_inbox_shows_parked_and_carried_work(tmp_path):
+    state = core.new_state()
+    state["parked"] = [parked_entry("CVE-2026-4000")]
+    state["carry"] = {
+        "feed-a": [
+            {
+                "guid": "feed-a:item-1",
+                "title": "Carried item",
+                "link": "https://vendor.example.net/item-1",
+                "published": NOW - 7200,
+                "explicit": ["CVE-2026-9500"],
+            },
+            {"guid": "feed-a:item-2", "title": "Carried without an id", "link": "", "published": NOW - 1800},
+        ]
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get("/inbox").text
+    assert "awaiting a decision" in page, "a parked message is part of the inbox, not a separate queue"
+    assert "awaiting classification" in page
+    assert "CVE-2026-9500" in page
+    assert "src:feed-a:item-2" in page, "work with no identifier is still discoverable by its own identity"
+
+
+def test_the_dashboard_counts_link_to_the_views_they_describe(tmp_path):
+    window = quiet_window_around(NOW)
+    body = (
+        "sources:\n"
+        "  - id: feed-a\n"
+        "    type: rss\n"
+        "    url: https://feeds.example.com/a\n"
+        "  - id: feed-b\n"
+        "    type: rss\n"
+        "    url: https://feeds.example.com/b\n"
+        "    interval: 10m\n"
+        "notifiers: []\n"
+        f"quiet_hours: {window}\n"
+    )
+    state = core.new_state()
+    critical = pending_entry("CVE-2026-6000", tag="critical")
+    critical["queued_at"] = NOW - 7200
+    critical["source_id"] = "vendor-feed"
+    held = pending_entry("CVE-2026-6001")
+    held["queued_at"] = NOW - 90
+    held["source_id"] = "vendor-feed"
+    state["pending"] = [critical, held]
+    state["parked"] = [parked_entry("CVE-2026-4000")]
+    state["carry"] = {"feed-a": [{"guid": "feed-a:item-1", "title": "Carried", "link": "", "published": NOW - 60}]}
+    state["seen"]["CVE-2026-5000"] = seen(NOW - 60, "delivered")
+    state["enrich_retry"] = {"vendor:item": NOW - 10}
+    state["source_health"] = {
+        "feed-a": {"at": NOW, "ok": False, "ok_at": 0, "items": 0, "error": "boom"},
+        "feed-b": {"at": NOW - 5000, "ok": True, "ok_at": NOW - 5000, "items": 3, "error": ""},
+    }
+    state["runs"] = [{"at": NOW - 600, "finished_at": NOW - 540, "sent": 3, "parked": 0, "pending": 2, "code": 0}]
+    client, token, _ = make_client(tmp_path, body=body, state=state)
+    sign_in(client, token)
+    page = client.get("/").text
+
+    def tile(label: str, href: str) -> str:
+        match = re.search(
+            rf"<a href='{re.escape(href)}'><span class='stat-label'>{label}</span>"
+            r"<span class='stat-value'>(\d+)</span>",
+            page,
+        )
+        assert match, f"the {label} tile must link to {href}"
+        return match.group(1)
+
+    assert tile("Undelivered criticals", "/inbox?state=open&amp;tag=critical") == "2"
+    assert tile("Held by quiet hours", "/inbox?state=held") == "1"
+    assert tile("Parked", "/inbox?state=parked") == "1"
+    assert tile("Awaiting classification", "/inbox?state=carried") == "1"
+    # Exit 0 with four items still owed says so: finishing is not the same as having nothing left.
+    assert "4 item(s) still owed" in page
+    assert "deferred work" in page
+    assert "attempted 2026-10-21 16:16" in page
+    assert "completed 2026-10-21 16:17" in page
+    assert "last success 2026-10-21 16:17" in page
+    assert "2h ago" in page, "the oldest recorded queue time reports the age its queued_at proves"
+    # Every tile leads to the rows it counted: two criticals (one held in the queue, one parked) and both
+    # unsent messages for the queued count, the held warning included.
+    criticals = client.get("/inbox?state=open&tag=critical").text
+    assert "CVE-2026-6000" in criticals and "CVE-2026-4000" in criticals
+    queued_view = client.get("/inbox?state=pending").text
+    assert "CVE-2026-6000" in queued_view and "CVE-2026-6001" in queued_view
+    assert "1 item(s) awaiting a retry" in page
+    assert "2 <a class='small' href='/sources?state=unhealthy'>review sources</a>" in page
+    assert "href='/inbox?state=delivered&amp;since=2026-10-20'>open the inbox</a>" in page
+
+
+def test_a_legacy_run_says_the_completion_time_is_unknown(tmp_path):
+    """A run record written before completion times existed must say not recorded, never invent one."""
+    state = core.new_state()
+    state["runs"] = [{"at": NOW - 60, "sent": 1, "parked": 0, "pending": 0, "code": 0}]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get("/").text
+    assert "completed <span class='muted'>not recorded</span>" in page
+    assert "last success 2026-10-21 16:25" in page, "the attempt time is the only time the record holds"
+
+
+def test_the_sources_page_filters_by_health_state(tmp_path):
+    body = (
+        "sources:\n"
+        "  - id: feed-a\n"
+        "    type: rss\n"
+        "    url: https://feeds.example.com/a\n"
+        "  - id: feed-b\n"
+        "    type: rss\n"
+        "    url: https://feeds.example.com/b\n"
+        "    interval: 10m\n"
+        "notifiers: []\n"
+    )
+    state = core.new_state()
+    state["source_health"] = {
+        "feed-a": {"at": NOW, "ok": False, "ok_at": 0, "items": 0, "error": "boom"},
+        "feed-b": {"at": NOW - 5000, "ok": True, "ok_at": NOW - 5000, "items": 3, "error": ""},
+    }
+    client, token, _ = make_client(tmp_path, body=body, state=state)
+    sign_in(client, token)
+
+    unhealthy = client.get("/sources?state=unhealthy").text
+    assert "feed-a" in unhealthy and "feed-b" in unhealthy
+    assert "failing" in unhealthy and "stale" in unhealthy
+    stale = client.get("/sources?state=stale").text
+    assert "feed-b" in stale and "feed-a" not in stale
+    empty = client.get("/sources?state=ok").text
+    assert "No source matches this state." in empty
+
+
+def test_the_inbox_and_dashboard_survive_a_hand_edited_state(tmp_path):
+    """The state is a file a person can edit: malformed rows are skipped, never raised out of a page."""
+    state = core.new_state()
+    state["pending"] = "not-a-list"
+    state["parked"] = {"nope": True}
+    state["carry"] = {"feed-a": "not-a-list", "feed-b": [None, {"guid": 5, "explicit": "CVE-2026-1"}]}
+    state["deliveries"] = {"broken": "not-an-event"}
+    state["seen"] = {"CVE-2026-1": "not-a-record", "CVE-2026-2": {"at": "soon", "outcome": 5}}
+    state["runs"] = ["not-a-run", {"at": "soon", "code": "x", "finished_at": None}]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    inbox = client.get("/inbox")
+    assert inbox.status_code == 200
+    assert "CVE-2026-1" in inbox.text, "the carried row with a readable identifier is still shown"
+    dashboard = client.get("/")
+    assert dashboard.status_code == 200
+    assert "not recorded" in dashboard.text

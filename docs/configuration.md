@@ -281,6 +281,27 @@ busy or failed request is not read as the previous successful pass. The result t
 signed token that expires after two minutes and is bound to the signed-in session, so a
 missing, stale or other-session token renders no notice.
 
+`/inbox` is the work list across the whole lifecycle. Its rows are one per identifier:
+pending, held by the quiet window, carried (fetched and awaiting classification), parked,
+then the delivery history and event-only notifications such as an Adobe bulletin. `state`
+accepts `open` — everything the queue still owes: pending, held, carried and parked — or
+exactly one of pending, held, carried, parked, delivered, dropped, filtered, suppressed,
+backlog, alias, not-security and notified. `pending` matches every unsent row, the ones the
+quiet window holds included; `held` narrows to exactly those. `tag`, `source` (a configured source id the row's
+messages named), `q` and the inclusive UTC `since`/`until` days behave as on `/alerts`, with
+the same 50-row keyset pagination. Identifiers that one message named are listed as related,
+never merged into one row: the state records co-occurrence, not an alias map, and merging a
+multi-CVE bulletin would lose each advisory's own evidence. The **Remediation** column says
+`not tracked`: this version does not record whether a vulnerability was fixed, so transport is
+never presented as remediation.
+
+The dashboard counts undelivered criticals, quiet-window holds, parked messages and
+awaiting-classification items above the last pass, and each count links to the inbox view it
+describes. The work-owed block reports the oldest queued age (or that the age is unknown for a
+record with no queue time), deferred enrichment, unhealthy sources and the last-day delivery
+count; a pass that exited 0 while work remains says **deferred work** instead of reading as
+complete.
+
 Every accepted or dropped message is also kept as a delivery event with its own time,
 outcome and accepted destinations. A later escalation adds an event beside the first-seen
 record instead of rewriting it; an Adobe bulletin never becomes a first-seen record, so its

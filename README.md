@@ -5,7 +5,7 @@ and changedetection.io watches you configure, enriches every finding with
 CVE.org / NVD, EPSS, CISA KEV and OSV, decides a severity per CVE, and sends one
 deduplicated alert per new advisory to the channels you choose.
 
-![Dashboard: pending, parked, seen-today and total counts above the last pass's sent, parked and exit result](docs/screenshots/dashboard.png)
+![Dashboard: undelivered criticals, quiet-window holds, parked messages and awaiting classification above the last pass, marked deferred work, then the oldest recorded queue age, source health and delivery count](docs/screenshots/dashboard.png)
 
 ## What it does
 

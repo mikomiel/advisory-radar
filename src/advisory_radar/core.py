@@ -1897,6 +1897,9 @@ def classify_new(
             )
             queued = {
                 "kind": "new",
+                # The one clock an unattempted entry has: delivery stamps ``first_attempt_at`` only when it
+                # first tries, so a held warning would otherwise have no age at all.
+                "queued_at": now,
                 "tag": verdict.tag,
                 "title": title,
                 "body": body,
@@ -2107,6 +2110,7 @@ def reevaluate(
         state["pending"].append(
             {
                 "kind": "escalation",
+                "queued_at": now,
                 "tag": level,
                 "title": title,
                 "body": body,
@@ -2195,6 +2199,12 @@ def _login_answer(detail: adobe.Detail | None) -> str:
         return "no critical CVEs" if detail and detail.cves else NO_DETAILS
     worst = max(critical, key=lambda cve: (cve.cvss or 0.0, cve.auth_required is False))
     return NO_DETAILS if worst.auth_required is None else "yes" if worst.auth_required else "no"
+
+
+def _queued(entry: dict, now: int) -> dict:
+    """A message just built for the queue, stamped with when it was queued; later attempts never move it."""
+    entry.setdefault("queued_at", now)
+    return entry
 
 
 def _adobe_new_message(bulletin: adobe.Bulletin, detail: adobe.Detail | None, exploited: str) -> dict:
@@ -2386,7 +2396,7 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
                 record["exploited"] = bool(listed)
             continue
         if listed and not record["exploited"]:
-            state["pending"].append(_adobe_kev_message(bulletin, listed))
+            state["pending"].append(_queued(_adobe_kev_message(bulletin, listed), now))
             record["exploited"] = True
             followed += 1
     for bulletin in fresh:
@@ -2408,7 +2418,7 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
         backlog.pop(bulletin.apsb, None)  # delivered: no longer outstanding
         cves = list(dict.fromkeys((*bulletin.cves, *(cve.cve for cve in detail.cves))) if detail else bulletin.cves)
         exploited = adobe_exploited(cves, detail, kev, kev_known)
-        state["pending"].append(_adobe_new_message(bulletin, detail, exploited))
+        state["pending"].append(_queued(_adobe_new_message(bulletin, detail, exploited), now))
         seen[bulletin.apsb] = {"cves": cves, "at": now, "exploited": exploited == "yes"}
         queued += 1
     if retry:

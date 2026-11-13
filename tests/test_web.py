@@ -103,7 +103,10 @@ def test_login_and_dashboard(tmp_path):
     client.cookies.set("advisory_radar_session", cookie)
     dashboard = client.get("/")
     assert dashboard.status_code == 200
-    assert "<span class='stat-label'>Pending</span><span class='stat-value'>1</span>" in dashboard.text
+    # The queue is still the headline number, now as a fact beside the linked attention tiles.
+    assert "1 <a class='small' href='/inbox?state=pending'>open the queue</a>" in dashboard.text
+    assert "<span class='stat-label'>Undelivered criticals</span><span class='stat-value'>0</span>" in dashboard.text
+    assert "1 item(s) still owed" in dashboard.text
     assert client.get("/alerts").status_code == 200
     assert "CVE-2026-1" in client.get("/alerts").text
     assert client.get("/runs").status_code == 200
@@ -158,8 +161,10 @@ def test_pages_tolerate_records_that_are_not_objects_or_not_times(tmp_path):
 
     dashboard = client.get("/")
     assert dashboard.status_code == 200
-    assert "Last pass: 2026-10-21 16:26" in dashboard.text
-    assert "<span class='stat-label'>Seen in last 24h</span><span class='stat-value'>1</span>" in dashboard.text
+    assert "2026-10-21 16:26" in dashboard.text
+    # The page must render the valid latest pass whatever came before it, in one of the two pass phrasings.
+    assert "Last pass" in dashboard.text
+    assert re.search(r"Delivered in the last 24h</dt><dd>1 ", dashboard.text)
 
     alerts = client.get("/alerts")
     assert alerts.status_code == 200
@@ -180,7 +185,9 @@ def test_a_last_run_that_is_not_an_object_renders_as_never(tmp_path):
     state["runs"] = [None, "nope"]
     save_state(tmp_path / "state.json", state)
     signed_in(client, token)
-    assert "Last pass: never" in client.get("/").text
+    page = client.get("/").text
+    assert "No pass has completed yet." in page
+    assert "attempted <span class='muted'>never</span>" in page
     assert client.get("/runs").status_code == 200
 
 
@@ -311,7 +318,7 @@ def test_run_now_reports_what_this_request_did(tmp_path, code, text, tone):
     assert tone in page
     # The notice names this request and sits above the stored last pass, which is a different fact.
     assert "This request:" in page
-    assert page.index("This request:") < page.index("Last pass:")
+    assert page.index("This request:") < page.index("<div class='pass'>")
     assert ("Open Run history" in page) == (code in (0, 1))
 
 

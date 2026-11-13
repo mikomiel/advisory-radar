@@ -5,10 +5,10 @@ the reader's light or dark preference. These are from a local run with demo data
 advisories in them are not real findings. The set is
 reproducible: `uv run --with playwright python scripts/capture_screenshots.py` builds the
 demo config and state in a temporary directory, serves the app on loopback and writes the
-six PNGs (Playwright is opt-in and not a project dependency; see
+seven PNGs (Playwright is opt-in and not a project dependency; see
 `deployment.md`).
 
-![Dashboard: pending, parked, seen-today and total counts above the last pass's sent, parked and exit result](screenshots/dashboard.png)
+![Dashboard: undelivered criticals, quiet-window holds, parked messages and awaiting classification above the last pass, marked deferred work, then the oldest recorded queue age, source health and delivery count](screenshots/dashboard.png)
 
 | Alerts | Configuration |
 |---|---|
@@ -18,7 +18,7 @@ six PNGs (Playwright is opt-in and not a project dependency; see
 |---|---|
 | ![The product scope: one row per watched product with its aliases and domains, the Debian package patterns and exclusions, and the form that checks one advisory against the document](screenshots/watchlist.png) | ![Parked queue: severity, title and advisory ids, with per-entry release and drop plus the bulk actions](screenshots/parked.png) |
 
-| Runs |
-|---|
-| ![Run history: sent, parked, pending and exit code per pass, filtered by exit code and day](screenshots/runs.png) |
+| Inbox | Runs |
+|---|---|
+| ![The unified inbox: queued, held, carried, parked and delivered rows with transport state, source id, related identifiers and an explicit not-tracked remediation column](screenshots/inbox.png) | ![Run history: sent, parked, pending and exit code per pass, filtered by exit code and day](screenshots/runs.png) |
 
