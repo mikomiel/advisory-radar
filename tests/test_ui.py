@@ -2607,3 +2607,47 @@ def test_an_escalation_keeps_the_identifiers_delivered_history(tmp_path):
     assert primary_ids(client, "/inbox?state=delivered") == {"CVE-2026-8400"}
     assert primary_ids(client, "/inbox?state=pending") == {"CVE-2026-8400"}
     assert "Also: delivered" in client.get("/inbox").text
+
+
+def test_related_links_for_carried_only_identifiers_are_not_advisory_links(tmp_path):
+    """A carried item's other identifiers have no record yet, so a related link would open a 404."""
+    state = core.new_state()
+    state["carry"] = {
+        "feed-a": [
+            {
+                "guid": "feed-a:tail-2",
+                "title": "Awaiting classification",
+                "link": "",
+                "published": NOW - 60,
+                "explicit": ["CVE-2026-8500", "CVE-2026-8501"],
+            }
+        ]
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get("/inbox").text
+    assert "CVE-2026-8500" in page and "CVE-2026-8501" in page
+    assert "Related:" in page
+    assert "href='/advisories/" not in page, "neither the primary nor the related identifier is resolvable yet"
+
+
+def test_a_related_link_is_kept_for_an_identifier_with_a_record(tmp_path):
+    """The same alias is a link when the state can resolve it, so the fix does not remove useful links."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-8600"] = seen(NOW - 3600, "delivered")
+    state["carry"] = {
+        "feed-a": [
+            {
+                "guid": "feed-a:tail-3",
+                "title": "Awaiting classification",
+                "link": "",
+                "published": NOW - 60,
+                "explicit": ["CVE-2026-8600", "CVE-2026-8601"],
+            }
+        ]
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get("/inbox").text
+    assert f"href='/advisories/{advisory_token('CVE-2026-8600')}'" in page, "the delivered identifier keeps its link"
+    assert f"href='/advisories/{advisory_token('CVE-2026-8601')}'" not in page

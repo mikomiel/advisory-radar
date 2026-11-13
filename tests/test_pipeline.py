@@ -1689,3 +1689,55 @@ def test_admission_keeps_parking_and_the_lookup_budget_independent(tmp_path):
     assert len(bounded["watch"]) == core.MAX_CLASSIFY, "MAX_CLASSIFY is still the independent lookup bound"
     assert len(left) == 5, "the items past the lookup budget are carried, not classified"
     assert bounded["pending"] == [], "a suppressed advisory is never queued"
+
+
+def test_an_out_of_scope_webhook_retry_does_not_consume_a_queued_owner(tmp_path):
+    """A retry after a scope change must not record a filtered disposition for an identifier a message owns."""
+    watch = tmp_path / "watchlist.json"
+    watch.write_text(
+        json.dumps(
+            {
+                "schema": "security-watchlist.v1",
+                "debian_source_packages": ["curl"],
+                "excluded_products": [],
+                "products": [{"id": "libfoo", "aliases": ["libfoo"], "domains": ["libfoo.example"]}],
+            }
+        )
+    )
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "sources:\n  - id: wh\n    type: webhook\nnotifiers: []\n"
+        f"state_path: {tmp_path}/state.json\nwatchlist: {watch}\n"
+    )
+    cfg = load_config(cfg_path, {})
+    state = core.new_state()
+    state["seeded"] = {"wh": True}
+    state["pending"] = [
+        {
+            "kind": "new",
+            "queued_at": NOW - 60,
+            "fresh": ["src:wh:wh:noise"],
+            "tag": "warning",
+            "title": "WARNING: out of scope already queued",
+            "body": "",
+            "ids": ["src:wh:wh:noise"],
+            "cves": [],
+            "levels": {},
+            "source": "Vendor",
+            "link": "",
+        }
+    ]
+    state["webhook_inbox"] = {"wh": [{"guid": "wh:noise", "title": "garden notes", "link": "", "summary": ""}]}
+    save_state(cfg.state_path, state)
+    pipeline.run_pass(
+        cfg,
+        [WebhookSource("wh")],
+        [],
+        http=fake_http,
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    stored = json.loads((tmp_path / "state.json").read_text())
+    assert stored.get("webhook_inbox", {}) == {}, "the filtered entry is still released from the inbox"
+    assert "src:wh:wh:noise" not in stored["seen"], "the queued owner keeps its identifier"
+    assert [entry["ids"] for entry in stored["pending"]] == [["src:wh:wh:noise"]]

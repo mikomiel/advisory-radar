@@ -2489,6 +2489,9 @@ def create_app(
         before = _cursor_decode(request.query_params["before"]) if request.query_params.get("before") else None
         now = int(clock())
         rows = inbox_rows(state, now=now, quiet_hours=runtime.cfg.quiet_hours)
+        # Only an identifier the advisory page can resolve is linked: a carried item's other ids have no
+        # record yet, and a link to a 404 is worse than the identifier as text.
+        detail_ids = {row["identifier"] for row in rows if row.get("detail")}
         matched = [((row["at"], row["identifier"]), row) for row in rows if _matches_inbox(row, filters, since, until)]
         window, previous, following = _alert_page(matched, cursor, before)
 
@@ -2529,7 +2532,10 @@ def create_app(
             related = ""
             if aliases:
                 shown = ", ".join(
-                    f"<a href='/advisories/{esc(_advisory_token(alias))}'>{esc(alias)}</a>" for alias in aliases[:4]
+                    f"<a href='/advisories/{esc(_advisory_token(alias))}'>{esc(alias)}</a>"
+                    if alias in detail_ids
+                    else esc(alias)
+                    for alias in aliases[:4]
                 )
                 more = f" +{len(aliases) - 4}" if len(aliases) > 4 else ""
                 related = f"<br><span class='muted small'>Related: {shown}{more}</span>"
