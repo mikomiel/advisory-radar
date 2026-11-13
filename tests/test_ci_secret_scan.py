@@ -8,11 +8,14 @@ shell text, so the range and the fail-closed paths cannot be removed by accident
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 import yaml
 
-WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+CONFIG = ROOT / ".gitleaks.toml"
 
 
 def ci_job() -> dict:
@@ -57,4 +60,24 @@ def test_the_secret_scan_self_tests_history_before_the_real_scan():
     assert '"$self_code" -ne 1' in run, "the self-test must fail the job unless the removed secret is detected"
     assert run.index("self-test: remove") < run.index("--report-path"), (
         "the self-test must run before the real scan: a scanner that cannot see history invalidates it"
+    )
+
+
+def test_the_fixture_exceptions_match_the_whole_secret_only():
+    """An unanchored exception would also hide a longer credential that merely contains a fixture value."""
+    regexes = tomllib.loads(CONFIG.read_text())["allowlist"]["regexes"]
+    for literal in ("AbCdEf123456", "abcdef1234567890"):
+        matching = [pattern for pattern in regexes if literal in pattern]
+        assert matching == [f"^{literal}$"], (
+            f"the synthetic exception for {literal} must match that exact secret, not a substring"
+        )
+
+
+def test_the_self_test_proves_an_allowlisted_literal_does_not_hide_a_longer_token():
+    """The anchored exception is only safe if the scanner still reports a token that contains it."""
+    run = secret_scan_step()["run"]
+    assert "long_token=" in run and "AbCdEf123456" in run
+    assert '"$near_code" -ne 1' in run, "the near-miss self-test must fail the job unless the longer token is found"
+    assert run.index("long_token=") < run.index("--report-path"), (
+        "the near-miss self-test must run before the real scan"
     )

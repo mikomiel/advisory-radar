@@ -143,7 +143,8 @@ jobs:
           # Self-test in a throwaway repository: an invented token is added in one commit and removed in
           # the next, so the working tree is clean and only history can reveal it. The scanner must exit 1.
           fixture=$(mktemp -d)
-          trap 'rm -rf "$fixture"' EXIT
+          near_miss=$(mktemp -d)
+          trap 'rm -rf "$fixture" "$near_miss"' EXIT
           git -C "$fixture" init -q
           git -C "$fixture" config user.email "ci@example.invalid"
           git -C "$fixture" config user.name "advisory-radar secret scan self-test"
@@ -163,6 +164,29 @@ jobs:
             exit 1
           fi
           echo "secret scan self-test: the commit that removed the secret was detected"
+
+          # The two fixture exceptions in .gitleaks.toml are anchored to the whole secret. A longer token
+          # that merely contains one of those literals must still be reported: an unanchored exception would
+          # silently hide a real credential, and the first self-test could not tell the difference.
+          long_token="ghp_AbCdEf123456$(printf '%s' 'allowlist-anchor self-test' | sha256sum | cut -c1-24)"
+          git -C "$near_miss" init -q
+          git -C "$near_miss" config user.email "ci@example.invalid"
+          git -C "$near_miss" config user.name "advisory-radar secret scan self-test"
+          printf 'token: %s\n' "$long_token" > "$near_miss/leak.txt"
+          git -C "$near_miss" add leak.txt
+          git -C "$near_miss" commit -q -m "self-test: add a token containing an allowlisted literal"
+          git -C "$near_miss" rm -q leak.txt
+          git -C "$near_miss" commit -q -m "self-test: remove it again"
+          set +e
+          (cd "$near_miss" && /tmp/gitleaks git --config "$config" --redact --log-opts=--all .) >/dev/null 2>"$near_miss/gitleaks.log"
+          near_code=$?
+          set -e
+          if [ "$near_code" -ne 1 ]; then
+            echo "::error::secret scan self-test exited $near_code, expected 1: an allowlist exception matched inside a longer token, so a real credential containing a fixture value could be hidden"
+            cat "$near_miss/gitleaks.log"
+            exit 1
+          fi
+          echo "secret scan self-test: a longer token containing an allowlisted literal is still detected"
 
           set +e
           /tmp/gitleaks git --config "$config" --redact --report-format json --report-path /tmp/gitleaks-report.json --log-opts="$range" . 2>/tmp/gitleaks-stderr.log

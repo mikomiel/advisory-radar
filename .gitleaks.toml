@@ -22,6 +22,6 @@ useDefault = true
     '''(?i)(webhook|token|secret|password|api[_-]?key)\s*[:=]\s*["']?(your[-_]|xxx|example|changeme|placeholder)''',
     '''https://discord\.com/api/webhooks/000000000000000000/xxxxxxxx''',
     # synthetic credential values in tests/test_source_admin.py, not real secrets
-    '''AbCdEf123456''',
-    '''abcdef1234567890''',
+    '''^AbCdEf123456$''',
+    '''^abcdef1234567890$''',
   ]
