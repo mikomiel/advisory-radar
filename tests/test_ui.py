@@ -332,7 +332,8 @@ def test_an_escalation_appears_beside_the_first_record_on_the_advisory_page(tmp_
     assert "<td>new</td>" not in section, "the record's own first delivery is the page's first block"
 
 
-def test_an_adobe_event_is_a_page_after_its_queue_entry_is_gone(tmp_path):
+@pytest.mark.parametrize("kind", ["adobe", "adobe-kev"])
+def test_an_adobe_event_is_a_page_after_its_queue_entry_is_gone(tmp_path, kind):
     """#73: an APSB bulletin has no seen record, so its delivery event is what the lookup can find."""
     state = core.new_state()
     state["deliveries"] = {
@@ -349,7 +350,7 @@ def test_an_adobe_event_is_a_page_after_its_queue_entry_is_gone(tmp_path):
             ),
             "ids": ["APSB26-1"],
             "cves": [],
-            "kind": "adobe",
+            "kind": kind,
         }
     }
     client, token, _ = make_client(tmp_path, state=state)
@@ -396,6 +397,101 @@ def test_a_legacy_record_without_events_has_no_notifications_section(tmp_path):
     page = client.get(f"/advisories/{_advisory_token('CVE-2026-9')}").text
     assert "Notifications" not in page
     assert "Recent notifications" not in client.get("/alerts").text
+
+
+def test_a_suppressed_advisory_shows_a_later_escalation(tmp_path):
+    """#73 review: a suppressed record has no snapshot, but the escalation is the whole explanation."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-1"] = seen(NOW, "suppressed")
+    state["deliveries"] = {
+        "later": {
+            **snapshot(
+                NOW + 60, "critical", "Vendor Feed", "CRITICAL: CVE-2026-1", "CVE-2026-1", "critical", 9.8, ["ops"]
+            ),
+            "ids": ["CVE-2026-1"],
+            "cves": ["CVE-2026-1"],
+            "kind": "escalation",
+        }
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get(f"/advisories/{_advisory_token('CVE-2026-1')}").text
+    assert "Notifications" in page and "escalation" in page and "ops" in page
+    assert "suppressed" in page, "the original outcome is preserved, not overwritten"
+
+
+def test_a_legacy_record_shows_a_later_escalation(tmp_path):
+    """A record written before snapshots existed still gains the events that arrived afterwards."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-1"] = seen(NOW, "delivered")
+    state["deliveries"] = {
+        "later": {
+            **snapshot(
+                NOW + 60, "critical", "Vendor Feed", "CRITICAL: CVE-2026-1", "CVE-2026-1", "critical", 9.8, ["ops"]
+            ),
+            "ids": ["CVE-2026-1"],
+            "cves": ["CVE-2026-1"],
+            "kind": "escalation",
+        }
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get(f"/advisories/{_advisory_token('CVE-2026-1')}").text
+    assert "Notifications" in page and "escalation" in page
+
+
+@pytest.mark.parametrize("channel", ["/advisories/CVE-2026-1", "/alerts"])
+def test_a_dropped_event_is_shown_as_dropped(tmp_path, channel):
+    """A dropped event can carry an earlier partial acknowledgement; the outcome must not be inferred from it."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-1"] = seen(NOW, "delivered", delivery="first")
+    state["deliveries"] = {
+        "first": {
+            **snapshot(NOW, "critical", "Vendor Feed", "CRITICAL: CVE-2026-1", "CVE-2026-1", "critical", 9.8, ["ops"]),
+            "ids": ["CVE-2026-1"],
+            "cves": ["CVE-2026-1"],
+        },
+        "later": {
+            **snapshot(
+                NOW + 60, "critical", "Vendor Feed", "CRITICAL: CVE-2026-1", "CVE-2026-1", "critical", 9.8, ["ops"]
+            ),
+            "ids": ["CVE-2026-1"],
+            "cves": ["CVE-2026-1"],
+            "kind": "escalation",
+            "outcome": "dropped",
+        },
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get(channel if channel == "/alerts" else f"/advisories/{_advisory_token('CVE-2026-1')}").text
+    section = page.split("Notifications" if channel != "/alerts" else "Recent notifications", 1)[1]
+    assert "badge-critical'>dropped</span>" in section
+    assert "escalation" in section
+
+
+def test_malformed_delivery_events_do_not_break_the_pages(tmp_path):
+    """#73 review: hand-edited state is scanned for two pages and must never raise or render a repr."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-2"] = seen(NOW, "delivered")
+    state["deliveries"] = {
+        "bad": "not an object",
+        "ok": {"kind": "adobe", "ids": "CVE-2026-1", "at": "soon", "delivered_to": "ops"},
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    assert client.get("/alerts").status_code == 200
+    assert client.get(f"/advisories/{_advisory_token('CVE-2026-2')}").status_code == 200
+
+
+def test_a_pending_message_names_its_source_id_and_heading(tmp_path):
+    """The delivered, pending and parked pages use the same two provenance labels."""
+    state = core.new_state()
+    state["pending"].append(pending_entry("CVE-2026-50111", source_id="vendor-feed"))
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get(f"/advisories/{_advisory_token('CVE-2026-50111')}").text
+    assert "Source id" in page and "vendor-feed" in page
+    assert "Heading" in page and "Vendor Feed" in page
 
 
 def test_a_legacy_record_is_excluded_by_snapshot_filters_but_found_by_identifier(tmp_path):

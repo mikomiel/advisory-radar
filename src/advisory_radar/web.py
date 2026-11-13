@@ -663,19 +663,29 @@ def _linked_ids(values: object) -> str:
 
 
 def _events_table(events: Sequence[tuple[str, Mapping]]) -> str:
-    """One row per delivery event, in the order given: when, kind, tag, identifiers and destinations."""
+    """One row per delivery event, in the order given: when, kind, outcome, tag, identifiers and destinations.
+
+    The outcome is rendered per event rather than inferred from the destinations: a dropped message can carry
+    an earlier partial acknowledgement, and a record written before outcomes were stored must say so rather
+    than look delivered.
+    """
     rows = []
     for _, event in events:
         kind = _field(event.get("kind"))
         tag = _field(event.get("tag"))
+        outcome = _field(event.get("outcome"))
         accepted = event.get("delivered_to")
         delivered = (
             ", ".join(esc(value) for value in accepted if isinstance(value, str)) if isinstance(accepted, list) else ""
         )
         source_id = _field(event.get("source_id"))
+        shown_outcome = (
+            _badge(outcome, _outcome_tone(outcome)) if outcome else ("<span class='muted'>not recorded</span>")
+        )
         rows.append(
             f"<tr><td class='muted nowrap'>{esc(_when(event.get('at')))}</td>"
             f"<td>{esc(kind) or '—'}</td>"
+            f"<td>{shown_outcome}</td>"
             f"<td>{_badge(tag, tag) if tag else '—'}</td>"
             f"<td>{_linked_ids(event.get('ids'))}</td>"
             f"<td>{delivered or '—'}</td>"
@@ -683,8 +693,9 @@ def _events_table(events: Sequence[tuple[str, Mapping]]) -> str:
         )
     return (
         "<div class='scroll'><table class='levels'><tr><th scope='col'>When (UTC)</th>"
-        "<th scope='col'>Kind</th><th scope='col'>Tag</th><th scope='col'>Identifiers</th>"
-        "<th scope='col'>Accepted by</th><th scope='col'>Source id</th></tr>" + "".join(rows) + "</table></div>"
+        "<th scope='col'>Kind</th><th scope='col'>Outcome</th><th scope='col'>Tag</th>"
+        "<th scope='col'>Identifiers</th><th scope='col'>Accepted by</th>"
+        "<th scope='col'>Source id</th></tr>" + "".join(rows) + "</table></div>"
     )
 
 
@@ -715,9 +726,11 @@ def _event_advisory(identifier: str, events: Sequence[tuple[str, Mapping]]) -> s
         if isinstance(accepted, list) and accepted
         else "<span class='muted'>not recorded</span>"
     )
+    outcome = _field(newest.get("outcome"))
     facts = [
         ("Identifier", esc(identifier)),
         ("Tag", _badge(tag, tag) if tag else "<span class='muted'>—</span>"),
+        ("Outcome", _badge(outcome, _outcome_tone(outcome)) if outcome else "<span class='muted'>not recorded</span>"),
         ("Message kind", esc(_field(newest.get("kind"))) or "<span class='muted'>not recorded</span>"),
         ("Recorded (UTC)", esc(_when(newest.get("at"))) or "<span class='muted'>not recorded</span>"),
         ("Source id", esc(_field(newest.get("source_id"))) or "<span class='muted'>not a feed source</span>"),
@@ -842,7 +855,12 @@ def _seen_advisory(
             "<p>The state holds this identifier, but only its outcome and when it was recorded.</p>"
             "<p class='muted'>The delivered message's details were not recorded: this record was written by an "
             "older version of advisory-radar, or no message was delivered for this identifier. Nothing is "
-            "reconstructed here, and the message body is not retained.</p>" + _facts(facts) + back
+            "reconstructed here, and the message body is not retained.</p>"
+            + _facts(facts)
+            # A suppressed CVE gets no snapshot, so its original record is minimal -- but a later escalation
+            # still added an event, and the page must show it rather than hide the only explanation.
+            + _notification_history(events, exclude=reference if isinstance(reference, str) else None)
+            + back
         )
     accepted = record.get("delivered_to")
     if isinstance(accepted, list) and accepted:
@@ -890,7 +908,8 @@ def _queued_advisory(state_label: str, entry: Mapping) -> str:
     facts = [
         ("State", _badge(state_label, "warning" if state_label == "parked" else "neutral")),
         ("Tag", esc(_field(entry.get("tag"))) or "<span class='muted'>not recorded</span>"),
-        ("Source", esc(_field(entry.get("source"))) or "<span class='muted'>not recorded</span>"),
+        ("Source id", esc(_field(entry.get("source_id"))) or "<span class='muted'>not recorded</span>"),
+        ("Heading", esc(_field(entry.get("source"))) or "<span class='muted'>not recorded</span>"),
         ("Message kind", esc(_field(entry.get("kind"))) or "<span class='muted'>not recorded</span>"),
         ("Identifiers", _identifier_list(entry.get("ids"))),
         ("CVEs in this message", _identifier_list(entry.get("cves"))),
