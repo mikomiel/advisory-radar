@@ -81,3 +81,19 @@ def test_the_self_test_proves_an_allowlisted_literal_does_not_hide_a_longer_toke
     assert run.index("long_token=") < run.index("--report-path"), (
         "the near-miss self-test must run before the real scan"
     )
+
+
+def test_no_path_is_exempt_from_the_secret_scan():
+    """A path exemption would hide a real credential committed in that file, whatever its value."""
+    config = tomllib.loads(CONFIG.read_text())
+    assert "paths" not in config["allowlist"], (
+        "a credential in a README or an example file must be found like any other"
+    )
+
+
+def test_the_self_test_proves_documentation_and_example_paths_are_scanned():
+    run = secret_scan_step()["run"]
+    assert "example_repo=" in run
+    assert '"$path_code" -ne 1' in run, "the path self-test must fail the job unless the token is found"
+    assert "README.md" in run and "examples/config.yml" in run
+    assert run.index("example_repo=") < run.index("--report-path"), "the path self-test must run before the real scan"

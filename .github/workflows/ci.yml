@@ -144,7 +144,8 @@ jobs:
           # the next, so the working tree is clean and only history can reveal it. The scanner must exit 1.
           fixture=$(mktemp -d)
           near_miss=$(mktemp -d)
-          trap 'rm -rf "$fixture" "$near_miss"' EXIT
+          example_repo=$(mktemp -d)
+          trap 'rm -rf "$fixture" "$near_miss" "$example_repo"' EXIT
           git -C "$fixture" init -q
           git -C "$fixture" config user.email "ci@example.invalid"
           git -C "$fixture" config user.name "advisory-radar secret scan self-test"
@@ -187,6 +188,29 @@ jobs:
             exit 1
           fi
           echo "secret scan self-test: a longer token containing an allowlisted literal is still detected"
+
+          # No path is exempt: the same invented token inside a README and an example config must be
+          # reported. A path allowlist would hide a real credential committed in a documentation file.
+          git -C "$example_repo" init -q
+          git -C "$example_repo" config user.email "ci@example.invalid"
+          git -C "$example_repo" config user.name "advisory-radar secret scan self-test"
+          mkdir -p "$example_repo/examples"
+          printf 'token: %s\n' "$token" > "$example_repo/README.md"
+          printf 'secret: %s\n' "$token" > "$example_repo/examples/config.yml"
+          git -C "$example_repo" add README.md examples/config.yml
+          git -C "$example_repo" commit -q -m "self-test: add a token in documentation and an example"
+          git -C "$example_repo" rm -q README.md examples/config.yml
+          git -C "$example_repo" commit -q -m "self-test: remove it again"
+          set +e
+          (cd "$example_repo" && /tmp/gitleaks git --config "$config" --redact --log-opts=--all .) >/dev/null 2>"$example_repo/gitleaks.log"
+          path_code=$?
+          set -e
+          if [ "$path_code" -ne 1 ]; then
+            echo "::error::secret scan self-test exited $path_code, expected 1: a path exemption hid a token in README.md or examples/, so a real credential there would be missed"
+            cat "$example_repo/gitleaks.log"
+            exit 1
+          fi
+          echo "secret scan self-test: a token in README.md and examples/ is detected"
 
           set +e
           /tmp/gitleaks git --config "$config" --redact --report-format json --report-path /tmp/gitleaks-report.json --log-opts="$range" . 2>/tmp/gitleaks-stderr.log
