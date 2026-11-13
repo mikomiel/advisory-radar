@@ -189,8 +189,9 @@ jobs:
           fi
           echo "secret scan self-test: a longer token containing an allowlisted literal is still detected"
 
-          # No path is exempt: the same invented token inside a README and an example config must be
-          # reported. A path allowlist would hide a real credential committed in a documentation file.
+          # No path is exempt: the same invented token inside a README and an example config must each be
+          # reported. Both findings are required from one scan, so an exemption for either path cannot hide
+          # behind the other one still being detected.
           git -C "$example_repo" init -q
           git -C "$example_repo" config user.email "ci@example.invalid"
           git -C "$example_repo" config user.name "advisory-radar secret scan self-test"
@@ -202,7 +203,7 @@ jobs:
           git -C "$example_repo" rm -q README.md examples/config.yml
           git -C "$example_repo" commit -q -m "self-test: remove it again"
           set +e
-          (cd "$example_repo" && /tmp/gitleaks git --config "$config" --redact --log-opts=--all .) >/dev/null 2>"$example_repo/gitleaks.log"
+          (cd "$example_repo" && /tmp/gitleaks git --config "$config" --redact --report-format json --report-path "$example_repo/report.json" --log-opts=--all .) >/dev/null 2>"$example_repo/gitleaks.log"
           path_code=$?
           set -e
           if [ "$path_code" -ne 1 ]; then
@@ -210,7 +211,19 @@ jobs:
             cat "$example_repo/gitleaks.log"
             exit 1
           fi
-          echo "secret scan self-test: a token in README.md and examples/ is detected"
+          if ! python3 - "$example_repo/report.json" <<'PYREPORT'
+          import json
+          import sys
+
+          paths = {finding["File"] for finding in json.load(open(sys.argv[1], encoding="utf-8"))}
+          missing = {"README.md", "examples/config.yml"} - paths
+          sys.exit(1 if missing else 0)
+          PYREPORT
+          then
+            echo "::error::the path self-test did not report a finding for both README.md and examples/config.yml"
+            exit 1
+          fi
+          echo "secret scan self-test: a token in README.md and examples/ is detected in both"
 
           set +e
           /tmp/gitleaks git --config "$config" --redact --report-format json --report-path /tmp/gitleaks-report.json --log-opts="$range" . 2>/tmp/gitleaks-stderr.log

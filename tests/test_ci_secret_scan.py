@@ -96,4 +96,7 @@ def test_the_self_test_proves_documentation_and_example_paths_are_scanned():
     assert "example_repo=" in run
     assert '"$path_code" -ne 1' in run, "the path self-test must fail the job unless the token is found"
     assert "README.md" in run and "examples/config.yml" in run
+    assert "report.json" in run and "python3 -" in run, (
+        "both paths must be asserted from the scan report, not just one non-zero exit"
+    )
     assert run.index("example_repo=") < run.index("--report-path"), "the path self-test must run before the real scan"
