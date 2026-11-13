@@ -84,7 +84,8 @@ and `src/advisory_radar/__init__.py`, the generated `CHANGELOG.md` section, and
 
 ## Code style
 
-- Python 3.13+, standard-library-first for the core pipeline (HTTP via
+- Python 3.13 and 3.14 are supported and tested (the range is declared in
+  `pyproject.toml`), standard-library-first for the core pipeline (HTTP via
   `urllib`), FastAPI only for the web layer.
 - Explicit, boring, reversible code. No clever abstractions without a second
   real consumer.

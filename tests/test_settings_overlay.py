@@ -252,6 +252,37 @@ def test_load_settings_is_empty_until_a_document_exists_and_refuses_a_corrupt_on
     assert str(path) in str(caught.value)
 
 
+def test_a_deeply_nested_overlay_is_a_config_error_and_a_save_leaves_it_alone(tmp_path):
+    """#81: a hand edit can nest past the decoder's limit; the overlay must refuse by name and never be replaced."""
+    path = settings_path(tmp_path / "state.json")
+    deep = b"[" * 10_000 + b"]" * 10_000
+    path.write_bytes(deep)
+    with pytest.raises(ConfigError):
+        load_settings_document(path)
+    assert path.read_bytes() == deep, "a failed read never rewrites the damaged overlay"
+    with pytest.raises(ConfigError):
+        save_settings(path, {"poll_interval": "30s"}, now=NOW)
+    assert path.read_bytes() == deep, "a save refuses an unreadable overlay instead of resetting its revision"
+
+
+def test_a_deeply_nested_settings_schema_is_a_config_error_and_is_not_rewritten(tmp_path):
+    """#81 review: the schema value can be the deep part; the overlay must still refuse without representing it."""
+    path = settings_path(tmp_path / "state.json")
+    body = b'{"schema": ' + b"[" * 10_000 + b"]" * 10_000 + b', "revision": 1, "settings": {}}'
+    path.write_bytes(body)
+    with pytest.raises(ConfigError):
+        load_settings_document(path)
+    assert path.read_bytes() == body, "a failed read never rewrites the damaged overlay"
+
+
+def test_a_settings_schema_that_is_not_a_string_is_named_by_type(tmp_path):
+    """A decoded container schema must not be represented: only a string is safe to ``repr``."""
+    path = settings_path(tmp_path / "state.json")
+    path.write_text(json.dumps({"schema": ["x"], "revision": 1, "settings": {}}))
+    with pytest.raises(ConfigError, match="declares a list schema"):
+        load_settings_document(path)
+
+
 def test_save_settings_writes_0600_and_moves_the_revision_forward(tmp_path):
     path = settings_path(tmp_path / "state.json")
     first = save_settings(path, {"poll_interval": "30s"}, now=100)

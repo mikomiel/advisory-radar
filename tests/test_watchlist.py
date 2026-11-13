@@ -446,11 +446,18 @@ def test_a_link_retargeted_while_the_save_waits_is_refused(tmp_path, monkeypatch
 
 
 def test_a_document_nested_too_deeply_is_unreadable_not_a_crash(tmp_path):
-    """A hand edit can leave a document the decoder gives up on; the pass and the page must say so."""
+    """A hand edit can leave a document past the interpreter's decode or validation limit.
+
+    The contract is the class of outcome, not the decoder's message or its exact nesting threshold: 3.13's
+    decoder gives up on this depth, a newer one accepts it and the schema check refuses the document. A read
+    must refuse either way, and leave the file exactly as it was.
+    """
     deep = tmp_path / "deep.json"
-    deep.write_text("[" * 10_000 + "]" * 10_000)
-    with pytest.raises(SourceError, match="cannot be read"):
+    payload = "[" * 10_000 + "]" * 10_000
+    deep.write_text(payload)
+    with pytest.raises(SourceError):
         read_watchlist(deep)
+    assert deep.read_text() == payload
 
 
 def test_a_path_with_an_embedded_nul_is_refused_not_a_crash(tmp_path):

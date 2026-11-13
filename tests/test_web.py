@@ -23,10 +23,12 @@ from advisory_radar.sources import (
     WebhookTextNotEncodable,
     webhook_item_from_payload,
 )
-from advisory_radar.state import load_state_document, save_state, state_lock
+from advisory_radar.state import SourceError, load_state_document, save_state, state_lock
 from advisory_radar.web import LoginThrottle, _epoch, _when, create_app, readiness
 
 LOG = logging.getLogger("advisory_radar")
+#: Deeper than both the intake's 100-level limit and, on 3.13, the decoder's own limit.
+DEEP_PAYLOAD = b"[" * 10_000 + b"]" * 10_000
 
 
 @pytest.fixture(autouse=True)
@@ -533,6 +535,41 @@ def test_readyz_reports_invalid_utf8(tmp_path):
     assert "advisory_radar_state_readable 0" in client.get("/metrics").text
 
 
+def test_readyz_reports_a_deeply_nested_state_without_reseeding(tmp_path):
+    """#81: a hand edit can nest past the decoder's limit; that is an unreadable state, not a crash or an empty one."""
+    client, _ = make_client(tmp_path)
+    deep = b"[" * 10_000 + b"]" * 10_000
+    (tmp_path / "state.json").write_bytes(deep)
+    with pytest.raises(SourceError):
+        load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    assert (tmp_path / "state.json").read_bytes() == deep, "a failed read never reseeds or rewrites the document"
+    response = client.get("/readyz")
+    assert response.status_code == 503
+    assert response.text.startswith("not ready:")
+
+
+def test_a_deeply_nested_state_does_not_break_the_configuration_page(tmp_path):
+    """The overlay page reads the applied state marker; a decoder refusal there must not become a 500."""
+    client, token = make_client(tmp_path)
+    signed_in(client, token)
+    deep = b"[" * 10_000 + b"]" * 10_000
+    (tmp_path / "state.json").write_bytes(deep)
+    response = client.get("/config")
+    assert response.status_code == 200
+    assert (tmp_path / "state.json").read_bytes() == deep
+
+
+def test_readyz_reports_a_deeply_nested_schema_value_without_reseeding(tmp_path):
+    """#81 review: the schema value itself can nest; the refusal must not represent it either."""
+    client, _ = make_client(tmp_path)
+    body = b'{"schema": ' + DEEP_PAYLOAD + b"}"
+    (tmp_path / "state.json").write_bytes(body)
+    with pytest.raises(SourceError):
+        load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    assert (tmp_path / "state.json").read_bytes() == body, "a failed read never reseeds or rewrites the document"
+    assert client.get("/readyz").status_code == 503
+
+
 def test_readiness_uses_the_completion_time_not_the_start(tmp_path):
     """A pass slower than the limit must not be stale the moment it completes."""
     client, _ = make_client(tmp_path, clock=1792600000 + 400)
@@ -635,6 +672,32 @@ def test_a_malformed_collection_does_not_break_the_scrape(tmp_path):
 
 
 # --- the settings overlay: /config, its POSTs and /reload -------------------------------------
+
+
+def test_a_deeply_nested_overlay_is_reported_on_the_configuration_page(tmp_path):
+    """#81: an unreadable overlay is the page's own error banner, not a 500 traceback out of the handler."""
+    client, token, runtime = make_app_client(tmp_path)
+    overlay = settings_path(runtime.cfg.state_path)
+    deep = b"[" * 10_000 + b"]" * 10_000
+    overlay.write_bytes(deep)
+    signed_in(client, token)
+    page = client.get("/config")
+    assert page.status_code == 200
+    assert "The overlay cannot be read" in page.text
+    assert overlay.read_bytes() == deep, "rendering the error never rewrites the damaged overlay"
+
+
+def test_a_deeply_nested_schema_value_is_reported_on_the_configuration_page(tmp_path):
+    """#81 review: the same safe banner applies when the overlay's schema value is the deep part."""
+    client, token, runtime = make_app_client(tmp_path)
+    overlay = settings_path(runtime.cfg.state_path)
+    body = b'{"schema": ' + DEEP_PAYLOAD + b', "revision": 1, "settings": {}}'
+    overlay.write_bytes(body)
+    signed_in(client, token)
+    page = client.get("/config")
+    assert page.status_code == 200
+    assert "The overlay cannot be read" in page.text
+    assert overlay.read_bytes() == body, "rendering the error never rewrites the damaged overlay"
 
 
 def test_two_saved_notifiers_survive_while_the_application_is_blocked(tmp_path):
@@ -1542,10 +1605,59 @@ def test_the_native_webhook_guid_fingerprint_is_pinned(tmp_path):
 
 
 def test_a_deeply_nested_webhook_payload_is_refused_without_state(tmp_path):
-    """#75: a few thousand nested arrays defeat ``json.loads`` with a RecursionError, which is a client error."""
-    response = post_webhook(tmp_path, content=b"[" * 10000 + b"]" * 10000)
+    """#75 #84: an over-deep body is a client error with one literal answer on every supported interpreter.
+
+    3.13's decoder gives up before the depth guard; an interpreter that accepts the nesting reaches it. Both
+    answer the same 400, and neither writes state.
+    """
+    response = post_webhook(tmp_path, content=DEEP_PAYLOAD)
     assert response.status_code == 400
-    assert "nested" in response.json()["error"]
+    assert response.json() == {"error": "payload is nested too deeply"}
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_a_deeply_nested_value_inside_a_webhook_object_is_refused(tmp_path):
+    """#84 review: the decoder is not the contract -- a deep value inside a mapped object is refused too."""
+    response = post_webhook(tmp_path, content=b'{"title": "Security update", "summary": ' + DEEP_PAYLOAD + b"}")
+    assert response.status_code == 400
+    assert response.json() == {"error": "payload is nested too deeply"}
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_a_shallow_nested_webhook_object_is_accepted(tmp_path):
+    """The depth limit must not refuse ordinary structured metadata."""
+    entry, _ = queued_webhook_item(tmp_path, {"title": "Security update", "meta": {"a": {"b": 1}}})
+    assert entry["title"] == "Security update"
+
+
+def test_a_mapping_recursion_is_still_a_refused_request(tmp_path, monkeypatch):
+    """Defence in depth: a mapping that recurses is a 400, never a 500 after the decoder guard."""
+    import advisory_radar.sources as sources_module
+
+    def recurse(payload):
+        raise RecursionError("simulated mapping recursion")
+
+    monkeypatch.setattr(sources_module, "webhook_item_from_payload", recurse)
+    response = post_webhook(tmp_path, {"title": "Security update"})
+    assert response.status_code == 400
+    assert response.json() == {"error": "payload is nested too deeply"}
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_an_empty_webhook_object_has_no_title(tmp_path):
+    """A JSON object is mapped; one without a title is the mapper's 422, not the object refusal."""
+    response = post_webhook(tmp_path, {})
+    assert response.status_code == 422
+    assert response.json() == {"error": "payload has no title"}
+    assert not (tmp_path / "state.json").exists()
+
+
+@pytest.mark.parametrize("payload", [None, [], "text", 7, True])
+def test_a_json_body_that_is_not_an_object_is_refused(tmp_path, payload):
+    """#84: the documented contract is a JSON object; a list, string, number or null is a 400, not a 422."""
+    response = post_webhook(tmp_path, payload)
+    assert response.status_code == 400
+    assert response.json() == {"error": "payload must be a JSON object"}
     assert not (tmp_path / "state.json").exists()
 
 
@@ -1597,7 +1709,8 @@ def test_a_refused_webhook_payload_leaves_the_state_document_untouched(tmp_path)
     save_state(tmp_path / "state.json", state)
     before = (tmp_path / "state.json").read_bytes()
     refused = [
-        b"[" * 10000 + b"]" * 10000,
+        DEEP_PAYLOAD,
+        b'{"title": "Security update", "summary": ' + DEEP_PAYLOAD + b"}",
         b'{"title": "Vendor \\ud800 advisory"}',
         json.dumps({"title": "advisory", "ids": ["not-an-identifier"]}).encode(),
     ]

@@ -79,6 +79,8 @@ uv run pytest -q
 uv run python -m advisory_radar --help
 ```
 
+Python 3.13 and 3.14 are supported and tested; the range is declared in `pyproject.toml`.
+
 Conventional Commits; every PR runs lint, tests, a secret scan and a
 no-internal-identifiers scan on free GitHub-hosted runners; `main` is protected
 (requires green CI and a review).

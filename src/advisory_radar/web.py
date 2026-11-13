@@ -1149,6 +1149,32 @@ def _json_list(name: str, raw: str) -> list[str]:
     return parsed
 
 
+#: The deepest container nesting the webhook intake accepts; the top-level value counts as one level. JSON
+#: decoding has an interpreter-specific limit, so the refusal must not depend on which interpreter read the body.
+WEBHOOK_MAX_DEPTH = 100
+
+
+def _nested_too_deeply(value: object, limit: int = WEBHOOK_MAX_DEPTH) -> bool:
+    """Whether containers in ``value`` nest more than ``limit`` levels deep.
+
+    Iterative on an explicit stack: the check for decoder-defeating depth must not recurse itself, or the
+    refusal would again depend on the interpreter that decoded the body.
+    """
+    stack = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > limit:
+            return True
+        if isinstance(current, dict):
+            children = current.values()
+        elif isinstance(current, list):
+            children = current
+        else:
+            continue
+        stack.extend((child, depth + 1) for child in children if isinstance(child, (dict, list)))
+    return False
+
+
 def _lists(form: Mapping[str, list[str]], name: str, split: Callable[[str], list[str]]) -> list[str]:
     """Exactly one of a list's two representations: the visible field, or the exact hidden one.
 
@@ -4172,14 +4198,24 @@ def create_app(
         try:
             payload = json.loads(text)
         except RecursionError:
-            # A few thousand nested arrays defeat the decoder with a tiny body; that is a refused request,
-            # not a server fault. ``http.parse_json`` guards the same failure, but its None answer cannot be
-            # told apart from a literal ``null``, which this route maps to a different status below.
+            # A few thousand nested arrays defeat some decoders with a tiny body; that is a refused request,
+            # not a server fault. An interpreter that accepts the depth refuses it with the object check below.
             return JSONResponse({"error": "payload is nested too deeply"}, status_code=400)
         except ValueError:
             return JSONResponse({"error": "payload is not JSON"}, status_code=400)
+        if _nested_too_deeply(payload):
+            # One interpreter-independent contract for a hostile nesting depth: 3.13's decoder refuses the body
+            # before this check, an interpreter that accepts it refuses it here, and both answer the same literal.
+            return JSONResponse({"error": "payload is nested too deeply"}, status_code=400)
+        if not isinstance(payload, dict):
+            # The documented contract is a JSON object: a list, string, number or null is a refused request, not
+            # a mapped object missing its title.
+            return JSONResponse({"error": "payload must be a JSON object"}, status_code=400)
         try:
             entry = webhook_item_from_payload(payload)
+        except RecursionError:
+            # Defence in depth: a mapping or representation that recurses is still a refused request, not a 500.
+            return JSONResponse({"error": "payload is nested too deeply"}, status_code=400)
         except WebhookIdsUnsupported:
             # A fixed contract message, never exception text: the response is built from literals only.
             return JSONResponse({"error": "ids must be a list of CVE, GHSA or PSA identifier strings"}, status_code=400)

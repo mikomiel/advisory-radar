@@ -1027,6 +1027,30 @@ def test_an_unconfigured_watchlist_is_read_beside_the_state_file(tmp_path):
     assert stored.get("webhook_inbox", {}) == {}, "both entries are released from the inbox"
 
 
+def test_a_deeply_nested_state_fails_the_pass_without_reseeding(tmp_path, caplog):
+    """#81: a decoder that gives up is an unreadable state, not an absent one -- nor a reason to replay history."""
+    cfg = _webhook_config(tmp_path)
+    deep = b"[" * 10_000 + b"]" * 10_000
+    cfg.state_path.write_bytes(deep)
+    with caplog.at_level(logging.ERROR, logger="advisory_radar"):
+        code = pipeline.run_pass(cfg, [], [], http=fake_http, clock=lambda: float(NOW), sleep=lambda s: None)
+    assert code == 1, "an unreadable state must fail the pass, not seed a new document over it"
+    assert "not re-seeding" in caplog.text
+    assert cfg.state_path.read_bytes() == deep
+
+
+def test_a_deeply_nested_schema_value_fails_the_pass_without_reseeding(tmp_path, caplog):
+    """#81 review: the schema value can be the deep part; it is still an unreadable state, never absent."""
+    cfg = _webhook_config(tmp_path)
+    body = b'{"schema": ' + b"[" * 10_000 + b"]" * 10_000 + b"}"
+    cfg.state_path.write_bytes(body)
+    with caplog.at_level(logging.ERROR, logger="advisory_radar"):
+        code = pipeline.run_pass(cfg, [], [], http=fake_http, clock=lambda: float(NOW), sleep=lambda s: None)
+    assert code == 1, "an unreadable state must fail the pass, not seed a new document over it"
+    assert "not re-seeding" in caplog.text
+    assert cfg.state_path.read_bytes() == body
+
+
 def test_an_unreadable_watchlist_fails_the_pass_instead_of_raising(tmp_path, caplog):
     """The document is writable through /watchlist now, so a broken one is a state this program can reach."""
     scope = tmp_path / "scope.json"

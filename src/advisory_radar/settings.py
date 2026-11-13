@@ -24,7 +24,7 @@ from pathlib import Path
 
 from .catalogue import SOURCE_SPECS
 from .config import NOTIFIER_SECRET_KEYS, ConfigError
-from .state import save_json, serialize_json
+from .state import describe_schema, save_json, serialize_json
 
 #: The schema tag the stored document declares.
 #: One overlay transaction at a time in this process. Each save reads the revision, validates and replaces
@@ -214,13 +214,15 @@ def load_settings_document(path: Path) -> dict:
         raise ConfigError(f"cannot read {path}: {exc}") from exc
     try:
         document = json.loads(text)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
+        # A hand-edited overlay can nest arrays past the decoder's limit: the page and the reload report an
+        # unreadable overlay, and a save refuses instead of replacing the damaged file.
         raise ConfigError(f"{path} is not JSON: {exc}") from exc
     if not isinstance(document, dict):
         raise ConfigError(f"{path} is not a settings document")
     schema = document.get("schema")
     if schema != SETTINGS_SCHEMA:
-        raise ConfigError(f"{path} declares schema {schema!r}, not {SETTINGS_SCHEMA!r}")
+        raise ConfigError(f"{path} declares {describe_schema(schema)}, not {SETTINGS_SCHEMA!r}")
     revision = document.get("revision")
     settings = document.get("settings")
     if not isinstance(revision, int) or isinstance(revision, bool) or not isinstance(settings, dict):
