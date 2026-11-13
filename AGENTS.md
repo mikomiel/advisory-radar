@@ -59,8 +59,8 @@ uv run python scripts/check_no_estate_identifiers.py
   request and the tested head to the maintainer.
 - `scripts/guard_sensitive_paths.py` owns the sensitive paths. A person
   merges a change to `.github/`, `scripts/`, `tests/`, `deploy/`, the
-  container files, the dependency files or the release files. Do not narrow
-  that list to unblock a pull request.
+  container files, the dependency files, the secret-scan configuration or
+  the release files. Do not narrow that list to unblock a pull request.
 - Do not bump a version and do not edit `CHANGELOG.md`. The release pull
   request owns both. A person merges it, and that merge creates the tag and
   publishes the image. A source change does not authorize a release.
