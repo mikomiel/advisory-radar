@@ -1454,9 +1454,10 @@ def _delivery_snapshot(entry: dict, delivered_to: Sequence[str], *, at: int, out
     while ``source_id`` is the configured source the item was queued from and ``""`` for an escalation or a
     bulletin, which are not feed items. ``at`` and ``outcome`` are the event's own time and result, so a later
     escalation or drop keeps its event beside the first-seen record instead of overwriting it. The body is
-    deliberately absent: it is the rendered text, not a fact.
+    deliberately absent: it is the rendered text, not a fact. ``queued_at`` travels too, because the message
+    was owed from that moment: the inbox must not move an identifier's ownership when delivery succeeds.
     """
-    return {
+    snapshot = {
         "tag": entry.get("tag", ""),
         "source_id": entry.get("source_id", ""),
         "source": entry.get("source", ""),
@@ -1474,6 +1475,14 @@ def _delivery_snapshot(entry: dict, delivered_to: Sequence[str], *, at: int, out
         "at": at,
         "outcome": outcome,
     }
+    # The message's claim clock travels with the snapshot. A queue entry queued before ``queued_at`` existed
+    # still has its first attempt, and dropping that would hand its identifiers to a message queued later.
+    for key in ("queued_at", "first_attempt_at"):
+        stamp = entry.get(key)
+        if isinstance(stamp, int) and not isinstance(stamp, bool) and stamp > 0:
+            snapshot["queued_at"] = stamp
+            break
+    return snapshot
 
 
 def _snapshot_id(snapshot: dict) -> str:
@@ -1506,7 +1515,23 @@ def _delivered(
     """
     kind = entry["kind"]
     if kind == "new":
-        fresh = [identifier for identifier in entry["ids"] if identifier not in state["seen"]]
+        # Only the identifiers this message introduced may become first-seen here. A message that merely
+        # names an identifier another message owns must not write that identifier's history: the owner's
+        # delivery is what the operator is owed, and this message's classification is not about it.
+        owned = entry.get("fresh")
+        owned_set = set(owned) if isinstance(owned, (list, tuple)) else None
+        candidates = (
+            [identifier for identifier in entry["ids"] if identifier in owned_set]
+            if owned_set is not None
+            else list(entry["ids"])
+        )
+        fresh = []
+        for identifier in candidates:
+            record = state["seen"].get(identifier)
+            if record is None or (isinstance(record, dict) and record.get("outcome") not in ("delivered", "dropped")):
+                # A legacy suppression (or another non-delivery disposition) for an identifier this message
+                # owns is a placeholder, not first-seen history: the owner's outcome replaces it.
+                fresh.append(identifier)
         if fresh:
             snapshot_id = _record_event(state, entry, now, outcome, delivered_to)
             for identifier in fresh:
@@ -1592,8 +1617,12 @@ def _suppressed(
     thresholds: Thresholds,
     source_id: str = "",
 ) -> None:
+    claimed = _claimed(state)
     for identifier in ids:
-        # An identifier that was already notified keeps its history: this message is about the new CVEs.
+        # An identifier another message owns keeps that message's history: a suppressed message must not
+        # record a co-named advisory as suppressed and make it look like this message judged it.
+        if identifier in claimed:
+            continue
         state["seen"].setdefault(identifier, {"at": now, "outcome": "suppressed"})
     for cve, level in verdict.levels:
         watch = {
@@ -1612,6 +1641,198 @@ def _suppressed(
             # CVE whose source never changed its rules.
             watch["source_id"] = source_id
         state["watch"][cve] = watch
+
+
+#: A legacy claim with no recorded time sorts behind every dated one.
+_LEGACY_UNKNOWN_CLAIM = 1 << 62
+
+
+def seen_claim_time(record: object, deliveries: object) -> int:
+    """When the message that first recorded an identifier was queued, not when it was delivered.
+
+    A delivered message's snapshot carries the entry's ``queued_at``, so ownership does not move when a
+    retrying message finally succeeds while a later message also names the identifier. A record written
+    before snapshots held that key falls back to its own recorded time.
+    """
+    source = record if isinstance(record, dict) else {}
+    reference = source.get("delivery")
+    snapshot = deliveries.get(reference) if isinstance(deliveries, dict) and isinstance(reference, str) else None
+    if isinstance(snapshot, dict):
+        stamp = snapshot.get("queued_at")
+        if isinstance(stamp, int) and not isinstance(stamp, bool) and stamp > 0:
+            return stamp
+    at = source.get("at")
+    return at if isinstance(at, int) and not isinstance(at, bool) else 0
+
+
+def _queue_time(entry: object) -> int:
+    """When a queued message entered the queue, from the best clock the state recorded."""
+    source = entry if isinstance(entry, dict) else {}
+    for key in ("queued_at", "first_attempt_at"):
+        value = source.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return 0
+
+
+#: The message kinds that are about every identifier they name: an escalation is one CVE and a bulletin is
+#: its own id. Every other message's ``fresh`` list says which identifiers it introduced.
+WHOLE_MESSAGE_KINDS = ("escalation", "adobe", "adobe-kev")
+
+
+def _ensure_ownership(state: dict) -> None:
+    """Record what each queued and parked message owns when it predates the recorded list.
+
+    A message written by this version carries ``fresh``: exactly the identifiers it introduced. An older
+    message does not, and the earliest-claim rule the inbox uses is applied once here and stored, so delivery
+    and drop write the same history the inbox displays. The rule: the earliest recorded claim wins, a tie
+    prefers parked work, then the queue, then history, and a message with no clock sorts last.
+    """
+    pending = state.get("pending")
+    pending = pending if isinstance(pending, list) else []
+    parked = state.get("parked")
+    parked = parked if isinstance(parked, list) else []
+    seen = state.get("seen")
+    seen = seen if isinstance(seen, dict) else {}
+    claims: dict[str, tuple[int, int, int]] = {}
+    # Recorded ownership is reserved first: a message that wrote ``fresh`` owns exactly those identifiers, and
+    # a legacy message may not compete for them even if it names them too.
+    reserved: set[str] = set()
+    for entry in (*parked, *pending):
+        if (
+            isinstance(entry, dict)
+            and entry.get("kind") not in WHOLE_MESSAGE_KINDS
+            and isinstance(entry.get("fresh"), (list, tuple))
+        ):
+            # A whole-message fact (an escalation, a bulletin) is additional work, not an exclusive claim:
+            # the inbox keeps it alongside another owner, so it must not reserve the identifier here.
+            reserved.update(_stored_list(entry.get("fresh")))
+
+    def claim(identifier: object, *, kind: int, at: object, index: int) -> None:
+        if not isinstance(identifier, str) or identifier in reserved:
+            return
+        stamp = at if isinstance(at, int) and not isinstance(at, bool) and at > 0 else _LEGACY_UNKNOWN_CLAIM
+        key = (stamp, kind, index)
+        current = claims.get(identifier)
+        if current is None or key < current:
+            claims[identifier] = key
+
+    deliveries = state.get("deliveries")
+    for identifier, record in seen.items():
+        if isinstance(record, dict):
+            claim(identifier, kind=2, at=seen_claim_time(record, deliveries), index=0)
+    # Only a legacy entry competes: a message that recorded ``fresh`` already said which ids it owns, and the
+    # rest of its ids are mentions that must not take a claim from a legacy owner.
+    for index, entry in enumerate(parked):
+        if isinstance(entry, dict) and "fresh" not in entry and entry.get("kind") not in WHOLE_MESSAGE_KINDS:
+            for identifier in _stored_list(entry.get("ids")):
+                claim(identifier, kind=0, at=_queue_time(entry), index=index)
+    for index, entry in enumerate(pending):
+        if isinstance(entry, dict) and "fresh" not in entry and entry.get("kind") not in WHOLE_MESSAGE_KINDS:
+            for identifier in _stored_list(entry.get("ids")):
+                claim(identifier, kind=1, at=_queue_time(entry), index=index)
+
+    def record(entries: list, kind: int) -> None:
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict) or "fresh" in entry:
+                continue
+            identifiers = _stored_list(entry.get("ids"))
+            if entry.get("kind") in WHOLE_MESSAGE_KINDS:
+                # An escalation or bulletin is about everything it names, whatever the claim competition says.
+                entry["fresh"] = identifiers
+                continue
+            at = _queue_time(entry)
+            stamp = at if at > 0 else _LEGACY_UNKNOWN_CLAIM
+            entry["fresh"] = [
+                identifier for identifier in identifiers if claims.get(identifier) == (stamp, kind, index)
+            ]
+
+    record(parked, 0)
+    record(pending, 1)
+
+
+def owner_of(state: dict, identifier: str) -> tuple[str, dict] | None:
+    """Which message or seen record owns an identifier, read without changing the state.
+
+    Recorded ownership comes first: a whole-message kind owns every identifier it names, and a message owns
+    exactly its ``fresh`` list. Competing recorded owners resolve as the inbox displays them -- parked before
+    queued, and the newest message within a rank -- so a newer parked critical escalation opens over an older
+    warning. With no recorded owner, the seen record competes on the message's claim clock against the legacy
+    claim rule (earliest recorded time, parked before queued, unknown time last). A caller that must not write
+    state -- a page render, before a pass has settled the queue -- gets the same answer the inbox row was
+    built from.
+    """
+    pending = state.get("pending")
+    pending = pending if isinstance(pending, list) else []
+    parked = state.get("parked")
+    parked = parked if isinstance(parked, list) else []
+    seen = state.get("seen")
+    seen = seen if isinstance(seen, dict) else {}
+
+    def display_at(entry: dict) -> int:
+        parked_at = entry.get("parked_at")
+        if isinstance(parked_at, int) and not isinstance(parked_at, bool) and parked_at > 0:
+            return parked_at
+        return _queue_time(entry)
+
+    candidates: list[tuple[int, int, int, str, dict]] = []
+
+    def candidate(label: str, entry: dict, index: int) -> None:
+        # The inbox keeps the first fact when rank and time tie, and it appends parked entries in queue order.
+        candidates.append((0 if label == "parked" else 1, -display_at(entry), index, label, entry))
+
+    # Exclusive owners: a message's recorded ``fresh`` list. A whole-message fact (escalation, bulletin) is
+    # additional work the inbox keeps alongside another owner, so it is a candidate too, never a replacement.
+    exclusive = False
+    for label, entries in (("parked", parked), ("pending", pending)):
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("kind") in WHOLE_MESSAGE_KINDS:
+                if identifier in _stored_list(entry.get("ids")):
+                    candidate(label, entry, index)
+                continue
+            fresh = entry.get("fresh")
+            if isinstance(fresh, (list, tuple)) and identifier in _stored_list(fresh):
+                exclusive = True
+                candidate(label, entry, index)
+
+    if not exclusive:
+        # No exclusive owner: the seen record and the legacy entries compete on the claim clock, exactly as
+        # the inbox's legacy branch does.
+        claims: dict[str, tuple[int, int, int]] = {}
+        record = seen.get(identifier)
+        if isinstance(record, dict):
+            at = seen_claim_time(record, state.get("deliveries"))
+            claims[identifier] = (at if at > 0 else _LEGACY_UNKNOWN_CLAIM, 2, 0)
+        for entries, kind in ((parked, 0), (pending, 1)):
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, dict) or "fresh" in entry or entry.get("kind") in WHOLE_MESSAGE_KINDS:
+                    continue
+                if identifier not in _stored_list(entry.get("ids")):
+                    continue
+                stamp = _queue_time(entry)
+                key = (stamp if stamp > 0 else _LEGACY_UNKNOWN_CLAIM, kind, index)
+                current = claims.get(identifier)
+                if current is None or key < current:
+                    claims[identifier] = key
+        key = claims.get(identifier)
+        if key is not None:
+            _, kind, index = key
+            if kind == 2:
+                if isinstance(record, dict):
+                    candidates.append((3, -seen_claim_time(record, state.get("deliveries")), 0, "seen", record))
+            else:
+                entries = parked if kind == 0 else pending
+                entry = entries[index] if index < len(entries) else None
+                if isinstance(entry, dict):
+                    candidate("parked" if kind == 0 else "pending", entry, index)
+
+    if not candidates:
+        return None
+    # The inbox's primary order: parked before queued, then the newest fact, then queue order on a tie.
+    _, _, _, label, entry = min(candidates, key=lambda item: (item[0], item[1], item[2]))
+    return label, entry
 
 
 def _claimed(state: dict) -> set[str]:
@@ -1843,6 +2064,8 @@ def classify_new(
             # Remember the alias so the next pass skips the OSV lookup, or the tracker or ChangeLog fetch. Another
             # branch of the same PHP release claimed these CVEs moments ago: this item is that release, not news.
             for alias in (*ghsas, *(identifier for identifier in explicit if identifier.startswith("DSA-")), *own):
+                if alias in claimed:
+                    continue  # a queued message owns it and will record its own outcome
                 seen.setdefault(alias, {"at": now, "outcome": "alias"})
             continue
         classified += 1
@@ -1876,7 +2099,11 @@ def classify_new(
         if verdict.tag == "suppressed":
             _suppressed(state, ids, verdict, item, scores, now, thresholds, source_id=source_id)
         else:
-            shown_ids = [i for i in ids if i not in claimed and not i.startswith("src:")]
+            # The identifiers this message introduces: the ones it owns, as opposed to the ids its text
+            # merely mentions because another message already owns them. The inbox keeps them apart so a
+            # co-named advisory cannot inherit this message's state or severity.
+            fresh_ids = [identifier for identifier in ids if identifier not in claimed]
+            shown_ids = [identifier for identifier in fresh_ids if not identifier.startswith("src:")]
             heading, excerpt = headline(item.title, item.summary)
             if release is not None:
                 excerpt = PHP_EXCERPT + ", ".join(release.versions)
@@ -1897,10 +2124,14 @@ def classify_new(
             )
             queued = {
                 "kind": "new",
+                # The one clock an unattempted entry has: delivery stamps ``first_attempt_at`` only when it
+                # first tries, so a held warning would otherwise have no age at all.
+                "queued_at": now,
                 "tag": verdict.tag,
                 "title": title,
                 "body": body,
                 "ids": ids,
+                "fresh": fresh_ids,
                 "cves": new_cves,
                 "levels": dict(verdict.levels),
                 "kev_only": list(verdict.skipped),
@@ -2107,6 +2338,8 @@ def reevaluate(
         state["pending"].append(
             {
                 "kind": "escalation",
+                "queued_at": now,
+                "fresh": [cve],
                 "tag": level,
                 "title": title,
                 "body": body,
@@ -2195,6 +2428,18 @@ def _login_answer(detail: adobe.Detail | None) -> str:
         return "no critical CVEs" if detail and detail.cves else NO_DETAILS
     worst = max(critical, key=lambda cve: (cve.cvss or 0.0, cve.auth_required is False))
     return NO_DETAILS if worst.auth_required is None else "yes" if worst.auth_required else "no"
+
+
+def _queued(entry: dict, now: int) -> dict:
+    """A message just built for the queue, stamped with when it was queued and what it owns.
+
+    A message built outside classification (an escalation, an Adobe bulletin) is about every identifier it
+    names: there is no larger text for it to merely mention. ``queued_at`` and ``fresh`` never move after
+    this, so delivery, parking and release cannot change what the message owns.
+    """
+    entry.setdefault("queued_at", now)
+    entry.setdefault("fresh", list(entry.get("ids") or ()))
+    return entry
 
 
 def _adobe_new_message(bulletin: adobe.Bulletin, detail: adobe.Detail | None, exploited: str) -> dict:
@@ -2386,7 +2631,7 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
                 record["exploited"] = bool(listed)
             continue
         if listed and not record["exploited"]:
-            state["pending"].append(_adobe_kev_message(bulletin, listed))
+            state["pending"].append(_queued(_adobe_kev_message(bulletin, listed), now))
             record["exploited"] = True
             followed += 1
     for bulletin in fresh:
@@ -2408,7 +2653,7 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
         backlog.pop(bulletin.apsb, None)  # delivered: no longer outstanding
         cves = list(dict.fromkeys((*bulletin.cves, *(cve.cve for cve in detail.cves))) if detail else bulletin.cves)
         exploited = adobe_exploited(cves, detail, kev, kev_known)
-        state["pending"].append(_adobe_new_message(bulletin, detail, exploited))
+        state["pending"].append(_queued(_adobe_new_message(bulletin, detail, exploited), now))
         seen[bulletin.apsb] = {"cves": cves, "at": now, "exploited": exploited == "yes"}
         queued += 1
     if retry:
@@ -2819,8 +3064,19 @@ PARKED_ATTEMPT_KEYS = ("attempts", "first_attempt_at", "parked_at")
 
 
 def _released(entry: dict) -> dict:
-    """A parked message as it goes back to the queue: no retry history, so the next pass starts fresh."""
-    return {key: value for key, value in entry.items() if key not in PARKED_ATTEMPT_KEYS}
+    """A parked message as it goes back to the queue: no retry history, so the next pass starts fresh.
+
+    The queue time survives. It is the message's claim on its identifiers, and dropping it would make an
+    entry queued before this field existed look newer than a later message that names the same identifier.
+    """
+    released = {key: value for key, value in entry.items() if key not in PARKED_ATTEMPT_KEYS}
+    if "queued_at" not in released:
+        for key in ("first_attempt_at", "parked_at"):
+            stamp = entry.get(key)
+            if isinstance(stamp, int) and not isinstance(stamp, bool) and stamp > 0:
+                released["queued_at"] = stamp
+                break
+    return released
 
 
 def manage_parked(store: Store, release: bool, now: int) -> int:
@@ -2837,6 +3093,7 @@ def manage_parked(store: Store, release: bool, now: int) -> int:
     if state is None:
         LOG.error("no state document in %s; nothing is parked", store)
         return 1
+    _ensure_ownership(state)
     parked = state.setdefault("parked", [])
     if release:
         state["pending"] = [*map(_released, parked), *state["pending"]]
@@ -2896,6 +3153,7 @@ def manage_parked_entry(store: Store, index: int, release: bool, now: int, *, ex
             index,
         )
         return False
+    _ensure_ownership(state)
     parked.pop(index)
     if release:
         state["pending"] = [_released(entry), *state["pending"]]
@@ -2926,6 +3184,7 @@ def seed(state: dict, items: Sequence[Item], now: int) -> list[Item]:
     identifier already recorded keeps its first record, including when another source's history names it: the
     first record wins, as it does for every other write to ``seen``.
     """
+    claimed = _claimed(state)
     recent = []
     for item in items:
         # An undated item is unknown, not old: a valid RSS feed may omit dates, and consuming its current
@@ -2934,5 +3193,9 @@ def seed(state: dict, items: Sequence[Item], now: int) -> list[Item]:
             recent.append(item)
             continue
         for identifier in item.explicit or (f"src:{item.guid}",):
+            # Bootstrap history must not take an identifier a queued or parked message owns: that message's
+            # delivery is what the operator is owed, and a backlog record here would swallow its event.
+            if identifier in claimed:
+                continue
             state["seen"].setdefault(identifier, {"at": now, "outcome": "backlog"})
     return recent

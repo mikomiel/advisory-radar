@@ -36,6 +36,7 @@ from advisory_radar.web import create_app
 #: The pages the README illustrates, as ``(file stem, path)``, in capture order.
 PAGES = (
     ("dashboard", "/"),
+    ("inbox", "/inbox"),
     ("alerts", "/alerts"),
     ("parked", "/parked"),
     ("config", "/config"),
@@ -100,6 +101,8 @@ DEMO_ADVISORIES = (
     "CVE-2026-50111",
     "CVE-2026-46601",
     "CVE-2026-45230",
+    # the item a source still owes a classification pass
+    "CVE-2026-48212",
 )
 #: A seen record written before the delivery snapshot existed, so the Alerts screenshot shows the dash note.
 DEMO_LEGACY = "CVE-2026-45510"
@@ -153,10 +156,20 @@ def demo_watchlist(state_path: Path) -> Path:
     return path
 
 
-def _seen(cve: str, tag: str, source: str, title: str, level: str, score: float, delivered: list[str]):
+def _seen(
+    cve: str,
+    tag: str,
+    source: str,
+    title: str,
+    level: str,
+    score: float,
+    delivered: list[str],
+    source_id: str = "",
+):
     """The delivery snapshot the advisory page reads, and the id its seen record points at."""
     snapshot = {
         "tag": tag,
+        "source_id": source_id,
         "source": source,
         "title": title,
         "link": f"https://vendor.example.net/advisories/{cve}",
@@ -172,10 +185,22 @@ def _seen(cve: str, tag: str, source: str, title: str, level: str, score: float,
     return snapshot, f"demo-{cve.lower().replace(':', '-')}"
 
 
-def _queued(title: str, tag: str, cves: list[str], levels: dict, scores: dict, *, parked_at: int | None = None):
+def _queued(
+    title: str,
+    tag: str,
+    cves: list[str],
+    levels: dict,
+    scores: dict,
+    *,
+    source: str,
+    source_id: str,
+    queued_at: int,
+    parked_at: int | None = None,
+):
     """One pending or parked message, with the attempt history a failed delivery leaves behind."""
     entry = {
         "kind": "new",
+        "queued_at": queued_at,
         "tag": tag,
         "title": title,
         "body": "The rendered message body is not stored on a seen record and is not shown by the UI.",
@@ -184,7 +209,8 @@ def _queued(title: str, tag: str, cves: list[str], levels: dict, scores: dict, *
         "levels": levels,
         "scores": scores,
         "kev_only": [],
-        "source": "Vendor Feed",
+        "source": source,
+        "source_id": source_id,
         "link": f"https://vendor.example.net/advisories/{cves[0]}",
         "attempts": 3,
         "first_attempt_at": 0,
@@ -207,15 +233,64 @@ def demo_state(now: int | None = None) -> dict:
     state = core.new_state()
     #: ``(hours ago, tag, source heading, identifier, title)``; every identifier is in ``DEMO_ADVISORIES``.
     rows = (
-        (2, "critical", "Vendor Feed", "CVE-2026-48211", "CRITICAL: CVE-2026-48211 in widgetd (CVSS 9.8)"),
-        (6, "warning", "GitHub advisories", "GHSA-3q9c-9x6v-2v8m", "WARNING: GHSA-3q9c-9x6v-2v8m in http-client"),
-        (23, "warning", "Vendor Feed", "CVE-2026-47120", "WARNING: CVE-2026-47120 in image-parser (CVSS 5.9)"),
-        (29, "critical", "Debian security", "DSA-6104-1: openssl", "CRITICAL: DSA-6104-1: openssl (CVSS 9.8)"),
-        (51, "critical", "Vendor Feed", "CVE-2026-44117", "CRITICAL: CVE-2026-44117 in auth-gateway (CVSS 9.1)"),
-        (70, "warning", "Adobe bulletins", "APSB26-97", "WARNING: APSB26-97 in Commerce (CVSS 7.2)"),
-        (77, "warning", "Vendor Feed", "CVE-2026-39887", "WARNING: CVE-2026-39887 in scheduler (CVSS 6.5)"),
-        (96, "warning", "GitHub advisories", "GHSA-7h2p-4m6c-9r3x", "WARNING: GHSA-7h2p-4m6c-9r3x in template-engine"),
-        (120, "warning", "Debian security", "DSA-6098-1: curl", "WARNING: DSA-6098-1: curl (CVSS 6.5)"),
+        (
+            2,
+            "critical",
+            "nodejs",
+            "Node.js security",
+            "CVE-2026-48211",
+            "CRITICAL: CVE-2026-48211 in widgetd (CVSS 9.8)",
+        ),
+        (
+            6,
+            "warning",
+            "nodejs",
+            "Node.js security",
+            "GHSA-3q9c-9x6v-2v8m",
+            "WARNING: GHSA-3q9c-9x6v-2v8m in http-client",
+        ),
+        (
+            23,
+            "warning",
+            "php-releases",
+            "PHP releases",
+            "CVE-2026-47120",
+            "WARNING: CVE-2026-47120 in image-parser (CVSS 5.9)",
+        ),
+        (
+            29,
+            "critical",
+            "debian-dsa",
+            "Debian security",
+            "DSA-6104-1: openssl",
+            "CRITICAL: DSA-6104-1: openssl (CVSS 9.8)",
+        ),
+        (
+            51,
+            "critical",
+            "adobe-commerce",
+            "Adobe Commerce",
+            "CVE-2026-44117",
+            "CRITICAL: CVE-2026-44117 in auth-gateway (CVSS 9.1)",
+        ),
+        (70, "warning", "adobe-commerce", "Adobe Commerce", "APSB26-97", "WARNING: APSB26-97 in Commerce (CVSS 7.2)"),
+        (
+            77,
+            "warning",
+            "php-releases",
+            "PHP releases",
+            "CVE-2026-39887",
+            "WARNING: CVE-2026-39887 in scheduler (CVSS 6.5)",
+        ),
+        (
+            96,
+            "warning",
+            "nodejs",
+            "Node.js security",
+            "GHSA-7h2p-4m6c-9r3x",
+            "WARNING: GHSA-7h2p-4m6c-9r3x in template-engine",
+        ),
+        (120, "warning", "debian-dsa", "Debian security", "DSA-6098-1: curl", "WARNING: DSA-6098-1: curl (CVSS 6.5)"),
     )
     scores = {
         "CVE-2026-48211": 9.8,
@@ -229,9 +304,11 @@ def demo_state(now: int | None = None) -> dict:
         "DSA-6098-1: curl": 6.5,
     }
     deliveries: dict[str, dict] = {}
-    for hours, tag, source, identifier, title in rows:
+    for hours, tag, source_id, source, identifier, title in rows:
         delivered = ["discord-security", "ntfy-phone"] if tag == "critical" else ["discord-security"]
-        snapshot, delivery_id = _seen(identifier, tag, source, title, tag, scores[identifier], delivered)
+        snapshot, delivery_id = _seen(
+            identifier, tag, source, title, tag, scores[identifier], delivered, source_id=source_id
+        )
         deliveries[delivery_id] = snapshot
         state["seen"][identifier] = {"at": now - hours * hour, "outcome": "delivered", "delivery": delivery_id}
     if deliveries:
@@ -245,6 +322,9 @@ def demo_state(now: int | None = None) -> dict:
         ["CVE-2026-50111"],
         {"CVE-2026-50111": "warning"},
         {"CVE-2026-50111": 7.5},
+        source="Node.js security",
+        source_id="nodejs",
+        queued_at=now - 25 * 60,
     )
     pending["attempts"] = 1
     pending["first_attempt_at"] = now - 5 * 60
@@ -257,6 +337,9 @@ def demo_state(now: int | None = None) -> dict:
         ["CVE-2026-46601"],
         {"CVE-2026-46601": "critical"},
         {"CVE-2026-46601": 9.1},
+        source="Adobe Commerce",
+        source_id="adobe-commerce",
+        queued_at=now - 2 * hour,
         parked_at=now - 20 * 60,
     )
     parked_critical["first_attempt_at"] = now - 2 * hour
@@ -267,11 +350,39 @@ def demo_state(now: int | None = None) -> dict:
         ["CVE-2026-45230"],
         {"CVE-2026-45230": "warning"},
         {"CVE-2026-45230": 7.5},
+        source="PHP releases",
+        source_id="php-releases",
+        queued_at=now - 3 * hour,
         parked_at=now - 40 * 60,
     )
     parked_warning["first_attempt_at"] = now - 3 * hour
     parked_warning["last_status"] = 500
     state["parked"] = [parked_critical, parked_warning]
+    # Work a source still owes: fetched, not yet classified. The inbox shows it as awaiting classification.
+    state["carry"] = {
+        "nodejs": [
+            {
+                "guid": "demo-nodejs-carried-1",
+                "title": "Node.js security release awaiting classification",
+                "link": "https://vendor.example.net/advisories/CVE-2026-48212",
+                "published": now - 8 * 60,
+                "explicit": ["CVE-2026-48212"],
+            }
+        ]
+    }
+    # What the Sources page and the dashboard's health count read: one source failing, the rest answering.
+    state["source_health"] = {
+        "nodejs": {"at": now - 10 * 60, "ok": True, "ok_at": now - 10 * 60, "items": 12, "error": ""},
+        "debian-dsa": {"at": now - 12 * 60, "ok": True, "ok_at": now - 12 * 60, "items": 4, "error": ""},
+        "php-releases": {
+            "at": now - 120,
+            "ok": False,
+            "ok_at": now - 2 * hour,
+            "items": 0,
+            "error": "HTTP 502 from the FreshRSS endpoint",
+        },
+        "adobe-commerce": {"at": now - 7 * 60, "ok": True, "ok_at": now - 7 * 60, "items": 2, "error": ""},
+    }
     # Oldest first, as the writer appends them: the page reverses the list to show the newest pass on top.
     history = ((3, 0, 0), (3, 0, 0), (2, 1, 1), (3, 0, 0), (4, 0, 0), (3, 0, 0))
     state["runs"] = [

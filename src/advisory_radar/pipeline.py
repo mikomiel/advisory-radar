@@ -202,6 +202,9 @@ def _run_pass(
     core.HIDDEN_SOURCE_HOSTS = cfg.hidden_source_hosts
 
     state = core.new_state() if stored is None else stored
+    # A pass may deliver or drop an entry written before ownership was recorded; settle that before anything
+    # leaves a queue, so delivery writes the same history the inbox displays.
+    core._ensure_ownership(state)
     _reset_validators_on_policy_change(state, policy)
     state.setdefault("parked", [])
     core._prune(state, now)
@@ -303,6 +306,9 @@ def _run_pass(
         units = units[turn:] + units[:turn]
         state["classify_turn"] = turn + 1
 
+    # What the state already owns, read once: an out-of-scope webhook retry must not record a disposition for
+    # an identifier that a queued or parked message owns and will report itself.
+    claimed_before = core._claimed(state)
     for source, window in units:
         if window is None:
             host = ""
@@ -317,8 +323,11 @@ def _run_pass(
                     # An out-of-scope webhook entry gets a terminal disposition, so the inbox can release it
                     # instead of letting irrelevant entries fill the capacity that real advisories need. The
                     # guid is already namespaced, and classification claims ``src:<namespaced guid>``; another
-                    # prefix here would not match the identity the inbox cleanup looks for.
-                    state["seen"].setdefault(f"src:{item.guid}", {"at": now, "outcome": "filtered"})
+                    # prefix here would not match the identity the inbox cleanup looks for. A retry the sender
+                    # makes after a scope change must not overwrite a queued message's own identifier.
+                    identity = f"src:{item.guid}"
+                    if identity not in claimed_before:
+                        state["seen"].setdefault(identity, {"at": now, "outcome": "filtered"})
         # Items carried from an earlier pass come first: the window they arrived in is already gone.
         earlier = [core.item_from_state(row) for row in carried.pop(source.id, [])]
         # The policy may have changed while these waited: scope applies at classification time, not arrival.

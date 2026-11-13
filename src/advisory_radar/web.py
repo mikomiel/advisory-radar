@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import heapq
 import hmac
 import html
 import json
@@ -30,7 +31,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from itsdangerous import BadSignature, URLSafeSerializer
 
-from . import __version__, feeds, pipeline, watchlist
+from . import __version__, core, delivery, feeds, pipeline, watchlist
 from .catalogue import SOURCE_SPECS
 from .config import (
     DEFAULT_THRESHOLDS,
@@ -177,6 +178,8 @@ border-top:1px solid var(--ink);border-bottom:1px solid var(--line)}
 .stat:last-child{border-right:0}
 .stat-label{display:block;color:var(--muted);font-size:11px;letter-spacing:.09em;text-transform:uppercase}
 .stat-value{display:block;font-family:var(--mono);font-size:1.9rem;line-height:1.25;letter-spacing:-.02em}
+.stat a{display:block;color:inherit;text-decoration:none}
+.stat a:hover .stat-value{text-decoration:underline}
 .pass{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem 1.25rem;padding:1rem 0 1.1rem;
 border-bottom:1px solid var(--line)}
 .pass .grow{margin-right:auto}
@@ -226,6 +229,7 @@ body{max-width:none;background:#fff;color:#000}
 #: The authenticated navigation, in reading order: (path, label).
 _NAV = (
     ("/", "Dashboard"),
+    ("/inbox", "Inbox"),
     ("/alerts", "Alerts"),
     ("/parked", "Parked"),
     ("/config", "Config"),
@@ -436,12 +440,40 @@ def _when(value: object) -> str:
     return datetime.fromtimestamp(stamp, tz=UTC).strftime("%Y-%m-%d %H:%M")
 
 
+def _day_text(value: object) -> str:
+    """A stored epoch second as the UTC ``YYYY-MM-DD`` a day filter takes, or empty when unusable."""
+    stamp = _epoch(value)
+    if stamp is None:
+        return ""
+    return datetime.fromtimestamp(stamp, tz=UTC).strftime("%Y-%m-%d")
+
+
 #: One page of /alerts: a screenful of rows, and small enough to stay fast on a phone.
 ALERT_PAGE_SIZE = 50
 #: The filters /alerts keeps in the URL. One tuple, so the form and the pagination links cannot disagree.
 ALERT_FILTERS = ("tag", "source", "outcome", "q", "since", "until")
 #: The outcomes a seen record can carry. A filter value outside this list matches nothing.
 SEEN_OUTCOMES = ("delivered", "dropped", "filtered", "suppressed", "backlog", "alias", "not-security")
+#: The states one inbox row can carry, most current first. ``open`` is a filter over the queue states, never a
+#: state a row holds: one link names everything the queue still owes, without inventing a fourth state.
+INBOX_STATES = (
+    "pending",
+    "held",
+    "carried",
+    "parked",
+    "delivered",
+    "dropped",
+    "filtered",
+    "suppressed",
+    "backlog",
+    "alias",
+    "not-security",
+    "notified",
+)
+#: The states that still owe work; ``/inbox?state=open`` names exactly these.
+INBOX_OPEN_STATES = ("pending", "held", "carried", "parked")
+#: The filters /inbox keeps in the URL, so the form, the links and the pagination cannot disagree.
+INBOX_FILTERS = ("state", "tag", "source", "q", "since", "until")
 
 
 def _advisory_token(identifier: str) -> str:
@@ -565,7 +597,9 @@ def _alert_page(
     cursor: tuple[int, str] | None,
     before: tuple[int, str] | None,
 ) -> tuple[list[tuple[tuple[int, str], Mapping]], tuple[int, str] | None, tuple[int, str] | None]:
-    """One page of seen records, and the positions its previous/next links point at.
+    """One page of ordered rows, and the positions its previous/next links point at.
+
+    ``/alerts`` and ``/inbox`` share it: both order by ``(at desc, identifier asc)`` and page the same way.
 
     Keyset, not an offset: both directions slice the same ordered list, so a record arriving between two
     requests cannot shift a page and make a row repeat or go missing. ``cursor`` continues towards older
@@ -591,6 +625,554 @@ def _alert_page(
     previous = first if keys and keys[0] < first_key else None
     following = last if keys and keys[-1] > last_key else None
     return list(window), previous, following
+
+
+def _stored_strings(value: object) -> tuple[str, ...]:
+    """The string members of a stored list; a bare string is one value, never one per character."""
+    if isinstance(value, str):
+        return (value,) if value else ()
+    if isinstance(value, (list, tuple)):
+        return tuple(item for item in value if isinstance(item, str))
+    return ()
+
+
+def _related(identifiers: Iterable[object], *, limit: int = 4) -> tuple[tuple[str, ...], int]:
+    """The related identifiers a row may show, and how many others the message named.
+
+    Returns the first ``limit + 1`` unique identifiers (a row drops its own and still has ``limit``) and the
+    number of other identifiers. The full list is shared, never copied per row: a message may name thousands
+    of advisories, and one tuple per identifier would be quadratic memory for a page that renders a handful.
+    """
+    unique = tuple(dict.fromkeys(item for item in identifiers if isinstance(item, str)))
+    return unique[: limit + 1], max(0, len(unique) - 1)
+
+
+def _queue_time(entry: Mapping) -> int:
+    """When a queued message entered the queue, from the best clock the state recorded.
+
+    ``queued_at`` is written by this version; an entry queued before it has only its first delivery attempt,
+    and one never attempted has no clock at all. 0 says unknown -- it is never read as epoch.
+    """
+    for key in ("queued_at", "first_attempt_at"):
+        value = entry.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return 0
+
+
+def _age_text(seconds: int) -> str:
+    """A duration as the largest whole unit the age needs; a negative age reads as zero."""
+    seconds = max(0, seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def _source_health_state(record: object, interval: object, now: int) -> str:
+    """One source's health as /sources and the dashboard both read it: ok, failing, stale or never.
+
+    ``stale`` is a recorded success older than two fetch intervals: the interval decides when the next fetch
+    is due, so two missed windows mean nothing is polling, not that the feed is down. A source with no
+    interval is fetched every pass, so only its recorded outcome is judged.
+    """
+    if not isinstance(record, dict) or not record:
+        return "never"
+    if record.get("ok") is not True:
+        return "failing"
+    at = record.get("at")
+    if (
+        isinstance(interval, int)
+        and not isinstance(interval, bool)
+        and interval > 0
+        and isinstance(at, int)
+        and not isinstance(at, bool)
+        and now - at >= interval * 2
+    ):
+        return "stale"
+    return "ok"
+
+
+#: A fact's rank: parked work needs a decision, then the queue, then carried work, then history. Within one
+#: rank the newest fact is shown; every fact stays on the row for the filters and the "also" line, so a
+#: co-named message can never replace an identifier's own state.
+_INBOX_FACT_RANK = {"parked": 0, "pending": 1, "held": 1, "carried": 2}
+#: The event outcomes that are a transport result in their own right; anything else is an event notice only.
+_EVENT_STATES = ("delivered", "dropped")
+#: The message kinds that are about every identifier they name, owned by ``core``: an escalation is one CVE
+#: and a bulletin is its own id. A ``new`` message names everything its text mentioned, so its claim decides
+#: ownership. The same rule applies to delivery events, where a ``new`` event is the message rather than its
+#: judgement.
+_WHOLE_KINDS = core.WHOLE_MESSAGE_KINDS
+#: No claim time sorts last: an entry with no recorded time is not assumed to be the oldest.
+_UNKNOWN_CLAIM = 1 << 62
+#: Claim kinds break a same-time tie: parked work needs a decision, then the queue, then history. A
+#: suppression recorded in the same pass as a queued message must not take that message's identifier.
+_CLAIM_PARKED, _CLAIM_PENDING, _CLAIM_SEEN = 0, 1, 2
+
+
+def _seen_claim_time(record: Mapping, deliveries: Mapping) -> int:
+    """The queue time of the message that recorded this identifier, shared with settlement and the detail page."""
+    return core.seen_claim_time(record, deliveries)
+
+
+def _fact_rank(state: str) -> int:
+    """The display rank of one fact; a delivered or dropped event ranks as history, not as a notification."""
+    if state in _INBOX_FACT_RANK:
+        return _INBOX_FACT_RANK[state]
+    return 3 if state in _EVENT_STATES else 4
+
+
+def _identifier_tag(source: Mapping, identifier: str) -> str:
+    """The severity recorded for this identifier, falling back to the message's aggregate tag.
+
+    One message can judge a critical CVE and a warning CVE: each row must carry its own level, or the
+    critical filter and the dashboard would select a message-level set instead of the identifier-level one.
+    A non-CVE identifier usually has no level of its own and falls back to the message's tag.
+    """
+    levels = source.get("levels")
+    if isinstance(levels, dict):
+        level = levels.get(identifier)
+        if isinstance(level, str) and level:
+            return level
+    tag = source.get("tag")
+    return tag if isinstance(tag, str) else ""
+
+
+def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | None = None) -> list[dict]:
+    """One row per identifier, aggregating every fact the state holds about it.
+
+    A row is never a merge of two advisories. Ownership is the first claim: the state record, parked message
+    or queued message that first named an identifier owns it, and every later message that merely mentions it
+    adds context instead of replacing its state or severity. That is what keeps a new feed item from hiding a
+    parked critical, and a delivered GHSA from being queued again as work. The same distinction decides what
+    a delivery event delivered (only the identifiers its seen records point at; an escalation or bulletin is
+    about all it names) and whether carried work introduces an identifier (an item naming only
+    already-classified identifiers adds context). Grouping a multi-CVE bulletin into one row would merge
+    unrelated advisories and lose each one's own level, so the grouping stops at the identifier; resolving
+    true aliases is S04's job.
+
+    Facts rank parked, then pending/held, then carried, then history (delivered and the other seen outcomes),
+    then an event-only notification. The primary fact is displayed; every fact stays available to the
+    filters and to the "also" line. ``at`` is when the primary fact began, and ``detail`` says whether the
+    advisory page can resolve the row.
+    """
+    rows: dict[str, dict] = {}
+    mentions: list[tuple[str, dict]] = []
+    carried_facts: list[tuple[str, dict]] = []
+
+    seen = state.get("seen")
+    seen = seen if isinstance(seen, dict) else {}
+    deliveries = state.get("deliveries")
+    deliveries = deliveries if isinstance(deliveries, dict) else {}
+    pending = state.get("pending")
+    pending = [entry for entry in pending if isinstance(entry, dict)] if isinstance(pending, list) else []
+    parked = state.get("parked")
+    parked = [entry for entry in parked if isinstance(entry, dict)] if isinstance(parked, list) else []
+
+    # What the live messages own. A message written by this version records ``fresh``: exactly the
+    # identifiers it introduced, so ownership does not change when it is delivered, parked or released. Its
+    # other ids are mentions. Entries and records from before that key keep the older claim-time heuristic
+    # (earliest recorded time, then parked, then queue, then history; unknown time sorts last).
+    fresh_claimed: set[str] = set()
+    legacy_claims: dict[str, tuple[int, int, int]] = {}
+
+    def claim(identifiers: Iterable[str], *, kind: int, at: object, index: int) -> None:
+        stamp = _number(at, 0)
+        key = (stamp if stamp > 0 else _UNKNOWN_CLAIM, kind, index)
+        for identifier in identifiers:
+            current = legacy_claims.get(identifier)
+            if current is None or key < current:
+                legacy_claims[identifier] = key
+
+    for identifier, record in seen.items():
+        if isinstance(identifier, str) and isinstance(record, dict):
+            claim((identifier,), kind=_CLAIM_SEEN, at=_seen_claim_time(record, deliveries), index=0)
+    for index, entry in enumerate(parked):
+        if "fresh" in entry:
+            if entry.get("kind") not in _WHOLE_KINDS:
+                fresh_claimed.update(_stored_strings(entry.get("fresh")))
+        elif entry.get("kind") not in _WHOLE_KINDS:
+            # The claim time is when the message was queued, not when it parked: parking is a later transport
+            # state and must not hand the identifier to a message that arrived in between. A whole-message
+            # entry is additional work, so it never competes for an exclusive claim.
+            claim(_stored_strings(entry.get("ids")), kind=_CLAIM_PARKED, at=_queue_time(entry), index=index)
+    for index, entry in enumerate(pending):
+        if "fresh" in entry:
+            if entry.get("kind") not in _WHOLE_KINDS:
+                fresh_claimed.update(_stored_strings(entry.get("fresh")))
+        elif entry.get("kind") not in _WHOLE_KINDS:
+            claim(_stored_strings(entry.get("ids")), kind=_CLAIM_PENDING, at=_queue_time(entry), index=index)
+
+    def make(
+        identifier_id: str,
+        *,
+        state: str,
+        at: object,
+        origin: str,
+        detail: bool = True,
+        tag: object = "",
+        title: object = "",
+        link: object = "",
+        source: object = "",
+        related: tuple[tuple[str, ...], int] = ((), 0),
+        mention: bool = False,
+    ) -> dict:
+        head, others = related
+        return {
+            "state": state,
+            "at": _number(at, 0),
+            "rank": _fact_rank(state),
+            "origin": origin,
+            "tag": tag if isinstance(tag, str) else "",
+            "title": title if isinstance(title, str) else "",
+            "link": link if isinstance(link, str) else "",
+            "source": source if isinstance(source, str) else "",
+            "aliases": tuple(alias for alias in head if alias != identifier_id)[:4],
+            "alias_count": others,
+            "detail": detail,
+            "mention": mention,
+        }
+
+    def own(identifier: str, fact: dict) -> None:
+        """Record a fact the identifier owns; it may become the row's primary fact."""
+        row = rows.get(identifier)
+        if row is None:
+            row = rows[identifier] = {
+                "identifier": identifier,
+                "facts": [],
+                "origins": set(),
+                "source_set": set(),
+                "sources": (),
+                "detail": False,
+                "aliases": (),
+                "primary_origin": "",
+                "primary_rank": None,
+                "primary_at": 0,
+            }
+        if fact["detail"]:
+            row["detail"] = True
+        if fact["origin"] in row["origins"]:
+            return
+        row["origins"].add(fact["origin"])
+        if fact["source"]:
+            row["source_set"].add(fact["source"])
+        row["facts"].append(fact)
+        # The primary is maintained incrementally: rank first, then the newest fact within it.
+        if (
+            row["primary_rank"] is None
+            or fact["rank"] < row["primary_rank"]
+            or (fact["rank"] == row["primary_rank"] and fact["at"] > row["primary_at"])
+        ):
+            row["primary_rank"] = fact["rank"]
+            row["primary_at"] = fact["at"]
+            for key in ("state", "at", "tag", "title", "link", "alias_count"):
+                row[key] = fact[key]
+            row["aliases"] = fact["aliases"]
+            row["primary_origin"] = fact["origin"]
+
+    def mention(identifier: str, fact: dict) -> None:
+        """Record context for a row that exists; a mention never creates a row and never becomes primary."""
+        row = rows.get(identifier)
+        if row is None or fact["origin"] in row["origins"]:
+            return
+        row["origins"].add(fact["origin"])
+        if fact["source"]:
+            row["source_set"].add(fact["source"])
+        row["facts"].append({**fact, "mention": True})
+
+    def legacy_owned(identifier: str, *, kind: int, index: int, at: int) -> bool:
+        """Whether the legacy claim order gives this message the identifier.
+
+        Recorded ownership is reserved: a message that wrote ``fresh`` keeps its identifiers even if an older
+        entry's text names them, so the legacy branch never duplicates it.
+        """
+        if identifier in fresh_claimed:
+            return False
+        stamp = at if at > 0 else _UNKNOWN_CLAIM
+        return legacy_claims.get(identifier) == (stamp, kind, index)
+
+    def seen_owned(identifier: str, record: Mapping) -> bool:
+        """Whether the seen record owns the identifier, rather than being context for a live message."""
+        if identifier in fresh_claimed:
+            return False
+        stamp = _seen_claim_time(record, deliveries)
+        return legacy_claims.get(identifier) == (stamp if stamp > 0 else _UNKNOWN_CLAIM, _CLAIM_SEEN, 0)
+
+    for index, entry in enumerate(pending):
+        identifiers = list(dict.fromkeys(_stored_strings(entry.get("ids"))))
+        related = _related(identifiers)
+        fresh = entry.get("fresh")
+        fresh_set = set(_stored_strings(fresh)) if isinstance(fresh, (list, tuple)) else None
+        held = delivery.is_held(now, entry, quiet_hours)
+        at = _queue_time(entry)
+        whole = entry.get("kind") in _WHOLE_KINDS
+        source_id = entry.get("source_id") if isinstance(entry.get("source_id"), str) else ""
+        for identifier in identifiers:
+            fact = make(
+                identifier,
+                state="held" if held else "pending",
+                at=at,
+                origin=f"pending:{index}",
+                tag=_identifier_tag(entry, identifier),
+                title=entry.get("title"),
+                link=entry.get("link"),
+                source=source_id,
+                related=related,
+            )
+            if whole or (
+                identifier in fresh_set
+                if fresh_set is not None
+                else legacy_owned(identifier, kind=_CLAIM_PENDING, index=index, at=at)
+            ):
+                own(identifier, fact)
+            else:
+                mentions.append((identifier, fact))
+
+    for index, entry in enumerate(parked):
+        identifiers = list(dict.fromkeys(_stored_strings(entry.get("ids"))))
+        related = _related(identifiers)
+        fresh = entry.get("fresh")
+        fresh_set = set(_stored_strings(fresh)) if isinstance(fresh, (list, tuple)) else None
+        claim_at = _queue_time(entry)
+        at = _number(entry.get("parked_at"), 0) or claim_at
+        whole = entry.get("kind") in _WHOLE_KINDS
+        source_id = entry.get("source_id") if isinstance(entry.get("source_id"), str) else ""
+        for identifier in identifiers:
+            fact = make(
+                identifier,
+                state="parked",
+                at=at,
+                origin=f"parked:{index}",
+                tag=_identifier_tag(entry, identifier),
+                title=entry.get("title"),
+                link=entry.get("link"),
+                source=source_id,
+                related=related,
+            )
+            if whole or (
+                identifier in fresh_set
+                if fresh_set is not None
+                else legacy_owned(identifier, kind=_CLAIM_PARKED, index=index, at=claim_at)
+            ):
+                own(identifier, fact)
+            else:
+                mentions.append((identifier, fact))
+
+    snapshot_related: dict[str, tuple[tuple[str, ...], int]] = {}
+    for identifier, record in seen.items():
+        if not isinstance(identifier, str) or not isinstance(record, dict):
+            continue
+        reference = record.get("delivery")
+        snapshot = deliveries.get(reference) if isinstance(reference, str) else None
+        # A record written before the delivery table holds the snapshot inline; the advisory page reads it the
+        # same way, so the inbox must not lose a tag and title the state does hold.
+        if not isinstance(snapshot, dict):
+            snapshot = record
+        # One projection per message: a delivery snapshot is shared by every identifier it named, so
+        # rebuilding it here would be quadratic for a message naming thousands of advisories.
+        snapshot_key = reference if isinstance(reference, str) else f"inline:{identifier}"
+        if snapshot_key not in snapshot_related:
+            snapshot_related[snapshot_key] = _related(_stored_strings(snapshot.get("ids")))
+        outcome = record.get("outcome")
+        at = _number(record.get("at"), 0)
+        fact = make(
+            identifier,
+            state=outcome if isinstance(outcome, str) and outcome else "recorded",
+            at=at,
+            origin=f"seen:{identifier}",
+            tag=_identifier_tag(snapshot, identifier),
+            title=snapshot.get("title"),
+            link=snapshot.get("link"),
+            source=snapshot.get("source_id") if isinstance(snapshot.get("source_id"), str) else "",
+            related=snapshot_related[snapshot_key],
+        )
+        # A suppression can record an identifier another message already owns (state written before the
+        # writer stopped doing that); then it is history about that identifier, not its current state, and
+        # belongs under "Also" rather than in a filtered view.
+        if seen_owned(identifier, record):
+            own(identifier, fact)
+        else:
+            mentions.append((identifier, fact))
+
+    for event_id, event in deliveries.items():
+        if not isinstance(event_id, str) or not isinstance(event, dict):
+            continue
+        identifiers = tuple(dict.fromkeys((*_stored_strings(event.get("ids")), *_stored_strings(event.get("cves")))))
+        if not identifiers:
+            continue
+        related = _related(identifiers)
+        pointed = {
+            identifier
+            for identifier in identifiers
+            if isinstance(seen.get(identifier), dict) and seen[identifier].get("delivery") == event_id
+        }
+        kind = event.get("kind")
+        # A bulletin and an escalation are about everything they name. A ``new`` event is the message, not its
+        # judgement: only the seen records that point at it say which identifiers it actually delivered.
+        whole = kind in _WHOLE_KINDS or not pointed
+        outcome = event.get("outcome")
+        state_name = outcome if isinstance(outcome, str) and outcome in _EVENT_STATES else "notified"
+        source_id = event.get("source_id") if isinstance(event.get("source_id"), str) else ""
+        for identifier in identifiers:
+            fact = make(
+                identifier,
+                state=state_name,
+                at=event.get("at"),
+                origin=f"event:{event_id}",
+                tag=_identifier_tag(event, identifier) if whole else "",
+                title=event.get("title"),
+                link=event.get("link"),
+                source=source_id,
+                related=related,
+            )
+            if identifier in pointed:
+                continue  # its own seen record already carries this event's outcome
+            if whole:
+                own(identifier, fact)
+            else:
+                mentions.append((identifier, {**fact, "state": "notified"}))
+
+    for source_id, items in state.get("carry").items() if isinstance(state.get("carry"), dict) else ():
+        if not isinstance(items, list):
+            continue
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            explicit = _stored_strings(item.get("explicit"))
+            guid = item.get("guid")
+            identifiers = explicit or (f"src:{guid}" if isinstance(guid, str) and guid else "",)
+            related = _related(identifiers)
+            for identifier in identifiers:
+                carried_facts.append(
+                    (
+                        identifier,
+                        make(
+                            identifier,
+                            state="carried",
+                            at=item.get("published"),
+                            origin=f"carry:{source_id}:{index}",
+                            detail=False,
+                            title=item.get("title"),
+                            link=item.get("link"),
+                            source=source_id if isinstance(source_id, str) else "",
+                            related=related,
+                        ),
+                    )
+                )
+
+    # Carried work is unclassified, so an identifier it names may already be classified elsewhere. It adds
+    # context there instead of promoting a delivered or parked advisory back into the queue.
+    for identifier, fact in carried_facts:
+        if identifier in rows:
+            mention(identifier, fact)
+        else:
+            own(identifier, fact)
+
+    for identifier, fact in mentions:
+        mention(identifier, fact)
+
+    for row in rows.values():
+        row["sources"] = tuple(sorted(row["source_set"]))
+        # The accumulators are internal; the rows are display data a caller may serialise.
+        del row["source_set"], row["origins"], row["primary_rank"], row["primary_at"]
+    return sorted(rows.values(), key=lambda row: (-row["at"], row["identifier"]))
+
+
+def _inbox_also(row: Mapping) -> str:
+    """The row's other facts, so a co-named message cannot hide its own state or an earlier delivery."""
+    primary = row.get("primary_origin")
+    others = [fact for fact in row.get("facts") or () if fact.get("origin") != primary]
+    if not others:
+        return ""
+    # Only three are shown: a bounded selection keeps an identifier with a long history linear to render.
+    shown = heapq.nsmallest(3, others, key=lambda item: (item["rank"], -item["at"]))
+    labels = []
+    for fact in shown:
+        label = fact["state"] + (f" {fact['tag']}" if fact["tag"] else "")
+        labels.append(f"{esc(label)} {esc(_when(fact['at']) or 'unknown')}")
+    more = f" +{len(others) - len(shown)}" if len(others) > len(shown) else ""
+    return f"<br><span class='muted small'>Also: {', '.join(labels)}{more}</span>"
+
+
+def _matches_inbox(row: Mapping, filters: Mapping[str, str], since: int | None, until: int | None) -> bool:
+    """Whether one inbox row matches every filter.
+
+    The state and tag filters select one fact, and they must select the same one: a row is a match when some
+    recorded fact is, so a parked critical stays findable even when a later message co-names the identifier.
+    A mention never satisfies a filter (it is context, not transport). ``pending`` matches every unsent fact,
+    including the ones the quiet window holds; ``held`` narrows to those. The source filter matches a
+    configured source id the row's messages named, never the advisory heading. A date range selects facts a
+    process can render: an unrepresentable stored time is not recent and never raises.
+    """
+    wanted = filters.get("state")
+    allowed = {"open": INBOX_OPEN_STATES, "pending": ("pending", "held")}.get(wanted, (wanted,))
+    tag = filters.get("tag")
+    fact_filter = bool(wanted or tag or since is not None or until is not None)
+    if fact_filter:
+        matched = False
+        for fact in row.get("facts") or ():
+            if fact.get("mention"):
+                continue
+            if wanted and fact.get("state") not in allowed:
+                continue
+            if tag and fact.get("tag") != tag:
+                continue
+            at = _epoch(fact.get("at")) if isinstance(fact.get("at"), int) else None
+            if since is not None and (at is None or at < since):
+                continue
+            if until is not None and (at is None or at >= until):
+                continue
+            matched = True
+            break
+        if not matched:
+            return False
+    if filters.get("source") and filters["source"] not in (row.get("sources") or ()):
+        return False
+    text = filters.get("q")
+    if text:
+        needle = text.casefold()
+        if (
+            needle not in str(row.get("identifier") or "").casefold()
+            and needle not in str(row.get("title") or "").casefold()
+        ):
+            return False
+    return True
+
+
+def _transport_text(row: Mapping) -> str:
+    """One row's transport state as a phrase, kept apart from remediation on purpose."""
+    phrases = {
+        "pending": "queued, not yet sent",
+        "held": "held by the quiet window",
+        "carried": "awaiting classification",
+        "parked": "awaiting a decision",
+        "delivered": "accepted by a channel",
+        "dropped": "dropped before delivery",
+        "filtered": "out of scope",
+        "suppressed": "below the alert threshold",
+        "backlog": "older than the backlog window",
+        "alias": "an alias already recorded",
+        "not-security": "not a security advisory",
+        "notified": "notified from an event",
+        "recorded": "recorded without a state",
+    }
+    state = row.get("state")
+    return phrases.get(state, "unknown") if isinstance(state, str) else "unknown"
+
+
+def _inbox_tone(state: str) -> str:
+    """The badge tone a transport state earns: only an accepted delivery is good, and only a drop is bad."""
+    return {
+        "delivered": "ok",
+        "dropped": "critical",
+        "pending": "warning",
+        "held": "warning",
+        "parked": "warning",
+    }.get(state, "neutral")
 
 
 def _short(value: object, limit: int = 70) -> str:
@@ -808,14 +1390,22 @@ def _empty(message: str, hint: str = "") -> str:
     return f"<div class='empty'><p>{message}</p>{tail}</div>"
 
 
-def _stats(pairs: Sequence[tuple[str, object]]) -> str:
-    """The dashboard's headline numbers: one label above one value per tile."""
-    tiles = "".join(
-        f"<div class='stat'><span class='stat-label'>{esc(label)}</span>"
-        f"<span class='stat-value'>{esc(value)}</span></div>"
-        for label, value in pairs
-    )
-    return f"<section class='stats'>{tiles}</section>"
+def _stats(pairs: Sequence[tuple[object, ...]]) -> str:
+    """The dashboard's headline numbers: one label above one value per tile.
+
+    A third item, when present, is the view the count describes; the whole tile becomes the link, so every
+    number on the dashboard leads to exactly the filtered rows it counted.
+    """
+    tiles = []
+    for label, value, *rest in pairs:
+        content = f"<span class='stat-label'>{esc(label)}</span><span class='stat-value'>{esc(value)}</span>"
+        href = rest[0] if rest else ""
+        tiles.append(
+            f"<div class='stat'><a href='{esc(href)}'>{content}</a></div>"
+            if href
+            else f"<div class='stat'>{content}</div>"
+        )
+    return f"<section class='stats'>{''.join(tiles)}</section>"
 
 
 def _exit_code(value: object) -> tuple[str, str]:
@@ -895,8 +1485,12 @@ def _seen_advisory(
     )
 
 
-def _queued_advisory(state_label: str, entry: Mapping) -> str:
-    """The detail page for a pending or parked message: everything the queued entry itself holds."""
+def _queued_advisory(state_label: str, entry: Mapping, events: Sequence[tuple[str, Mapping]] = ()) -> str:
+    """The detail page for a pending or parked message: everything the queued entry itself holds.
+
+    ``events`` is the identifier's delivery history, if it has one: an escalation about an already-delivered
+    CVE shows the actionable message first and the delivery that preceded it below.
+    """
     attempts = _number(entry.get("attempts"), 0)
     first = _when(entry.get("first_attempt_at"))
     parked_at = _when(entry.get("parked_at"))
@@ -928,6 +1522,7 @@ def _queued_advisory(state_label: str, entry: Mapping) -> str:
         + _facts(facts)
         + "<h2>CVEs and levels</h2>"
         + _levels_table(entry.get("levels"), entry.get("scores"))
+        + _notification_history(events)
         + "<p class='back'><a href='/parked'>← Back to the parked queue</a></p>"
     )
 
@@ -1664,41 +2259,140 @@ def create_app(
                 active="/",
                 actions=sign_out_form(request),
             )
-        pending, parked = state.get("pending", []), state.get("parked", [])
+        pending = state.get("pending")
+        pending = [entry for entry in pending if isinstance(entry, dict)] if isinstance(pending, list) else []
+        parked = state.get("parked")
+        parked = [entry for entry in parked if isinstance(entry, dict)] if isinstance(parked, list) else []
         seen = state.get("seen")
         seen = seen if isinstance(seen, dict) else {}
         runs = state.get("runs")
         runs = runs if isinstance(runs, list) else []
         last = runs[-1] if runs and isinstance(runs[-1], dict) else {}
-        today = int(time.time()) - 86400
-        # ``seen`` is state as it was written: a record that is not an object, or whose ``at`` is not a time this
-        # process can render, is simply not "seen today" -- it must never take the page down or inflate the count.
-        today_seen = 0
-        for record in seen.values():
-            stamp = _epoch(record.get("at")) if isinstance(record, dict) else None
-            if stamp is not None and stamp >= today:
-                today_seen += 1
-        when = _when(last.get("at"))
+        now = int(clock())
+        queued = [_queue_time(entry) for entry in pending]
+        oldest = min((stamp for stamp in queued if stamp), default=0)
+        undated = sum(1 for stamp in queued if not stamp)
+        carry = state.get("carry")
+        carried = (
+            sum(len(items) for items in carry.values() if isinstance(items, list)) if isinstance(carry, dict) else 0
+        )
+        deferred_enrichment = _length(state.get("enrich_retry")) + _length(state.get("enrich_pending"))
+        health = state.get("source_health")
+        health = health if isinstance(health, dict) else {}
+        unhealthy = sum(
+            1
+            for source in runtime.cfg.sources
+            if _source_health_state(
+                health.get(str(source.get("id", ""))),
+                runtime.cfg.source_intervals.get(str(source.get("id", ""))),
+                now,
+            )
+            != "ok"
+        )
+        rows = inbox_rows(state, now=now, quiet_hours=runtime.cfg.quiet_hours)
+
+        def counted(filters: dict[str, str], *, start: int | None = None) -> int:
+            """How many inbox rows the same filters select, so a tile and its link cannot disagree."""
+            return sum(1 for row in rows if _matches_inbox(row, filters, start, None))
+
+        today = _day_text(now)
+        today_start = _day_start(today, "today")
+        delivered_today = counted({"state": "delivered"}, start=today_start)
+        deferred = len(pending) + len(parked) + carried
         code_text, code_tone = _exit_code(last.get("code"))
-        dot = {"ok": "dot dot-ok", "critical": "dot dot-bad"}.get(code_tone, "dot") if when else "dot"
-        exit_badge = _badge(code_text, code_tone)
+        when = _when(last.get("at"))
+        completed = _when(last.get("finished_at"))
+        successful = next(
+            (run for run in reversed(runs) if isinstance(run, dict) and _number(run.get("code"), -1) == 0),
+            None,
+        )
+        success_when = _when((successful or {}).get("finished_at")) or _when((successful or {}).get("at"))
+        attempted_text = esc(when) if when else "<span class='muted'>never</span>"
+        completed_text = esc(completed) if completed else "<span class='muted'>not recorded</span>"
+        success_text = esc(success_when) if success_when else "<span class='muted'>none recorded</span>"
+        if not when:
+            pass_line = "<p class='grow'><span class='dot'></span>No pass has completed yet.</p>"
+        elif code_tone == "ok" and deferred:
+            # Exit 0 says the pass finished, not that nothing is left: the two facts stay separate.
+            pass_line = (
+                f"<p class='grow'><span class='dot'></span>Last pass finished {esc(when)} with "
+                f"{deferred} item(s) still owed {_badge('deferred work', 'warning')}</p>"
+            )
+        elif code_tone == "ok":
+            pass_line = (
+                f"<p class='grow'><span class='dot dot-ok'></span>Last pass: {esc(when)} "
+                f"{_badge(code_text, code_tone)}</p>"
+            )
+        else:
+            pass_line = (
+                f"<p class='grow'><span class='dot dot-bad'></span>Last pass: {esc(when)} "
+                f"{_badge(code_text, code_tone)}</p>"
+            )
         body = (
             _stats(
                 [
-                    ("Pending", len(pending)),
-                    ("Parked", len(parked)),
-                    ("Seen in last 24h", today_seen),
-                    ("Total seen", len(seen)),
+                    (
+                        "Undelivered criticals",
+                        counted({"state": "open", "tag": "critical"}),
+                        "/inbox?state=open&tag=critical",
+                    ),
+                    ("Held by quiet hours", counted({"state": "held"}), "/inbox?state=held"),
+                    ("Parked", counted({"state": "parked"}), "/inbox?state=parked"),
+                    ("Awaiting classification", counted({"state": "carried"}), "/inbox?state=carried"),
                 ]
             )
             + _run_notice(result)
             + "<div class='pass'>"
-            f"<p class='grow'><span class='{dot}'></span>Last pass: {esc(when or 'never')}</p>"
-            f"<p class='muted small'>sent {esc(last.get('sent', 0))} · parked {esc(last.get('parked', 0))} · "
-            f"exit {exit_badge}</p>"
+            + pass_line
+            + f"<p class='muted small'>attempted {attempted_text} · completed {completed_text} · "
+            f"last success {success_text}</p>"
             f'<form method="post" action="/run">{csrf_field(request)}'
             "<button class='btn btn-primary'>Run a pass now</button></form>"
             "</div>"
+            + "<h2>Work owed</h2>"
+            + _facts(
+                [
+                    (
+                        "Queued advisories",
+                        f"{counted({'state': 'pending'})} <a class='small' href='/inbox?state=pending'>"
+                        "open the queue</a>",
+                    ),
+                    (
+                        # Not "the oldest message": one entry with no clock could be older than every dated one.
+                        "Oldest recorded queue time",
+                        f"{esc(_age_text(now - oldest))} ago ({esc(_when(oldest))})"
+                        if oldest
+                        else "<span class='muted'>no queued message has a recorded time</span>",
+                    ),
+                    (
+                        "Queued with no recorded time",
+                        f"{undated} (age unknown)" if undated else "<span class='muted'>none</span>",
+                    ),
+                    (
+                        "Deferred enrichment",
+                        f"{deferred_enrichment} item(s) awaiting a retry"
+                        if deferred_enrichment
+                        else "<span class='muted'>none</span>",
+                    ),
+                    (
+                        "Sources not healthy",
+                        f"{unhealthy} <a class='small' href='/sources?state=unhealthy'>review sources</a>"
+                        if unhealthy
+                        else "<span class='muted'>none</span>",
+                    ),
+                    (
+                        # A calendar day, so the count and its link agree exactly: the inbox turns ``since``
+                        # into that day's UTC midnight, and a rolling cutoff could not be expressed there.
+                        "Delivered today (UTC)",
+                        f"{delivered_today} <a class='small' "
+                        f"href='/inbox?state=delivered&amp;since={esc(today)}'>open the inbox</a>",
+                    ),
+                    ("Total identifiers", f"{len(seen)} <a class='small' href='/alerts'>open alerts</a>"),
+                ]
+            )
+            + "<p class='muted small'>Each count links to the filtered view it describes. Delivery is "
+            "transport, not remediation. A pass that exited 0 while work is outstanding says 'deferred "
+            "work', because finishing is not the same as having nothing left.</p>"
         )
         return page("Dashboard", body, active="/", actions=sign_out_form(request))
 
@@ -1835,9 +2529,131 @@ def create_app(
             )
         return page("Alerts", body, active="/alerts", actions=sign_out_form(request))
 
+    @app.get("/inbox", response_class=HTMLResponse)
+    def inbox(request: Request):
+        """Every advisory the state holds, in one work list: queue, held, carried, parked and history.
+
+        Filters live in the URL and pagination is keyset, so a reload or a shared link keeps both. Transport
+        state is shown apart from remediation: this version does not track whether a vulnerability was fixed,
+        so "accepted by a channel" is never rendered as a fix.
+        """
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        state = load_state()
+        filters = {key: (request.query_params.get(key) or "").strip() for key in INBOX_FILTERS}
+        since = _day_start(filters["since"], "since") if filters["since"] else None
+        until = _day_start(filters["until"], "until") + 86400 if filters["until"] else None
+        cursor = _cursor_decode(request.query_params["cursor"]) if request.query_params.get("cursor") else None
+        before = _cursor_decode(request.query_params["before"]) if request.query_params.get("before") else None
+        now = int(clock())
+        rows = inbox_rows(state, now=now, quiet_hours=runtime.cfg.quiet_hours)
+        # Only an identifier the advisory page can resolve is linked: a carried item's other ids have no
+        # record yet, and a link to a 404 is worse than the identifier as text.
+        detail_ids = {row["identifier"] for row in rows if row.get("detail")}
+        matched = [((row["at"], row["identifier"]), row) for row in rows if _matches_inbox(row, filters, since, until)]
+        window, previous, following = _alert_page(matched, cursor, before)
+
+        def link(**overrides: str) -> str:
+            """This page's filters plus one pagination position; empties never reach the URL."""
+            params = {key: value for key, value in filters.items() if value}
+            params.update({key: value for key, value in overrides.items() if value})
+            return "/inbox" + (f"?{urllib.parse.urlencode(sorted(params.items()))}" if params else "")
+
+        def option(value: str, current: str) -> str:
+            selected = " selected" if value == current else ""
+            return f"<option value='{esc(value)}'{selected}>{esc(value or 'any')}</option>"
+
+        filter_form = (
+            "<form class='toolbar' method='get' action='/inbox'>"
+            "<label>State<select name='state'>"
+            f"{''.join(option(value, filters['state']) for value in ('', 'open', *INBOX_STATES))}</select></label>"
+            f"<label>Tag<select name='tag'>{''.join(option(value, filters['tag']) for value in ('', *TAGS))}"
+            "</select></label>"
+            f"<label>Source id<input type='text' name='source' value='{esc(filters['source'])}'></label>"
+            f"<label>Text<input type='text' name='q' value='{esc(filters['q'])}'></label>"
+            f"<label>Since<input type='date' name='since' value='{esc(filters['since'])}'></label>"
+            f"<label>Until<input type='date' name='until' value='{esc(filters['until'])}'></label>"
+            "<div class='toolbar-actions'><button class='btn btn-primary'>Filter</button>"
+            "<a class='btn btn-quiet' href='/inbox'>Reset</a></div></form>"
+        )
+
+        def row_html(row: Mapping) -> str:
+            identifier = _field(row.get("identifier"))
+            state_name = _field(row.get("state")) or "unknown"
+            tag = _field(row.get("tag"))
+            title = _field(row.get("title"))
+            if row.get("detail"):
+                advisory = f"<a href='/advisories/{esc(_advisory_token(identifier))}'>{esc(identifier)}</a>"
+            else:
+                advisory = _external_link(row.get("link"), identifier) if row.get("link") else esc(identifier)
+            aliases = [alias for alias in row.get("aliases") or () if isinstance(alias, str)]
+            related = ""
+            if aliases:
+                shown = ", ".join(
+                    f"<a href='/advisories/{esc(_advisory_token(alias))}'>{esc(alias)}</a>"
+                    if alias in detail_ids
+                    else esc(alias)
+                    for alias in aliases
+                )
+                more_count = max(0, _number(row.get("alias_count"), 0) - len(aliases))
+                more = f" +{more_count}" if more_count else ""
+                related = f"<br><span class='muted small'>Related: {shown}{more}</span>"
+            also = _inbox_also(row)
+            sources = ", ".join(esc(source) for source in row.get("sources") or ()) or "<span class='muted'>—</span>"
+            age = (
+                f" <span class='muted small'>({_age_text(now - _number(row.get('at'), 0))})</span>"
+                if row.get("at")
+                else " <span class='muted small'>(age unknown)</span>"
+            )
+            title_cell = (
+                _external_link(row.get("link"), title)
+                if title and row.get("link")
+                else (esc(title) if title else "<span class='muted'>—</span>")
+            )
+            return (
+                f"<tr><td class='nowrap'>{advisory}{related}{also}</td>"
+                f"<td>{_badge(state_name, _inbox_tone(state_name))}<br>"
+                f"<span class='muted small'>{esc(_transport_text(row))}</span></td>"
+                f"<td>{_badge(tag, tag) if tag else "<span class='muted'>—</span>"}</td>"
+                f"<td class='mono small nowrap'>{sources}</td>"
+                f"<td>{title_cell}</td>"
+                f"<td class='muted small'>not tracked</td>"
+                f"<td class='muted nowrap'>{esc(_when(row.get('at')) or 'unknown')}{age}</td></tr>"
+            )
+
+        if window:
+            table = (
+                "<div class='scroll'><table><tr><th scope='col'>Advisory</th><th scope='col'>Transport</th>"
+                "<th scope='col'>Tag</th><th scope='col'>Sources</th><th scope='col'>Title</th>"
+                "<th scope='col'>Remediation</th><th scope='col'>Since (UTC)</th></tr>"
+                + "".join(row_html(row) for _, row in window)
+                + "</table></div>"
+            )
+        elif any(filters.values()):
+            table = _empty("No advisory matches these filters.", "<a href='/inbox'>Clear the filters</a>")
+        else:
+            table = _empty("No advisory is recorded yet: the first pass fills this queue.")
+        pager = []
+        if previous is not None:
+            pager.append(f"<a class='btn' href='{esc(link(before=_cursor_encode(*previous)))}'>← Newer</a>")
+        if following is not None:
+            pager.append(f"<a class='btn' href='{esc(link(cursor=_cursor_encode(*following)))}'>Older →</a>")
+        body = (
+            filter_form
+            + f"<p class='muted small'>{len(matched)} advisory record(s). One row per identifier: identifiers "
+            "named by the same message are listed as related, never merged, because the state records "
+            "co-occurrence rather than an alias map. Transport is delivery, not remediation: this version "
+            "does not track whether a vulnerability was fixed, so an accepted message never means safe.</p>" + table
+        )
+        if pager:
+            body += f"<nav class='pager' aria-label='Pages'>{''.join(pager)}</nav>"
+        elif cursor is not None or before is not None:
+            body += _empty(f"No records on this page. <a href='{esc(link())}'>Newest rows</a>.")
+        return page("Inbox", body, active="/inbox", actions=sign_out_form(request))
+
     @app.get("/advisories/{token}", response_class=HTMLResponse)
     def advisory_page(token: str, request: Request):
-        """One advisory, from the seen record first, then a pending message, then a parked one."""
+        """One advisory, from the message that owns the identifier (see ``core.owner_of``)."""
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         from . import core
@@ -1845,21 +2661,23 @@ def create_app(
         identifier = _advisory_identifier(token)
         state = load_state()
         events = core.delivery_events(state, identifier)
-        seen = state.get("seen")
-        if isinstance(seen, dict) and isinstance(seen.get(identifier), dict):
-            record = seen[identifier]
-            deliveries = state.get("deliveries")
-            reference = record.get("delivery")
-            snapshot = (
-                deliveries.get(reference) if isinstance(deliveries, dict) and isinstance(reference, str) else None
-            )
-            body = _seen_advisory(record, snapshot if isinstance(snapshot, dict) else None, events)
+        # The same ownership projection the inbox row was built from, read-only: a live owning message is
+        # the actionable fact (an escalation about an already-delivered CVE opens as the escalation, with the
+        # delivered history listed below it); otherwise the seen record is the identifier's history, and only
+        # then does the legacy claim rule decide between older entries.
+        owner = core.owner_of(state, identifier)
+        if owner is not None:
+            label, record = owner
+            if label == "seen":
+                deliveries = state.get("deliveries")
+                reference = record.get("delivery")
+                snapshot = (
+                    deliveries.get(reference) if isinstance(deliveries, dict) and isinstance(reference, str) else None
+                )
+                body = _seen_advisory(record, snapshot if isinstance(snapshot, dict) else None, events)
+            else:
+                body = _queued_advisory(label, record, events)
             return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
-        for label, queue in (("pending", state.get("pending")), ("parked", state.get("parked"))):
-            for entry in queue if isinstance(queue, list) else ():
-                if isinstance(entry, dict) and identifier in (entry.get("ids") or ()):
-                    body = _queued_advisory(label, entry)
-                    return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
         if events:
             # An Adobe bulletin is recorded only as its delivery event: it never had a seen record, so the
             # event list is the whole history and the page must not answer 404 after its queue entry left.
@@ -4123,6 +4941,8 @@ def create_app(
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         csrf = csrf_field(request)
+        wanted = (request.query_params.get("state") or "").strip()
+        now = int(clock())
         try:
             stored_health = load_state().get("source_health")
         except SourceError:
@@ -4137,11 +4957,18 @@ def create_app(
             kind = str(source.get("type", ""))
             origin = redacted_origin(source.get("url", ""), secret_values(runtime.cfg))
             badge = f" {_badge('added', 'neutral')}" if identifier in added_ids else ""
-            tone = (
-                "<span class='muted small'>not polled yet</span>"
-                if not record
-                else (_badge("ok", "ok") if record.get("ok") else _badge("failing", "critical"))
-            )
+            # The same read the dashboard counts with: a filter and the number that led here cannot disagree.
+            state = _source_health_state(record, runtime.cfg.source_intervals.get(identifier), now)
+            if wanted == "unhealthy" and state == "ok":
+                continue
+            if wanted and wanted != "unhealthy" and state != wanted:
+                continue
+            tone = {
+                "never": "<span class='muted small'>not polled yet</span>",
+                "failing": _badge("failing", "critical"),
+                "stale": _badge("stale", "warning"),
+                "ok": _badge("ok", "ok"),
+            }[state]
             error = pipeline.redact(str(record.get("error") or ""), secret_values(runtime.cfg))
             # 0 is the state's "never", not midnight 1970: a source that has not succeeded must say so.
             attempt = _when(record.get("at")) if record.get("at") else "never"
@@ -4164,7 +4991,24 @@ def create_app(
             "<th scope='col' class='narrow'>Items</th><th scope='col'>Last error</th>"
             f"<th scope='col' class='narrow'>Test</th></tr>{''.join(rows)}</table></div>"
             if rows
-            else _empty("No source is enabled.", "Add one on the configuration page.")
+            else (
+                _empty("No source matches this state.", "<a href='/sources'>Clear the filter</a>")
+                if wanted
+                else _empty("No source is enabled.", "Add one on the configuration page.")
+            )
+        )
+
+        def state_option(value: str) -> str:
+            selected = " selected" if value == wanted else ""
+            return f"<option value='{esc(value)}'{selected}>{esc(value or 'any')}</option>"
+
+        filter_form = (
+            "<form class='toolbar' method='get' action='/sources'>"
+            "<label>State<select name='state'>"
+            + "".join(state_option(value) for value in ("", "ok", "failing", "stale", "never", "unhealthy"))
+            + "</select></label>"
+            "<div class='toolbar-actions'><button class='btn btn-primary'>Filter</button>"
+            "<a class='btn btn-quiet' href='/sources'>Reset</a></div></form>"
         )
         catalogue_rows = []
         for spec in SOURCE_SPECS.values():
@@ -4177,10 +5021,11 @@ def create_app(
             )
         body = (
             "<div class='strip'><p class='muted small'>Every enabled source, when it last answered, and the error "
-            "it reported when it did not. A probe reads the source now and delivers nothing.</p>"
+            "it reported when it did not. A probe reads the source now and delivers nothing. A source is stale "
+            "when its last success is older than two fetch intervals: nothing is polling it.</p>"
             "<div class='row-actions'><a class='btn' href='/config'>Add or edit a source</a>"
             "<a class='btn' href='/watchlist'>Set the product scope</a></div></div>"
-            f"<h2>Configured sources</h2>{configured}"
+            f"{filter_form}<h2>Configured sources</h2>{configured}"
             "<h2>Built-in types</h2>"
             "<p class='muted'>Every built-in source type, its keys and an example. Required keys have no default.</p>"
             "<div class='scroll'><table><tr><th scope='col'>Kind</th><th scope='col'>Summary</th>"

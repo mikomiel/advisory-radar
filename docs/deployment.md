@@ -353,16 +353,26 @@ shows the latest of them under **Recent notifications**. The page never renders 
 delivered record does not retain it, while a pending or parked entry still carries its body
 in the queue until it leaves. The record is stored once per message and each identifier
 points at it, so a message naming thousands of identifiers does not multiply it.
+`/inbox` is the work list over the queue, quiet-window holds, carried work, the parked queue
+and the delivery history, with its own URL filters (`state`, `tag`, `source`, `q`, `since`,
+`until`) and the same keyset pagination. One row per identifier keeps every fact the state holds
+about it: the state and tag filters select one fact (so a co-named message cannot hide a parked
+critical), the other facts are listed under **Also**, related identifiers are shown rather than
+merged, and the page says remediation is not tracked.
 `/parked` releases or drops one message per row as well as
 the whole queue, and `/runs` filters by exit code and day; the state keeps only the last 200
-passes, so the page states that cap instead of paging.
+passes, so the page states that cap instead of paging. The dashboard above the queue counts
+undelivered criticals, quiet-window holds, parked and awaiting-classification work, each count
+linking to the filtered inbox view, and marks a pass that exited 0 with work outstanding as
+deferred work.
 
 The UI screenshots are written by an opt-in script, never by the application:
 `uv run --with playwright python scripts/capture_screenshots.py` (add
 `--output-dir` to write elsewhere) builds a demo configuration and state in a temporary
-directory, serves the app on `127.0.0.1` with a throwaway token and captures the five pages
-through the real login form. Playwright is not a project dependency; install the browser
-once with `uv run --with playwright playwright install chromium`. No CI job runs it.
+directory, serves the app on `127.0.0.1` with a throwaway token and captures the seven pages
+through the real login form (`dashboard`, `inbox`, `alerts`, `parked`, `config`,
+`watchlist` and `runs`). Playwright is not a project dependency; install the browser once with
+`uv run --with playwright playwright install chromium`. No CI job runs it.
 
 ## Multi-arch images
 

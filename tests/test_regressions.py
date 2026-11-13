@@ -3065,3 +3065,101 @@ def test_withdrawal_does_not_rewrite_delivered_history():
     assert [entry["tag"] for entry in state["pending"]] == ["warning"], (
         "the withdrawn advisory is not current critical evidence"
     )
+
+
+def test_a_suppressed_item_leaves_an_identifier_another_message_owns():
+    """Suppression must not record history for an identifier a queued message introduced."""
+    state = core.new_state()
+    state["pending"].append(
+        {
+            "kind": "new",
+            "queued_at": NOW,
+            "fresh": ["CVE-2026-1111"],
+            "tag": "critical",
+            "title": "queued",
+            "body": "",
+            "ids": ["CVE-2026-1111"],
+            "cves": ["CVE-2026-1111"],
+            "levels": {"CVE-2026-1111": "critical"},
+            "source": "s",
+            "link": "https://x.example",
+        }
+    )
+    item = core.Item(
+        "g1", "CVE-2026-1111 and CVE-2026-2222", "https://x.example/a", "n", NOW, ("CVE-2026-1111", "CVE-2026-2222")
+    )
+    verdict = core.Verdict("suppressed", (), "CVSS 2.0", "")
+    core._suppressed(state, ["CVE-2026-1111", "CVE-2026-2222"], verdict, item, {}, NOW, DEFAULT_THRESHOLDS)
+    assert "CVE-2026-1111" not in state["seen"], "the queued message owns it and will report it"
+    assert state["seen"]["CVE-2026-2222"]["outcome"] == "suppressed"
+
+
+def test_bootstrap_history_does_not_take_a_queued_identifier():
+    """Seeding an old item must not record an identifier a queued message owns, or its delivery event is lost."""
+    state = core.new_state()
+    state["pending"].append(
+        {
+            "kind": "new",
+            "queued_at": NOW,
+            "fresh": ["CVE-2026-1111"],
+            "tag": "warning",
+            "title": "WARNING: CVE-2026-1111 in widget",
+            "body": "",
+            "ids": ["CVE-2026-1111"],
+            "cves": ["CVE-2026-1111"],
+            "levels": {"CVE-2026-1111": "warning"},
+            "source": "s",
+            "link": "https://x.example",
+        }
+    )
+    old = core.Item(
+        "g1",
+        "CVE-2026-1111 and CVE-2026-2222",
+        "https://x.example/a",
+        "",
+        NOW - 40 * 86400,
+        ("CVE-2026-1111", "CVE-2026-2222"),
+    )
+    core.seed(state, [old], NOW)
+    assert "CVE-2026-1111" not in state["seen"], "the queued message owns it and will report it"
+    assert state["seen"]["CVE-2026-2222"]["outcome"] == "backlog"
+
+
+def test_settlement_is_idempotent_across_a_serialisation():
+    """Settling a state twice, with a save between, changes nothing: recorded ownership is never rewritten."""
+    state = core.new_state()
+    state["parked"].append(
+        {
+            "kind": "new",
+            "queued_at": NOW - 7200,
+            "tag": "critical",
+            "title": "legacy owner",
+            "body": "",
+            "ids": ["CVE-2026-3333"],
+            "cves": ["CVE-2026-3333"],
+            "levels": {"CVE-2026-3333": "critical"},
+            "source": "s",
+            "link": "https://x.example",
+        }
+    )
+    state["pending"].append(
+        {
+            "kind": "new",
+            "queued_at": NOW - 3600,
+            "fresh": ["CVE-2026-4444"],
+            "tag": "warning",
+            "title": "modern mention",
+            "body": "",
+            "ids": ["CVE-2026-3333", "CVE-2026-4444"],
+            "cves": ["CVE-2026-4444"],
+            "levels": {"CVE-2026-4444": "warning"},
+            "source": "s",
+            "link": "https://x.example",
+        }
+    )
+    core._ensure_ownership(state)
+    once = json.dumps(state, sort_keys=True)
+    # A save and a load are a JSON round trip: settlement must produce the same state on the other side.
+    reloaded = json.loads(once)
+    core._ensure_ownership(reloaded)
+    assert json.dumps(reloaded, sort_keys=True) == once

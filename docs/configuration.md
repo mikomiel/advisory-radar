@@ -281,6 +281,46 @@ busy or failed request is not read as the previous successful pass. The result t
 signed token that expires after two minutes and is bound to the signed-in session, so a
 missing, stale or other-session token renders no notice.
 
+`/inbox` is the work list across the whole lifecycle. Its rows are one per identifier, and
+each row keeps every fact the state holds about it — a parked message, a queued one, carried
+work, an earlier delivery, an event — with the most actionable fact shown and the rest listed
+under **Also**. Ownership is recorded, not inferred: when a message is queued it records the
+identifiers it introduced, and that list never changes, so delivery, parking or release cannot
+move an identifier to a message that arrived in between. A later message that names it again
+is a mention — context that never replaces its own state or severity, so a new feed item cannot
+hide a parked critical or requeue a delivered GHSA. A suppressed message does not record an
+identifier another message owns, so it cannot hide queued work. An escalation or an Adobe
+bulletin is about everything it names and always counts as work, even when the identifier
+already has history. An entry written before that record is settled with the same earliest-claim
+rule on the next pass, before it can be delivered or dropped. `/advisories/<id>` opens the message that owns the identifier — a parked or queued
+owner before a mention — so the detail page matches the row it was opened from, and a live
+escalation shows the delivery that preceded it below. Each row's severity is the level recorded for that identifier,
+falling back to the message's tag when it has none, so a multi-CVE message with mixed levels
+does not label every row with its strongest one. The same rule decides what a delivery event
+delivered (only the identifiers its seen records point at; an escalation or bulletin is about
+all it names) and whether a carried item is new work (one naming only already-classified
+identifiers adds context instead of promoting them back into the queue). `state` accepts `open` — everything the queue still
+owes: pending, held, carried and parked — or exactly one of pending, held, carried, parked,
+delivered, dropped, filtered, suppressed, backlog, alias, not-security and notified. The state
+and tag filters select one fact and must select the same one; a row matches when some recorded
+fact does. `pending` matches every unsent fact, the ones the quiet window holds included;
+`held` narrows to those. `source` (a configured source id the row's messages named), `q` and the
+inclusive UTC `since`/`until` days behave as on `/alerts`, with the same 50-row keyset
+pagination; a date range matches a fact whose stored time this process can render, and an
+unrepresentable one is neither recent nor an error. Identifiers that one message named are
+listed as related, never merged into one row: the state records co-occurrence, not an alias
+map, and merging a multi-CVE bulletin would lose each advisory's own evidence. The
+**Remediation** column says `not tracked`: this version does not record whether a vulnerability
+was fixed, so transport is never presented as remediation.
+
+The dashboard counts undelivered criticals, quiet-window holds, parked and
+awaiting-classification advisories above the last pass with the same reader and predicate the
+inbox uses, so each tile shows exactly the number of rows its link renders. The work-owed block
+reports the oldest recorded queue time (and separately how many entries have no recorded time),
+deferred enrichment, unhealthy sources and deliveries since UTC midnight, whose link carries
+that same day; a pass that exited 0 while work remains says **deferred work** instead of
+reading as complete.
+
 Every accepted or dropped message is also kept as a delivery event with its own time,
 outcome and accepted destinations. A later escalation adds an event beside the first-seen
 record instead of rewriting it; an Adobe bulletin never becomes a first-seen record, so its

@@ -16,6 +16,16 @@ turns critical, and never re-sends what you already received.
 - Severity decision per CVE with re-evaluation window and one escalation per level; the
   thresholds are configurable on `/config` globally or per source, and `/thresholds` previews
   what one advisory would be judged as and where its message would go
+- A dashboard of what needs attention — undelivered criticals, quiet-window holds, parked
+  advisories, awaiting classification, oldest recorded queue age, failing or stale sources and
+  deferred enrichment — counting with the same reader and predicate as the inbox, so every
+  count equals the rows its link renders; the last attempted, completed and successful pass are
+  kept apart, and a pass that exited 0 with work outstanding is marked deferred work
+- One `/inbox` work list over the queue, quiet-window holds, carried work, the parked queue and
+  the delivery history, with URL filters and keyset pagination; each identifier keeps its own
+  facts, a co-named message is context rather than a replacement, related identifiers are shown
+  rather than merged, and transport state is kept apart from remediation, which this version
+  does not track
 - Filterable `/alerts` and `/runs` lists with their state in the URL, keyset pagination for
   the alert history, and a per-advisory page (`/advisories/<id>`) showing the stored
   classification, delivery record and later notification events. The source filter matches the
