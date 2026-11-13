@@ -855,15 +855,22 @@ def test_a_read_only_exclusion_list_cannot_be_replaced_through_its_hidden_field(
 
 
 def test_a_document_nested_too_deeply_is_reported_and_not_saved_over(tmp_path):
-    """A hand edit can leave a document the decoder gives up on: the page and a save must say so, not crash."""
+    """A hand edit can leave a document past the interpreter's decode or validation limit.
+
+    The decoder's message and nesting threshold are not the contract: 3.13 refuses this depth while a newer
+    decoder accepts it and the schema check refuses the document. Both render the unreadable-document page with
+    no editor, and a save leaves the file byte-for-byte unchanged.
+    """
     watch = tmp_path / "scope.json"
-    watch.write_text("[" * 10_000 + "]" * 10_000)
-    before = watch.read_text()
+    payload = "[" * 10_000 + "]" * 10_000
+    watch.write_text(payload)
+    before = watch.read_bytes()
     client, _ = make_client(tmp_path, watch)
     sign_in(client)
     page = client.get("/watchlist")
     assert page.status_code == 200
-    assert "cannot be read" in page.text and "name='fingerprint'" not in page.text
+    assert "The scope cannot be read" in page.text
+    assert "name='fingerprint'" not in page.text
     csrf = CSRF_RE.search(client.get("/").text).group(1)
     response = client.post(
         "/watchlist",
@@ -878,8 +885,8 @@ def test_a_document_nested_too_deeply_is_reported_and_not_saved_over(tmp_path):
         },
     )
     assert response.status_code == 200
-    assert "cannot be read" in response.text
-    assert watch.read_text() == before
+    assert "Not saved" in response.text
+    assert watch.read_bytes() == before
 
 
 def test_a_scope_path_that_is_a_directory_root_is_refused_not_a_crash(tmp_path):

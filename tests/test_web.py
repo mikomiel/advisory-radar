@@ -1493,10 +1493,23 @@ def test_the_native_webhook_guid_fingerprint_is_pinned(tmp_path):
 
 
 def test_a_deeply_nested_webhook_payload_is_refused_without_state(tmp_path):
-    """#75: a few thousand nested arrays defeat ``json.loads`` with a RecursionError, which is a client error."""
+    """#75 #84: a hostile nesting depth is a client error on every supported interpreter, and writes nothing.
+
+    The contract is the class of outcome, not the decoder: 3.13 raises RecursionError at this depth while a
+    newer decoder accepts the list and the object check refuses it. Both are a 400.
+    """
     response = post_webhook(tmp_path, content=b"[" * 10000 + b"]" * 10000)
     assert response.status_code == 400
-    assert "nested" in response.json()["error"]
+    assert "error" in response.json()
+    assert not (tmp_path / "state.json").exists()
+
+
+@pytest.mark.parametrize("payload", [None, [], "text", 7, True])
+def test_a_json_body_that_is_not_an_object_is_refused(tmp_path, payload):
+    """#84: the documented contract is a JSON object; a list, string, number or null is a 400, not a 422."""
+    response = post_webhook(tmp_path, payload)
+    assert response.status_code == 400
+    assert response.json() == {"error": "payload must be a JSON object"}
     assert not (tmp_path / "state.json").exists()
 
 

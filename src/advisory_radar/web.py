@@ -4098,12 +4098,15 @@ def create_app(
         try:
             payload = json.loads(text)
         except RecursionError:
-            # A few thousand nested arrays defeat the decoder with a tiny body; that is a refused request,
-            # not a server fault. ``http.parse_json`` guards the same failure, but its None answer cannot be
-            # told apart from a literal ``null``, which this route maps to a different status below.
+            # A few thousand nested arrays defeat some decoders with a tiny body; that is a refused request,
+            # not a server fault. An interpreter that accepts the depth refuses it with the object check below.
             return JSONResponse({"error": "payload is nested too deeply"}, status_code=400)
         except ValueError:
             return JSONResponse({"error": "payload is not JSON"}, status_code=400)
+        if not isinstance(payload, dict):
+            # The documented contract is a JSON object: a list, string, number or null is a refused request, not
+            # a mapped object missing its title. This also makes a deeply nested body a deterministic 400.
+            return JSONResponse({"error": "payload must be a JSON object"}, status_code=400)
         try:
             entry = webhook_item_from_payload(payload)
         except WebhookIdsUnsupported:
