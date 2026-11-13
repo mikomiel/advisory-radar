@@ -74,6 +74,8 @@ jobs:
           curl -fsS http://127.0.0.1:18080/healthz
           # the state file must be writable by the container user
           docker exec radar-ci python -c "import pathlib; pathlib.Path('/data/probe').write_text('x')"
+          # the runtime image carries the optional PostgreSQL driver, as the non-root user that runs it
+          docker exec radar-ci python -c "import psycopg; print(psycopg.__version__)"
           docker logs radar-ci | tail -20
           docker rm -f radar-ci
 
