@@ -18,6 +18,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The secret scan below proves and scans the event's whole commit range. The default
+          # one-commit merge checkout would hide a secret added and removed earlier in the branch.
+          fetch-depth: 0
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
         with:
@@ -80,18 +84,154 @@ jobs:
           docker rm -f radar-ci
 
       - name: Secret scan
-        # pinned binary + reviewed digest: the v2 action fails on stderr noise and needs a token for PR scans
+        # pinned binary + reviewed digest: the v2 action fails on stderr noise and needs a token for PR scans.
+        # The range is proved before the scan: a green result over a clone that cannot see the range is no result.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
-          set -e
+          set -euo pipefail
           curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz" -o /tmp/gitleaks.tgz
           echo "9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c  /tmp/gitleaks.tgz" | sha256sum -c -
           tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          config="$PWD/.gitleaks.toml"
+          if [ ! -f "$config" ]; then echo "::error::.gitleaks.toml is missing from the checkout"; exit 1; fi
+
+          head=$(git rev-parse HEAD)
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE_SHA"
+            if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+              echo "::error::pull request base $base is not in the checkout; the full-history fetch did not provide the intended range"
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$base" "$head"; then
+              echo "::error::pull request base $base is not an ancestor of $head; the intended range cannot be proved"
+              exit 1
+            fi
+            range="$base..$head"
+          elif [ "$EVENT_NAME" = "push" ]; then
+            base="$PUSH_BEFORE_SHA"
+            if [ "$base" = "0000000000000000000000000000000000000000" ]; then
+              range="--all"
+            else
+              if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+                echo "::error::push base $base is not in the checkout; refusing to fall back to a smaller scan"
+                exit 1
+              fi
+              if ! git merge-base --is-ancestor "$base" "$head"; then
+                echo "::error::push base $base is not an ancestor of $head; the intended range cannot be proved"
+                exit 1
+              fi
+              range="$base..$head"
+            fi
+          else
+            range="--all"
+          fi
+
+          if [ "$range" = "--all" ]; then
+            count=$(git rev-list --count --all)
+          else
+            count=$(git rev-list --count "$range")
+          fi
+          if [ "$count" -eq 0 ]; then
+            echo "::error::the intended commit range $range is empty; refusing to report a scan that covers nothing"
+            exit 1
+          fi
+          echo "secret scan range: $range ($count commits)"
+
+          # Self-test in a throwaway repository: an invented token is added in one commit and removed in
+          # the next, so the working tree is clean and only history can reveal it. The scanner must exit 1.
+          fixture=$(mktemp -d)
+          near_miss=$(mktemp -d)
+          example_repo=$(mktemp -d)
+          trap 'rm -rf "$fixture" "$near_miss" "$example_repo"' EXIT
+          git -C "$fixture" init -q
+          git -C "$fixture" config user.email "ci@example.invalid"
+          git -C "$fixture" config user.name "advisory-radar secret scan self-test"
+          token="ghp_$(printf '%s' 'advisory-radar secret-scan self-test' | sha256sum | cut -c1-36)"
+          printf 'token: %s\n' "$token" > "$fixture/leak.txt"
+          git -C "$fixture" add leak.txt
+          git -C "$fixture" commit -q -m "self-test: add synthetic secret"
+          git -C "$fixture" rm -q leak.txt
+          git -C "$fixture" commit -q -m "self-test: remove synthetic secret"
           set +e
-          /tmp/gitleaks git --config .gitleaks.toml --redact --report-format json --report-path /tmp/gitleaks-report.json . 2>/tmp/gitleaks-stderr.log
+          (cd "$fixture" && /tmp/gitleaks git --config "$config" --redact --log-opts=--all .) >/dev/null 2>"$fixture/gitleaks.log"
+          self_code=$?
+          set -e
+          if [ "$self_code" -ne 1 ]; then
+            echo "::error::secret scan self-test exited $self_code, expected 1: gitleaks did not see the commit that removed the secret, so a history scan could not prove the range secret-free"
+            cat "$fixture/gitleaks.log"
+            exit 1
+          fi
+          echo "secret scan self-test: the commit that removed the secret was detected"
+
+          # The two fixture exceptions in .gitleaks.toml are anchored to the whole secret. A longer token
+          # that merely contains one of those literals must still be reported: an unanchored exception would
+          # silently hide a real credential, and the first self-test could not tell the difference.
+          long_token="ghp_AbCdEf123456$(printf '%s' 'allowlist-anchor self-test' | sha256sum | cut -c1-24)"
+          git -C "$near_miss" init -q
+          git -C "$near_miss" config user.email "ci@example.invalid"
+          git -C "$near_miss" config user.name "advisory-radar secret scan self-test"
+          printf 'token: %s\n' "$long_token" > "$near_miss/leak.txt"
+          git -C "$near_miss" add leak.txt
+          git -C "$near_miss" commit -q -m "self-test: add a token containing an allowlisted literal"
+          git -C "$near_miss" rm -q leak.txt
+          git -C "$near_miss" commit -q -m "self-test: remove it again"
+          set +e
+          (cd "$near_miss" && /tmp/gitleaks git --config "$config" --redact --log-opts=--all .) >/dev/null 2>"$near_miss/gitleaks.log"
+          near_code=$?
+          set -e
+          if [ "$near_code" -ne 1 ]; then
+            echo "::error::secret scan self-test exited $near_code, expected 1: an allowlist exception matched inside a longer token, so a real credential containing a fixture value could be hidden"
+            cat "$near_miss/gitleaks.log"
+            exit 1
+          fi
+          echo "secret scan self-test: a longer token containing an allowlisted literal is still detected"
+
+          # No path is exempt: the same invented token inside a README and an example config must each be
+          # reported. Both findings are required from one scan, so an exemption for either path cannot hide
+          # behind the other one still being detected.
+          git -C "$example_repo" init -q
+          git -C "$example_repo" config user.email "ci@example.invalid"
+          git -C "$example_repo" config user.name "advisory-radar secret scan self-test"
+          mkdir -p "$example_repo/examples"
+          printf 'token: %s\n' "$token" > "$example_repo/README.md"
+          printf 'secret: %s\n' "$token" > "$example_repo/examples/config.yml"
+          git -C "$example_repo" add README.md examples/config.yml
+          git -C "$example_repo" commit -q -m "self-test: add a token in documentation and an example"
+          git -C "$example_repo" rm -q README.md examples/config.yml
+          git -C "$example_repo" commit -q -m "self-test: remove it again"
+          set +e
+          (cd "$example_repo" && /tmp/gitleaks git --config "$config" --redact --report-format json --report-path "$example_repo/report.json" --log-opts=--all .) >/dev/null 2>"$example_repo/gitleaks.log"
+          path_code=$?
+          set -e
+          if [ "$path_code" -ne 1 ]; then
+            echo "::error::secret scan self-test exited $path_code, expected 1: a path exemption hid a token in README.md or examples/, so a real credential there would be missed"
+            cat "$example_repo/gitleaks.log"
+            exit 1
+          fi
+          if ! python3 - "$example_repo/report.json" <<'PYREPORT'
+          import json
+          import sys
+
+          paths = {finding["File"] for finding in json.load(open(sys.argv[1], encoding="utf-8"))}
+          missing = {"README.md", "examples/config.yml"} - paths
+          sys.exit(1 if missing else 0)
+          PYREPORT
+          then
+            echo "::error::the path self-test did not report a finding for both README.md and examples/config.yml"
+            exit 1
+          fi
+          echo "secret scan self-test: a token in README.md and examples/ is detected in both"
+
+          set +e
+          /tmp/gitleaks git --config "$config" --redact --report-format json --report-path /tmp/gitleaks-report.json --log-opts="$range" . 2>/tmp/gitleaks-stderr.log
           code=$?
           set -e
-          if [ "$code" -eq 1 ]; then echo "::error::leaks found"; cat /tmp/gitleaks-report.json; exit 1; fi
+          if [ "$code" -eq 1 ]; then echo "::error::leaks found in $range"; cat /tmp/gitleaks-report.json; exit 1; fi
           if [ "$code" -ne 0 ]; then echo "::error::gitleaks exited $code"; cat /tmp/gitleaks-stderr.log; exit "$code"; fi
+          echo "secret scan clean over $range ($count commits)"
 
   py314:
     name: py314

@@ -43,9 +43,14 @@ uv run pytest -q
 uv run python scripts/check_no_estate_identifiers.py   # CI guard, must pass
 ```
 
-CI additionally runs a secret scan (gitleaks). Never commit secrets, tokens,
-webhook URLs, internal hostnames or IPs — the CI guard and the secret scan
-both fail the build on them.
+CI additionally runs a secret scan (gitleaks) over the **complete intended commit range**: the
+checkout fetches full history and the job proves the event's `base..head` range (or `--all` for a
+new branch) before it scans, so a secret added and removed earlier in the branch is still
+detected. That is **post-push detection, not a substitute for pre-push prevention**: once a
+secret is pushed it is already exposed and must be revoked. Never commit secrets, tokens, webhook
+URLs, internal hostnames or IPs, and scan your branch locally before pushing — for example
+`gitleaks git --config .gitleaks.toml --log-opts="origin/main..HEAD" .`. The CI guard and the
+secret scan both fail the build on what they find.
 
 ## Review automation
 

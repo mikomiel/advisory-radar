@@ -157,3 +157,22 @@ The reviewer is the Gandalf GitHub App, which posts its review through the
 review, it does not write one. Contributors can of course review each other, and a
 maintainer's approval satisfies the gate on a contributor's pull request; the point is
 that no human has to click merge.
+
+## Secret scan
+
+The `ci` job scans with a pinned gitleaks binary. It checks out with `fetch-depth: 0` and proves
+the event's complete commit range before the scanner runs: `base..head` for a pull request,
+`before..HEAD` for a push, and `--all` for a new branch or any other event. A missing base
+commit, a base that is not an ancestor of the head, or an empty range fails the job — it never
+falls back to a smaller scan, and it prints the range and its commit count. Before the real
+scan, a self-test in a throwaway repository adds a synthetic token in one commit and removes it
+in the next; the job fails unless the scanner finds it, so a scanner that cannot see history
+cannot report a clean range.
+
+What a green scan means, exactly: **post-push detection**. The commits are already on the remote
+when `ci` runs, so the result says the proven range contained no secret the scanner detects. It
+is not prevention: once a secret is pushed it is exposed, and a later commit that deletes it
+does not undo the exposure — the credential must be revoked. Prevention is pre-push and belongs
+to the contributor: never commit a secret, and scan locally before pushing. This policy alleges
+no historical leak; it closes the gap between what the job claimed to cover and what a
+one-commit checkout could see.
