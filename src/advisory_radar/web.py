@@ -689,10 +689,10 @@ def _source_health_state(record: object, interval: object, now: int) -> str:
 _INBOX_FACT_RANK = {"parked": 0, "pending": 1, "held": 1, "carried": 2}
 #: The event outcomes that are a transport result in their own right; anything else is an event notice only.
 _EVENT_STATES = ("delivered", "dropped")
-#: The event kinds that are about every identifier they name: an escalation is one CVE and a bulletin is its
-#: own list. A ``new`` event names everything its message mentioned, so only its seen records say what it
-#: actually delivered.
-_WHOLE_EVENT_KINDS = ("escalation", "adobe", "adobe-kev")
+#: The message kinds that are about every identifier they name: an escalation is one CVE and a bulletin is
+#: its own id. A ``new`` message names everything its text mentioned, so its claim decides ownership. The
+#: same rule applies to delivery events, where a ``new`` event is the message rather than its judgement.
+_WHOLE_KINDS = ("escalation", "adobe", "adobe-kev")
 #: No claim time sorts last: an entry with no recorded time is not assumed to be the oldest.
 _UNKNOWN_CLAIM = 1 << 62
 
@@ -767,12 +767,9 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         if isinstance(identifier, str) and isinstance(record, dict):
             claim((identifier,), kind=0, at=record.get("at"), index=0)
     for index, entry in enumerate(parked):
-        claim(
-            _stored_strings(entry.get("ids")),
-            kind=1,
-            at=_number(entry.get("parked_at"), 0) or _queue_time(entry),
-            index=index,
-        )
+        # The claim time is when the message was queued, not when it parked: parking is a later transport
+        # state and must not hand the identifier to a message that arrived in between.
+        claim(_stored_strings(entry.get("ids")), kind=1, at=_queue_time(entry), index=index)
     for index, entry in enumerate(pending):
         claim(_stored_strings(entry.get("ids")), kind=2, at=_queue_time(entry), index=index)
 
@@ -832,11 +829,13 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         row = rows.get(identifier)
         if row is None:
             return
+        if fact["source"]:
+            row["sources"] = tuple(sorted({*row["sources"], fact["source"]}))
         fact = {**fact, "mention": True}
         if all(existing["origin"] != fact["origin"] for existing in row["facts"]):
             row["facts"].append(fact)
 
-    def owned(entry: Mapping, identifier: str, *, kind: int, index: int, at: int) -> bool:
+    def owned(identifier: str, *, kind: int, index: int, at: int) -> bool:
         """Whether this message is the one that owns the identifier, by the claim order above."""
         stamp = at if at > 0 else _UNKNOWN_CLAIM
         return claim_order.get(identifier) == (stamp, kind, index)
@@ -845,6 +844,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         identifiers = list(dict.fromkeys(_stored_strings(entry.get("ids"))))
         held = delivery.is_held(now, entry, quiet_hours)
         at = _queue_time(entry)
+        whole = entry.get("kind") in _WHOLE_KINDS
         source_id = entry.get("source_id") if isinstance(entry.get("source_id"), str) else ""
         for identifier in identifiers:
             fact = make(
@@ -857,14 +857,16 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
                 source=source_id,
                 aliases=tuple(other for other in identifiers if other != identifier),
             )
-            if owned(entry, identifier, kind=2, index=index, at=at):
+            if whole or owned(identifier, kind=2, index=index, at=at):
                 own(identifier, fact)
             else:
                 mentions.append((identifier, fact))
 
     for index, entry in enumerate(parked):
         identifiers = list(dict.fromkeys(_stored_strings(entry.get("ids"))))
-        at = _number(entry.get("parked_at"), 0) or _queue_time(entry)
+        claim_at = _queue_time(entry)
+        at = _number(entry.get("parked_at"), 0) or claim_at
+        whole = entry.get("kind") in _WHOLE_KINDS
         source_id = entry.get("source_id") if isinstance(entry.get("source_id"), str) else ""
         for identifier in identifiers:
             fact = make(
@@ -877,7 +879,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
                 source=source_id,
                 aliases=tuple(other for other in identifiers if other != identifier),
             )
-            if owned(entry, identifier, kind=1, index=index, at=at):
+            if whole or owned(identifier, kind=1, index=index, at=claim_at):
                 own(identifier, fact)
             else:
                 mentions.append((identifier, fact))
@@ -893,19 +895,23 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
             snapshot = record
         identifiers = _stored_strings(snapshot.get("ids"))
         outcome = record.get("outcome")
-        own(
-            identifier,
-            make(
-                state=outcome if isinstance(outcome, str) and outcome else "recorded",
-                at=record.get("at"),
-                origin=f"seen:{identifier}",
-                tag=_identifier_tag(snapshot, identifier),
-                title=snapshot.get("title"),
-                link=snapshot.get("link"),
-                source=snapshot.get("source_id") if isinstance(snapshot.get("source_id"), str) else "",
-                aliases=tuple(other for other in identifiers if other != identifier),
-            ),
+        at = _number(record.get("at"), 0)
+        fact = make(
+            state=outcome if isinstance(outcome, str) and outcome else "recorded",
+            at=at,
+            origin=f"seen:{identifier}",
+            tag=_identifier_tag(snapshot, identifier),
+            title=snapshot.get("title"),
+            link=snapshot.get("link"),
+            source=snapshot.get("source_id") if isinstance(snapshot.get("source_id"), str) else "",
+            aliases=tuple(other for other in identifiers if other != identifier),
         )
+        # A suppression can record an identifier another message already owns; then it is history about
+        # that identifier, not its current state, and belongs under "Also" rather than in a filtered view.
+        if owned(identifier, kind=0, index=0, at=at):
+            own(identifier, fact)
+        else:
+            mentions.append((identifier, fact))
 
     for event_id, event in deliveries.items():
         if not isinstance(event_id, str) or not isinstance(event, dict):
@@ -921,7 +927,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         kind = event.get("kind")
         # A bulletin and an escalation are about everything they name. A ``new`` event is the message, not its
         # judgement: only the seen records that point at it say which identifiers it actually delivered.
-        whole = kind in _WHOLE_EVENT_KINDS or not pointed
+        whole = kind in _WHOLE_KINDS or not pointed
         outcome = event.get("outcome")
         state_name = outcome if isinstance(outcome, str) and outcome in _EVENT_STATES else "notified"
         source_id = event.get("source_id") if isinstance(event.get("source_id"), str) else ""

@@ -287,7 +287,8 @@ work, an earlier delivery, an event — with the most actionable fact shown and 
 under **Also**. Ownership is the first claim: the state record or message that first named an
 identifier owns it, and a later message that names it again is a mention — context that never
 replaces its own state or severity, so a new feed item cannot hide a parked critical or
-requeue a delivered GHSA. Each row's severity is the level recorded for that identifier,
+requeue a delivered GHSA. An escalation or an Adobe bulletin is about everything it names and
+always counts as work, even when the identifier already has history. Each row's severity is the level recorded for that identifier,
 falling back to the message's tag when it has none, so a multi-CVE message with mixed levels
 does not label every row with its strongest one. The same rule decides what a delivery event
 delivered (only the identifiers its seen records point at; an escalation or bulletin is about
