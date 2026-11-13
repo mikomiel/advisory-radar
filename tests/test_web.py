@@ -43,6 +43,7 @@ def make_app_client(
     token: str = "secret-token",
     clock: float | None = None,
     environment: dict[str, str] | None = None,
+    run_pass=None,
 ):
     """A signed-out client, its token and the runtime the app serves."""
     cfg_path = tmp_path / "config.yml"
@@ -66,7 +67,7 @@ def make_app_client(
     )
     state.setdefault("runs", []).append({"at": 1792600000, "sent": 1, "parked": 0, "pending": 1, "code": 0})
     save_state(runtime.cfg.state_path, state)
-    app = create_app(runtime, env, clock=(lambda: clock) if clock else time.time)
+    app = create_app(runtime, env, clock=(lambda: clock) if clock else time.time, run_pass=run_pass)
     return TestClient(app), token, runtime
 
 
@@ -274,6 +275,50 @@ def test_a_state_changing_post_needs_the_form_token(tmp_path):
     # a non-browser caller may carry the token in a header instead
     header = client.post("/parked/release", headers={"x-csrf-token": csrf}, follow_redirects=False)
     assert header.status_code == 303
+
+
+def run_result_page(tmp_path: Path, code: int) -> str:
+    """Submit the real Run a pass now form for an injected result and return the page its redirect lands on."""
+    client, token, _ = make_app_client(tmp_path, run_pass=lambda **_: code)
+    csrf = signed_in(client, token)
+    response = client.post("/run", data={"csrf": csrf}, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == f"/?ran={code}"
+    return client.get(response.headers["location"]).text
+
+
+@pytest.mark.parametrize(
+    ("code", "text", "tone"),
+    [
+        (0, "Pass finished.", "notice-ok"),
+        (1, "The pass failed.", "notice-critical"),
+        (2, "A pass is already running. Nothing was sent and nothing was changed.", "notice-warning"),
+        (-1, "Running a pass is not available in this process.", "notice-warning"),
+    ],
+)
+def test_run_now_reports_what_this_request_did(tmp_path, code, text, tone):
+    page = run_result_page(tmp_path, code)
+    assert text in page
+    assert tone in page
+    # The notice names this request and sits above the stored last pass, which is a different fact.
+    assert "This request:" in page
+    assert page.index("This request:") < page.index("Last pass:")
+    assert ("Open Run history" in page) == (code in (0, 1))
+
+
+def test_a_busy_run_is_not_a_failed_run(tmp_path):
+    busy = run_result_page(tmp_path, 2)
+    failed = run_result_page(tmp_path, 1)
+    assert "A pass is already running" in busy and "The pass failed" not in busy
+    assert "The pass failed" in failed and "A pass is already running" not in failed
+
+
+def test_an_unknown_run_code_renders_no_notice_and_is_not_echoed(tmp_path):
+    client, token, _ = make_app_client(tmp_path)
+    signed_in(client, token)
+    for ran in ("3", "not-a-code", ""):
+        assert "This request:" not in client.get("/", params={"ran": ran}).text, ran
+    assert "not-a-code" not in client.get("/", params={"ran": "not-a-code"}).text
 
 
 def test_a_form_token_from_another_session_is_refused(tmp_path):

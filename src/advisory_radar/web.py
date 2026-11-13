@@ -233,6 +233,28 @@ _NAV = (
     ("/runs", "Runs"),
 )
 
+#: What ``POST /run`` may report through the ``/?ran=<code>`` redirect it lands on. Only these codes are
+#: rendered; anything else in the query string is ignored rather than echoed. The notice is about the request
+#: just made, not about the stored last pass, so a failed or skipped request cannot read as an old success.
+#: A fault before the pass starts (an unreadable store, an unreadable watchlist) returns 1 without writing a
+#: run record, hence the conditional: the newest entry is this pass only when it got far enough to record one.
+_RUN_NOTICES = {
+    "0": ("ok", "Pass finished. <a href='/runs'>Open Run history</a>."),
+    "1": (
+        "critical",
+        "The pass failed. Its result is the newest entry in Run history when the pass recorded one. "
+        "<a href='/runs'>Open Run history</a>.",
+    ),
+    "2": ("warning", "A pass is already running. Nothing was sent and nothing was changed."),
+    "-1": ("warning", "Running a pass is not available in this process."),
+}
+
+
+def _run_notice(ran: str | None) -> str:
+    """The result of the Run a pass now request this page was redirected from, or nothing for no/unknown code."""
+    notice = _RUN_NOTICES.get(ran or "")
+    return _notice(f"<strong>This request:</strong> {notice[1]}", notice[0]) if notice else ""
+
 
 def _response_text(value: str) -> str:
     """``value`` made UTF-8 encodable: one legacy surrogate in state must not fail the whole page."""
@@ -1478,6 +1500,7 @@ def create_app(
                     ("Total seen", len(seen)),
                 ]
             )
+            + _run_notice(request.query_params.get("ran"))
             + "<div class='pass'>"
             f"<p class='grow'><span class='{dot}'></span>Last pass: {esc(when or 'never')}</p>"
             f"<p class='muted small'>sent {esc(last.get('sent', 0))} · parked {esc(last.get('parked', 0))} · "
