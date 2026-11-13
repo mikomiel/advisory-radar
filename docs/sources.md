@@ -120,13 +120,14 @@ the item's identifiers, so a CVE declared only in `ids` receives the same
 enrichment, scoring and ID routing as one written in the text.
 
 The endpoint refuses, with a `{"error": ...}` body and before it reads or writes
-the state document: a body that is not UTF-8 JSON (400); a body that is not a
-JSON object -- a list, string, number or `null`, including one nested deeply
-enough to exhaust the decoder (400); a text field carrying an unpaired
-surrogate, which cannot be encoded for the default-guid hash (400); and an
-`ids` value that is not a list of strings, holds a string that is not exactly
-one supported identifier, or holds a non-string (400). A JSON object with no
-`title` is 422. `guid` is kept verbatim and escaped when rendered, so a legacy
-sender that supplies a lone surrogate there keeps working. The bearer secret,
-the 64 KiB body bound and the inbox limit are unchanged.
+the state document: a body that is not UTF-8 JSON (400); a body nested more
+than 100 levels deep, including a deeply nested value inside an object (400); a
+body that is not a JSON object -- a list, string, number or `null` (400); a
+text field carrying an unpaired surrogate, which cannot be encoded for the
+default-guid hash (400); and an `ids` value that is not a list of strings,
+holds a string that is not exactly one supported identifier, or holds a
+non-string (400). A JSON object with no `title` is 422. `guid` is kept verbatim
+and escaped when rendered, so a legacy sender that supplies a lone surrogate
+there keeps working. The bearer secret, the 64 KiB body bound and the inbox
+limit are unchanged.
 

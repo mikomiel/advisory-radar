@@ -1519,14 +1519,50 @@ def test_the_native_webhook_guid_fingerprint_is_pinned(tmp_path):
 
 
 def test_a_deeply_nested_webhook_payload_is_refused_without_state(tmp_path):
-    """#75 #84: a hostile nesting depth is a client error on every supported interpreter, and writes nothing.
+    """#75 #84: an over-deep body is a client error with one literal answer on every supported interpreter.
 
-    The contract is the class of outcome, not the decoder: 3.13 raises RecursionError at this depth while a
-    newer decoder accepts the list and the object check refuses it. Both are a 400.
+    3.13's decoder gives up before the depth guard; an interpreter that accepts the nesting reaches it. Both
+    answer the same 400, and neither writes state.
     """
-    response = post_webhook(tmp_path, content=b"[" * 10000 + b"]" * 10000)
+    response = post_webhook(tmp_path, content=DEEP_PAYLOAD)
     assert response.status_code == 400
-    assert "error" in response.json()
+    assert response.json() == {"error": "payload is nested too deeply"}
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_a_deeply_nested_value_inside_a_webhook_object_is_refused(tmp_path):
+    """#84 review: the decoder is not the contract -- a deep value inside a mapped object is refused too."""
+    response = post_webhook(tmp_path, content=b'{"title": "Security update", "summary": ' + DEEP_PAYLOAD + b"}")
+    assert response.status_code == 400
+    assert response.json() == {"error": "payload is nested too deeply"}
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_a_shallow_nested_webhook_object_is_accepted(tmp_path):
+    """The depth limit must not refuse ordinary structured metadata."""
+    entry, _ = queued_webhook_item(tmp_path, {"title": "Security update", "meta": {"a": {"b": 1}}})
+    assert entry["title"] == "Security update"
+
+
+def test_a_mapping_recursion_is_still_a_refused_request(tmp_path, monkeypatch):
+    """Defence in depth: a mapping that recurses is a 400, never a 500 after the decoder guard."""
+    import advisory_radar.sources as sources_module
+
+    def recurse(payload):
+        raise RecursionError("simulated mapping recursion")
+
+    monkeypatch.setattr(sources_module, "webhook_item_from_payload", recurse)
+    response = post_webhook(tmp_path, {"title": "Security update"})
+    assert response.status_code == 400
+    assert response.json() == {"error": "payload is nested too deeply"}
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_an_empty_webhook_object_has_no_title(tmp_path):
+    """A JSON object is mapped; one without a title is the mapper's 422, not the object refusal."""
+    response = post_webhook(tmp_path, {})
+    assert response.status_code == 422
+    assert response.json() == {"error": "payload has no title"}
     assert not (tmp_path / "state.json").exists()
 
 
@@ -1587,7 +1623,8 @@ def test_a_refused_webhook_payload_leaves_the_state_document_untouched(tmp_path)
     save_state(tmp_path / "state.json", state)
     before = (tmp_path / "state.json").read_bytes()
     refused = [
-        b"[" * 10000 + b"]" * 10000,
+        DEEP_PAYLOAD,
+        b'{"title": "Security update", "summary": ' + DEEP_PAYLOAD + b"}",
         b'{"title": "Vendor \\ud800 advisory"}',
         json.dumps({"title": "advisory", "ids": ["not-an-identifier"]}).encode(),
     ]
