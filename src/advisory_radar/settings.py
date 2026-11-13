@@ -24,12 +24,12 @@ from pathlib import Path
 
 from .catalogue import SOURCE_SPECS
 from .config import NOTIFIER_SECRET_KEYS, ConfigError
-from .state import describe_schema, save_json, serialize_json
+from .state import describe_schema, save_json, serialize_json, state_lock
 
 #: The schema tag the stored document declares.
-#: One overlay transaction at a time in this process. Each save reads the revision, validates and replaces
-#: the file; two concurrent form posts would otherwise read the same revision and one section would be lost.
-#: It is deliberately independent of the state lock, so a save still lands while a pass is running.
+#: One form's read-check-write at a time in this process. The save itself is serialised across processes by
+#: the sidecar lock :func:`save_settings` takes; this keeps two requests in one process from building the same
+#: section twice. It is deliberately independent of the state lock, so a save still lands while a pass is running.
 SETTINGS_LOCK = threading.RLock()
 SETTINGS_SCHEMA = "advisory-radar-settings.v1"
 #: The filename beside the state file; see :func:`settings_path`.
@@ -241,16 +241,29 @@ def load_settings(path: Path) -> dict:
     return load_settings_document(path)["settings"]
 
 
-def save_settings(path: Path, settings: dict, *, now: int) -> dict:
+class StaleSettings(ConfigError):
+    """The overlay changed between the revision a save was rendered from and the save itself."""
+
+
+def save_settings(path: Path, settings: dict, *, now: int, expected_revision: int | None = None) -> dict:
     """Validate, then atomically write the overlay; returns the stored document.
 
     The shape is checked first, so a literal secret cannot be written even by a caller that skipped
-    the full merge. The revision always moves forward from the document already on disk, and an
-    unreadable previous document refuses the write instead of silently resetting the counter.
+    the full merge. The read, the revision comparison, the increment and the replacement are one
+    transaction under the sidecar lock beside ``path``: two processes that share the overlay cannot both
+    read revision 0 and then both write revision 1. ``expected_revision`` is the revision the form was
+    rendered from; a document that has moved on raises :class:`StaleSettings` and is left byte-identical.
+    ``None`` keeps the unconditional write, still serialised by the lock. The lock is independent of the
+    state lock, so a save still lands while a pass is running.
     """
     validate_settings(settings)
-    with SETTINGS_LOCK:
+    with state_lock(path):
         previous = load_settings_document(path)
+        if expected_revision is not None and previous["revision"] != expected_revision:
+            raise StaleSettings(
+                f"the overlay changed since this page was loaded: revision {previous['revision']} is stored, "
+                f"this save expected {expected_revision}"
+            )
         document = {
             "schema": SETTINGS_SCHEMA,
             "revision": previous["revision"] + 1,

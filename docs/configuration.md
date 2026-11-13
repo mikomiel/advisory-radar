@@ -311,7 +311,16 @@ document, whatever store holds that. The save applies immediately when the state
 page says the revision is not live yet, and Reload applies it when the pass finishes. Each
 form carries a fingerprint of the configuration it was rendered from, so a second tab —
 after another save, a YAML edit, or the overlay being deleted and recreated — is refused
-with `409` instead of overwriting rows it never saw.
+with `409` instead of overwriting rows it never saw. The overlay is written under a sidecar
+lock (`settings.json.lock`, the same `flock` mechanism the state file and the watchlist
+use), so the read, the revision comparison, the increment and the atomic replace are one
+transaction: two processes sharing one `/data` volume cannot both read revision 0 and write
+revision 1. Every form also carries the revision it was rendered from, and a save from an
+older revision is refused with `409` instead of replacing a newer document — the
+fingerprint is the broader check (a YAML edit moves no revision), the revision is the
+cross-process guarantee. Multi-instance use over a shared volume is therefore supported at
+that granularity: settings writes serialise, while each process still applies what it
+loaded until it reloads.
 `SIGHUP` re-reads `config.yml` and the overlay, for a configuration edited by hand. Every
 other setting stays in `config/config.yml`; editing most of it needs a reload (the button
 or `SIGHUP`), not a restart — `web.host`, `web.port`, `state_path` and `storage` are bound when the

@@ -25,7 +25,7 @@ from advisory_radar.config import ConfigError, load_config
 from advisory_radar.delivery import QuietHours
 from advisory_radar.http import RedactFilter
 from advisory_radar.runtime import Runtime
-from advisory_radar.settings import load_settings, settings_path
+from advisory_radar.settings import load_settings, load_settings_document, save_settings, settings_path
 from advisory_radar.state import load_state_document, save_state, serialize_json, state_lock
 from advisory_radar.storage import JsonStore
 from advisory_radar.web import _advisory_token, create_app
@@ -38,6 +38,7 @@ DAY_START = NOW - (16 * 3600 + 26 * 60 + 40)
 TOKEN = "secret-token"
 CSRF_RE = re.compile(r'name="csrf" value="([0-9a-f]{64})"')
 FINGERPRINT_RE = re.compile(r"name='fingerprint' value='([0-9a-f]{64})'")
+REVISION_RE = re.compile(r"name='revision' value='(\d+)'")
 ADVISORY_LINK_RE = re.compile(r"<td><a href='/advisories/[^']*'>([^<]+)</a></td>")
 PAGER_RE = re.compile(r"href='(/alerts\?[^']*)'")
 ROUTES_CONFIG = """\
@@ -114,6 +115,17 @@ def config_form(client: TestClient, token: str = TOKEN) -> tuple[str, str]:
     match = FINGERPRINT_RE.search(page)
     assert match, "every settings form must carry the configuration fingerprint"
     return csrf, match.group(1)
+
+
+def overlay_form(client: TestClient, token: str = TOKEN) -> tuple[str, str, int]:
+    """Log in and return the form token, the fingerprint and the overlay revision /config rendered."""
+    csrf = sign_in(client, token)
+    page = client.get("/config").text
+    fingerprint = FINGERPRINT_RE.search(page)
+    revision = REVISION_RE.search(page)
+    assert fingerprint, "every settings form must carry the configuration fingerprint"
+    assert revision, "every settings form must carry the overlay revision it was rendered from"
+    return csrf, fingerprint.group(1), int(revision.group(1))
 
 
 def advisory_token(identifier: str) -> str:
@@ -1078,6 +1090,96 @@ def test_digest_and_quiet_hours_round_trip_through_the_settings_form(tmp_path):
     assert cleared.status_code == 303, cleared.text
     assert runtime.cfg.digest is False and runtime.cfg.quiet_hours is None
     assert load_settings(settings_path(runtime.cfg.state_path))["quiet_hours"] == ""
+
+
+def test_a_form_whose_overlay_revision_moved_on_is_refused_without_applying_it(tmp_path):
+    """#77: the revision is the cross-process guard, so a bump that changes nothing else must still refuse."""
+    client, token, runtime = make_client(tmp_path)
+    csrf, fingerprint, revision = overlay_form(client, token)
+    assert revision == 0
+    overlay = settings_path(runtime.cfg.state_path)
+    # Another writer saves the same settings: the revision moves, the merged configuration does not, so
+    # only the submitted revision can tell that this page is stale.
+    save_settings(overlay, {}, now=NOW + 1)
+    assert load_settings_document(overlay)["revision"] == 1
+    response = client.post(
+        "/config/settings",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "revision": str(revision),
+            "poll_interval": "30s",
+            "hidden_source_hosts": "",
+            "quiet_hours": "",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 409
+    assert "The configuration changed since this page was loaded" in response.text
+    assert "Reload" in response.text
+    stored = load_settings_document(overlay)
+    assert stored["revision"] == 1, "the refused save wrote nothing"
+    assert "poll_interval" not in stored["settings"], "the stale form's change never reaches the file"
+    assert runtime.cfg.poll_interval_seconds == 900, "the stale save was not applied to the live runtime"
+    assert runtime.overlay["revision"] == 0
+
+
+def test_a_stale_configuration_form_keeps_the_newer_settings_in_the_file(tmp_path):
+    client, token, runtime = make_client(tmp_path)
+    csrf, fingerprint, revision = overlay_form(client, token)
+    overlay = settings_path(runtime.cfg.state_path)
+    newer = {"poll_interval": "12h", "quiet_hours": "22:00-07:00"}
+    save_settings(overlay, newer, now=NOW + 1)
+    response = client.post(
+        "/config/settings",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "revision": str(revision),
+            "poll_interval": "30s",
+            "hidden_source_hosts": "",
+            "quiet_hours": "",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 409
+    assert "The configuration changed since this page was loaded" in response.text
+    assert load_settings(overlay) == newer, "the newer settings are still in the file"
+    assert runtime.cfg.poll_interval_seconds == 900, "nothing was applied from the stale form"
+
+
+def test_a_settings_save_from_the_rendered_revision_redirects_to_the_new_one(tmp_path):
+    client, token, runtime = make_client(tmp_path)
+    csrf, fingerprint, revision = overlay_form(client, token)
+    response = client.post(
+        "/config/settings",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "revision": str(revision),
+            "poll_interval": "30s",
+            "hidden_source_hosts": "",
+            "quiet_hours": "",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/config?saved=1"
+    assert load_settings(settings_path(runtime.cfg.state_path))["poll_interval"] == "30s"
+    assert runtime.cfg.poll_interval_seconds == 30
+
+
+def test_a_settings_form_with_a_malformed_revision_is_a_reloadable_bad_request(tmp_path):
+    client, token, runtime = make_client(tmp_path)
+    csrf, fingerprint, _ = overlay_form(client, token)
+    response = client.post(
+        "/config/settings",
+        data={"csrf": csrf, "fingerprint": fingerprint, "revision": "not-a-revision", "poll_interval": "30s"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 400
+    assert "Reload" in response.text
+    assert not settings_path(runtime.cfg.state_path).exists(), "a malformed revision writes nothing"
 
 
 def test_a_bad_quiet_hours_window_is_refused_by_the_form_without_echoing_it(tmp_path):

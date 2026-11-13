@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import json
 import logging
+import multiprocessing
 import signal
 import stat
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 import yaml
@@ -25,6 +27,7 @@ from advisory_radar.runtime import Runtime
 from advisory_radar.settings import (
     MAX_SETTINGS_BYTES,
     SETTINGS_SCHEMA,
+    StaleSettings,
     load_settings,
     load_settings_document,
     save_settings,
@@ -298,6 +301,27 @@ def test_save_settings_writes_0600_and_moves_the_revision_forward(tmp_path):
     assert second["revision"] == 2
     assert load_settings(path) == {"poll_interval": "12h"}
     assert load_settings_document(path)["updated_at"] == 200
+
+
+def test_expected_revision_refuses_a_save_rendered_from_another_revision(tmp_path):
+    """#77: the revision a form was rendered from is compared inside the lock; a refusal writes nothing."""
+    path = settings_path(tmp_path / "state.json")
+    first = save_settings(path, {"poll_interval": "30s"}, now=100, expected_revision=0)
+    assert first["revision"] == 1
+    before = path.read_bytes()
+    with pytest.raises(StaleSettings):
+        save_settings(path, {"poll_interval": "12h"}, now=200, expected_revision=0)
+    assert path.read_bytes() == before, "a stale save must leave the newer overlay byte-identical"
+    second = save_settings(path, {"poll_interval": "12h"}, now=300, expected_revision=1)
+    assert second["revision"] == 2
+    assert load_settings(path) == {"poll_interval": "12h"}
+
+
+def test_a_save_without_an_expected_revision_keeps_the_unconditional_write(tmp_path):
+    path = settings_path(tmp_path / "state.json")
+    assert save_settings(path, {"poll_interval": "30s"}, now=1)["revision"] == 1
+    assert save_settings(path, {"poll_interval": "12h"}, now=2, expected_revision=None)["revision"] == 2
+    assert load_settings(path) == {"poll_interval": "12h"}
 
 
 def test_a_failed_replace_leaves_the_previous_overlay(tmp_path, monkeypatch):
@@ -605,6 +629,55 @@ def test_concurrent_saves_never_reuse_a_revision(tmp_path, monkeypatch):
         worker.join()
     assert failures == []
     assert load_settings_document(overlay_path)["revision"] == 4, "every save must advance the revision once"
+
+
+def _save_overlay_in_process(path: str, poll_interval: str, barrier, results) -> None:
+    """One contender in the cross-process save test: it waits for its peer, then saves, and reports back."""
+    barrier.wait(timeout=30)
+    try:
+        stored = save_settings(Path(path), {"poll_interval": poll_interval}, now=NOW, expected_revision=0)
+    except StaleSettings as exc:
+        results.put(("stale", str(exc), poll_interval))
+    else:
+        results.put(("saved", stored["revision"], poll_interval))
+
+
+def test_two_processes_cannot_both_write_revision_one(tmp_path):
+    """#77: the sidecar lock plus the expected revision makes one shared overlay safe across processes."""
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("this platform cannot fork, so the two-process contention cannot be reproduced")
+    context = multiprocessing.get_context("fork")
+    overlay_path = settings_path(tmp_path / "state.json")
+    barrier = context.Barrier(2)
+    results = context.Queue()
+    poll_intervals = ("30s", "12h")
+    workers = [
+        context.Process(target=_save_overlay_in_process, args=(str(overlay_path), poll, barrier, results))
+        for poll in poll_intervals
+    ]
+    finished = []
+    try:
+        for worker in workers:
+            worker.start()
+            finished.append(worker)
+        for worker in workers:
+            worker.join(timeout=30)
+        outcomes = [results.get(timeout=10) for _ in workers]
+    finally:
+        for worker in finished:
+            if worker.is_alive():
+                worker.kill()
+            worker.join(timeout=5)
+    assert [worker.exitcode for worker in workers] == [0, 0], "both children must report, not crash"
+    saved = [outcome for outcome in outcomes if outcome[0] == "saved"]
+    stale = [outcome for outcome in outcomes if outcome[0] == "stale"]
+    assert len(saved) == 1, outcomes
+    assert len(stale) == 1, outcomes
+    assert saved[0][1] == 1, "the one save that reaches the file is revision 1"
+    stored = load_settings_document(overlay_path)
+    assert stored["revision"] == 1, "both children read revision 0; only one may increment it"
+    assert stored["settings"] == {"poll_interval": saved[0][2]}, "the winner's whole settings document survives"
+    assert stored["settings"]["poll_interval"] in poll_intervals
 
 
 def test_a_refused_sighup_reload_keeps_the_secret_out_of_its_reason(tmp_path, caplog):

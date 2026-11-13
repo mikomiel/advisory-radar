@@ -48,6 +48,7 @@ from .runtime import Runtime
 from .settings import (
     SECRET_KEYS,
     SETTINGS_LOCK,
+    StaleSettings,
     is_reference,
     load_settings_document,
     save_settings,
@@ -1991,11 +1992,25 @@ def create_app(
     def first(form: dict[str, list[str]], name: str) -> str:
         return _form_value(form, name)
 
+    def submitted_revision(form: dict[str, list[str]]) -> int | None:
+        """The overlay revision a form was rendered from, or ``None`` for a form emitted before the field.
+
+        ``None`` keeps the old unconditional write for a page loaded before this version; a field that is
+        present but is not a revision number is the caller's bad request, never a silent ``None``.
+        """
+        if "revision" not in form:
+            return None
+        value = first(form, "revision").strip()
+        if not value.isdigit():
+            raise ValueError(value)
+        return int(value)
+
     def saved_overlay() -> tuple[dict, int]:
         """The overlay as saved and its revision.
 
         An unreadable file counts as revision 0: the save that follows replaces it, and the page shows the
-        error. The revision is what makes a stale form detectable, so both come from one read.
+        error. Both come from one read, and the revision is what a form submits so that
+        :func:`save_settings` can refuse a write from a page another process has since replaced.
         """
         if runtime.overlay_path is None:
             return {}, 0
@@ -2019,6 +2034,8 @@ def create_app(
 
         A second tab would rewrite the whole section from its own rows: the fingerprint it carries covers both
         the saved overlay and the YAML the rows came from, so any change is a refusal rather than a silent loss.
+        This is the broader check -- it also catches a YAML edit, which moves no overlay revision; the revision
+        the form carries is the cross-process guarantee, enforced where the write happens.
         """
         if first(form, "fingerprint") == form_fingerprint(document):
             return None
@@ -2641,14 +2658,28 @@ def create_app(
 
         Building the plugins here is what makes a saved overlay safe: it is the same build the next
         start and the reload perform, so a value that would fail then is refused now, while the live
-        configuration and the file on disk are still untouched. ``notice`` turns a save that has something
-        to report -- an OPML import counted what it added and skipped -- into a rendered page; every other
-        caller keeps the redirect that leaves a reloadable form.
+        configuration and the file on disk are still untouched. The revision the form was rendered from is
+        passed to :func:`save_settings`, so a save whose overlay another process replaced meanwhile is
+        refused with ``409`` instead of overwriting it; the handler's fingerprint check stays the broader
+        one, because a YAML edit moves no revision. ``notice`` turns a save that has something to report --
+        an OPML import counted what it added and skipped -- into a rendered page; every other caller keeps
+        the redirect that leaves a reloadable form.
         """
         if runtime.config_path is None or runtime.overlay_path is None:
             return page(
                 "Not saved",
                 "<p>This instance has no configuration file to update.</p>",
+                active="/config",
+                actions=sign_out_form(request),
+                status_code=400,
+            )
+        try:
+            expected_revision = submitted_revision(form_body(request))
+        except ValueError:
+            return page(
+                "Not saved",
+                "<p>This form carries no overlay revision that can be checked. Reload "
+                "<a href='/config'>the configuration page</a> and make the change again.</p>",
                 active="/config",
                 actions=sign_out_form(request),
                 status_code=400,
@@ -2671,7 +2702,16 @@ def create_app(
                 status_code=400,
             )
         try:
-            stored = save_settings(runtime.overlay_path, overlay, now=int(clock()))
+            stored = save_settings(runtime.overlay_path, overlay, now=int(clock()), expected_revision=expected_revision)
+        except StaleSettings:
+            return page(
+                "Not saved",
+                "<p>The configuration changed since this page was loaded. Reload "
+                "<a href='/config'>the configuration page</a> and make the change again.</p>",
+                active="/config",
+                actions=sign_out_form(request),
+                status_code=409,
+            )
         except ConfigError as exc:
             return page(
                 "Not saved",
@@ -3383,7 +3423,12 @@ def create_app(
         )
         csrf = csrf_field(request)
         fingerprint = form_fingerprint(document)
-        fingerprint_field = f"<input type='hidden' name='fingerprint' value='{fingerprint}'>"
+        # What this form was rendered from: the revision is the cross-process guarantee, the fingerprint the
+        # broader check (a YAML edit or a deleted overlay moves no revision). Both travel on every form below.
+        form_state = (
+            f"<input type='hidden' name='revision' value='{saved_revision}'>"
+            f"<input type='hidden' name='fingerprint' value='{fingerprint}'>"
+        )
         try:
             scope_name = watchlist.display_path(cfg.watchlist_path, cfg.state_path)
             scope_link = f"<a href='/watchlist'><code>{esc(scope_name)}</code></a>"
@@ -3399,7 +3444,7 @@ def create_app(
             "</div>"
             f"<p class='notice notice-{status_tone}'>Settings overlay: {status}</p>{banner}"
             "<h2><span class='sec-num'>01</span>Settings</h2>"
-            f'<form method="post" action="/config/settings">{csrf}{fingerprint_field}'
+            f'<form method="post" action="/config/settings">{csrf}{form_state}'
             "<div class='fields'>"
             "<label class='poll'>Poll interval"
             f"<input type='text' name='poll_interval' value='{esc(poll_text)}'></label>"
@@ -3416,7 +3461,7 @@ def create_app(
             "ends and never hold a critical one; an empty field means off.</p>"
             "<button class='btn btn-primary'>Save settings</button></form>"
             "<h2><span class='sec-num'>02</span>Risk thresholds</h2>"
-            f'<form method="post" action="/config/thresholds">{csrf}{fingerprint_field}'
+            f'<form method="post" action="/config/thresholds">{csrf}{form_state}'
             "<div class='fields'>"
             "<label>Critical at CVSS"
             f"<input type='text' name='threshold:critical_cvss' size='5' value='{threshold_text('critical_cvss')}'>"
@@ -3448,7 +3493,7 @@ def create_app(
             "the settings overlay, so it needs no edit to a read-only config mount. The watch tag scopes a "
             "changedetection.io poll and is ignored by the other kinds. An interval of 30m thins this source's "
             "polling; an empty field uses the global poll interval, and alerts are never delayed by it.</p>"
-            f'<form method="post" action="/config/sources">{csrf}{fingerprint_field}'
+            f'<form method="post" action="/config/sources">{csrf}{form_state}'
             "<div class='scroll'><table><tr><th scope='col'>Source</th>"
             "<th scope='col' class='narrow'>Enabled</th>"
             "<th scope='col' class='tag-col'>Watch tag</th>"
@@ -3469,7 +3514,7 @@ def create_app(
             "<button class='btn' type='submit' formaction='/config/sources/probe'>Test the new source</button>"
             "</form>"
             "<h3>Import OPML</h3>"
-            f'<form method="post" action="/config/sources/opml">{csrf}{fingerprint_field}'
+            f'<form method="post" action="/config/sources/opml">{csrf}{form_state}'
             "<label>Paste an OPML subscription list"
             "<textarea name='opml' rows='6'></textarea></label>"
             "<p class='muted small'>Every outline with an <code>xmlUrl</code> becomes an <code>rss</code> source. "
@@ -3477,7 +3522,7 @@ def create_app(
             "checked exactly as a single add is, and nothing is written when the document cannot be read.</p>"
             "<button class='btn'>Add feeds from OPML</button></form>"
             "<h2><span class='sec-num'>04</span>Notifiers</h2>"
-            f'<form method="post" action="/config/notifiers">{csrf}{fingerprint_field}'
+            f'<form method="post" action="/config/notifiers">{csrf}{form_state}'
             f"{notifier_form_entries(notifiers)}"
             "<h3>New notifier</h3>"
             "<p class='muted small'>Secrets stay in the environment: a reference field takes ${NAME} or "
@@ -3490,7 +3535,7 @@ def create_app(
             f"{new_reference_fields}{new_fields}</div>"
             "<button class='btn btn-primary'>Save notifiers</button></form>"
             "<h2><span class='sec-num'>05</span>Routes</h2>"
-            f'<form method="post" action="/config/routes">{csrf}{fingerprint_field}'
+            f'<form method="post" action="/config/routes">{csrf}{form_state}'
             f"{route_form_entries(routes, defaults, notifier_choices(notifiers))}"
             "<button class='btn btn-primary'>Save routes</button></form>"
             f"{route_notice}"
