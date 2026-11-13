@@ -1074,6 +1074,8 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
 
     for row in rows.values():
         row["sources"] = tuple(sorted(row["source_set"]))
+        # The accumulators are internal; the rows are display data a caller may serialise.
+        del row["source_set"], row["origins"], row["primary_rank"], row["primary_at"]
     return sorted(rows.values(), key=lambda row: (-row["at"], row["identifier"]))
 
 

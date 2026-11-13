@@ -1699,7 +1699,13 @@ def _ensure_ownership(state: dict) -> None:
     # a legacy message may not compete for them even if it names them too.
     reserved: set[str] = set()
     for entry in (*parked, *pending):
-        if isinstance(entry, dict) and isinstance(entry.get("fresh"), (list, tuple)):
+        if (
+            isinstance(entry, dict)
+            and entry.get("kind") not in WHOLE_MESSAGE_KINDS
+            and isinstance(entry.get("fresh"), (list, tuple))
+        ):
+            # A whole-message fact (an escalation, a bulletin) is additional work, not an exclusive claim:
+            # the inbox keeps it alongside another owner, so it must not reserve the identifier here.
             reserved.update(_stored_list(entry.get("fresh")))
 
     def claim(identifier: object, *, kind: int, at: object, index: int) -> None:
@@ -1763,60 +1769,69 @@ def owner_of(state: dict, identifier: str) -> tuple[str, dict] | None:
     seen = state.get("seen")
     seen = seen if isinstance(seen, dict) else {}
 
-    def recorded(entry: object) -> bool:
-        if not isinstance(entry, dict):
-            return False
-        identifiers = _stored_list(entry.get("ids"))
-        if entry.get("kind") in WHOLE_MESSAGE_KINDS:
-            return identifier in identifiers
-        fresh = entry.get("fresh")
-        return isinstance(fresh, (list, tuple)) and identifier in _stored_list(fresh)
-
     def display_at(entry: dict) -> int:
         parked_at = entry.get("parked_at")
         if isinstance(parked_at, int) and not isinstance(parked_at, bool) and parked_at > 0:
             return parked_at
         return _queue_time(entry)
 
-    owner_candidates = [
-        (0 if label == "parked" else 1, -display_at(entry), label, entry)
-        for label, entries in (("parked", parked), ("pending", pending))
-        for entry in entries
-        if recorded(entry)
-    ]
-    if owner_candidates:
-        # The inbox displays the most recent fact within a rank, so a newer parked critical escalation wins.
-        _, _, label, entry = min(owner_candidates, key=lambda item: (item[0], item[1]))
-        return label, entry
+    candidates: list[tuple[int, int, str, dict]] = []
 
-    claims: dict[str, tuple[int, int, int]] = {}
-    record = seen.get(identifier)
-    if isinstance(record, dict):
-        # The seen record claims at the queue time of the message that recorded it, as the inbox reads it.
-        at = seen_claim_time(record, state.get("deliveries"))
-        claims[identifier] = (at if at > 0 else _LEGACY_UNKNOWN_CLAIM, 2, 0)
-    for entries, kind in ((parked, 0), (pending, 1)):
-        for index, entry in enumerate(entries):
-            if not isinstance(entry, dict) or "fresh" in entry or entry.get("kind") in WHOLE_MESSAGE_KINDS:
+    def candidate(label: str, entry: dict) -> None:
+        candidates.append((0 if label == "parked" else 1, -display_at(entry), label, entry))
+
+    # Exclusive owners: a message's recorded ``fresh`` list. A whole-message fact (escalation, bulletin) is
+    # additional work the inbox keeps alongside another owner, so it is a candidate too, never a replacement.
+    exclusive = False
+    for label, entries in (("parked", parked), ("pending", pending)):
+        for entry in entries:
+            if not isinstance(entry, dict):
                 continue
-            if identifier not in _stored_list(entry.get("ids")):
+            if entry.get("kind") in WHOLE_MESSAGE_KINDS:
+                if identifier in _stored_list(entry.get("ids")):
+                    candidate(label, entry)
                 continue
-            stamp = _queue_time(entry)
-            key = (stamp if stamp > 0 else _LEGACY_UNKNOWN_CLAIM, kind, index)
-            current = claims.get(identifier)
-            if current is None or key < current:
-                claims[identifier] = key
-    key = claims.get(identifier)
-    if key is None:
+            fresh = entry.get("fresh")
+            if isinstance(fresh, (list, tuple)) and identifier in _stored_list(fresh):
+                exclusive = True
+                candidate(label, entry)
+
+    if not exclusive:
+        # No exclusive owner: the seen record and the legacy entries compete on the claim clock, exactly as
+        # the inbox's legacy branch does.
+        claims: dict[str, tuple[int, int, int]] = {}
+        record = seen.get(identifier)
+        if isinstance(record, dict):
+            at = seen_claim_time(record, state.get("deliveries"))
+            claims[identifier] = (at if at > 0 else _LEGACY_UNKNOWN_CLAIM, 2, 0)
+        for entries, kind in ((parked, 0), (pending, 1)):
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, dict) or "fresh" in entry or entry.get("kind") in WHOLE_MESSAGE_KINDS:
+                    continue
+                if identifier not in _stored_list(entry.get("ids")):
+                    continue
+                stamp = _queue_time(entry)
+                key = (stamp if stamp > 0 else _LEGACY_UNKNOWN_CLAIM, kind, index)
+                current = claims.get(identifier)
+                if current is None or key < current:
+                    claims[identifier] = key
+        key = claims.get(identifier)
+        if key is not None:
+            _, kind, index = key
+            if kind == 2:
+                if isinstance(record, dict):
+                    candidates.append((3, -seen_claim_time(record, state.get("deliveries")), "seen", record))
+            else:
+                entries = parked if kind == 0 else pending
+                entry = entries[index] if index < len(entries) else None
+                if isinstance(entry, dict):
+                    candidate("parked" if kind == 0 else "pending", entry)
+
+    if not candidates:
         return None
-    _, kind, index = key
-    if kind == 2:
-        return ("seen", record) if isinstance(record, dict) else None
-    entries = parked if kind == 0 else pending
-    entry = entries[index] if index < len(entries) else None
-    if not isinstance(entry, dict):
-        return None
-    return ("parked" if kind == 0 else "pending"), entry
+    # The inbox's primary order: parked before queued, then the newest fact within a rank.
+    _, _, label, entry = min(candidates, key=lambda item: (item[0], item[1]))
+    return label, entry
 
 
 def _claimed(state: dict) -> set[str]:

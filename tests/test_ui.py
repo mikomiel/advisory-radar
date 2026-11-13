@@ -2896,6 +2896,7 @@ def test_a_message_naming_thousands_of_identifiers_keeps_related_lists_bounded(t
     assert all(len(row["aliases"]) <= 4 for row in rows)
     assert all(row["identifier"] not in row["aliases"] for row in rows)
     assert all(row["alias_count"] == len(set(identifiers)) - 1 for row in rows)
+    json.dumps(rows[:2])  # display data, not internal accumulator sets
     client, token, _ = make_client(tmp_path, state=state)
     sign_in(client, token)
     page = client.get("/inbox").text
@@ -2967,10 +2968,15 @@ def test_settlement_uses_the_delivery_messages_claim_clock(tmp_path):
     legacy["levels"] = {"CVE-2026-9501": "warning"}
     legacy["queued_at"] = NOW - 3600
     state["pending"] = [legacy]
+    first, token, _ = make_client(tmp_path, state=state)
+    sign_in(first, token)
+    before = (primary_ids(first, "/inbox?state=delivered"), primary_ids(first, "/inbox?state=pending"))
     core._ensure_ownership(state)
     assert legacy["fresh"] == ["CVE-2026-9501"], "the delivered message owns CVE-2026-9500"
     client, token, _ = make_client(tmp_path, state=state)
     sign_in(client, token)
+    after = (primary_ids(client, "/inbox?state=delivered"), primary_ids(client, "/inbox?state=pending"))
+    assert after == before
     assert primary_ids(client, "/inbox?state=delivered") == {"CVE-2026-9500"}
     assert primary_ids(client, "/inbox?state=pending") == {"CVE-2026-9501"}
     page = client.get(f"/advisories/{advisory_token('CVE-2026-9500')}")
@@ -3017,6 +3023,7 @@ def test_a_newer_parked_escalation_owns_the_advisory_link(tmp_path):
     state["parked"] = [warning, critical]
     client, token, _ = make_client(tmp_path, state=state)
     sign_in(client, token)
+    assert primary_ids(client, "/inbox?state=parked") == {"CVE-2026-9600"}
     assert "CVE-2026-9600 now critical" in client.get(f"/advisories/{advisory_token('CVE-2026-9600')}").text
 
 
@@ -3041,3 +3048,59 @@ def test_many_messages_naming_one_identifier_stay_linear(tmp_path):
     assert rows[0]["identifier"] == "CVE-2026-9700"
     assert len(rows[0]["facts"]) == 2001, "the delivery and every mention are retained"
     assert rows[0]["state"] == "delivered", "mentions never become the primary fact"
+
+
+def test_whole_message_work_stays_additional_to_a_legacy_owner(tmp_path):
+    """An escalation is extra work; it must not reserve the identifier from a legacy parked critical."""
+    state = core.new_state()
+    parked = parked_entry("CVE-2026-9800", tag="critical")
+    parked.pop("fresh", None)
+    parked["queued_at"] = NOW - 3600
+    parked["parked_at"] = NOW - 300
+    state["parked"] = [parked]
+    state["seen"]["CVE-2026-9800"] = {"at": NOW - 1800, "outcome": "suppressed"}
+    escalation = {
+        "kind": "escalation",
+        "queued_at": NOW - 60,
+        "fresh": ["CVE-2026-9800"],
+        "tag": "warning",
+        "title": "CVE-2026-9800 now warning",
+        "body": "",
+        "ids": ["CVE-2026-9800"],
+        "cves": ["CVE-2026-9800"],
+        "levels": {},
+        "source": "CVE-2026-9800",
+        "link": "https://vendor.example.net/advisories/CVE-2026-9800",
+    }
+    state["pending"] = [escalation]
+
+    first, token, _ = make_client(tmp_path, state=state)
+    sign_in(first, token)
+    before = {
+        key: primary_ids(first, path)
+        for key, path in (
+            ("parked", "/inbox?state=parked"),
+            ("critical", "/inbox?state=open&tag=critical"),
+            ("pending", "/inbox?state=pending"),
+        )
+    }
+    detail_before = first.get(f"/advisories/{advisory_token('CVE-2026-9800')}").text
+    assert "libxml2" in detail_before, "the parked critical owns the detail page before settlement"
+
+    core._ensure_ownership(state)
+    assert parked["fresh"] == ["CVE-2026-9800"], "whole-message work must not reserve the identifier"
+    second, token, _ = make_client(tmp_path, state=state)
+    sign_in(second, token)
+    after = {
+        key: primary_ids(second, path)
+        for key, path in (
+            ("parked", "/inbox?state=parked"),
+            ("critical", "/inbox?state=open&tag=critical"),
+            ("pending", "/inbox?state=pending"),
+        )
+    }
+    assert after == before, "settlement must not move work a legacy owner already held"
+    assert after["parked"] == {"CVE-2026-9800"}
+    assert after["critical"] == {"CVE-2026-9800"}
+    detail_after = second.get(f"/advisories/{advisory_token('CVE-2026-9800')}").text
+    assert "libxml2" in detail_after and "now warning" not in detail_after
