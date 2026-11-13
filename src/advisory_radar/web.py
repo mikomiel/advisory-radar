@@ -233,6 +233,29 @@ _NAV = (
     ("/runs", "Runs"),
 )
 
+#: What ``POST /run`` may report through the signed ``/?result=<token>`` redirect it lands on. Only these
+#: codes are rendered; a token that fails its signature, age or session binding renders nothing. The notice is
+#: about the request just made, not about the stored last pass, so a failed or skipped request cannot read as
+#: an old success. A fault before the pass starts (an unreadable store, an unreadable watchlist) returns 1
+#: without writing a run record, hence the conditional: the newest entry is this pass only when it got far
+#: enough to record one.
+_RUN_NOTICES = {
+    0: ("ok", "Pass finished. <a href='/runs'>Open Run history</a>."),
+    1: (
+        "critical",
+        "The pass failed. Its result is the newest entry in Run history when the pass recorded one. "
+        "<a href='/runs'>Open Run history</a>.",
+    ),
+    2: ("warning", "A pass is already running. Nothing was sent and nothing was changed."),
+    -1: ("warning", "Running a pass is not available in this process."),
+}
+
+
+def _run_notice(code: int | None) -> str:
+    """The result of the Run a pass now request this page was redirected from, or nothing when there is none."""
+    notice = _RUN_NOTICES.get(code) if code is not None else None
+    return _notice(f"<strong>This request:</strong> {notice[1]}", notice[0]) if notice else ""
+
 
 def _response_text(value: str) -> str:
     """``value`` made UTF-8 encodable: one legacy surrogate in state must not fail the whole page."""
@@ -286,8 +309,12 @@ def page(
 
 
 class Auth:
+    #: How long a run-result token stays valid: enough for the 303 redirect and a reload, no longer.
+    RUN_RESULT_TTL = 120
+
     def __init__(self, token: str) -> None:
         self._serializer = URLSafeSerializer(token, salt="advisory-radar-session")
+        self._run_serializer = URLSafeSerializer(token, salt="advisory-radar-run-result")
 
     def login_cookie(self) -> str:
         return self._serializer.dumps({"t": time.time()})
@@ -301,6 +328,37 @@ class Auth:
         except BadSignature:
             return False
         return time.time() - float(data.get("t", 0)) < 7 * 86400
+
+    def run_result(self, code: int, cookie: str) -> str:
+        """A short-lived token saying what this session's Run a pass now returned.
+
+        The session binding keeps the token from being replayed by another signed-in session: the redirect is
+        followed by the same browser that submitted the form, and its cookie is what the token names.
+        """
+        return self._run_serializer.dumps({"ran": code, "t": time.time(), "s": _session_binding(cookie)})
+
+    def read_run_result(self, value: str | None, cookie: str | None) -> int | None:
+        """The code in a run-result token, or None when it is absent, forged, stale or another session's."""
+        if not value or not cookie:
+            return None
+        try:
+            data = self._run_serializer.loads(value)
+        except BadSignature:
+            return None
+        if not isinstance(data, dict) or data.get("s") != _session_binding(cookie):
+            return None
+        ran, issued = data.get("ran"), data.get("t")
+        if isinstance(ran, bool) or not isinstance(ran, int) or ran not in (0, 1, 2, -1):
+            return None
+        if isinstance(issued, bool) or not isinstance(issued, (int, float)):
+            return None
+        age = time.time() - issued
+        return ran if 0 <= age <= self.RUN_RESULT_TTL else None
+
+
+def _session_binding(cookie: str) -> str:
+    """The short digest a run-result token carries instead of the session cookie itself."""
+    return hashlib.sha256(cookie.encode()).hexdigest()[:16]
 
 
 def _public_url(url: str) -> str:
@@ -1450,7 +1508,21 @@ def create_app(
     def dashboard(request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
-        state = load_state()
+        result = auth.read_run_result(request.query_params.get("result"), request.cookies.get("advisory_radar_session"))
+        try:
+            state = load_state()
+        except (SourceError, StoreUnavailable) as exc:
+            if result is None:
+                raise
+            # This page is the redirect from the pass request, and that pass failed because the state cannot be
+            # read. Report the failure here rather than raising out of the redirect: the counts and last pass
+            # would be guesses, so the page carries only this request's result and the read error.
+            return page(
+                "Dashboard",
+                _run_notice(result) + _notice(f"The state document cannot be read: {esc(exc)}", "critical"),
+                active="/",
+                actions=sign_out_form(request),
+            )
         pending, parked = state.get("pending", []), state.get("parked", [])
         seen = state.get("seen")
         seen = seen if isinstance(seen, dict) else {}
@@ -1478,6 +1550,7 @@ def create_app(
                     ("Total seen", len(seen)),
                 ]
             )
+            + _run_notice(result)
             + "<div class='pass'>"
             f"<p class='grow'><span class='{dot}'></span>Last pass: {esc(when or 'never')}</p>"
             f"<p class='muted small'>sent {esc(last.get('sent', 0))} · parked {esc(last.get('parked', 0))} · "
@@ -1493,7 +1566,8 @@ def create_app(
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         code = run_pass(lock_blocking=False) if run_pass is not None else -1
-        return RedirectResponse(f"/?ran={code}", status_code=303)
+        token = auth.run_result(code, request.cookies.get("advisory_radar_session") or "")
+        return RedirectResponse(f"/?result={token}", status_code=303)
 
     @app.get("/alerts", response_class=HTMLResponse)
     def alerts(request: Request):

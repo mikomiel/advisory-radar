@@ -497,14 +497,11 @@ def _ssvc_exploitation(metrics: object) -> str | None:
     return None
 
 
-def parse_cve_org(document: dict) -> tuple[float | None, str | None]:
-    """(CVSS, SSVC exploitation). The CNA score wins; CISA-ADP supplies one only when the CNA gave none."""
-    cvss, ssvc, _ = cve_org_facts(document)
-    return cvss, ssvc
-
-
 def cve_org_facts(document: dict) -> tuple[float | None, str | None, bool, bool]:
-    """``parse_cve_org`` plus whether a metric giving the chosen score is remote and unauthenticated (same source)."""
+    """(CVSS, SSVC exploitation, whether the chosen score is remote and unauthenticated, any metric malformed).
+
+    The CNA score wins; CISA-ADP supplies one only when the CNA gave none.
+    """
     containers = document.get("containers")
     containers = containers if isinstance(containers, dict) else {}
     cna = containers.get("cna")

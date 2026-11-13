@@ -217,7 +217,9 @@ def test_an_rss_source_reads_a_json_feed():
     assert state["feeds"]["vendor"]["etag"] == ETAG
 
 
-def test_an_rss_source_follows_a_page_to_the_feed_it_advertises():
+def test_an_rss_source_follows_a_page_to_the_feed_it_advertises(monkeypatch):
+    # The guard is exercised in tests/test_source_admin.py; stubbing its resolver keeps this test off real DNS.
+    monkeypatch.setattr(feeds, "private_destination", lambda url: False)
     calls: list[tuple[str, dict[str, str]]] = []
 
     def http(method, url, headers, body):
@@ -237,13 +239,15 @@ def test_an_rss_source_follows_a_page_to_the_feed_it_advertises():
     assert "feeds" not in state
 
 
-def test_an_autodiscovered_page_clears_the_validator_of_the_feed_it_replaced():
+def test_an_autodiscovered_page_clears_the_validator_of_the_feed_it_replaced(monkeypatch):
     """The URL used to answer the feed directly and now answers a page.
 
     Keeping the stored ETag would send ``If-None-Match`` to the page: a 304 would then hide every change behind
     the autodiscovery hop for as long as the page stayed unchanged, which is exactly the silence this source
     exists to break.
     """
+    # The guard is exercised in tests/test_source_admin.py; stubbing its resolver keeps this test off real DNS.
+    monkeypatch.setattr(feeds, "private_destination", lambda url: False)
     calls: list[dict[str, str]] = []
     state = {"feeds": {"vendor": {"url_digest": hashlib.sha256(PAGE_URL.encode()).hexdigest(), "etag": '"old"'}}}
 
