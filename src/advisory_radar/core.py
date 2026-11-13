@@ -1647,6 +1647,24 @@ def _suppressed(
 _LEGACY_UNKNOWN_CLAIM = 1 << 62
 
 
+def seen_claim_time(record: object, deliveries: object) -> int:
+    """When the message that first recorded an identifier was queued, not when it was delivered.
+
+    A delivered message's snapshot carries the entry's ``queued_at``, so ownership does not move when a
+    retrying message finally succeeds while a later message also names the identifier. A record written
+    before snapshots held that key falls back to its own recorded time.
+    """
+    source = record if isinstance(record, dict) else {}
+    reference = source.get("delivery")
+    snapshot = deliveries.get(reference) if isinstance(deliveries, dict) and isinstance(reference, str) else None
+    if isinstance(snapshot, dict):
+        stamp = snapshot.get("queued_at")
+        if isinstance(stamp, int) and not isinstance(stamp, bool) and stamp > 0:
+            return stamp
+    at = source.get("at")
+    return at if isinstance(at, int) and not isinstance(at, bool) else 0
+
+
 def _queue_time(entry: object) -> int:
     """When a queued message entered the queue, from the best clock the state recorded."""
     source = entry if isinstance(entry, dict) else {}
@@ -1693,9 +1711,10 @@ def _ensure_ownership(state: dict) -> None:
         if current is None or key < current:
             claims[identifier] = key
 
+    deliveries = state.get("deliveries")
     for identifier, record in seen.items():
         if isinstance(record, dict):
-            claim(identifier, kind=2, at=record.get("at"), index=0)
+            claim(identifier, kind=2, at=seen_claim_time(record, deliveries), index=0)
     # Only a legacy entry competes: a message that recorded ``fresh`` already said which ids it owns, and the
     # rest of its ids are mentions that must not take a claim from a legacy owner.
     for index, entry in enumerate(parked):
@@ -1730,10 +1749,12 @@ def owner_of(state: dict, identifier: str) -> tuple[str, dict] | None:
     """Which message or seen record owns an identifier, read without changing the state.
 
     Recorded ownership comes first: a whole-message kind owns every identifier it names, and a message owns
-    exactly its ``fresh`` list. Then the seen record, which is the identifier's history. Only then does the
-    legacy claim rule decide between older entries: earliest recorded time, parked before queued, unknown
-    time last. A caller that must not write state -- a page render, before a pass has settled the queue -- gets
-    the same answer the inbox row was built from.
+    exactly its ``fresh`` list. Competing recorded owners resolve as the inbox displays them -- parked before
+    queued, and the newest message within a rank -- so a newer parked critical escalation opens over an older
+    warning. With no recorded owner, the seen record competes on the message's claim clock against the legacy
+    claim rule (earliest recorded time, parked before queued, unknown time last). A caller that must not write
+    state -- a page render, before a pass has settled the queue -- gets the same answer the inbox row was
+    built from.
     """
     pending = state.get("pending")
     pending = pending if isinstance(pending, list) else []
@@ -1751,26 +1772,28 @@ def owner_of(state: dict, identifier: str) -> tuple[str, dict] | None:
         fresh = entry.get("fresh")
         return isinstance(fresh, (list, tuple)) and identifier in _stored_list(fresh)
 
-    for label, entries in (("parked", parked), ("pending", pending)):
-        for entry in entries:
-            if recorded(entry):
-                return label, entry
+    def display_at(entry: dict) -> int:
+        parked_at = entry.get("parked_at")
+        if isinstance(parked_at, int) and not isinstance(parked_at, bool) and parked_at > 0:
+            return parked_at
+        return _queue_time(entry)
+
+    owner_candidates = [
+        (0 if label == "parked" else 1, -display_at(entry), label, entry)
+        for label, entries in (("parked", parked), ("pending", pending))
+        for entry in entries
+        if recorded(entry)
+    ]
+    if owner_candidates:
+        # The inbox displays the most recent fact within a rank, so a newer parked critical escalation wins.
+        _, _, label, entry = min(owner_candidates, key=lambda item: (item[0], item[1]))
+        return label, entry
 
     claims: dict[str, tuple[int, int, int]] = {}
     record = seen.get(identifier)
     if isinstance(record, dict):
         # The seen record claims at the queue time of the message that recorded it, as the inbox reads it.
-        reference = record.get("delivery")
-        deliveries = state.get("deliveries")
-        snapshot = deliveries.get(reference) if isinstance(deliveries, dict) and isinstance(reference, str) else None
-        at = None
-        if isinstance(snapshot, dict):
-            candidate = snapshot.get("queued_at")
-            if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate > 0:
-                at = candidate
-        if at is None:
-            candidate = record.get("at")
-            at = candidate if isinstance(candidate, int) and not isinstance(candidate, bool) else 0
+        at = seen_claim_time(record, state.get("deliveries"))
         claims[identifier] = (at if at > 0 else _LEGACY_UNKNOWN_CLAIM, 2, 0)
     for entries, kind in ((parked, 0), (pending, 1)):
         for index, entry in enumerate(entries):

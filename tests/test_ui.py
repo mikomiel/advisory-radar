@@ -1196,7 +1196,7 @@ def advisory_state() -> dict:
     state["pending"] = [pending_entry("CVE-2026-3000", kev_only=["CVE-2026-3001"])]
     # A pending message wins over a parked one that claims the same identifier.
     state["parked"] = [parked_entry("CVE-2026-4000"), parked_entry("CVE-2026-3000", title="PARKED-DUPLICATE")]
-    # The seen record wins over a pending message that also claims the identifier.
+    # The first claim owns it: the pending message is queued before the seen record, so it wins.
     state["seen"]["CVE-2026-DUP"] = snapshot(
         NOW, "warning", "Seen source", "Seen title", "CVE-2026-DUP", "warning", 4.0, ["ops"]
     )
@@ -2941,3 +2941,103 @@ def test_the_advisory_link_opens_a_legacy_owner_before_settlement(tmp_path):
     assert page.status_code == 200
     assert "libxml2" in page.text, "the legacy parked owner is the page"
     assert "nginx" not in page.text
+
+
+def test_settlement_uses_the_delivery_messages_claim_clock(tmp_path):
+    """A legacy message queued after the delivery message must not take the delivered identifier at settlement."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-9500"] = {"at": NOW - 60, "outcome": "delivered", "delivery": "evt-4"}
+    state.setdefault("deliveries", {})["evt-4"] = {
+        "kind": "new",
+        "tag": "critical",
+        "title": "CRITICAL: CVE-2026-9500 in widget",
+        "ids": ["CVE-2026-9500"],
+        "cves": ["CVE-2026-9500"],
+        "levels": {"CVE-2026-9500": "critical"},
+        "at": NOW - 60,
+        "outcome": "delivered",
+        "delivered_to": ["ops"],
+        # Queued two hours before delivery: that is the claim.
+        "queued_at": NOW - 7200,
+    }
+    legacy = pending_entry("CVE-2026-9501")
+    legacy.pop("fresh", None)
+    legacy["ids"] = ["CVE-2026-9500", "CVE-2026-9501"]
+    legacy["cves"] = ["CVE-2026-9501"]
+    legacy["levels"] = {"CVE-2026-9501": "warning"}
+    legacy["queued_at"] = NOW - 3600
+    state["pending"] = [legacy]
+    core._ensure_ownership(state)
+    assert legacy["fresh"] == ["CVE-2026-9501"], "the delivered message owns CVE-2026-9500"
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    assert primary_ids(client, "/inbox?state=delivered") == {"CVE-2026-9500"}
+    assert primary_ids(client, "/inbox?state=pending") == {"CVE-2026-9501"}
+    page = client.get(f"/advisories/{advisory_token('CVE-2026-9500')}")
+    assert "CRITICAL: CVE-2026-9500 in widget" in page.text
+
+
+def test_a_newer_parked_escalation_owns_the_advisory_link(tmp_path):
+    """Two parked escalations for one CVE: the inbox shows the newer critical, so the link must open it."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-9600"] = {"at": NOW - 7200, "outcome": "delivered", "delivery": "evt-5"}
+    state.setdefault("deliveries", {})["evt-5"] = {
+        "kind": "new",
+        "tag": "warning",
+        "title": "WARNING: CVE-2026-9600 in widget",
+        "ids": ["CVE-2026-9600"],
+        "cves": ["CVE-2026-9600"],
+        "levels": {"CVE-2026-9600": "warning"},
+        "at": NOW - 7200,
+        "outcome": "delivered",
+        "delivered_to": ["ops"],
+        "queued_at": NOW - 10000,
+    }
+    warning = {
+        "kind": "escalation",
+        "queued_at": NOW - 3600,
+        "parked_at": NOW - 3000,
+        "fresh": ["CVE-2026-9600"],
+        "tag": "warning",
+        "title": "CVE-2026-9600 now warning",
+        "body": "",
+        "ids": ["CVE-2026-9600"],
+        "cves": ["CVE-2026-9600"],
+        "levels": {},
+        "source": "CVE-2026-9600",
+        "link": "https://vendor.example.net/advisories/CVE-2026-9600",
+    }
+    critical = {
+        **warning,
+        "queued_at": NOW - 1200,
+        "parked_at": NOW - 60,
+        "tag": "critical",
+        "title": "CVE-2026-9600 now critical",
+    }
+    state["parked"] = [warning, critical]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    assert "CVE-2026-9600 now critical" in client.get(f"/advisories/{advisory_token('CVE-2026-9600')}").text
+
+
+def test_many_messages_naming_one_identifier_stay_linear(tmp_path):
+    """Thousands of carried mentions of one recorded identifier aggregate without rescanning every fact."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-9700"] = seen(NOW - 3600, "delivered")
+    state["carry"] = {
+        "feed-a": [
+            {
+                "guid": f"feed-a:item-{number}",
+                "title": "tail",
+                "link": "",
+                "published": NOW - 60,
+                "explicit": ["CVE-2026-9700"],
+            }
+            for number in range(2000)
+        ]
+    }
+    rows = inbox_rows(state, now=NOW)
+    assert len(rows) == 1
+    assert rows[0]["identifier"] == "CVE-2026-9700"
+    assert len(rows[0]["facts"]) == 2001, "the delivery and every mention are retained"
+    assert rows[0]["state"] == "delivered", "mentions never become the primary fact"

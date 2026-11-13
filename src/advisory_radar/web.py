@@ -713,19 +713,8 @@ _CLAIM_PARKED, _CLAIM_PENDING, _CLAIM_SEEN = 0, 1, 2
 
 
 def _seen_claim_time(record: Mapping, deliveries: Mapping) -> int:
-    """When the message that first recorded an identifier was queued, not when it was delivered.
-
-    A delivered message's snapshot carries the entry's ``queued_at``, so ownership does not move when a
-    retrying message finally succeeds while a later message also names the identifier. A record written
-    before snapshots held that key falls back to its own recorded time.
-    """
-    reference = record.get("delivery")
-    snapshot = deliveries.get(reference) if isinstance(reference, str) else None
-    if isinstance(snapshot, dict):
-        stamp = _number(snapshot.get("queued_at"), 0)
-        if stamp > 0:
-            return stamp
-    return _number(record.get("at"), 0)
+    """The queue time of the message that recorded this identifier, shared with settlement and the detail page."""
+    return core.seen_claim_time(record, deliveries)
 
 
 def _fact_rank(state: str) -> int:
@@ -852,33 +841,45 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
             row = rows[identifier] = {
                 "identifier": identifier,
                 "facts": [],
+                "origins": set(),
+                "source_set": set(),
                 "sources": (),
                 "detail": False,
                 "aliases": (),
                 "primary_origin": "",
+                "primary_rank": None,
+                "primary_at": 0,
             }
         if fact["detail"]:
             row["detail"] = True
+        if fact["origin"] in row["origins"]:
+            return
+        row["origins"].add(fact["origin"])
         if fact["source"]:
-            row["sources"] = tuple(sorted({*row["sources"], fact["source"]}))
-        if all(existing["origin"] != fact["origin"] for existing in row["facts"]):
-            row["facts"].append(fact)
-        primary = min(row["facts"], key=lambda item: (item["rank"], -item["at"]))
-        for key in ("state", "at", "tag", "title", "link", "alias_count"):
-            row[key] = primary[key]
-        row["aliases"] = primary["aliases"]
-        row["primary_origin"] = primary["origin"]
+            row["source_set"].add(fact["source"])
+        row["facts"].append(fact)
+        # The primary is maintained incrementally: rank first, then the newest fact within it.
+        if (
+            row["primary_rank"] is None
+            or fact["rank"] < row["primary_rank"]
+            or (fact["rank"] == row["primary_rank"] and fact["at"] > row["primary_at"])
+        ):
+            row["primary_rank"] = fact["rank"]
+            row["primary_at"] = fact["at"]
+            for key in ("state", "at", "tag", "title", "link", "alias_count"):
+                row[key] = fact[key]
+            row["aliases"] = fact["aliases"]
+            row["primary_origin"] = fact["origin"]
 
     def mention(identifier: str, fact: dict) -> None:
         """Record context for a row that exists; a mention never creates a row and never becomes primary."""
         row = rows.get(identifier)
-        if row is None:
+        if row is None or fact["origin"] in row["origins"]:
             return
+        row["origins"].add(fact["origin"])
         if fact["source"]:
-            row["sources"] = tuple(sorted({*row["sources"], fact["source"]}))
-        fact = {**fact, "mention": True}
-        if all(existing["origin"] != fact["origin"] for existing in row["facts"]):
-            row["facts"].append(fact)
+            row["source_set"].add(fact["source"])
+        row["facts"].append({**fact, "mention": True})
 
     def legacy_owned(identifier: str, *, kind: int, index: int, at: int) -> bool:
         """Whether the legacy claim order gives this message the identifier.
@@ -1071,6 +1072,8 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
     for identifier, fact in mentions:
         mention(identifier, fact)
 
+    for row in rows.values():
+        row["sources"] = tuple(sorted(row["source_set"]))
     return sorted(rows.values(), key=lambda row: (-row["at"], row["identifier"]))
 
 
@@ -2644,7 +2647,7 @@ def create_app(
 
     @app.get("/advisories/{token}", response_class=HTMLResponse)
     def advisory_page(token: str, request: Request):
-        """One advisory, from the seen record first, then a pending message, then a parked one."""
+        """One advisory, from the message that owns the identifier (see ``core.owner_of``)."""
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         from . import core
