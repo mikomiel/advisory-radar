@@ -634,7 +634,7 @@ class PostgreSqlStore:
         except ImportError:
             raise StoreUnavailable(
                 "the PostgreSQL state store needs the optional psycopg driver; install it with "
-                "python -m pip install 'psycopg[binary]'"
+                "uv sync --extra postgres (the container image already includes it)"
             ) from None
         return psycopg
 
