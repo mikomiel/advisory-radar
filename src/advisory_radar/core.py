@@ -1448,12 +1448,16 @@ def _stored_list(value: object) -> list[str]:
 def _delivery_snapshot(entry: dict, delivered_to: Sequence[str]) -> dict:
     """The compact record of one delivered message, copied off the queue entry so a later edit cannot reach it.
 
-    ``tag``/``source``/``levels``/``scores`` are the classification the message was sent with, which the seen
-    record previously dropped, and the identifiers, KEV-only CVEs and matched products answer the rest of the
-    advisory page from the record alone. The body is deliberately absent: it is the rendered text, not a fact.
+    ``tag``/``source_id``/``source``/``levels``/``scores`` are the classification the message was sent with,
+    which the seen record previously dropped, and the identifiers, KEV-only CVEs and matched products answer
+    the rest of the advisory page from the record alone. ``source`` is display text -- a feed item's advisory
+    heading or an Adobe bulletin's name -- while ``source_id`` is the configured source the item was queued
+    from and ``""`` for an escalation or a bulletin, which are not feed items. The body is deliberately
+    absent: it is the rendered text, not a fact.
     """
     return {
         "tag": entry.get("tag", ""),
+        "source_id": entry.get("source_id", ""),
         "source": entry.get("source", ""),
         "title": entry.get("title", ""),
         "link": entry.get("link", ""),

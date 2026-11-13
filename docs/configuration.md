@@ -254,10 +254,13 @@ byte-for-byte the one earlier versions sent.
 
 ## Advisories, filters and the queue
 
-`/alerts` filters the seen advisories by severity tag, recorded source, outcome, a
-case-insensitive text search (identifier and title) and an inclusive UTC day range. Every
-filter lives in the URL query string, so a reload or a shared link keeps it. The list is
-paged with a keyset cursor (50 rows, newest first by time then identifier) instead of a
+`/alerts` filters the seen advisories by severity tag, the configured source id the message
+was queued from, outcome, a case-insensitive text search (identifier and title) and an
+inclusive UTC day range. The source filter matches the stored `source_id` exactly and never
+the advisory heading: the heading is display text, and a record written before source ids
+were stored carries none, so the filter excludes it rather than matching an empty value.
+Every filter lives in the URL query string, so a reload or a shared link keeps it. The list
+is paged with a keyset cursor (50 rows, newest first by time then identifier) instead of a
 fixed cap, and each row links to the advisory's page (the identifier is encoded in the path,
 so a stored GUID or URL containing slashes still opens). An advisory's identity is kept
 exactly as the publisher sent it — only its log and display spelling is escaped — because

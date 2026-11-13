@@ -327,19 +327,21 @@ written in the YAML is carried over by id when the notifier form rewrites the li
 
 ### Lists, the advisory page and screenshots
 
-`/alerts` keeps its filters in the URL (`tag`, `source`, `outcome`, `q`, `since` and
-`until`, the dates as inclusive UTC days) and pages by keyset cursor rather than an offset,
-so a reload, a bookmark or a shared link shows the same rows and adding an advisory cannot
-shift a page. Each row links to the advisory's page (the identifier is encoded in the path, so
-one containing slashes still opens), which shows the stored classification
-and delivery record — tag, source, title, identifiers and CVEs, KEV-only CVEs, matched
-products, per-CVE level and CVSS, and the notifiers that accepted the message — and says the details were not recorded for a seen record written by
+`/alerts` keeps its filters in the URL (`tag`, `source` — the configured source id, never the
+advisory heading — `outcome`, `q`, `since` and `until`, the dates as inclusive UTC days) and
+pages by keyset cursor rather than an offset, so a reload, a bookmark or a shared link shows
+the same rows and adding an advisory cannot shift a page. Each row links to the advisory's
+page (the identifier is encoded in the path, so one containing slashes still opens), which
+shows the stored classification and delivery record — tag, source, title, identifiers and
+CVEs, KEV-only CVEs, matched products, per-CVE level and CVSS, and the notifiers that
+accepted the message — and says the details were not recorded for a seen record written by
 an older version, instead of inventing them. The page never renders the message body: a
 delivered record does not retain it, while a pending or parked entry still carries its body
 in the queue until it leaves. The record is stored once per message and each identifier
-points at it, so a message naming thousands of identifiers does not multiply it. `/parked` releases or drops one message per row as well as the whole queue, and
-`/runs` filters by exit code and day; the state keeps only the last 200 passes, so the page
-states that cap instead of paging.
+points at it, so a message naming thousands of identifiers does not multiply it.
+`/parked` releases or drops one message per row as well as
+the whole queue, and `/runs` filters by exit code and day; the state keeps only the last 200
+passes, so the page states that cap instead of paging.
 
 The UI screenshots are written by an opt-in script, never by the application:
 `uv run --with playwright python scripts/capture_screenshots.py` (add

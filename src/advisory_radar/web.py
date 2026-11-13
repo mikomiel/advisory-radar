@@ -535,13 +535,15 @@ def _matches_seen(
 ) -> bool:
     """Whether one seen record passes every filter.
 
-    A record that predates the delivery snapshot carries only ``at``/``outcome``, so a tag, source or
-    title filter excludes it -- matching on an empty value would be a lie. The date range and the text
-    filter still apply, so it stays findable by its identifier.
+    The source filter compares the configured ``source_id`` exactly. It never falls back to ``source``, which
+    is display text -- a feed item's advisory heading -- and matching it would answer a question the record
+    does not hold an answer to. A record that predates the delivery snapshot carries only
+    ``at``/``outcome``, so a tag, source id or title filter excludes it: matching on an empty value would be a
+    lie. The date range and the text filter still apply, so it stays findable by its identifier.
     """
     if filters.get("tag") and record.get("tag") != filters["tag"]:
         return False
-    if filters.get("source") and record.get("source") != filters["source"]:
+    if filters.get("source") and record.get("source_id") != filters["source"]:
         return False
     if filters.get("outcome") and record.get("outcome") != filters["outcome"]:
         return False
@@ -1650,7 +1652,7 @@ def create_app(
             "<form class='toolbar' method='get' action='/alerts'>"
             f"<label>Tag<select name='tag'>{''.join(option(value, filters['tag']) for value in ('', *TAGS))}"
             "</select></label>"
-            f"<label>Source<input type='text' name='source' value='{esc(filters['source'])}'></label>"
+            f"<label>Source id<input type='text' name='source' value='{esc(filters['source'])}'></label>"
             f"<label>Outcome<select name='outcome'>"
             f"{''.join(option(value, filters['outcome']) for value in ('', *outcome_values))}</select></label>"
             f"<label>Text<input type='text' name='q' value='{esc(filters['q'])}'></label>"
@@ -1664,13 +1666,13 @@ def create_app(
             path = _advisory_token(identifier)
             tag = _field(record.get("tag"))
             outcome = _field(record.get("outcome"))
-            source = _field(record.get("source"))
+            source_id = _field(record.get("source_id"))
             title = _field(record.get("title"))
             tone = {"delivered": " dot-ok", "dropped": " dot-bad"}.get(outcome, "")
             table_rows.append(
                 f"<tr><td><a href='/advisories/{esc(path)}'>{esc(identifier)}</a></td>"
                 f"<td>{_badge(tag, tag) if tag else "<span class='muted'>—</span>"}</td>"
-                f"<td>{esc(source) if source else '—'}</td>"
+                f"<td>{esc(source_id) if source_id else "<span class='muted'>—</span>"}</td>"
                 f"<td>{_short(title) if title else '—'}</td>"
                 f"<td><span class='dot{tone}'></span>{esc(outcome)}</td>"
                 f"<td class='muted nowrap'>{esc(_when(record.get('at')))}</td></tr>"
@@ -1678,7 +1680,7 @@ def create_app(
         if table_rows:
             table = (
                 "<div class='scroll'><table><tr><th scope='col'>ID</th><th scope='col'>Tag</th>"
-                "<th scope='col'>Source</th><th scope='col'>Title</th><th scope='col'>Outcome</th>"
+                "<th scope='col'>Source id</th><th scope='col'>Title</th><th scope='col'>Outcome</th>"
                 "<th scope='col'>First seen (UTC)</th></tr>" + "".join(table_rows) + "</table></div>"
             )
         elif any(filters.values()):
@@ -1691,9 +1693,9 @@ def create_app(
         if following is not None:
             pager.append(f"<a class='btn' href='{esc(link(cursor=_cursor_encode(*following)))}'>Older →</a>")
         body = (
-            filter_form
-            + f"<p class='muted small'>{len(rows)} matching record(s). A dash means the record predates the "
-            "delivery snapshot, so it carries no tag, source or title.</p>" + table
+            filter_form + f"<p class='muted small'>{len(rows)} matching record(s). A dash means the record carries no "
+            "value for that column: one written before the delivery snapshot has no tag, source id or title, "
+            "and a source filter matches only the configured source id, never the advisory heading.</p>" + table
         )
         if pager:
             body += f"<nav class='pager' aria-label='Pages'>{''.join(pager)}</nav>"
