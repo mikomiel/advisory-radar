@@ -11,6 +11,13 @@ release decision: the `vX.Y.Z` tag it creates is what builds and publishes
 section by hand -- [CONTRIBUTING.md](CONTRIBUTING.md#releases) owns the release
 boundary.
 
+## [0.3.0](https://github.com/mikomiel/advisory-radar/compare/v0.2.2...v0.3.0) (2026-11-13)
+
+
+### Added
+
+* **web:** add an actionable dashboard and a unified advisory inbox ([#125](https://github.com/mikomiel/advisory-radar/issues/125)) ([eb45b7c](https://github.com/mikomiel/advisory-radar/commit/eb45b7c475fca943a3a7d39c253d4c53564dfda9))
+
 ## [0.2.2](https://github.com/mikomiel/advisory-radar/compare/v0.2.1...v0.2.2) (2026-11-13)
 
 
