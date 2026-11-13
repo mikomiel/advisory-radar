@@ -15,12 +15,16 @@ import stat
 import sys
 import threading
 import time
+import tomllib
+from pathlib import Path
 
 import pytest
 
 from advisory_radar import core, pipeline, storage
 from advisory_radar.config import ConfigError, load_config
 from advisory_radar.state import LockBusy, SourceError, describe_schema, expect_schema, serialize_json
+
+ROOT = Path(__file__).parent.parent
 
 DOCUMENT = {
     "schema": storage.DEFAULT_SCHEMA,
@@ -467,8 +471,24 @@ def test_a_missing_driver_is_a_store_error(monkeypatch):
     with pytest.raises(storage.StoreUnavailable) as caught:
         store.load()
     assert not isinstance(caught.value, ImportError)
-    assert "python -m pip install 'psycopg[binary]'" in str(caught.value)
-    assert "s3cr3t-pass" not in str(caught.value)
+    message = str(caught.value)
+    assert "uv sync --extra postgres" in message  # the recovery the documented interpreter can run
+    assert "python -m pip" not in message
+    assert "s3cr3t-pass" not in message
+
+
+def test_the_postgres_extra_is_declared_and_the_image_installs_it():
+    """Packaging evidence only: the optional driver is declared and both image layers request it.
+
+    This says nothing about a live PostgreSQL server, which no test here reaches.
+    """
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    extra = project["project"]["optional-dependencies"]["postgres"]
+    assert any(requirement.startswith("psycopg[binary]") for requirement in extra)
+
+    installs = [line for line in (ROOT / "Dockerfile").read_text().splitlines() if line.startswith("RUN uv sync")]
+    assert len(installs) == 2, "the dependency layer and the project layer both install"
+    assert all("--extra postgres" in line for line in installs)
 
 
 def test_a_connection_failure_does_not_carry_the_credential(monkeypatch):

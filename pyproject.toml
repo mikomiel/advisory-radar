@@ -18,6 +18,11 @@ dependencies = [
     "uvicorn>=0.30",
 ]
 
+[project.optional-dependencies]
+# The PostgreSQL state store is optional: the driver is installed only where a deployment sets
+# `storage: postgresql://...`, and the published container image installs this extra itself.
+postgres = ["psycopg[binary]>=3.2"]
+
 [project.scripts]
 advisory-radar = "advisory_radar.cli:main"
 

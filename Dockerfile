@@ -13,9 +13,10 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_PROJECT_ENVIRONMENT=/app/.venv
 WORKDIR /app
 COPY pyproject.toml uv.lock README.md LICENSE ./
-RUN uv sync --frozen --no-dev --no-install-project
+# The postgres extra installs psycopg so the image can use the PostgreSQL state store.
+RUN uv sync --frozen --no-dev --no-install-project --extra postgres
 COPY src ./src
-RUN uv sync --frozen --no-dev --no-editable
+RUN uv sync --frozen --no-dev --no-editable --extra postgres
 
 FROM python:3.13-slim-bookworm
 RUN useradd --system --uid 10001 --home /data radar
