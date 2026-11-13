@@ -167,15 +167,15 @@ def snapshot(
     }
 
 
-def pending_entry(cve: str = "CVE-2026-50111", **extra) -> dict:
+def pending_entry(cve: str = "CVE-2026-50111", *, tag: str = "warning", **extra) -> dict:
     entry = {
         "kind": "new",
-        "tag": "warning",
-        "title": f"WARNING: {cve} in nginx",
+        "tag": tag,
+        "title": f"{tag.upper()}: {cve} in nginx",
         "body": "BODY-MARKER: the rendered message is not retained",
         "ids": [cve],
         "cves": [cve],
-        "levels": {cve: "warning"},
+        "levels": {cve: tag},
         "scores": {cve: 7.5},
         "kev_only": [],
         "source": "Vendor Feed",
@@ -1897,6 +1897,13 @@ def test_the_inbox_keeps_each_cve_of_one_message_on_its_own_row(tmp_path):
     # Two advisory links and two related links: each identifier keeps its own row and names the other.
     assert page.count("href='/advisories/") == 4
     assert "CVE-2026-9100" in page and "CVE-2026-9101" in page
+    # Each row carries the level recorded for its own CVE, not the message's aggregate tag.
+    critical = client.get("/inbox?state=open&tag=critical").text
+    assert critical.count("<tr>") - 1 == 1 and "CVE-2026-9100" in critical
+    warning = client.get("/inbox?state=open&tag=warning").text
+    assert warning.count("<tr>") - 1 == 1 and "CVE-2026-9101" in warning
+    dashboard = client.get("/").text
+    assert re.search(r"Undelivered criticals</span><span class='stat-value'>1</span>", dashboard)
 
 
 def test_the_inbox_shows_parked_and_carried_work(tmp_path):
@@ -2258,3 +2265,24 @@ def test_two_carried_items_with_the_same_title_and_time_keep_both_facts(tmp_path
     page = client.get("/inbox").text
     assert page.count("<tr>") == 4, "the delivered row and both carried rows are present"
     assert page.count("carried 2026") == 2, "both carried items are kept on the delivered identifier's row"
+
+
+def test_a_delivered_ghsa_is_context_not_queue_work(tmp_path):
+    """Ownership is the first claim: a message naming a delivered GHSA owns only what it introduces."""
+    state = core.new_state()
+    state["seen"]["GHSA-aaaa-bbbb-cccc"] = seen(NOW - 3600, "delivered")
+    entry = pending_entry("CVE-2026-6900", tag="critical")
+    entry["ids"] = ["GHSA-aaaa-bbbb-cccc", "CVE-2026-6900"]
+    entry["cves"] = ["CVE-2026-6900"]
+    entry["levels"] = {"CVE-2026-6900": "critical"}
+    entry["queued_at"] = NOW - 60
+    entry["source_id"] = "vendor-feed"
+    state["pending"] = [entry]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    pending = client.get("/inbox?state=pending").text
+    assert pending.count("<tr>") - 1 == 1
+    assert "CVE-2026-6900" in pending
+    delivered = client.get("/inbox?state=delivered").text
+    assert delivered.count("<tr>") - 1 == 1
+    assert "Also: pending" in client.get("/inbox").text

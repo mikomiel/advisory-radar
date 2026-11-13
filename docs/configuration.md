@@ -284,9 +284,12 @@ missing, stale or other-session token renders no notice.
 `/inbox` is the work list across the whole lifecycle. Its rows are one per identifier, and
 each row keeps every fact the state holds about it — a parked message, a queued one, carried
 work, an earlier delivery, an event — with the most actionable fact shown and the rest listed
-under **Also**. A message that merely co-names an identifier another message owns is a mention:
-it is shown as context and never replaces that identifier's own state or severity, so a new
-feed item cannot hide a parked critical. The same rule decides what a delivery event
+under **Also**. Ownership is the first claim: the state record or message that first named an
+identifier owns it, and a later message that names it again is a mention — context that never
+replaces its own state or severity, so a new feed item cannot hide a parked critical or
+requeue a delivered GHSA. Each row's severity is the level recorded for that identifier,
+falling back to the message's tag when it has none, so a multi-CVE message with mixed levels
+does not label every row with its strongest one. The same rule decides what a delivery event
 delivered (only the identifiers its seen records point at; an escalation or bulletin is about
 all it names) and whether a carried item is new work (one naming only already-classified
 identifiers adds context instead of promoting them back into the queue). `state` accepts `open` — everything the queue still

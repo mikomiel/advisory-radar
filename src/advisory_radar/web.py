@@ -693,6 +693,8 @@ _EVENT_STATES = ("delivered", "dropped")
 #: own list. A ``new`` event names everything its message mentioned, so only its seen records say what it
 #: actually delivered.
 _WHOLE_EVENT_KINDS = ("escalation", "adobe", "adobe-kev")
+#: No claim time sorts last: an entry with no recorded time is not assumed to be the oldest.
+_UNKNOWN_CLAIM = 1 << 62
 
 
 def _fact_rank(state: str) -> int:
@@ -702,44 +704,34 @@ def _fact_rank(state: str) -> int:
     return 3 if state in _EVENT_STATES else 4
 
 
-def _message_subjects(entry: Mapping) -> set[str]:
-    """The identifiers a queued message is actually about, as far as the state recorded it.
+def _identifier_tag(source: Mapping, identifier: str) -> str:
+    """The severity recorded for this identifier, falling back to the message's aggregate tag.
 
-    A message's ``ids`` is everything its text names, and a new item can name an identifier another message
-    already owns (a feed item announcing CVE-B next to the CVE-A that is already parked). The judged CVEs are
-    the message's subjects; so is every non-CVE identifier, because a DSA, GHSA or APSB id is the advisory
-    itself rather than a co-mentioned CVE. An entry that records neither ``levels`` nor ``cves`` predates the
-    distinction, so the message itself is the only evidence there is and every id is a subject.
+    One message can judge a critical CVE and a warning CVE: each row must carry its own level, or the
+    critical filter and the dashboard would select a message-level set instead of the identifier-level one.
+    A non-CVE identifier usually has no level of its own and falls back to the message's tag.
     """
-    identifiers = _stored_strings(entry.get("ids"))
-    if "levels" not in entry and "cves" not in entry:
-        return set(identifiers)
-    judged: set[str] = set()
-    cves = entry.get("cves")
-    if isinstance(cves, (list, tuple)):
-        judged |= {cve for cve in cves if isinstance(cve, str)}
-    levels = entry.get("levels")
+    levels = source.get("levels")
     if isinstance(levels, dict):
-        judged |= set(levels)
-    subjects = {
-        identifier for identifier in identifiers if identifier in judged or not identifier.upper().startswith("CVE-")
-    }
-    # An entry with no recorded judgement at all is still evidence about its own identifiers.
-    return subjects or set(identifiers)
+        level = levels.get(identifier)
+        if isinstance(level, str) and level:
+            return level
+    tag = source.get("tag")
+    return tag if isinstance(tag, str) else ""
 
 
 def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | None = None) -> list[dict]:
     """One row per identifier, aggregating every fact the state holds about it.
 
-    A row is never a merge of two advisories. One message can name several identifiers; each identifier the
-    message is about gets its own row, and the others are listed as related identifiers. An identifier the
-    message merely co-names -- one another message already owns -- is a *mention*: it is added below the
-    row's own state and outside the filters, because the text names it but it is not that message's advisory.
-    The same distinction applies to a delivery event (a ``new`` event only delivers the identifiers its seen
-    records point at; an escalation or bulletin is about all it names) and to carried work (an item that only
-    names identifiers already classified is context, not a new lifecycle state). Grouping a multi-CVE
-    bulletin into one row would merge unrelated advisories and lose each one's own evidence, so the grouping
-    stops at the identifier; resolving true aliases is S04's job.
+    A row is never a merge of two advisories. Ownership is the first claim: the state record, parked message
+    or queued message that first named an identifier owns it, and every later message that merely mentions it
+    adds context instead of replacing its state or severity. That is what keeps a new feed item from hiding a
+    parked critical, and a delivered GHSA from being queued again as work. The same distinction decides what
+    a delivery event delivered (only the identifiers its seen records point at; an escalation or bulletin is
+    about all it names) and whether carried work introduces an identifier (an item naming only
+    already-classified identifiers adds context). Grouping a multi-CVE bulletin into one row would merge
+    unrelated advisories and lose each one's own level, so the grouping stops at the identifier; resolving
+    true aliases is S04's job.
 
     Facts rank parked, then pending/held, then carried, then history (delivered and the other seen outcomes),
     then an event-only notification. The primary fact is displayed; every fact stays available to the
@@ -749,6 +741,40 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
     rows: dict[str, dict] = {}
     mentions: list[tuple[str, dict]] = []
     carried_facts: list[tuple[str, dict]] = []
+
+    seen = state.get("seen")
+    seen = seen if isinstance(seen, dict) else {}
+    deliveries = state.get("deliveries")
+    deliveries = deliveries if isinstance(deliveries, dict) else {}
+    pending = state.get("pending")
+    pending = [entry for entry in pending if isinstance(entry, dict)] if isinstance(pending, list) else []
+    parked = state.get("parked")
+    parked = [entry for entry in parked if isinstance(entry, dict)] if isinstance(parked, list) else []
+
+    # Which state record or message owns each identifier: the earliest claim wins, and a tie prefers the
+    # history, then parked work, then the queue. An entry with no recorded time sorts behind every dated one.
+    claim_order: dict[str, tuple[int, int, int]] = {}
+
+    def claim(identifiers: Iterable[str], *, kind: int, at: object, index: int) -> None:
+        stamp = _number(at, 0)
+        key = (stamp if stamp > 0 else _UNKNOWN_CLAIM, kind, index)
+        for identifier in identifiers:
+            current = claim_order.get(identifier)
+            if current is None or key < current:
+                claim_order[identifier] = key
+
+    for identifier, record in seen.items():
+        if isinstance(identifier, str) and isinstance(record, dict):
+            claim((identifier,), kind=0, at=record.get("at"), index=0)
+    for index, entry in enumerate(parked):
+        claim(
+            _stored_strings(entry.get("ids")),
+            kind=1,
+            at=_number(entry.get("parked_at"), 0) or _queue_time(entry),
+            index=index,
+        )
+    for index, entry in enumerate(pending):
+        claim(_stored_strings(entry.get("ids")), kind=2, at=_queue_time(entry), index=index)
 
     def make(
         *,
@@ -802,7 +828,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         row["primary_origin"] = primary["origin"]
 
     def mention(identifier: str, fact: dict) -> None:
-        """Record context for a row that exists; a mention never creates a row."""
+        """Record context for a row that exists; a mention never creates a row and never becomes primary."""
         row = rows.get(identifier)
         if row is None:
             return
@@ -810,60 +836,53 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         if all(existing["origin"] != fact["origin"] for existing in row["facts"]):
             row["facts"].append(fact)
 
-    pending = state.get("pending")
-    for index, entry in enumerate(pending if isinstance(pending, list) else ()):
-        if not isinstance(entry, dict):
-            continue
-        identifiers = _stored_strings(entry.get("ids"))
-        subjects = _message_subjects(entry)
+    def owned(entry: Mapping, identifier: str, *, kind: int, index: int, at: int) -> bool:
+        """Whether this message is the one that owns the identifier, by the claim order above."""
+        stamp = at if at > 0 else _UNKNOWN_CLAIM
+        return claim_order.get(identifier) == (stamp, kind, index)
+
+    for index, entry in enumerate(pending):
+        identifiers = list(dict.fromkeys(_stored_strings(entry.get("ids"))))
         held = delivery.is_held(now, entry, quiet_hours)
+        at = _queue_time(entry)
         source_id = entry.get("source_id") if isinstance(entry.get("source_id"), str) else ""
         for identifier in identifiers:
-            owned = identifier in subjects
             fact = make(
                 state="held" if held else "pending",
-                at=_queue_time(entry),
+                at=at,
                 origin=f"pending:{index}",
-                tag=entry.get("tag") if owned else "",
+                tag=_identifier_tag(entry, identifier),
                 title=entry.get("title"),
                 link=entry.get("link"),
                 source=source_id,
                 aliases=tuple(other for other in identifiers if other != identifier),
             )
-            if owned:
+            if owned(entry, identifier, kind=2, index=index, at=at):
                 own(identifier, fact)
             else:
                 mentions.append((identifier, fact))
 
-    parked = state.get("parked")
-    for index, entry in enumerate(parked if isinstance(parked, list) else ()):
-        if not isinstance(entry, dict):
-            continue
-        identifiers = _stored_strings(entry.get("ids"))
-        subjects = _message_subjects(entry)
-        source_id = entry.get("source_id") if isinstance(entry.get("source_id"), str) else ""
+    for index, entry in enumerate(parked):
+        identifiers = list(dict.fromkeys(_stored_strings(entry.get("ids"))))
         at = _number(entry.get("parked_at"), 0) or _queue_time(entry)
+        source_id = entry.get("source_id") if isinstance(entry.get("source_id"), str) else ""
         for identifier in identifiers:
-            owned = identifier in subjects
             fact = make(
                 state="parked",
                 at=at,
                 origin=f"parked:{index}",
-                tag=entry.get("tag") if owned else "",
+                tag=_identifier_tag(entry, identifier),
                 title=entry.get("title"),
                 link=entry.get("link"),
                 source=source_id,
                 aliases=tuple(other for other in identifiers if other != identifier),
             )
-            if owned:
+            if owned(entry, identifier, kind=1, index=index, at=at):
                 own(identifier, fact)
             else:
                 mentions.append((identifier, fact))
 
-    deliveries = state.get("deliveries")
-    deliveries = deliveries if isinstance(deliveries, dict) else {}
-    seen = state.get("seen")
-    for identifier, record in seen.items() if isinstance(seen, dict) else ():
+    for identifier, record in seen.items():
         if not isinstance(identifier, str) or not isinstance(record, dict):
             continue
         reference = record.get("delivery")
@@ -880,7 +899,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
                 state=outcome if isinstance(outcome, str) and outcome else "recorded",
                 at=record.get("at"),
                 origin=f"seen:{identifier}",
-                tag=snapshot.get("tag"),
+                tag=_identifier_tag(snapshot, identifier),
                 title=snapshot.get("title"),
                 link=snapshot.get("link"),
                 source=snapshot.get("source_id") if isinstance(snapshot.get("source_id"), str) else "",
@@ -894,11 +913,10 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         identifiers = tuple(dict.fromkeys((*_stored_strings(event.get("ids")), *_stored_strings(event.get("cves")))))
         if not identifiers:
             continue
-        seen_records = seen if isinstance(seen, dict) else {}
         pointed = {
             identifier
             for identifier in identifiers
-            if isinstance(seen_records.get(identifier), dict) and seen_records[identifier].get("delivery") == event_id
+            if isinstance(seen.get(identifier), dict) and seen[identifier].get("delivery") == event_id
         }
         kind = event.get("kind")
         # A bulletin and an escalation are about everything they name. A ``new`` event is the message, not its
@@ -912,7 +930,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
                 state=state_name,
                 at=event.get("at"),
                 origin=f"event:{event_id}",
-                tag=event.get("tag") if whole else "",
+                tag=_identifier_tag(event, identifier) if whole else "",
                 title=event.get("title"),
                 link=event.get("link"),
                 source=source_id,
@@ -925,8 +943,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
             else:
                 mentions.append((identifier, {**fact, "state": "notified"}))
 
-    carry = state.get("carry")
-    for source_id, items in carry.items() if isinstance(carry, dict) else ():
+    for source_id, items in state.get("carry").items() if isinstance(state.get("carry"), dict) else ():
         if not isinstance(items, list):
             continue
         for index, item in enumerate(items):
