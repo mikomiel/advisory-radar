@@ -28,7 +28,7 @@ from advisory_radar.runtime import Runtime
 from advisory_radar.settings import load_settings, settings_path
 from advisory_radar.state import load_state_document, save_state, serialize_json, state_lock
 from advisory_radar.storage import JsonStore
-from advisory_radar.web import _advisory_token, create_app, inbox_rows
+from advisory_radar.web import _advisory_token, _inbox_also, create_app, inbox_rows
 
 LOG = logging.getLogger("advisory_radar")
 NOW = 1792600000  # 2026-10-21 16:26:40 UTC
@@ -3195,3 +3195,55 @@ def test_equal_parked_times_open_the_first_queue_message(tmp_path):
     assert primary_ids(second, "/inbox?state=parked") == {"CVE-2026-9950"}
     detail_after = second.get(f"/advisories/{advisory_token('CVE-2026-9950')}").text
     assert "libxml2" in detail_after and "now warning" not in detail_after
+
+
+def test_the_also_line_orders_mixed_facts_by_rank_then_time():
+    """Three of the other facts, ordered as the row orders them: rank first, then the newest."""
+    row = {
+        "primary_origin": "parked:0",
+        "facts": [
+            {"origin": "parked:0", "state": "parked", "rank": 0, "at": NOW, "tag": "critical"},
+            {"origin": "pending:0", "state": "pending", "rank": 1, "at": NOW + 5, "tag": "warning"},
+            {"origin": "seen:A", "state": "delivered", "rank": 3, "at": NOW, "tag": "warning"},
+            {"origin": "seen:B", "state": "suppressed", "rank": 3, "at": NOW - 5, "tag": ""},
+        ],
+    }
+    line = _inbox_also(row)
+    assert "pending warning" in line and "delivered warning" in line and "suppressed" in line
+    assert line.index("pending warning") < line.index("delivered warning")
+    assert line.index("delivered warning") < line.index("suppressed")
+
+
+@pytest.mark.parametrize("critical_first", [True, False])
+def test_owner_of_matches_the_inbox_primary_on_a_parked_tie(critical_first):
+    """Both queue orders: the row and its detail page name the same primary fact, before and after settlement."""
+    state = core.new_state()
+    critical = parked_entry("CVE-2026-9960", tag="critical")
+    critical.pop("fresh", None)
+    critical["queued_at"] = NOW - 3600
+    critical["parked_at"] = NOW - 300
+    warning = {
+        "kind": "escalation",
+        "queued_at": NOW - 7200,
+        "parked_at": NOW - 300,
+        "tag": "warning",
+        "title": "CVE-2026-9960 now warning",
+        "body": "",
+        "ids": ["CVE-2026-9960"],
+        "cves": ["CVE-2026-9960"],
+        "levels": {},
+        "source": "CVE-2026-9960",
+        "link": "https://vendor.example.net/advisories/CVE-2026-9960",
+    }
+    state["parked"] = [critical, warning] if critical_first else [warning, critical]
+    expected = critical["title"] if critical_first else warning["title"]
+
+    def agree() -> None:
+        row = next(row for row in inbox_rows(state, now=NOW) if row["identifier"] == "CVE-2026-9960")
+        assert row["title"] == expected
+        owner = core.owner_of(state, "CVE-2026-9960")
+        assert owner is not None and owner[0] == "parked" and owner[1]["title"] == expected
+
+    agree()
+    core._ensure_ownership(state)
+    agree()
