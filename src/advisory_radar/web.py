@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import heapq
 import hmac
 import html
 import json
@@ -1086,13 +1087,14 @@ def _inbox_also(row: Mapping) -> str:
     others = [fact for fact in row.get("facts") or () if fact.get("origin") != primary]
     if not others:
         return ""
-    others.sort(key=lambda item: (item["rank"], -item["at"]))
-    shown = []
-    for fact in others[:3]:
+    # Only three are shown: a bounded selection keeps an identifier with a long history linear to render.
+    shown = heapq.nsmallest(3, others, key=lambda item: (item["rank"], -item["at"]))
+    labels = []
+    for fact in shown:
         label = fact["state"] + (f" {fact['tag']}" if fact["tag"] else "")
-        shown.append(f"{esc(label)} {esc(_when(fact['at']) or 'unknown')}")
-    more = f" +{len(others) - 3}" if len(others) > 3 else ""
-    return f"<br><span class='muted small'>Also: {', '.join(shown)}{more}</span>"
+        labels.append(f"{esc(label)} {esc(_when(fact['at']) or 'unknown')}")
+    more = f" +{len(others) - len(shown)}" if len(others) > len(shown) else ""
+    return f"<br><span class='muted small'>Also: {', '.join(labels)}{more}</span>"
 
 
 def _matches_inbox(row: Mapping, filters: Mapping[str, str], since: int | None, until: int | None) -> bool:

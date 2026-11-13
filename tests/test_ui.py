@@ -3048,6 +3048,9 @@ def test_many_messages_naming_one_identifier_stay_linear(tmp_path):
     assert rows[0]["identifier"] == "CVE-2026-9700"
     assert len(rows[0]["facts"]) == 2001, "the delivery and every mention are retained"
     assert rows[0]["state"] == "delivered", "mentions never become the primary fact"
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    assert "+1997" in client.get("/inbox").text, "only three of the other facts are rendered"
 
 
 def test_whole_message_work_stays_additional_to_a_legacy_owner(tmp_path):
@@ -3154,3 +3157,41 @@ def test_a_legacy_escalation_does_not_compete_for_an_exclusive_claim(tmp_path):
     assert before["parked"] == {"CVE-2026-9900"} and before["critical"] == {"CVE-2026-9900"}
     assert "libxml2" in detail_before
     assert "libxml2" in second.get(f"/advisories/{advisory_token('CVE-2026-9900')}").text
+
+
+def test_equal_parked_times_open_the_first_queue_message(tmp_path):
+    """When rank and time tie, the inbox keeps the first parked message; the detail page must too."""
+    state = core.new_state()
+    critical = parked_entry("CVE-2026-9950", tag="critical")
+    critical.pop("fresh", None)
+    critical["queued_at"] = NOW - 3600
+    critical["parked_at"] = NOW - 300
+    warning = {
+        "kind": "escalation",
+        "queued_at": NOW - 7200,
+        "parked_at": NOW - 300,
+        "tag": "warning",
+        "title": "CVE-2026-9950 now warning",
+        "body": "",
+        "ids": ["CVE-2026-9950"],
+        "cves": ["CVE-2026-9950"],
+        "levels": {},
+        "source": "CVE-2026-9950",
+        "link": "https://vendor.example.net/advisories/CVE-2026-9950",
+    }
+    state["parked"] = [critical, warning]
+
+    first, token, _ = make_client(tmp_path, state=state)
+    sign_in(first, token)
+    assert primary_ids(first, "/inbox?state=parked") == {"CVE-2026-9950"}
+    detail_before = first.get(f"/advisories/{advisory_token('CVE-2026-9950')}").text
+    assert "libxml2" in detail_before and "now warning" not in detail_before
+
+    core._ensure_ownership(state)
+    assert critical["fresh"] == ["CVE-2026-9950"]
+    assert warning["fresh"] == ["CVE-2026-9950"]
+    second, token, _ = make_client(tmp_path, state=state)
+    sign_in(second, token)
+    assert primary_ids(second, "/inbox?state=parked") == {"CVE-2026-9950"}
+    detail_after = second.get(f"/advisories/{advisory_token('CVE-2026-9950')}").text
+    assert "libxml2" in detail_after and "now warning" not in detail_after

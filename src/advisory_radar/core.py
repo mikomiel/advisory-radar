@@ -1775,26 +1775,27 @@ def owner_of(state: dict, identifier: str) -> tuple[str, dict] | None:
             return parked_at
         return _queue_time(entry)
 
-    candidates: list[tuple[int, int, str, dict]] = []
+    candidates: list[tuple[int, int, int, str, dict]] = []
 
-    def candidate(label: str, entry: dict) -> None:
-        candidates.append((0 if label == "parked" else 1, -display_at(entry), label, entry))
+    def candidate(label: str, entry: dict, index: int) -> None:
+        # The inbox keeps the first fact when rank and time tie, and it appends parked entries in queue order.
+        candidates.append((0 if label == "parked" else 1, -display_at(entry), index, label, entry))
 
     # Exclusive owners: a message's recorded ``fresh`` list. A whole-message fact (escalation, bulletin) is
     # additional work the inbox keeps alongside another owner, so it is a candidate too, never a replacement.
     exclusive = False
     for label, entries in (("parked", parked), ("pending", pending)):
-        for entry in entries:
+        for index, entry in enumerate(entries):
             if not isinstance(entry, dict):
                 continue
             if entry.get("kind") in WHOLE_MESSAGE_KINDS:
                 if identifier in _stored_list(entry.get("ids")):
-                    candidate(label, entry)
+                    candidate(label, entry, index)
                 continue
             fresh = entry.get("fresh")
             if isinstance(fresh, (list, tuple)) and identifier in _stored_list(fresh):
                 exclusive = True
-                candidate(label, entry)
+                candidate(label, entry, index)
 
     if not exclusive:
         # No exclusive owner: the seen record and the legacy entries compete on the claim clock, exactly as
@@ -1820,17 +1821,17 @@ def owner_of(state: dict, identifier: str) -> tuple[str, dict] | None:
             _, kind, index = key
             if kind == 2:
                 if isinstance(record, dict):
-                    candidates.append((3, -seen_claim_time(record, state.get("deliveries")), "seen", record))
+                    candidates.append((3, -seen_claim_time(record, state.get("deliveries")), 0, "seen", record))
             else:
                 entries = parked if kind == 0 else pending
                 entry = entries[index] if index < len(entries) else None
                 if isinstance(entry, dict):
-                    candidate("parked" if kind == 0 else "pending", entry)
+                    candidate("parked" if kind == 0 else "pending", entry, index)
 
     if not candidates:
         return None
-    # The inbox's primary order: parked before queued, then the newest fact within a rank.
-    _, _, label, entry = min(candidates, key=lambda item: (item[0], item[1]))
+    # The inbox's primary order: parked before queued, then the newest fact, then queue order on a tie.
+    _, _, _, label, entry = min(candidates, key=lambda item: (item[0], item[1], item[2]))
     return label, entry
 
 
