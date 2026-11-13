@@ -21,6 +21,10 @@ LOG = logging.getLogger("advisory_radar")
 
 KEV_CACHE_NAME = "kev.json"
 
+#: ``run_pass`` exit code for "another pass held the lock, so nothing ran" on the non-blocking path. It is
+#: separate from 1 so a caller (the web UI's Run a pass now) can tell a skipped request from a failed one.
+PASS_BUSY = 2
+
 
 def _drop_removed_sources(
     state: dict, declared_ids: Collection[str], enabled_ids: Collection[str], *, complete: bool
@@ -148,7 +152,9 @@ def run_pass(
 
     The lock is held for the whole read/classify/deliver/write transaction, so the scheduler, the web
     UI's "run now" and a CLI ``once`` can never deliver the same pending message twice or overwrite each
-    other's state. ``lock_blocking=False`` returns 1 immediately when another pass holds it.
+    other's state. ``lock_blocking=False`` returns :data:`PASS_BUSY` immediately when another pass holds it,
+    so the web UI can say nothing ran; the blocking default still returns 1 after the lock timeout, which is
+    the failure the CLI and scheduler already report.
     """
     store = cfg.store()
     if dry_run:
@@ -158,7 +164,7 @@ def run_pass(
             return _run_pass(cfg, store, sources, notifiers, http=http, clock=clock, sleep=sleep, dry_run=False)
     except LockBusy:
         LOG.warning("another pass holds the state lock; skipped this run")
-        return 1
+        return 1 if lock_blocking else PASS_BUSY
     except StoreUnavailable as exc:
         # A missing driver or an unreachable server is a deployment fault: the pass did not run, and saying so
         # with the code the caller already reports is better than a traceback out of the scheduler.

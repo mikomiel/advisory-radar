@@ -17,7 +17,7 @@ from advisory_radar import core, pipeline
 from advisory_radar.config import DEFAULT_THRESHOLDS, collect_secrets, load_config
 from advisory_radar.notifiers import AppriseNotifier, DiscordWebhookNotifier, build_notifier
 from advisory_radar.sources import RssSource
-from advisory_radar.state import state_lock
+from advisory_radar.state import LockBusy, state_lock
 from advisory_radar.watchlist import load_policy
 
 NOW = 1792600000
@@ -113,8 +113,21 @@ def test_pass_skips_when_another_pass_holds_the_lock(tmp_path):
             sleep=lambda s: None,
             lock_blocking=False,
         )
-    assert code == 1
+    assert code == pipeline.PASS_BUSY, "the web path needs the skipped outcome, not the generic failure"
     assert not notifier.sent
+
+
+def test_a_blocking_pass_still_reports_one_when_the_lock_times_out(tmp_path, monkeypatch):
+    """The CLI and scheduler keep their ``1 = failed`` contract; only the non-blocking web path has a skip code."""
+    cfg = config(tmp_path)
+
+    class BusyStore:
+        def lock(self, *, blocking: bool = True):
+            raise LockBusy
+
+    # ``Config`` is frozen, so the store factory is replaced on the class rather than on the instance.
+    monkeypatch.setattr(type(cfg), "store", lambda self: BusyStore())
+    assert pipeline.run_pass(cfg, [], []) == 1
 
 
 def test_empty_notifier_list_keeps_messages_pending(tmp_path):

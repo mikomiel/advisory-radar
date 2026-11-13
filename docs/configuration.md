@@ -272,7 +272,11 @@ thousands of identifiers does not multiply it. A record written by an older vers
 details were not recorded instead of inventing them. `/parked` releases or drops a
 single message per row while keeping the bulk actions, and `/runs` filters by exit code and
 day; the writer keeps only the last 200 passes, so that page states the cap rather than
-paging.
+paging. The dashboard's **Run a pass now** reports the result of that request above the
+last-pass line: finished, failed, already running, or not available in this process, so a
+busy or failed request is not read as the previous successful pass. The result travels in a
+signed token that expires after two minutes and is bound to the signed-in session, so a
+missing, stale or other-session token renders no notice.
 
 ## Settings without a restart
 

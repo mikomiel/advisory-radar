@@ -309,7 +309,11 @@ def test_parse_any_refuses_an_html_page():
         feeds.parse_any(PAGE)  # autodiscovery needs the page URL, which a parser does not have
 
 
-def test_fetch_any_follows_one_autodiscovery_hop():
+def test_fetch_any_follows_one_autodiscovery_hop(monkeypatch):
+    # The private-destination guard itself is exercised in tests/test_source_admin.py; stubbing it here keeps
+    # this test off real DNS. The recorder proves it still saw the discovered target.
+    guarded = []
+    monkeypatch.setattr(feeds, "private_destination", lambda url: guarded.append(url) or False)
     calls = []
 
     def http(method, url, headers, body):
@@ -324,10 +328,22 @@ def test_fetch_any_follows_one_autodiscovery_hop():
     (entry,) = export.items
     assert entry.title.startswith("APSB26-1")
     assert [url for url, _ in calls] == [PAGE_URL, "https://vendor.example.com/feeds/security.xml"]
+    assert guarded == ["https://vendor.example.com/feeds/security.xml"]
     assert "text/html" in calls[0][1]["Accept"]
     assert "text/html" not in calls[1][1]["Accept"]
     # A page's validators describe the page, not the feed it advertises, so none are stored.
     assert stored == {}
+
+
+def test_fetch_any_refuses_a_same_origin_feed_the_address_guard_calls_private(monkeypatch):
+    """The guard runs after the origin check too: a same-origin link to a private address is still refused."""
+    monkeypatch.setattr(feeds, "private_destination", lambda url: True)
+
+    def http(method, url, headers, body):
+        return 200, {}, PAGE
+
+    with pytest.raises(feeds.FeedError, match="private address"):
+        feeds.fetch_any(http, PAGE_URL)
 
 
 def test_fetch_any_refuses_a_discovered_private_feed_before_fetching_it():

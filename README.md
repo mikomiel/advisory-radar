@@ -24,19 +24,32 @@ deduplicated alert per new advisory to the channels you choose.
 
 ## Quickstart
 
+Create the mounts and the configuration the container expects, then start it:
+
 ```bash
-# Until the first tagged release is on GHCR, build locally:
-docker build -t ghcr.io/mikomiel/advisory-radar:latest .
+mkdir -p config data
+cp examples/config.yml config/config.yml   # edit sources/notifiers
+printf 'ADVISORY_RADAR_AUTH_TOKEN=%s\n' "$(openssl rand -hex 24)" > .env   # plus your notifier secrets
 docker compose up -d
-# or with Podman: install deploy/podman/advisory-radar.container as a quadlet
-# (see docs/deployment.md)
 ```
 
-Open http://localhost:8080 and sign in with `ADVISORY_RADAR_AUTH_TOKEN`.
-Configuration lives in `config/` on the mounted volume; start from
-[examples/config.yml](examples/config.yml) and read
+`docker compose up -d` pulls `ghcr.io/mikomiel/advisory-radar:latest`, which the
+`v*.*.*` tag workflow publishes ([Status](#status); `0.1.0` was the first public
+release). To run this checkout instead, build that tag first with
+`docker build -t ghcr.io/mikomiel/advisory-radar:latest .`.
+
+Open http://localhost:8080 and sign in with the token in `.env`. The session
+cookie is `Secure` by default, so a plain-HTTP local instance needs
+`ADVISORY_RADAR_INSECURE_COOKIES=1` in `.env`, or TLS terminated in front of it
+(see [the deployment configuration](docs/deployment.md#configuration)).
+
+Configuration is `config/config.yml` on the read-only `/config` mount, and state
+lives in `./data`; start from [examples/config.yml](examples/config.yml) and read
 [docs/configuration.md](docs/configuration.md). Secrets come from environment
 variables or a `${NAME_FILE}` reference to a file, never from committed files.
+[docs/deployment.md](docs/deployment.md) is the canonical deployment procedure,
+including Podman (the quadlet at `deploy/podman/advisory-radar.container`) and
+Kubernetes.
 
 ## Documentation
 
