@@ -1636,6 +1636,69 @@ def _suppressed(
         state["watch"][cve] = watch
 
 
+#: A legacy claim with no recorded time sorts behind every dated one.
+_LEGACY_UNKNOWN_CLAIM = 1 << 62
+
+
+def _ensure_ownership(state: dict) -> None:
+    """Record what each queued and parked message owns when it predates the recorded list.
+
+    A message written by this version carries ``fresh``: exactly the identifiers it introduced. An older
+    message does not, and the earliest-claim rule the inbox uses is applied once here and stored, so delivery
+    and drop write the same history the inbox displays. The rule: the earliest recorded claim wins, a tie
+    prefers parked work, then the queue, then history, and a message with no clock sorts last.
+    """
+    pending = state.get("pending")
+    pending = pending if isinstance(pending, list) else []
+    parked = state.get("parked")
+    parked = parked if isinstance(parked, list) else []
+    seen = state.get("seen")
+    seen = seen if isinstance(seen, dict) else {}
+    claims: dict[str, tuple[int, int, int]] = {}
+
+    def queue_time(entry: object) -> int:
+        source = entry if isinstance(entry, dict) else {}
+        for key in ("queued_at", "first_attempt_at"):
+            value = source.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+        return 0
+
+    def claim(identifier: object, *, kind: int, at: object, index: int) -> None:
+        if not isinstance(identifier, str):
+            return
+        stamp = at if isinstance(at, int) and not isinstance(at, bool) and at > 0 else _LEGACY_UNKNOWN_CLAIM
+        key = (stamp, kind, index)
+        current = claims.get(identifier)
+        if current is None or key < current:
+            claims[identifier] = key
+
+    for identifier, record in seen.items():
+        if isinstance(record, dict):
+            claim(identifier, kind=2, at=record.get("at"), index=0)
+    for index, entry in enumerate(parked):
+        for identifier in _stored_list(entry.get("ids")) if isinstance(entry, dict) else ():
+            claim(identifier, kind=0, at=queue_time(entry), index=index)
+    for index, entry in enumerate(pending):
+        for identifier in _stored_list(entry.get("ids")) if isinstance(entry, dict) else ():
+            claim(identifier, kind=1, at=queue_time(entry), index=index)
+
+    def record(entries: list, kind: int) -> None:
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict) or "fresh" in entry:
+                continue
+            at = queue_time(entry)
+            stamp = at if at > 0 else _LEGACY_UNKNOWN_CLAIM
+            entry["fresh"] = [
+                identifier
+                for identifier in _stored_list(entry.get("ids"))
+                if claims.get(identifier) == (stamp, kind, index)
+            ]
+
+    record(parked, 0)
+    record(pending, 1)
+
+
 def _claimed(state: dict) -> set[str]:
     """Every id the worker already answers for: seen, queued, or parked (a parked message is not lost).
 
@@ -2894,6 +2957,7 @@ def manage_parked(store: Store, release: bool, now: int) -> int:
     if state is None:
         LOG.error("no state document in %s; nothing is parked", store)
         return 1
+    _ensure_ownership(state)
     parked = state.setdefault("parked", [])
     if release:
         state["pending"] = [*map(_released, parked), *state["pending"]]
@@ -2953,6 +3017,7 @@ def manage_parked_entry(store: Store, index: int, release: bool, now: int, *, ex
             index,
         )
         return False
+    _ensure_ownership(state)
     parked.pop(index)
     if release:
         state["pending"] = [_released(entry), *state["pending"]]

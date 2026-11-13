@@ -2651,3 +2651,115 @@ def test_a_related_link_is_kept_for_an_identifier_with_a_record(tmp_path):
     page = client.get("/inbox").text
     assert f"href='/advisories/{advisory_token('CVE-2026-8600')}'" in page, "the delivered identifier keeps its link"
     assert f"href='/advisories/{advisory_token('CVE-2026-8601')}'" not in page
+
+
+def test_dropping_a_legacy_co_naming_message_does_not_take_the_owners_identifier(tmp_path):
+    """Legacy ownership is settled before a parked decision; dropping a co-naming message must not claim A."""
+    state = core.new_state()
+    critical = parked_entry("CVE-2026-8800", tag="critical")
+    critical.pop("fresh", None)
+    critical["queued_at"] = NOW - 7200
+    later = parked_entry("CVE-2026-8801", tag="warning")
+    later.pop("fresh", None)
+    later["queued_at"] = NOW - 3600
+    later["ids"] = ["CVE-2026-8800", "CVE-2026-8801"]
+    later["cves"] = ["CVE-2026-8801"]
+    later["levels"] = {"CVE-2026-8801": "warning"}
+    state["parked"] = [critical, later]
+    save_state(tmp_path / "state.json", state)
+    assert core.manage_parked_entry(JsonStore(tmp_path / "state.json"), 1, release=False, now=NOW) is True
+    stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    assert stored["seen"]["CVE-2026-8801"]["outcome"] == "dropped"
+    assert "CVE-2026-8800" not in stored["seen"], "the critical message still owns it"
+    assert stored["parked"][0]["fresh"] == ["CVE-2026-8800"]
+
+    assert core.manage_parked_entry(JsonStore(tmp_path / "state.json"), 0, release=True, now=NOW) is True
+    released = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    assert core.deliver(released, [RecordingNotifier("ops")], no_http, NOW) is True
+    record = released["seen"]["CVE-2026-8800"]
+    assert record["outcome"] == "delivered"
+    assert released["deliveries"][record["delivery"]]["tag"] == "critical"
+
+
+def test_the_advisory_link_for_a_queued_escalation_opens_it_with_its_history(tmp_path):
+    """The actionable escalation is the page; the delivered warning remains listed as history."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-8900"] = {"at": NOW - 3600, "outcome": "delivered", "delivery": "evt-1"}
+    state.setdefault("deliveries", {})["evt-1"] = {
+        "kind": "new",
+        "tag": "warning",
+        "title": "WARNING: CVE-2026-8900 in widget",
+        "ids": ["CVE-2026-8900"],
+        "cves": ["CVE-2026-8900"],
+        "levels": {"CVE-2026-8900": "warning"},
+        "at": NOW - 3600,
+        "outcome": "delivered",
+        "delivered_to": ["ops"],
+        "queued_at": NOW - 7200,
+    }
+    escalation = {
+        "kind": "escalation",
+        "queued_at": NOW - 60,
+        "fresh": ["CVE-2026-8900"],
+        "tag": "critical",
+        "title": "CVE-2026-8900 now critical",
+        "body": "",
+        "ids": ["CVE-2026-8900"],
+        "cves": ["CVE-2026-8900"],
+        "levels": {},
+        "scores": {"CVE-2026-8900": 9.8},
+        "kev": True,
+        "source": "CVE-2026-8900",
+        "link": "https://vendor.example.net/advisories/CVE-2026-8900",
+    }
+    state["pending"] = [escalation]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get(f"/advisories/{advisory_token('CVE-2026-8900')}")
+    assert page.status_code == 200
+    assert "CVE-2026-8900 now critical" in page.text
+    assert "pending" in page.text
+    assert "Notifications" in page.text, "the earlier delivery is still shown as history"
+    assert "badge-warning'>warning" in page.text
+
+
+def test_the_advisory_link_for_a_parked_escalation_opens_it_with_its_history(tmp_path):
+    state = core.new_state()
+    state["seen"]["CVE-2026-8910"] = {"at": NOW - 3600, "outcome": "delivered", "delivery": "evt-2"}
+    state.setdefault("deliveries", {})["evt-2"] = {
+        "kind": "new",
+        "tag": "warning",
+        "title": "WARNING: CVE-2026-8910 in widget",
+        "ids": ["CVE-2026-8910"],
+        "cves": ["CVE-2026-8910"],
+        "levels": {"CVE-2026-8910": "warning"},
+        "at": NOW - 3600,
+        "outcome": "delivered",
+        "delivered_to": ["ops"],
+        "queued_at": NOW - 7200,
+    }
+    state["parked"] = [
+        {
+            "kind": "escalation",
+            "queued_at": NOW - 600,
+            "parked_at": NOW - 60,
+            "fresh": ["CVE-2026-8910"],
+            "tag": "critical",
+            "title": "CVE-2026-8910 now critical",
+            "body": "",
+            "ids": ["CVE-2026-8910"],
+            "cves": ["CVE-2026-8910"],
+            "levels": {},
+            "scores": {"CVE-2026-8910": 9.8},
+            "kev": True,
+            "source": "CVE-2026-8910",
+            "link": "https://vendor.example.net/advisories/CVE-2026-8910",
+        }
+    ]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get(f"/advisories/{advisory_token('CVE-2026-8910')}")
+    assert page.status_code == 200
+    assert "CVE-2026-8910 now critical" in page.text
+    assert "parked" in page.text
+    assert "Notifications" in page.text

@@ -202,6 +202,9 @@ def _run_pass(
     core.HIDDEN_SOURCE_HOSTS = cfg.hidden_source_hosts
 
     state = core.new_state() if stored is None else stored
+    # A pass may deliver or drop an entry written before ownership was recorded; settle that before anything
+    # leaves a queue, so delivery writes the same history the inbox displays.
+    core._ensure_ownership(state)
     _reset_validators_on_policy_change(state, policy)
     state.setdefault("parked", [])
     core._prune(state, now)

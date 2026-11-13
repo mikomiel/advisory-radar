@@ -1432,8 +1432,12 @@ def _seen_advisory(
     )
 
 
-def _queued_advisory(state_label: str, entry: Mapping) -> str:
-    """The detail page for a pending or parked message: everything the queued entry itself holds."""
+def _queued_advisory(state_label: str, entry: Mapping, events: Sequence[tuple[str, Mapping]] = ()) -> str:
+    """The detail page for a pending or parked message: everything the queued entry itself holds.
+
+    ``events`` is the identifier's delivery history, if it has one: an escalation about an already-delivered
+    CVE shows the actionable message first and the delivery that preceded it below.
+    """
     attempts = _number(entry.get("attempts"), 0)
     first = _when(entry.get("first_attempt_at"))
     parked_at = _when(entry.get("parked_at"))
@@ -1465,6 +1469,7 @@ def _queued_advisory(state_label: str, entry: Mapping) -> str:
         + _facts(facts)
         + "<h2>CVEs and levels</h2>"
         + _levels_table(entry.get("levels"), entry.get("scores"))
+        + _notification_history(events)
         + "<p class='back'><a href='/parked'>← Back to the parked queue</a></p>"
     )
 
@@ -2603,15 +2608,6 @@ def create_app(
         state = load_state()
         events = core.delivery_events(state, identifier)
         seen = state.get("seen")
-        if isinstance(seen, dict) and isinstance(seen.get(identifier), dict):
-            record = seen[identifier]
-            deliveries = state.get("deliveries")
-            reference = record.get("delivery")
-            snapshot = (
-                deliveries.get(reference) if isinstance(deliveries, dict) and isinstance(reference, str) else None
-            )
-            body = _seen_advisory(record, snapshot if isinstance(snapshot, dict) else None, events)
-            return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
         pending = state.get("pending")
         parked = state.get("parked")
 
@@ -2622,14 +2618,24 @@ def create_app(
             fresh = entry.get("fresh")
             return isinstance(fresh, (list, tuple)) and identifier in _stored_strings(fresh)
 
-        # The entry that recorded the identifier as its own comes first: a parked critical must not open as
-        # a pending warning that happens to mention it. An entry written before ``fresh`` keeps the older
-        # membership rule, in the older pending-before-parked order.
+        # A live message that owns the identifier is the actionable fact: an escalation about an already-
+        # delivered CVE must open as the escalation, with the delivered history listed below it. The entry
+        # that recorded the identifier as its own comes next; a parked critical must not open as a pending
+        # warning that happens to mention it.
         for label, queue in (("parked", parked), ("pending", pending)):
             for entry in queue if isinstance(queue, list) else ():
                 if owns(entry):
-                    body = _queued_advisory(label, entry)
+                    body = _queued_advisory(label, entry, events)
                     return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
+        if isinstance(seen, dict) and isinstance(seen.get(identifier), dict):
+            record = seen[identifier]
+            deliveries = state.get("deliveries")
+            reference = record.get("delivery")
+            snapshot = (
+                deliveries.get(reference) if isinstance(deliveries, dict) and isinstance(reference, str) else None
+            )
+            body = _seen_advisory(record, snapshot if isinstance(snapshot, dict) else None, events)
+            return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
         for label, queue in (("pending", pending), ("parked", parked)):
             for entry in queue if isinstance(queue, list) else ():
                 # Only an entry written before ``fresh`` falls back to membership: a modern entry that names
