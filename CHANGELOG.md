@@ -11,6 +11,13 @@ release decision: the `vX.Y.Z` tag it creates is what builds and publishes
 section by hand -- [CONTRIBUTING.md](CONTRIBUTING.md#releases) owns the release
 boundary.
 
+## [0.2.2](https://github.com/mikomiel/advisory-radar/compare/v0.2.1...v0.2.2) (2026-11-13)
+
+
+### Fixed
+
+* **settings:** serialise overlay writes across processes ([#120](https://github.com/mikomiel/advisory-radar/issues/120)) ([977b09d](https://github.com/mikomiel/advisory-radar/commit/977b09d7c2c102ed53723789a65c4725b04f1e7d))
+
 ## [0.2.1](https://github.com/mikomiel/advisory-radar/compare/v0.2.0...v0.2.1) (2026-11-13)
 
 
