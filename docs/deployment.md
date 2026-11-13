@@ -124,11 +124,16 @@ a TLS-terminating reverse proxy; the session cookie is only sent over HTTPS unle
 `storage:` in `config.yml` moves the state document without changing its model. Empty is
 the default and means the JSON file at `state_path`; `sqlite:////data/state.db` keeps one
 file on the volume for one host; `postgresql://user:password@host/database` shares one
-document between instances and needs the optional driver:
+document between instances and needs the optional `postgres` extra, which installs the
+driver into the interpreter that runs the product:
 
 ```bash
-python -m pip install 'psycopg[binary]'
+uv sync --extra postgres
 ```
+
+The container image installs the same extra, so the PostgreSQL store needs no separate image
+build. This is packaging evidence, not live PostgreSQL acceptance: the driver path is
+unit-tested against a fake connection.
 
 Three slashes make a SQLite path relative to the working directory; four make it absolute.
 `sqlite:////data/state.db` is `/data/state.db` in the container, while
@@ -149,8 +154,8 @@ against a quiesced source: the command reads one consistent snapshot, but a pass
 running can record deliveries, parked messages and seen identifiers after that snapshot, and
 nothing in the copy accounts for them, so stop the service (or copy the store) first.
 
-PostgreSQL behaviour beyond the missing-driver path is unit-tested against a fake connection
-rather than a live server: the advisory lock, the connection that carries it and the credential
+The rest of the PostgreSQL behaviour is unit-tested against a fake connection rather than
+a live server: the advisory lock, the connection that carries it and the credential
 scrubbing are pinned by tests, so treat a switch to the PostgreSQL store as a change to verify
 on the target database first.
 

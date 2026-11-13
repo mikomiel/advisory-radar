@@ -352,8 +352,9 @@ returns to the YAML: the empty overlay is applied as revision 0.
 `state_path` is a single JSON document by default, and the `storage:` key moves those bytes
 without changing the document model, the pages or the commands. `sqlite:////data/state.db`
 keeps one file for one host (WAL, `synchronous=FULL`, mode `0600`); `postgresql://` shares
-one document between instances and needs the optional driver
-(`python -m pip install 'psycopg[binary]'`). The YAML owns the key: the overlay cannot move
+one document between instances and needs the optional `postgres` extra
+(`uv sync --extra postgres` for a source install; the container image already installs it, so
+PostgreSQL needs no separate image build). The YAML owns the key: the overlay cannot move
 the store, and a reload refuses a changed `storage:` exactly as it refuses a changed
 `state_path`. `settings.json` and the KEV cache stay beside `state_path`; neither is part of
 the document.
