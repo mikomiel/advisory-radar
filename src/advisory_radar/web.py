@@ -2604,7 +2604,25 @@ def create_app(
             )
             body = _seen_advisory(record, snapshot if isinstance(snapshot, dict) else None, events)
             return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
-        for label, queue in (("pending", state.get("pending")), ("parked", state.get("parked"))):
+        pending = state.get("pending")
+        parked = state.get("parked")
+
+        def owns(entry: object) -> bool:
+            """Whether a queued entry recorded this identifier as one it introduced."""
+            if not isinstance(entry, dict):
+                return False
+            fresh = entry.get("fresh")
+            return isinstance(fresh, (list, tuple)) and identifier in _stored_strings(fresh)
+
+        # The entry that recorded the identifier as its own comes first: a parked critical must not open as
+        # a pending warning that happens to mention it. An entry written before ``fresh`` keeps the older
+        # membership rule, in the older pending-before-parked order.
+        for label, queue in (("parked", parked), ("pending", pending)):
+            for entry in queue if isinstance(queue, list) else ():
+                if owns(entry):
+                    body = _queued_advisory(label, entry)
+                    return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
+        for label, queue in (("pending", pending), ("parked", parked)):
             for entry in queue if isinstance(queue, list) else ():
                 if isinstance(entry, dict) and identifier in (entry.get("ids") or ()):
                     body = _queued_advisory(label, entry)

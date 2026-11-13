@@ -2500,3 +2500,49 @@ def test_a_suppressed_co_name_does_not_hide_a_queued_critical_after_delivery(tmp
     assert primary_ids(client, "/inbox?state=delivered") == {"CVE-2026-7900"}
     assert primary_ids(client, "/inbox?state=suppressed") == {"CVE-2026-7901"}
     assert primary_ids(client, "/inbox?state=open&tag=critical") == set()
+
+
+def test_a_co_naming_message_cannot_deliver_the_owners_identifier(tmp_path):
+    """Only a message's recorded fresh ids become first-seen; a co-named warning must not deliver A for its owner."""
+    state = core.new_state()
+    parked = parked_entry("CVE-2026-8000", tag="critical")
+    parked["fresh"] = ["CVE-2026-8000"]
+    state["parked"] = [parked]
+    warning = pending_entry("CVE-2026-8001")
+    warning["ids"] = ["CVE-2026-8000", "CVE-2026-8001"]
+    warning["fresh"] = ["CVE-2026-8001"]
+    warning["cves"] = ["CVE-2026-8001"]
+    warning["levels"] = {"CVE-2026-8001": "warning"}
+    state["pending"] = [warning]
+    assert core.deliver(state, [RecordingNotifier("ops")], no_http, NOW) is True
+    assert "CVE-2026-8000" not in state["seen"], "the warning must not record the parked owner's identifier"
+    assert state["seen"]["CVE-2026-8001"]["outcome"] == "delivered"
+
+    save_state(tmp_path / "state.json", state)
+    assert core.manage_parked_entry(JsonStore(tmp_path / "state.json"), 0, release=True, now=NOW) is True
+    released = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    assert core.deliver(released, [RecordingNotifier("phone")], no_http, NOW + 1) is True
+    record = released["seen"]["CVE-2026-8000"]
+    assert record["outcome"] == "delivered"
+    assert released["deliveries"][record["delivery"]]["tag"] == "critical"
+
+
+def test_the_advisory_link_opens_the_parked_owner_not_a_pending_mention(tmp_path):
+    """A parked critical's link must not resolve to a pending warning that merely names it."""
+    state = core.new_state()
+    parked = parked_entry("CVE-2026-8100", tag="critical")
+    parked["fresh"] = ["CVE-2026-8100"]
+    state["parked"] = [parked]
+    warning = pending_entry("CVE-2026-8101")
+    warning["ids"] = ["CVE-2026-8100", "CVE-2026-8101"]
+    warning["fresh"] = ["CVE-2026-8101"]
+    warning["cves"] = ["CVE-2026-8101"]
+    warning["levels"] = {"CVE-2026-8101": "warning"}
+    state["pending"] = [warning]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get(f"/advisories/{advisory_token('CVE-2026-8100')}")
+    assert page.status_code == 200
+    assert "libxml2" in page.text, "the parked critical's own message is shown"
+    assert "nginx" not in page.text, "the pending warning that merely mentions it is not"
+    assert "parked" in page.text and "critical" in page.text

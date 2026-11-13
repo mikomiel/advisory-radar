@@ -1515,7 +1515,16 @@ def _delivered(
     """
     kind = entry["kind"]
     if kind == "new":
-        fresh = [identifier for identifier in entry["ids"] if identifier not in state["seen"]]
+        # Only the identifiers this message introduced may become first-seen here. A message that merely
+        # names an identifier another message owns must not write that identifier's history: the owner's
+        # delivery is what the operator is owed, and this message's classification is not about it.
+        owned = entry.get("fresh")
+        candidates = (
+            [identifier for identifier in entry["ids"] if identifier in set(owned)]
+            if isinstance(owned, (list, tuple))
+            else list(entry["ids"])
+        )
+        fresh = [identifier for identifier in candidates if identifier not in state["seen"]]
         if fresh:
             snapshot_id = _record_event(state, entry, now, outcome, delivered_to)
             for identifier in fresh:
