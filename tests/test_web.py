@@ -23,7 +23,7 @@ from advisory_radar.sources import (
     WebhookTextNotEncodable,
     webhook_item_from_payload,
 )
-from advisory_radar.state import load_state_document, save_state, state_lock
+from advisory_radar.state import SourceError, load_state_document, save_state, state_lock
 from advisory_radar.web import LoginThrottle, _epoch, _when, create_app, readiness
 
 LOG = logging.getLogger("advisory_radar")
@@ -447,6 +447,30 @@ def test_readyz_reports_invalid_utf8(tmp_path):
     assert "advisory_radar_state_readable 0" in client.get("/metrics").text
 
 
+def test_readyz_reports_a_deeply_nested_state_without_reseeding(tmp_path):
+    """#81: a hand edit can nest past the decoder's limit; that is an unreadable state, not a crash or an empty one."""
+    client, _ = make_client(tmp_path)
+    deep = b"[" * 10_000 + b"]" * 10_000
+    (tmp_path / "state.json").write_bytes(deep)
+    with pytest.raises(SourceError):
+        load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    assert (tmp_path / "state.json").read_bytes() == deep, "a failed read never reseeds or rewrites the document"
+    response = client.get("/readyz")
+    assert response.status_code == 503
+    assert response.text.startswith("not ready:")
+
+
+def test_a_deeply_nested_state_does_not_break_the_configuration_page(tmp_path):
+    """The overlay page reads the applied state marker; a decoder refusal there must not become a 500."""
+    client, token = make_client(tmp_path)
+    signed_in(client, token)
+    deep = b"[" * 10_000 + b"]" * 10_000
+    (tmp_path / "state.json").write_bytes(deep)
+    response = client.get("/config")
+    assert response.status_code == 200
+    assert (tmp_path / "state.json").read_bytes() == deep
+
+
 def test_readiness_uses_the_completion_time_not_the_start(tmp_path):
     """A pass slower than the limit must not be stale the moment it completes."""
     client, _ = make_client(tmp_path, clock=1792600000 + 400)
@@ -549,6 +573,19 @@ def test_a_malformed_collection_does_not_break_the_scrape(tmp_path):
 
 
 # --- the settings overlay: /config, its POSTs and /reload -------------------------------------
+
+
+def test_a_deeply_nested_overlay_is_reported_on_the_configuration_page(tmp_path):
+    """#81: an unreadable overlay is the page's own error banner, not a 500 traceback out of the handler."""
+    client, token, runtime = make_app_client(tmp_path)
+    overlay = settings_path(runtime.cfg.state_path)
+    deep = b"[" * 10_000 + b"]" * 10_000
+    overlay.write_bytes(deep)
+    signed_in(client, token)
+    page = client.get("/config")
+    assert page.status_code == 200
+    assert "The overlay cannot be read" in page.text
+    assert overlay.read_bytes() == deep, "rendering the error never rewrites the damaged overlay"
 
 
 def test_two_saved_notifiers_survive_while_the_application_is_blocked(tmp_path):

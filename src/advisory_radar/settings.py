@@ -214,7 +214,9 @@ def load_settings_document(path: Path) -> dict:
         raise ConfigError(f"cannot read {path}: {exc}") from exc
     try:
         document = json.loads(text)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
+        # A hand-edited overlay can nest arrays past the decoder's limit: the page and the reload report an
+        # unreadable overlay, and a save refuses instead of replacing the damaged file.
         raise ConfigError(f"{path} is not JSON: {exc}") from exc
     if not isinstance(document, dict):
         raise ConfigError(f"{path} is not a settings document")

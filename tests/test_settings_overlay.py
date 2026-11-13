@@ -252,6 +252,19 @@ def test_load_settings_is_empty_until_a_document_exists_and_refuses_a_corrupt_on
     assert str(path) in str(caught.value)
 
 
+def test_a_deeply_nested_overlay_is_a_config_error_and_a_save_leaves_it_alone(tmp_path):
+    """#81: a hand edit can nest past the decoder's limit; the overlay must refuse by name and never be replaced."""
+    path = settings_path(tmp_path / "state.json")
+    deep = b"[" * 10_000 + b"]" * 10_000
+    path.write_bytes(deep)
+    with pytest.raises(ConfigError):
+        load_settings_document(path)
+    assert path.read_bytes() == deep, "a failed read never rewrites the damaged overlay"
+    with pytest.raises(ConfigError):
+        save_settings(path, {"poll_interval": "30s"}, now=NOW)
+    assert path.read_bytes() == deep, "a save refuses an unreadable overlay instead of resetting its revision"
+
+
 def test_save_settings_writes_0600_and_moves_the_revision_forward(tmp_path):
     path = settings_path(tmp_path / "state.json")
     first = save_settings(path, {"poll_interval": "30s"}, now=100)

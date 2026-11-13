@@ -43,7 +43,9 @@ def load_state_document(path: Path, schema: str, owner: str) -> dict | None:
         raise SourceError(f"{owner} {path} cannot be read: {exc}") from exc
     try:
         document = json.loads(text)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
+        # RecursionError: a hand edit can nest arrays past the decoder's limit. It is the same unreadable
+        # document as invalid JSON -- the probes, the pass and the CLI answer it by name, never with a traceback.
         raise SourceError(f"{owner} {path} is not JSON: {exc}") from exc
     return expect_schema(document, schema, f"{owner} {path}")
 
