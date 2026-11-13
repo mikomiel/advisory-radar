@@ -1,6 +1,7 @@
 # Image release: on every v*.*.* tag, build and push to GHCR.
-# Tag creation is a deliberate operator action (per-release consent); the
-# workflow itself just builds what the tag points at.
+# release-please creates the tag when a maintainer merges its release pull
+# request -- that merge is the per-release consent; this workflow builds what the
+# tag points at.
 name: release
 
 on:

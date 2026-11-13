@@ -52,6 +52,9 @@ def run(*paths: str, declared: int | None = None, payload: str | None = None) ->
         ".python-version",
         ".dockerignore",
         ".gitleaks.toml",
+        # the release files decide the tag a release carries and the version it starts from
+        "release-please-config.json",
+        ".release-please-manifest.json",
         "tests/test_core.py",
         # the workflows execute scripts/ on the default branch: the guard and the approval rule are policy
         "scripts/guard_sensitive_paths.py",
@@ -76,6 +79,8 @@ def test_these_paths_need_a_human_merge(path: str):
         "uv.lock.bak",
         "docs/.python-version",
         ".dockerignore.example",
+        "docs/release-please-config.json",  # release policy lives at the root, not under docs/
+        "release-please-config.json.bak",
         "src/advisory_radar/tests_helper.py",
         "docs/tests/notes.md",  # only a top-level tests/ tree is the suite that decides what ci accepts
     ],
@@ -125,6 +130,8 @@ def test_the_policy_is_the_documented_one():
         r"^\.python-version$",
         r"^\.dockerignore$",
         r"^\.gitleaks\.toml$",
+        r"^release-please-config\.json$",
+        r"^\.release-please-manifest\.json$",
         r"^tests/",
         r"^scripts/",
     )

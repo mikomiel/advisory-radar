@@ -13,7 +13,8 @@ as a status:
   `ci` completion, on pull-request lifecycle events (opened, reopened, ready for review,
   converted to draft, closed, pushed) and every five minutes, then publishes `review` on
   the head commit: `success` when there is an **approving review at that exact commit** or
-  the pull request is an exempt dependency update (below), `failure` when a reviewer's
+  the pull request is one of the two exempt shapes described below (a dependency update, or
+  the release pull request release-please generates), `failure` when a reviewer's
   verdict is "changes requested", and `pending` otherwise. The logic lives in
   [`scripts/review_gate_plan.py`](../scripts/review_gate_plan.py), which also aggregates
   several pull requests sharing one head — a status is keyed by commit, so the worst
@@ -42,7 +43,7 @@ as a status:
   `.github/` is for a person either way. The `*/5` and `*/30` schedules remain only as a backstop: GitHub
   runs fixed crons late, and an approval that arrives after `ci` has finished would otherwise wait
   hours for one.
-- **Dependency updates are exempt from the App review, and nothing else is.** A pull
+- **Dependency updates are exempt from the App review.** A pull
   request opened by Dependabot (`dependabot[bot]`) gets `review: success` with the reason
   in the description, and only while *every* path the immutable `base...head` comparison
   names — both sides of a rename — is a dependency manifest (`.github/workflows`,
@@ -61,12 +62,36 @@ as a status:
   `gate`, `review` and `dependency-review` are green — no approval involved. If "a person merges every bump" is meant
   literally, turn that setting off: there is no other use for it here, because the merge
   is this repository's own workflow.
-- An exempt dependency update is the one case where a green `review` means "not required"
-  rather than "approved": the description says which, and the exemption applies only while
-  every changed path is a dependency manifest the gate checks — a bump that reached into
-  `src/` would not be exempt.
+- A green `review` means "not required" rather than "approved" in two cases: an exempt
+  dependency update and the generated release pull request. The description says which, and
+  each exemption applies only while every changed path is one it covers — a bump that
+  changed `src/advisory_radar/web.py` would not be exempt, and neither would a release
+  branch that carried one.
+- **The generated release pull request is the second exemption.** Merging that pull request
+  is the release decision, and no authoring session exists to request the App review, so the
+  gate publishes `review: success` for it — but only for the generator's output, which is
+  more than a branch name. The identity: the head branch
+  `release-please--branches--main--components--advisory-radar` in this repository, the
+  `RELEASE_PLEASE_TOKEN` owner as author, not a draft. The changes: every path the immutable
+  `base...head` comparison names is one of the four files the release manages
+  (`.release-please-manifest.json`, `CHANGELOG.md`, `pyproject.toml`,
+  `src/advisory_radar/__init__.py`) and all four are present; the changelog gains its section;
+  and each version-carrying file's patch is *exactly* its one `version` line replaced, with
+  the three versions agreeing and the version actually changing. The changed-file count must
+  also prove the list complete for the same two commits. A dependency added beside the
+  version, an import appended to the version line, a second changed line, a path outside the
+  set, a missing patch (the gate carries one only for a change of at most four lines) or an
+  unreadable list keeps the normal requirement and fails closed. An approval at the exact head
+  is still reported as that approval, a change request still makes the status a `failure`,
+  and `.github/workflows/automerge.yml` still never takes the pull request: it changes
+  `pyproject.toml`, a sensitive path, so a person merges it. The shape is recognised in
+  [`scripts/review_gate_plan.py`](../scripts/review_gate_plan.py), pinned by
+  [`tests/test_review_gate_plan.py`](../tests/test_review_gate_plan.py), and it mirrors
+  `release-please-config.json` and the token owner: a drift fails closed, and the release
+  pull request then needs the normal review.
 - What a green `review` proves, exactly: that this commit was approved **when last
-  evaluated** (or, for an exempt dependency update, that it was never required). It is a stored assertion, not a live query, so it is not a proof at the
+  evaluated** (or, for an exempt dependency update or the generated release pull request,
+  that none was required). It is a stored assertion, not a live query, so it is not a proof at the
   instant you click merge. Automerges re-read the reviews with the same rule immediately
   before merging, so a withdrawal before that read stops them. A withdrawal *after* the
   read, or a manual merge before the next evaluation, can still land — the window is
@@ -88,7 +113,9 @@ Two-person review still needs a second human account or a team with another memb
 [`scripts/guard_sensitive_paths.py`](../scripts/guard_sensitive_paths.py) — `.github/`
 (including the workflows and this automation), `Dockerfile`, `docker-compose.yml`,
 `deploy/`, `pyproject.toml`, `uv.lock` (the lock decides what CI installs under
-`uv sync --frozen`), `.python-version`, `.dockerignore`, `.gitleaks.toml`, `tests/` and
+`uv sync --frozen`), `.python-version`, `.dockerignore`, `.gitleaks.toml`,
+`release-please-config.json` and `.release-please-manifest.json` (the tag format, what a
+release contains, and the version it starts from), `tests/` and
 `scripts/` (the guard and the approval rule are policy too: the workflows execute them from
 the default branch, so they need the same human merge as the workflows themselves) — and
 [`tests/test_guard_sensitive_paths.py`](../tests/test_guard_sensitive_paths.py) pins it. A
@@ -111,8 +138,8 @@ ref, and that ref's copy of the file is what runs). Expected latency for an othe
 eligible pull request is therefore minutes, because a review starts the relay above; the
 schedules are the backstop, not the mechanism, and GitHub runs fixed crons late. Nothing
 merges without an approval from the configured reviewer at the exact head — or, for an
-exempt dependency update, without one being required — and any check that is not
-terminal-success stops it.
+exempt dependency update or the generated release pull request, without one being required —
+and any check that is not terminal-success stops it.
 
 To enable the required checks on a copy of this repository
 (`contexts` replaces the whole list, so name all four):
