@@ -82,8 +82,10 @@ vulnerabilities.
 
 ## Status
 
-`0.1.0` is the first public release. Version numbers follow SemVer; every
-`vX.Y.Z` tag on `main` publishes a multi-arch image to
+`0.1.0` was the first public release. Version numbers follow SemVer. Releases
+are prepared by [Release Please](https://github.com/googleapis/release-please)
+from the conventional commits merged to `main`: merging its release pull request
+creates the `vX.Y.Z` tag, and the tag publishes a multi-arch image to
 `ghcr.io/mikomiel/advisory-radar`, with build provenance and an SBOM attestation
 bound to the pushed digest:
 

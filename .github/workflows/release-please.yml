@@ -1,0 +1,52 @@
+# Release automation under the repository's own merge policy.
+#
+# release-please keeps one release pull request open: the next version in `pyproject.toml` and
+# `src/advisory_radar/__init__.py`, a generated `CHANGELOG.md` section, and `.release-please-manifest.json`.
+# Merging that pull request is the release decision; release-please then creates the `vX.Y.Z` tag and the
+# GitHub Release, and that tag starts `release.yml`, which builds and publishes the image.
+#
+# The release pull request always changes a sensitive path (`pyproject.toml` and the manifest), so
+# `scripts/guard_sensitive_paths.py` never lets `automerge` take it: a person merges it.
+#
+# The push trigger alone is not enough. Ordinary pull requests are merged by `automerge` with the default
+# `GITHUB_TOKEN`, and GitHub suppresses a workflow an event from that token would start. The `workflow_run`
+# trigger observes the completion of that trusted default-branch automation instead, and the guard keeps it
+# to the default branch. `workflow_dispatch` is the manual reconciliation path, accepted only from the
+# default branch so that a branch's copy of this privileged workflow never runs against the secret.
+#
+# The token is a fine-grained personal access token with Contents: write and Pull requests: write on this
+# repository, stored as RELEASE_PLEASE_TOKEN. The default `GITHUB_TOKEN` cannot be used: the tag and release
+# it creates would start no workflow, so the image would never be rebuilt, and the pull request it creates
+# would not start the pull-request checks.
+name: release-please
+
+on:
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: [automerge]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    if: >-
+      (github.event_name != 'workflow_run'
+      || github.event.workflow_run.head_branch == 'main')
+      && (github.event_name != 'workflow_dispatch'
+      || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

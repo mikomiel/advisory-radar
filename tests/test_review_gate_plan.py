@@ -55,6 +55,8 @@ def entry(
     base: str = BASE,
     count_head: str | None = None,
     count_base: str | None = None,
+    branch: str = "feat/example",
+    head_repo: str = "mikomiel/advisory-radar",
 ) -> dict:
     chosen = FILES if files is None else files
     return {
@@ -63,6 +65,8 @@ def entry(
         "base": base,
         "draft": draft,
         "author": author,
+        "branch": branch,
+        "head_repo": head_repo,
         "reviews": list(reviews),
         "files": chosen,
         "changed": len(chosen) if changed is None else changed,
@@ -70,6 +74,67 @@ def entry(
         "count_head": head if count_head is None else count_head,
         "count_base": base if count_base is None else count_base,
     }
+
+
+#: The repository root: the release configuration beside the scripts is what the exemption must keep matching.
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def release_files(new: str = "0.2.0", old: str = "0.1.0") -> list[dict]:
+    """The four files a generated release changes, with the one-line diff release-please writes in each.
+
+    Captured from the estate's own generated release pull request (mikomiel/ci-burst #102, same pinned action and
+    the same configuration shape): each version-carrying file replaces exactly one line, the changelog only gains
+    its new section, and all three versions agree.
+    """
+    return [
+        {
+            "filename": ".release-please-manifest.json",
+            "previous_filename": None,
+            "additions": 1,
+            "deletions": 1,
+            "patch": f'@@ -1,3 +1,3 @@\n {{\n-  ".": "{old}"\n+  ".": "{new}"\n }}',
+        },
+        {
+            "filename": "CHANGELOG.md",
+            "previous_filename": None,
+            "additions": 3,
+            "deletions": 0,
+            "patch": f"@@ -9,3 +9,6 @@\n \n+## [{new}](https://example) (2026-11-13)\n+\n+* a change\n",
+        },
+        {
+            "filename": "pyproject.toml",
+            "previous_filename": None,
+            "additions": 1,
+            "deletions": 1,
+            "patch": f'@@ -4,7 +4,7 @@\n [project]\n name = "advisory-radar"\n-version = "{old}"\n+version = "{new}"\n',
+        },
+        {
+            "filename": "src/advisory_radar/__init__.py",
+            "previous_filename": None,
+            "additions": 1,
+            "deletions": 1,
+            "patch": f'@@ -1,3 +1,3 @@\n """advisory-radar."""\n \n-__version__ = "{old}"\n+__version__ = "{new}"\n',
+        },
+    ]
+
+
+def release_entry(number: int = 40, **changes) -> dict:
+    """The generated release pull request: the generator's branch, author, paths and version diff."""
+    options = {
+        "reviews": [],
+        "author": plan.RELEASE_AUTHOR,
+        "files": release_files(),
+        "branch": plan.RELEASE_BRANCH,
+        "head_repo": plan.RELEASE_REPOSITORY,
+    }
+    options.update(changes)
+    return entry(number, **options)
+
+
+def with_file(files: list[dict], name: str, **changes) -> list[dict]:
+    """The release file list with one entry changed, for the negative cases."""
+    return [{**item, **changes} if item["filename"] == name else item for item in files]
 
 
 def decisions(entries: list[dict]) -> dict[str, tuple[str, str]]:
@@ -303,3 +368,111 @@ def test_a_comment_holds_a_dependency_update():
     # any review at all is used as-is; a comment is not an approval
     commented = decisions([entry(17, reviews=[review("COMMENTED")], author="app/dependabot")])[HEAD]
     assert commented[0] == "pending"
+
+
+def test_the_generated_release_pull_request_needs_no_app_review():
+    state, description = decisions([release_entry()])[HEAD]
+    assert state == "success"
+    assert "release" in description and "not required" in description
+
+
+def test_a_change_request_still_blocks_the_generated_release_pull_request():
+    # the exemption removes the approval requirement, not a veto
+    assert decisions([release_entry(reviews=[review("CHANGES_REQUESTED")])])[HEAD][0] == "failure"
+
+
+def test_an_approval_at_the_head_is_reported_as_that_approval():
+    # the exemption fills the gap; it does not rewrite a verdict that is already there
+    state, description = decisions([release_entry(reviews=[review("APPROVED")])])[HEAD]
+    assert state == "success" and "approved at" in description
+
+
+def test_a_stale_approval_or_a_dismissal_does_not_block_the_generated_release():
+    # release-please rewrites its branch on every run, so a review left on the previous head must not park it
+    for reviews in ([review("APPROVED", commit="0" * 40)], [review("DISMISSED")], [review("COMMENTED")]):
+        got = decisions([release_entry(reviews=reviews)])[HEAD]
+        assert got[0] == "success" and "not required" in got[1]
+
+
+def test_every_other_identity_keeps_the_review_requirement():
+    cases = {
+        "another branch": {"branch": "release-please--branches--main--components--other"},
+        "a consolidated branch": {"branch": "release-please--branches--main"},
+        "a fork's head": {"head_repo": "someone/advisory-radar"},
+        "another author": {"author": "contributor"},
+        "a draft": {"draft": True},
+        "no file list": {"files": []},
+        "a truncated list": {"files": release_files()[:1], "changed": len(release_files())},
+        "a count from another commit pair": {"count_head": OTHER},
+    }
+    for label, change in cases.items():
+        assert decisions([release_entry(**change)])[HEAD][0] == "pending", label
+
+
+def test_a_release_that_is_not_only_the_version_bump_keeps_the_review_requirement():
+    """The exemption proves the content, not just the names: a hand-written edit inside an allowed file fails."""
+    files = release_files()
+    cases = {
+        "a dependency beside the version": with_file(
+            files,
+            "pyproject.toml",
+            additions=2,
+            patch=(
+                '@@ -4,8 +4,9 @@\n [project]\n name = "advisory-radar"\n-version = "0.1.0"\n'
+                '+version = "0.2.0"\n+    "evil-package>=1.0",\n'
+            ),
+        ),
+        "an import on the version line": with_file(
+            files,
+            "src/advisory_radar/__init__.py",
+            patch=(
+                '@@ -1,3 +1,3 @@\n """advisory-radar."""\n \n-__version__ = "0.1.0"\n'
+                '+__version__ = "0.2.0"; __import__("os").system("id")\n'
+            ),
+        ),
+        "a carriage return in the version line": with_file(
+            files,
+            "src/advisory_radar/__init__.py",
+            # A Python parser reads a bare carriage return as a newline, but str.splitlines would hide the second
+            # statement from the content check: the patch must be split on LF only.
+            patch=(
+                '@@ -1,3 +1,3 @@\n """advisory-radar."""\n \n-__version__ = "0.1.0"\n'
+                '+__version__ = "0.2.0"\rprint("unexpected executable code")\n'
+            ),
+        ),
+        "two changed lines": with_file(files, "pyproject.toml", additions=2, deletions=2),
+        "no patch carried": with_file(files, "pyproject.toml", patch=None),
+        "the version unchanged": release_files(new="0.1.0"),
+        "versions that disagree": with_file(
+            files,
+            "pyproject.toml",
+            patch='@@ -4,7 +4,7 @@\n [project]\n name = "advisory-radar"\n-version = "0.1.0"\n+version = "0.9.9"\n',
+        ),
+        "no changelog section": [item for item in files if item["filename"] != "CHANGELOG.md"],
+        "an extra path": files + [{"filename": "docs/sources.md", "previous_filename": None}],
+        "a renamed file": with_file(files, "pyproject.toml", previous_filename="docs/pyproject.toml"),
+        "a changelog that gained nothing": with_file(files, "CHANGELOG.md", additions=0),
+    }
+    for label, changed in cases.items():
+        assert decisions([release_entry(files=changed, changed=len(changed))])[HEAD][0] == "pending", label
+
+
+def test_the_release_shape_follows_the_release_configuration():
+    """The exemption's literals mirror two files; a drift in either must fail here, not silently stop matching."""
+    config = json.loads((ROOT / "release-please-config.json").read_text(encoding="utf-8"))
+    package = config["packages"]["."]["package-name"]
+    assert f"release-please--branches--main--components--{package}" == plan.RELEASE_BRANCH
+    # The tag is `vX.Y.Z` because release.yml triggers on that and ignores a component prefix.
+    assert config["include-v-in-tag"] is True
+    assert config["include-component-in-tag"] is False
+    # One root package, so the release pull request changes the root files the exemption names.
+    assert list(json.loads((ROOT / ".release-please-manifest.json").read_text(encoding="utf-8"))) == ["."]
+    assert {"pyproject.toml", "src/advisory_radar/__init__.py", "CHANGELOG.md"} <= plan.RELEASE_PATHS
+
+
+def test_the_release_exemption_names_the_token_owner_and_the_observed_generator_branch():
+    # Literals on purpose: the branch is what release-please produced for this estate at the pinned action version
+    # (mikomiel/ci-burst #102, same configuration shape), and the author is the account behind the token.
+    assert plan.RELEASE_BRANCH == "release-please--branches--main--components--advisory-radar"
+    assert plan.RELEASE_AUTHOR == "mikomiel"
+    assert plan.RELEASE_REPOSITORY == "mikomiel/advisory-radar"
