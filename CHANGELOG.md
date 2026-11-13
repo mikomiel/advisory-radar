@@ -11,6 +11,15 @@ release decision: the `vX.Y.Z` tag it creates is what builds and publishes
 section by hand -- [CONTRIBUTING.md](CONTRIBUTING.md#releases) owns the release
 boundary.
 
+## [0.2.1](https://github.com/mikomiel/advisory-radar/compare/v0.2.0...v0.2.1) (2026-11-13)
+
+
+### Fixed
+
+* **alerts:** keep source provenance and retain later notification events ([#118](https://github.com/mikomiel/advisory-radar/issues/118)) ([1f8a205](https://github.com/mikomiel/advisory-radar/commit/1f8a20576778f4a812b34e9920d1541120a1b064))
+* **state:** refuse unreadable documents and test 3.13-3.14 ([#116](https://github.com/mikomiel/advisory-radar/issues/116)) ([25ef072](https://github.com/mikomiel/advisory-radar/commit/25ef0727caaeda97b3a0fccaa1bec62903ffeec6))
+* **web:** report the result of Run a pass now ([#115](https://github.com/mikomiel/advisory-radar/issues/115)) ([0a0a6f4](https://github.com/mikomiel/advisory-radar/commit/0a0a6f4111d2bf24af4274baa3654c69db0cebf3))
+
 ## [0.2.0](https://github.com/mikomiel/advisory-radar/compare/v0.1.0...v0.2.0) (2026-11-13)
 
 
