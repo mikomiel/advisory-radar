@@ -277,14 +277,21 @@ def test_a_state_changing_post_needs_the_form_token(tmp_path):
     assert header.status_code == 303
 
 
-def run_result_page(tmp_path: Path, code: int) -> str:
-    """Submit the real Run a pass now form for an injected result and return the page its redirect lands on."""
-    client, token, _ = make_app_client(tmp_path, run_pass=lambda **_: code)
+def submit_run(tmp_path: Path, code: int):
+    """Sign in, submit the real Run a pass now form for an injected result, and return client, redirect, runtime."""
+    client, token, runtime = make_app_client(tmp_path, run_pass=lambda **_: code)
     csrf = signed_in(client, token)
     response = client.post("/run", data={"csrf": csrf}, follow_redirects=False)
     assert response.status_code == 303
-    assert response.headers["location"] == f"/?ran={code}"
-    return client.get(response.headers["location"]).text
+    location = response.headers["location"]
+    assert location.startswith("/?result="), location
+    return client, location, runtime
+
+
+def run_result_page(tmp_path: Path, code: int) -> str:
+    """The page the Run a pass now redirect lands on for an injected result."""
+    client, location, _ = submit_run(tmp_path, code)
+    return client.get(location).text
 
 
 @pytest.mark.parametrize(
@@ -313,12 +320,46 @@ def test_a_busy_run_is_not_a_failed_run(tmp_path):
     assert "The pass failed" in failed and "A pass is already running" not in failed
 
 
-def test_an_unknown_run_code_renders_no_notice_and_is_not_echoed(tmp_path):
+def test_an_unsigned_run_result_url_renders_no_notice_and_is_not_echoed(tmp_path):
     client, token, _ = make_app_client(tmp_path)
     signed_in(client, token)
-    for ran in ("3", "not-a-code", ""):
-        assert "This request:" not in client.get("/", params={"ran": ran}).text, ran
-    assert "not-a-code" not in client.get("/", params={"ran": "not-a-code"}).text
+    for path in ("/?ran=0", "/?result=not-a-token"):
+        page = client.get(path).text
+        assert "This request:" not in page, path
+    assert "not-a-token" not in client.get("/?result=not-a-token").text
+
+
+def test_a_run_result_token_is_bound_to_the_session_that_submitted_the_form(tmp_path):
+    client, location, _ = submit_run(tmp_path, 0)
+    assert "This request:" in client.get(location).text
+    other, other_token, _ = make_app_client(tmp_path)
+    signed_in(other, other_token)
+    assert "This request:" not in other.get(location).text, "another session's token must render nothing"
+
+
+def test_an_expired_run_result_token_renders_no_notice(tmp_path, monkeypatch):
+    client, location, _ = submit_run(tmp_path, 0)
+    real_time = time.time
+    monkeypatch.setattr("advisory_radar.web.time.time", lambda: real_time() + 121)
+    assert "This request:" not in client.get(location).text
+
+
+def test_a_failed_run_reports_its_result_when_the_state_cannot_be_read(tmp_path):
+    client, token, runtime = make_app_client(tmp_path, run_pass=lambda **_: 1)
+    csrf = signed_in(client, token)
+    corrupt = b"{not json"
+    runtime.cfg.state_path.write_bytes(corrupt)
+    response = client.post("/run", data={"csrf": csrf}, follow_redirects=False)
+    assert response.status_code == 303
+    page = client.get(response.headers["location"])
+    assert page.status_code == 200
+    assert "The pass failed" in page.text
+    assert "The state document cannot be read" in page.text
+    # No numbers, no stale last pass and no form: none of them are known while the state is unreadable.
+    assert "Last pass" not in page.text
+    assert "<span class='stat-label'>" not in page.text
+    assert 'action="/run"' not in page.text
+    assert runtime.cfg.state_path.read_bytes() == corrupt, "reading the dashboard must not rewrite the state"
 
 
 def test_a_form_token_from_another_session_is_refused(tmp_path):

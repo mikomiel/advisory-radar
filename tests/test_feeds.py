@@ -335,6 +335,17 @@ def test_fetch_any_follows_one_autodiscovery_hop(monkeypatch):
     assert stored == {}
 
 
+def test_fetch_any_refuses_a_same_origin_feed_the_address_guard_calls_private(monkeypatch):
+    """The guard runs after the origin check too: a same-origin link to a private address is still refused."""
+    monkeypatch.setattr(feeds, "private_destination", lambda url: True)
+
+    def http(method, url, headers, body):
+        return 200, {}, PAGE
+
+    with pytest.raises(feeds.FeedError, match="private address"):
+        feeds.fetch_any(http, PAGE_URL)
+
+
 def test_fetch_any_refuses_a_discovered_private_feed_before_fetching_it():
     """The page is remote-authored: its link must not aim this poll at loopback or a metadata service."""
     calls = []
