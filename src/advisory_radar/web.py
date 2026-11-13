@@ -695,6 +695,25 @@ _EVENT_STATES = ("delivered", "dropped")
 _WHOLE_KINDS = ("escalation", "adobe", "adobe-kev")
 #: No claim time sorts last: an entry with no recorded time is not assumed to be the oldest.
 _UNKNOWN_CLAIM = 1 << 62
+#: Claim kinds break a same-time tie: parked work needs a decision, then the queue, then history. A
+#: suppression recorded in the same pass as a queued message must not take that message's identifier.
+_CLAIM_PARKED, _CLAIM_PENDING, _CLAIM_SEEN = 0, 1, 2
+
+
+def _seen_claim_time(record: Mapping, deliveries: Mapping) -> int:
+    """When the message that first recorded an identifier was queued, not when it was delivered.
+
+    A delivered message's snapshot carries the entry's ``queued_at``, so ownership does not move when a
+    retrying message finally succeeds while a later message also names the identifier. A record written
+    before snapshots held that key falls back to its own recorded time.
+    """
+    reference = record.get("delivery")
+    snapshot = deliveries.get(reference) if isinstance(reference, str) else None
+    if isinstance(snapshot, dict):
+        stamp = _number(snapshot.get("queued_at"), 0)
+        if stamp > 0:
+            return stamp
+    return _number(record.get("at"), 0)
 
 
 def _fact_rank(state: str) -> int:
@@ -765,13 +784,13 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
 
     for identifier, record in seen.items():
         if isinstance(identifier, str) and isinstance(record, dict):
-            claim((identifier,), kind=0, at=record.get("at"), index=0)
+            claim((identifier,), kind=_CLAIM_SEEN, at=_seen_claim_time(record, deliveries), index=0)
     for index, entry in enumerate(parked):
         # The claim time is when the message was queued, not when it parked: parking is a later transport
         # state and must not hand the identifier to a message that arrived in between.
-        claim(_stored_strings(entry.get("ids")), kind=1, at=_queue_time(entry), index=index)
+        claim(_stored_strings(entry.get("ids")), kind=_CLAIM_PARKED, at=_queue_time(entry), index=index)
     for index, entry in enumerate(pending):
-        claim(_stored_strings(entry.get("ids")), kind=2, at=_queue_time(entry), index=index)
+        claim(_stored_strings(entry.get("ids")), kind=_CLAIM_PENDING, at=_queue_time(entry), index=index)
 
     def make(
         *,
@@ -857,7 +876,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
                 source=source_id,
                 aliases=tuple(other for other in identifiers if other != identifier),
             )
-            if whole or owned(identifier, kind=2, index=index, at=at):
+            if whole or owned(identifier, kind=_CLAIM_PENDING, index=index, at=at):
                 own(identifier, fact)
             else:
                 mentions.append((identifier, fact))
@@ -879,7 +898,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
                 source=source_id,
                 aliases=tuple(other for other in identifiers if other != identifier),
             )
-            if whole or owned(identifier, kind=1, index=index, at=claim_at):
+            if whole or owned(identifier, kind=_CLAIM_PARKED, index=index, at=claim_at):
                 own(identifier, fact)
             else:
                 mentions.append((identifier, fact))
@@ -908,7 +927,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         )
         # A suppression can record an identifier another message already owns; then it is history about
         # that identifier, not its current state, and belongs under "Also" rather than in a filtered view.
-        if owned(identifier, kind=0, index=0, at=at):
+        if owned(identifier, kind=_CLAIM_SEEN, index=0, at=_seen_claim_time(record, deliveries)):
             own(identifier, fact)
         else:
             mentions.append((identifier, fact))

@@ -40,7 +40,8 @@ CSRF_RE = re.compile(r'name="csrf" value="([0-9a-f]{64})"')
 FINGERPRINT_RE = re.compile(r"name='fingerprint' value='([0-9a-f]{64})'")
 ADVISORY_LINK_RE = re.compile(r"<td><a href='/advisories/[^']*'>([^<]+)</a></td>")
 #: The identifier a rendered inbox row is about; related links are not rows and must never be counted.
-INBOX_ROW_RE = re.compile(r"<tr><td class='nowrap'><a href='/advisories/[^']*'>([^<]+)</a>")
+#: A carried row may render its identifier as an external link or as plain text, so both forms are read.
+INBOX_ROW_RE = re.compile(r"<tr><td class='nowrap'>(?:<a [^>]*>)?([^<]+)")
 PAGER_RE = re.compile(r"href='(/alerts\?[^']*)'")
 ROUTES_CONFIG = """\
 sources: []
@@ -2236,9 +2237,7 @@ def test_a_carried_item_does_not_replace_an_identifier_it_only_co_names(tmp_path
     client, token, _ = make_client(tmp_path, state=state)
     sign_in(client, token)
     assert primary_ids(client, "/inbox?state=delivered") == {"CVE-2026-6700"}
-    carried = client.get("/inbox?state=carried").text
-    assert carried.count("<tr>") - 1 == 1, "the new identifier is the carried row"
-    assert "CVE-2026-6701" in carried
+    assert primary_ids(client, "/inbox?state=carried") == {"CVE-2026-6701"}
     assert "Also: carried" in client.get("/inbox").text
 
 
@@ -2371,3 +2370,74 @@ def test_a_mention_contributes_its_source_to_the_filter(tmp_path):
     sign_in(client, token)
     assert primary_ids(client, "/inbox?source=feed-b") == {"CVE-2026-7300", "CVE-2026-7301"}
     assert primary_ids(client, "/inbox?source=feed-a") == {"CVE-2026-7300"}
+
+
+def test_a_same_pass_suppression_does_not_hide_a_queued_critical(tmp_path):
+    """A suppression stamped in the same pass must not outrank the message that queued the identifier."""
+    state = core.new_state()
+    entry = pending_entry("CVE-2026-7500", tag="critical")
+    entry["queued_at"] = NOW
+    state["pending"] = [entry]
+    state["seen"]["CVE-2026-7500"] = {"at": NOW, "outcome": "suppressed"}
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    assert primary_ids(client, "/inbox?state=pending") == {"CVE-2026-7500"}
+    assert primary_ids(client, "/inbox?state=suppressed") == set()
+    assert primary_ids(client, "/inbox?state=open&tag=critical") == {"CVE-2026-7500"}
+    assert re.search(r"Undelivered criticals</span><span class='stat-value'>1</span>", client.get("/").text)
+
+
+def test_delivery_does_not_hand_ownership_to_a_later_co_naming_message(tmp_path):
+    """An identifier keeps the queue time of the message that introduced it when delivery finally succeeds."""
+    state = core.new_state()
+    later = pending_entry("CVE-2026-7601")
+    later["ids"] = ["CVE-2026-7600", "CVE-2026-7601"]
+    later["cves"] = ["CVE-2026-7601"]
+    later["levels"] = {"CVE-2026-7601": "warning"}
+    later["queued_at"] = NOW - 3600
+    state["pending"] = [later]
+    state["seen"]["CVE-2026-7600"] = {"at": NOW - 60, "outcome": "delivered", "delivery": "evt-1"}
+    state.setdefault("deliveries", {})["evt-1"] = {
+        "kind": "new",
+        "tag": "critical",
+        "title": "CRITICAL: CVE-2026-7600 in widget",
+        "ids": ["CVE-2026-7600"],
+        "cves": ["CVE-2026-7600"],
+        "levels": {"CVE-2026-7600": "critical"},
+        "at": NOW - 60,
+        "outcome": "delivered",
+        "delivered_to": ["ops"],
+        # The message was queued two hours before it was delivered; that is what it claimed with.
+        "queued_at": NOW - 7200,
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    assert primary_ids(client, "/inbox?state=delivered") == {"CVE-2026-7600"}
+    assert primary_ids(client, "/inbox?state=pending") == {"CVE-2026-7601"}
+    assert primary_ids(client, "/inbox?state=open&tag=critical") == set()
+
+
+def test_a_released_legacy_message_keeps_its_claim_time(tmp_path):
+    """Releasing a parked entry must not drop the only clock its claim had."""
+    state = core.new_state()
+    legacy = parked_entry("CVE-2026-7700", tag="critical")
+    legacy.pop("queued_at")
+    legacy["first_attempt_at"] = NOW - 7200
+    state["parked"] = [legacy]
+    save_state(tmp_path / "state.json", state)
+    assert core.manage_parked_entry(JsonStore(tmp_path / "state.json"), 0, release=True, now=NOW) is True
+    stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    released = stored["pending"][0]
+    assert released["queued_at"] == NOW - 7200
+    assert "first_attempt_at" not in released
+
+    later = pending_entry("CVE-2026-7701")
+    later["ids"] = ["CVE-2026-7700", "CVE-2026-7701"]
+    later["cves"] = ["CVE-2026-7701"]
+    later["levels"] = {"CVE-2026-7701": "warning"}
+    later["queued_at"] = NOW - 3600
+    stored["pending"].append(later)
+    save_state(tmp_path / "state.json", stored)
+    client, token, _ = make_client(tmp_path, state=stored)
+    sign_in(client, token)
+    assert primary_ids(client, "/inbox?state=open&tag=critical") == {"CVE-2026-7700"}

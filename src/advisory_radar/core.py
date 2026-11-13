@@ -1454,9 +1454,10 @@ def _delivery_snapshot(entry: dict, delivered_to: Sequence[str], *, at: int, out
     while ``source_id`` is the configured source the item was queued from and ``""`` for an escalation or a
     bulletin, which are not feed items. ``at`` and ``outcome`` are the event's own time and result, so a later
     escalation or drop keeps its event beside the first-seen record instead of overwriting it. The body is
-    deliberately absent: it is the rendered text, not a fact.
+    deliberately absent: it is the rendered text, not a fact. ``queued_at`` travels too, because the message
+    was owed from that moment: the inbox must not move an identifier's ownership when delivery succeeds.
     """
-    return {
+    snapshot = {
         "tag": entry.get("tag", ""),
         "source_id": entry.get("source_id", ""),
         "source": entry.get("source", ""),
@@ -1474,6 +1475,10 @@ def _delivery_snapshot(entry: dict, delivered_to: Sequence[str], *, at: int, out
         "at": at,
         "outcome": outcome,
     }
+    queued_at = entry.get("queued_at")
+    if isinstance(queued_at, int) and not isinstance(queued_at, bool) and queued_at > 0:
+        snapshot["queued_at"] = queued_at
+    return snapshot
 
 
 def _snapshot_id(snapshot: dict) -> str:
@@ -2829,8 +2834,19 @@ PARKED_ATTEMPT_KEYS = ("attempts", "first_attempt_at", "parked_at")
 
 
 def _released(entry: dict) -> dict:
-    """A parked message as it goes back to the queue: no retry history, so the next pass starts fresh."""
-    return {key: value for key, value in entry.items() if key not in PARKED_ATTEMPT_KEYS}
+    """A parked message as it goes back to the queue: no retry history, so the next pass starts fresh.
+
+    The queue time survives. It is the message's claim on its identifiers, and dropping it would make an
+    entry queued before this field existed look newer than a later message that names the same identifier.
+    """
+    released = {key: value for key, value in entry.items() if key not in PARKED_ATTEMPT_KEYS}
+    if "queued_at" not in released:
+        for key in ("first_attempt_at", "parked_at"):
+            stamp = entry.get(key)
+            if isinstance(stamp, int) and not isinstance(stamp, bool) and stamp > 0:
+                released["queued_at"] = stamp
+                break
+    return released
 
 
 def manage_parked(store: Store, release: bool, now: int) -> int:
