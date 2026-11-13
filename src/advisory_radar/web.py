@@ -770,27 +770,36 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
     parked = state.get("parked")
     parked = [entry for entry in parked if isinstance(entry, dict)] if isinstance(parked, list) else []
 
-    # Which state record or message owns each identifier: the earliest claim wins, and a tie prefers the
-    # history, then parked work, then the queue. An entry with no recorded time sorts behind every dated one.
-    claim_order: dict[str, tuple[int, int, int]] = {}
+    # What the live messages own. A message written by this version records ``fresh``: exactly the
+    # identifiers it introduced, so ownership does not change when it is delivered, parked or released. Its
+    # other ids are mentions. Entries and records from before that key keep the older claim-time heuristic
+    # (earliest recorded time, then parked, then queue, then history; unknown time sorts last).
+    fresh_claimed: set[str] = set()
+    legacy_claims: dict[str, tuple[int, int, int]] = {}
 
     def claim(identifiers: Iterable[str], *, kind: int, at: object, index: int) -> None:
         stamp = _number(at, 0)
         key = (stamp if stamp > 0 else _UNKNOWN_CLAIM, kind, index)
         for identifier in identifiers:
-            current = claim_order.get(identifier)
+            current = legacy_claims.get(identifier)
             if current is None or key < current:
-                claim_order[identifier] = key
+                legacy_claims[identifier] = key
 
     for identifier, record in seen.items():
         if isinstance(identifier, str) and isinstance(record, dict):
             claim((identifier,), kind=_CLAIM_SEEN, at=_seen_claim_time(record, deliveries), index=0)
     for index, entry in enumerate(parked):
-        # The claim time is when the message was queued, not when it parked: parking is a later transport
-        # state and must not hand the identifier to a message that arrived in between.
-        claim(_stored_strings(entry.get("ids")), kind=_CLAIM_PARKED, at=_queue_time(entry), index=index)
+        if "fresh" in entry:
+            fresh_claimed.update(_stored_strings(entry.get("fresh")))
+        else:
+            # The claim time is when the message was queued, not when it parked: parking is a later transport
+            # state and must not hand the identifier to a message that arrived in between.
+            claim(_stored_strings(entry.get("ids")), kind=_CLAIM_PARKED, at=_queue_time(entry), index=index)
     for index, entry in enumerate(pending):
-        claim(_stored_strings(entry.get("ids")), kind=_CLAIM_PENDING, at=_queue_time(entry), index=index)
+        if "fresh" in entry:
+            fresh_claimed.update(_stored_strings(entry.get("fresh")))
+        else:
+            claim(_stored_strings(entry.get("ids")), kind=_CLAIM_PENDING, at=_queue_time(entry), index=index)
 
     def make(
         *,
@@ -854,10 +863,20 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         if all(existing["origin"] != fact["origin"] for existing in row["facts"]):
             row["facts"].append(fact)
 
-    def owned(identifier: str, *, kind: int, index: int, at: int) -> bool:
-        """Whether this message is the one that owns the identifier, by the claim order above."""
+    def owned(entry: Mapping, identifier: str, *, kind: int, index: int, at: int) -> bool:
+        """Whether this message owns the identifier: its recorded fresh ids, or the legacy claim order."""
+        fresh = entry.get("fresh")
+        if isinstance(fresh, (list, tuple)):
+            return identifier in _stored_strings(fresh)
         stamp = at if at > 0 else _UNKNOWN_CLAIM
-        return claim_order.get(identifier) == (stamp, kind, index)
+        return legacy_claims.get(identifier) == (stamp, kind, index)
+
+    def seen_owned(identifier: str, record: Mapping) -> bool:
+        """Whether the seen record owns the identifier, rather than being context for a live message."""
+        if identifier in fresh_claimed:
+            return False
+        stamp = _seen_claim_time(record, deliveries)
+        return legacy_claims.get(identifier) == (stamp if stamp > 0 else _UNKNOWN_CLAIM, _CLAIM_SEEN, 0)
 
     for index, entry in enumerate(pending):
         identifiers = list(dict.fromkeys(_stored_strings(entry.get("ids"))))
@@ -876,7 +895,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
                 source=source_id,
                 aliases=tuple(other for other in identifiers if other != identifier),
             )
-            if whole or owned(identifier, kind=_CLAIM_PENDING, index=index, at=at):
+            if whole or owned(entry, identifier, kind=_CLAIM_PENDING, index=index, at=at):
                 own(identifier, fact)
             else:
                 mentions.append((identifier, fact))
@@ -898,7 +917,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
                 source=source_id,
                 aliases=tuple(other for other in identifiers if other != identifier),
             )
-            if whole or owned(identifier, kind=_CLAIM_PARKED, index=index, at=claim_at):
+            if whole or owned(entry, identifier, kind=_CLAIM_PARKED, index=index, at=claim_at):
                 own(identifier, fact)
             else:
                 mentions.append((identifier, fact))
@@ -925,9 +944,10 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
             source=snapshot.get("source_id") if isinstance(snapshot.get("source_id"), str) else "",
             aliases=tuple(other for other in identifiers if other != identifier),
         )
-        # A suppression can record an identifier another message already owns; then it is history about
-        # that identifier, not its current state, and belongs under "Also" rather than in a filtered view.
-        if owned(identifier, kind=_CLAIM_SEEN, index=0, at=_seen_claim_time(record, deliveries)):
+        # A suppression can record an identifier another message already owns (state written before the
+        # writer stopped doing that); then it is history about that identifier, not its current state, and
+        # belongs under "Also" rather than in a filtered view.
+        if seen_owned(identifier, record):
             own(identifier, fact)
         else:
             mentions.append((identifier, fact))

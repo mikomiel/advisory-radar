@@ -21,7 +21,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 from advisory_radar import core
-from advisory_radar.config import ConfigError, load_config
+from advisory_radar.config import DEFAULT_THRESHOLDS, ConfigError, load_config
 from advisory_radar.delivery import QuietHours
 from advisory_radar.http import RedactFilter
 from advisory_radar.runtime import Runtime
@@ -689,6 +689,9 @@ def test_a_delivered_message_records_the_snapshot_and_keeps_the_first_record():
         # The event's own time and outcome: the first-seen record keeps its own, separate pair.
         "at": NOW,
         "outcome": "delivered",
+        # The message's claim clock travels with the snapshot; this entry predates ``queued_at``, so the
+        # first attempt is the best clock it has.
+        "queued_at": NOW - 300,
     }
     assert "body" not in delivery, "the rendered message body is not stored"
 
@@ -2441,3 +2444,59 @@ def test_a_released_legacy_message_keeps_its_claim_time(tmp_path):
     client, token, _ = make_client(tmp_path, state=stored)
     sign_in(client, token)
     assert primary_ids(client, "/inbox?state=open&tag=critical") == {"CVE-2026-7700"}
+
+
+def test_equal_queue_times_keep_delivery_ownership(tmp_path):
+    """Two messages queued in the same pass: the one that delivered an identifier keeps owning it."""
+    state = core.new_state()
+    later = pending_entry("CVE-2026-7801")
+    later["fresh"] = ["CVE-2026-7801"]
+    later["ids"] = ["CVE-2026-7800", "CVE-2026-7801"]
+    later["cves"] = ["CVE-2026-7801"]
+    later["levels"] = {"CVE-2026-7801": "warning"}
+    later["queued_at"] = NOW
+    state["pending"] = [later]
+    state["seen"]["CVE-2026-7800"] = {"at": NOW, "outcome": "delivered", "delivery": "evt-eq"}
+    state.setdefault("deliveries", {})["evt-eq"] = {
+        "kind": "new",
+        "tag": "critical",
+        "title": "CRITICAL: CVE-2026-7800 in widget",
+        "ids": ["CVE-2026-7800"],
+        "cves": ["CVE-2026-7800"],
+        "levels": {"CVE-2026-7800": "critical"},
+        "at": NOW,
+        "outcome": "delivered",
+        "delivered_to": ["ops"],
+        "queued_at": NOW,
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    assert primary_ids(client, "/inbox?state=delivered") == {"CVE-2026-7800"}
+    assert primary_ids(client, "/inbox?state=pending") == {"CVE-2026-7801"}
+    assert primary_ids(client, "/inbox?state=open&tag=critical") == set()
+
+
+def test_a_suppressed_co_name_does_not_hide_a_queued_critical_after_delivery(tmp_path):
+    """The writer no longer records a co-named identifier as suppressed, so delivery keeps its outcome."""
+    state = core.new_state()
+    entry = pending_entry("CVE-2026-7900", tag="critical")
+    entry["fresh"] = ["CVE-2026-7900"]
+    entry["queued_at"] = NOW
+    state["pending"] = [entry]
+    item = core.Item(
+        "g1",
+        "CVE-2026-7900 and CVE-2026-7901",
+        "https://vendor.example.net/a",
+        "",
+        NOW,
+        ("CVE-2026-7900", "CVE-2026-7901"),
+    )
+    verdict = core.Verdict("suppressed", (), "CVSS 2.0", "")
+    core._suppressed(state, ["CVE-2026-7900", "CVE-2026-7901"], verdict, item, {}, NOW, DEFAULT_THRESHOLDS)
+    assert "CVE-2026-7900" not in state["seen"]
+    assert core.deliver(state, [RecordingNotifier("ops")], no_http, NOW) is True
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    assert primary_ids(client, "/inbox?state=delivered") == {"CVE-2026-7900"}
+    assert primary_ids(client, "/inbox?state=suppressed") == {"CVE-2026-7901"}
+    assert primary_ids(client, "/inbox?state=open&tag=critical") == set()

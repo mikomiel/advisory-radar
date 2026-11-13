@@ -3065,3 +3065,30 @@ def test_withdrawal_does_not_rewrite_delivered_history():
     assert [entry["tag"] for entry in state["pending"]] == ["warning"], (
         "the withdrawn advisory is not current critical evidence"
     )
+
+
+def test_a_suppressed_item_leaves_an_identifier_another_message_owns():
+    """Suppression must not record history for an identifier a queued message introduced."""
+    state = core.new_state()
+    state["pending"].append(
+        {
+            "kind": "new",
+            "queued_at": NOW,
+            "fresh": ["CVE-2026-1111"],
+            "tag": "critical",
+            "title": "queued",
+            "body": "",
+            "ids": ["CVE-2026-1111"],
+            "cves": ["CVE-2026-1111"],
+            "levels": {"CVE-2026-1111": "critical"},
+            "source": "s",
+            "link": "https://x.example",
+        }
+    )
+    item = core.Item(
+        "g1", "CVE-2026-1111 and CVE-2026-2222", "https://x.example/a", "n", NOW, ("CVE-2026-1111", "CVE-2026-2222")
+    )
+    verdict = core.Verdict("suppressed", (), "CVSS 2.0", "")
+    core._suppressed(state, ["CVE-2026-1111", "CVE-2026-2222"], verdict, item, {}, NOW, DEFAULT_THRESHOLDS)
+    assert "CVE-2026-1111" not in state["seen"], "the queued message owns it and will report it"
+    assert state["seen"]["CVE-2026-2222"]["outcome"] == "suppressed"

@@ -284,16 +284,14 @@ missing, stale or other-session token renders no notice.
 `/inbox` is the work list across the whole lifecycle. Its rows are one per identifier, and
 each row keeps every fact the state holds about it — a parked message, a queued one, carried
 work, an earlier delivery, an event — with the most actionable fact shown and the rest listed
-under **Also**. Ownership is the first claim: the state record or message that first named an
-identifier owns it, and a later message that names it again is a mention — context that never
-replaces its own state or severity, so a new feed item cannot hide a parked critical or
-requeue a delivered GHSA. A message claims with the time it was queued, not when it was
-delivered or parked: a retry that finally succeeds, or an entry that parks, cannot move
-ownership to a message that arrived in between, and a released entry queued before this field
-existed takes its first attempt as that time. A same-time tie prefers parked work, then the
-queue, then history, so a suppression stamped in the same pass cannot hide a queued critical.
-An escalation or an Adobe bulletin is about everything it names and always counts as work,
-even when the identifier already has history. Each row's severity is the level recorded for that identifier,
+under **Also**. Ownership is recorded, not inferred: when a message is queued it records the
+identifiers it introduced, and that list never changes, so delivery, parking or release cannot
+move an identifier to a message that arrived in between. A later message that names it again
+is a mention — context that never replaces its own state or severity, so a new feed item cannot
+hide a parked critical or requeue a delivered GHSA. A suppressed message does not record an
+identifier another message owns, so it cannot hide queued work. An escalation or an Adobe
+bulletin is about everything it names and always counts as work, even when the identifier
+already has history. Each row's severity is the level recorded for that identifier,
 falling back to the message's tag when it has none, so a multi-CVE message with mixed levels
 does not label every row with its strongest one. The same rule decides what a delivery event
 delivered (only the identifiers its seen records point at; an escalation or bulletin is about

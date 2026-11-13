@@ -1475,9 +1475,13 @@ def _delivery_snapshot(entry: dict, delivered_to: Sequence[str], *, at: int, out
         "at": at,
         "outcome": outcome,
     }
-    queued_at = entry.get("queued_at")
-    if isinstance(queued_at, int) and not isinstance(queued_at, bool) and queued_at > 0:
-        snapshot["queued_at"] = queued_at
+    # The message's claim clock travels with the snapshot. A queue entry queued before ``queued_at`` existed
+    # still has its first attempt, and dropping that would hand its identifiers to a message queued later.
+    for key in ("queued_at", "first_attempt_at"):
+        stamp = entry.get(key)
+        if isinstance(stamp, int) and not isinstance(stamp, bool) and stamp > 0:
+            snapshot["queued_at"] = stamp
+            break
     return snapshot
 
 
@@ -1597,8 +1601,12 @@ def _suppressed(
     thresholds: Thresholds,
     source_id: str = "",
 ) -> None:
+    claimed = _claimed(state)
     for identifier in ids:
-        # An identifier that was already notified keeps its history: this message is about the new CVEs.
+        # An identifier another message owns keeps that message's history: a suppressed message must not
+        # record a co-named advisory as suppressed and make it look like this message judged it.
+        if identifier in claimed:
+            continue
         state["seen"].setdefault(identifier, {"at": now, "outcome": "suppressed"})
     for cve, level in verdict.levels:
         watch = {
@@ -1881,7 +1889,11 @@ def classify_new(
         if verdict.tag == "suppressed":
             _suppressed(state, ids, verdict, item, scores, now, thresholds, source_id=source_id)
         else:
-            shown_ids = [i for i in ids if i not in claimed and not i.startswith("src:")]
+            # The identifiers this message introduces: the ones it owns, as opposed to the ids its text
+            # merely mentions because another message already owns them. The inbox keeps them apart so a
+            # co-named advisory cannot inherit this message's state or severity.
+            fresh_ids = [identifier for identifier in ids if identifier not in claimed]
+            shown_ids = [identifier for identifier in fresh_ids if not identifier.startswith("src:")]
             heading, excerpt = headline(item.title, item.summary)
             if release is not None:
                 excerpt = PHP_EXCERPT + ", ".join(release.versions)
@@ -1909,6 +1921,7 @@ def classify_new(
                 "title": title,
                 "body": body,
                 "ids": ids,
+                "fresh": fresh_ids,
                 "cves": new_cves,
                 "levels": dict(verdict.levels),
                 "kev_only": list(verdict.skipped),
@@ -2116,6 +2129,7 @@ def reevaluate(
             {
                 "kind": "escalation",
                 "queued_at": now,
+                "fresh": [cve],
                 "tag": level,
                 "title": title,
                 "body": body,
@@ -2207,8 +2221,14 @@ def _login_answer(detail: adobe.Detail | None) -> str:
 
 
 def _queued(entry: dict, now: int) -> dict:
-    """A message just built for the queue, stamped with when it was queued; later attempts never move it."""
+    """A message just built for the queue, stamped with when it was queued and what it owns.
+
+    A message built outside classification (an escalation, an Adobe bulletin) is about every identifier it
+    names: there is no larger text for it to merely mention. ``queued_at`` and ``fresh`` never move after
+    this, so delivery, parking and release cannot change what the message owns.
+    """
     entry.setdefault("queued_at", now)
+    entry.setdefault("fresh", list(entry.get("ids") or ()))
     return entry
 
 
