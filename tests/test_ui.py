@@ -191,7 +191,7 @@ def pending_entry(cve: str = "CVE-2026-50111", **extra) -> dict:
 
 def parked_entry(cve: str = "CVE-2026-4000", tag: str = "critical", **extra) -> dict:
     entry = pending_entry(cve, tag=tag, title=f"{tag.upper()}: {cve} in libxml2", attempts=3)
-    entry.update({"first_attempt_at": NOW - 900, "parked_at": NOW - 600, "sent_to": []})
+    entry.update({"queued_at": NOW - 1200, "first_attempt_at": NOW - 900, "parked_at": NOW - 600, "sent_to": []})
     entry.update(extra)
     return entry
 
@@ -1274,6 +1274,7 @@ def test_core_releases_one_parked_message_by_position(tmp_path):
     released = stored["pending"][0]
     for gone in ("attempts", "first_attempt_at", "parked_at"):
         assert gone not in released, f"a released message must start its retry history again ({gone})"
+    assert released["queued_at"] == NOW - 1200, "a release must not reset when the message was first queued"
 
 
 def test_core_drops_one_parked_message_and_refuses_a_stale_position(tmp_path):
@@ -1966,10 +1967,30 @@ def test_the_dashboard_counts_link_to_the_views_they_describe(tmp_path):
         assert match, f"the {label} tile must link to {href}"
         return match.group(1)
 
-    assert tile("Undelivered criticals", "/inbox?state=open&amp;tag=critical") == "2"
-    assert tile("Held by quiet hours", "/inbox?state=held") == "1"
-    assert tile("Parked", "/inbox?state=parked") == "1"
-    assert tile("Awaiting classification", "/inbox?state=carried") == "1"
+    tiles = {
+        "Undelivered criticals": (
+            "/inbox?state=open&tag=critical",
+            int(tile("Undelivered criticals", "/inbox?state=open&amp;tag=critical")),
+        ),
+        "Held by quiet hours": ("/inbox?state=held", int(tile("Held by quiet hours", "/inbox?state=held"))),
+        "Parked": ("/inbox?state=parked", int(tile("Parked", "/inbox?state=parked"))),
+        "Awaiting classification": (
+            "/inbox?state=carried",
+            int(tile("Awaiting classification", "/inbox?state=carried")),
+        ),
+    }
+    assert {label: value for label, (_, value) in tiles.items()} == {
+        "Undelivered criticals": 2,
+        "Held by quiet hours": 1,
+        "Parked": 1,
+        "Awaiting classification": 1,
+    }
+
+    def rows_at(path: str) -> int:
+        return client.get(path).text.count("<tr>") - 1
+
+    for label, (path, value) in tiles.items():
+        assert rows_at(path) == value, f"{label} must count exactly the rows its link renders"
     # Exit 0 with four items still owed says so: finishing is not the same as having nothing left.
     assert "4 item(s) still owed" in page
     assert "deferred work" in page
@@ -1977,15 +1998,19 @@ def test_the_dashboard_counts_link_to_the_views_they_describe(tmp_path):
     assert "completed 2026-10-21 16:17" in page
     assert "last success 2026-10-21 16:17" in page
     assert "2h ago" in page, "the oldest recorded queue time reports the age its queued_at proves"
-    # Every tile leads to the rows it counted: two criticals (one held in the queue, one parked) and both
-    # unsent messages for the queued count, the held warning included.
-    criticals = client.get("/inbox?state=open&tag=critical").text
-    assert "CVE-2026-6000" in criticals and "CVE-2026-4000" in criticals
+    # The queued fact counts the held warning too, and its view must show both unsent advisories.
+    queued_fact = re.search(r"Queued advisories</dt><dd>(\d+) ", page)
+    assert queued_fact and queued_fact.group(1) == "2"
+    assert rows_at("/inbox?state=pending") == 2
     queued_view = client.get("/inbox?state=pending").text
     assert "CVE-2026-6000" in queued_view and "CVE-2026-6001" in queued_view
+    # A calendar day, not a rolling cutoff: the count and the view it links to agree exactly.
+    delivered_fact = re.search(r"Delivered today \(UTC\)</dt><dd>(\d+) ", page)
+    assert delivered_fact and delivered_fact.group(1) == "1"
+    assert "href='/inbox?state=delivered&amp;since=2026-10-21'>open the inbox</a>" in page
+    assert rows_at("/inbox?state=delivered&since=2026-10-21") == 1
     assert "1 item(s) awaiting a retry" in page
     assert "2 <a class='small' href='/sources?state=unhealthy'>review sources</a>" in page
-    assert "href='/inbox?state=delivered&amp;since=2026-10-20'>open the inbox</a>" in page
 
 
 def test_a_legacy_run_says_the_completion_time_is_unknown(tmp_path):
@@ -2045,3 +2070,97 @@ def test_the_inbox_and_dashboard_survive_a_hand_edited_state(tmp_path):
     dashboard = client.get("/")
     assert dashboard.status_code == 200
     assert "not recorded" in dashboard.text
+
+
+def test_a_conamed_identifier_keeps_its_own_parked_state_and_severity(tmp_path):
+    """A new message naming an already-parked CVE adds context; it cannot replace that CVE's own row."""
+    state = core.new_state()
+    state["parked"] = [parked_entry("CVE-2026-6100", tag="critical")]
+    entry = pending_entry("CVE-2026-6101")
+    entry["ids"] = ["CVE-2026-6100", "CVE-2026-6101"]
+    entry["cves"] = ["CVE-2026-6101"]
+    entry["levels"] = {"CVE-2026-6101": "warning"}
+    entry["tag"] = "warning"
+    entry["source_id"] = "vendor-feed"
+    entry["queued_at"] = NOW - 60
+    state["pending"] = [entry]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+
+    page = client.get("/inbox").text
+    assert "Also:" in page and "pending" in page, "the co-named pending message is shown as context"
+    parked_view = client.get("/inbox?state=parked").text
+    assert "CVE-2026-6100" in parked_view
+    critical_view = client.get("/inbox?state=open&tag=critical").text
+    assert "CVE-2026-6100" in critical_view, "the parked critical stays findable by its own severity"
+    pending_view = client.get("/inbox?state=pending").text
+    assert "CVE-2026-6101" in pending_view
+    assert pending_view.count("<tr>") - 1 == 1, "a mention is context, not the identifier's transport state"
+    assert "Related:" in pending_view, "the co-named parked CVE is still discoverable from the row"
+
+
+def test_the_delivered_today_count_and_its_view_use_the_same_calendar_day(tmp_path):
+    midnight = int(datetime(2026, 10, 21, tzinfo=UTC).timestamp())
+    state = core.new_state()
+    state["seen"]["CVE-2026-6200"] = seen(midnight - 1, "delivered")
+    state["seen"]["CVE-2026-6201"] = seen(midnight + 1, "delivered")
+    state["runs"] = [{"at": NOW, "finished_at": NOW, "sent": 2, "parked": 0, "pending": 0, "code": 0}]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get("/").text
+    assert re.search(r"Delivered today \(UTC\)</dt><dd>1 ", page)
+    view = client.get("/inbox?state=delivered&since=2026-10-21").text
+    assert "CVE-2026-6201" in view
+    assert "CVE-2026-6200" not in view, "the day starts at UTC midnight, not 24 hours before now"
+    assert view.count("<tr>") - 1 == 1
+
+
+def test_a_dropped_adobe_bulletin_keeps_its_dropped_state(tmp_path):
+    state = core.new_state()
+    state["deliveries"] = {
+        "demo-adobe": {
+            "kind": "adobe",
+            "tag": "critical",
+            "title": "CRITICAL: APSB-1 in Commerce",
+            "link": "https://vendor.example.net/advisories/APSB-1",
+            "ids": ["APSB-1"],
+            "cves": ["CVE-2026-6300"],
+            "at": NOW,
+            "outcome": "dropped",
+            "delivered_to": [],
+        }
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get("/inbox").text
+    assert "dropped" in page and "dropped before delivery" in page
+    assert "notified from an event" not in page, "a dropped bulletin was never a notification"
+    dropped = client.get("/inbox?state=dropped").text
+    assert "APSB-1" in dropped and "CVE-2026-6300" in dropped
+    assert "APSB-1" not in client.get("/inbox?state=notified").text
+
+
+def test_inbox_source_text_and_date_filters_exclude_rows(tmp_path):
+    state = core.new_state()
+    state["seen"]["CVE-2026-6400"] = {
+        "at": NOW - 100,
+        "outcome": "delivered",
+        "tag": "warning",
+        "title": "WARNING: kernel panic in driver",
+        "source_id": "feed-a",
+    }
+    state["seen"]["CVE-2026-6401"] = {
+        "at": NOW - 200,
+        "outcome": "delivered",
+        "tag": "warning",
+        "title": "WARNING: browser issue",
+        "source_id": "feed-b",
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    assert "CVE-2026-6400" in client.get("/inbox?source=feed-a").text
+    assert "CVE-2026-6401" not in client.get("/inbox?source=feed-a").text
+    assert "CVE-2026-6400" in client.get("/inbox?q=kernel").text
+    assert "CVE-2026-6401" not in client.get("/inbox?q=kernel").text
+    assert "CVE-2026-6400" in client.get("/inbox?since=2026-10-21").text
+    assert "CVE-2026-6400" not in client.get("/inbox?until=2026-10-20").text

@@ -348,8 +348,10 @@ in the queue until it leaves. The record is stored once per message and each ide
 points at it, so a message naming thousands of identifiers does not multiply it.
 `/inbox` is the work list over the queue, quiet-window holds, carried work, the parked queue
 and the delivery history, with its own URL filters (`state`, `tag`, `source`, `q`, `since`,
-`until`) and the same keyset pagination; one row per identifier keeps each advisory's evidence,
-related identifiers are shown rather than merged, and the page says remediation is not tracked.
+`until`) and the same keyset pagination. One row per identifier keeps every fact the state holds
+about it: the state and tag filters select one fact (so a co-named message cannot hide a parked
+critical), the other facts are listed under **Also**, related identifiers are shown rather than
+merged, and the page says remediation is not tracked.
 `/parked` releases or drops one message per row as well as
 the whole queue, and `/runs` filters by exit code and day; the state keeps only the last 200
 passes, so the page states that cap instead of paging. The dashboard above the queue counts

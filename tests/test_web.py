@@ -164,7 +164,7 @@ def test_pages_tolerate_records_that_are_not_objects_or_not_times(tmp_path):
     assert "2026-10-21 16:26" in dashboard.text
     # The page must render the valid latest pass whatever came before it, in one of the two pass phrasings.
     assert "Last pass" in dashboard.text
-    assert re.search(r"Delivered in the last 24h</dt><dd>1 ", dashboard.text)
+    assert re.search(r"Delivered today \(UTC\)</dt><dd>1 ", dashboard.text)
 
     alerts = client.get("/alerts")
     assert alerts.status_code == 200

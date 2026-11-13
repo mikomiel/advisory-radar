@@ -618,3 +618,14 @@ def test_complementary_acknowledgements_let_one_entry_finish_while_the_other_kee
     assert record["outcome"] == "delivered", "the entry with every destination accepted left the queue"
     assert state["deliveries"][record["delivery"]]["delivered_to"] == ["bad", "good"]
     assert "CVE-2026-1" not in state["seen"]
+
+
+def test_a_retry_never_moves_the_time_a_message_was_queued():
+    """``queued_at`` is the queue's clock: an attempt, successful or failed, must not rewrite it."""
+    state = core.new_state()
+    entry = queued("CVE-2026-1")
+    entry["queued_at"] = NOW - 3600
+    state["pending"] = [entry]
+    assert core.deliver(state, [Recorder("bad", status=500)], no_http, NOW) is False
+    assert state["pending"][0]["queued_at"] == NOW - 3600
+    assert state["pending"][0]["attempts"] == 1
