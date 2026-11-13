@@ -286,7 +286,10 @@ each row keeps every fact the state holds about it — a parked message, a queue
 work, an earlier delivery, an event — with the most actionable fact shown and the rest listed
 under **Also**. A message that merely co-names an identifier another message owns is a mention:
 it is shown as context and never replaces that identifier's own state or severity, so a new
-feed item cannot hide a parked critical. `state` accepts `open` — everything the queue still
+feed item cannot hide a parked critical. The same rule decides what a delivery event
+delivered (only the identifiers its seen records point at; an escalation or bulletin is about
+all it names) and whether a carried item is new work (one naming only already-classified
+identifiers adds context instead of promoting them back into the queue). `state` accepts `open` — everything the queue still
 owes: pending, held, carried and parked — or exactly one of pending, held, carried, parked,
 delivered, dropped, filtered, suppressed, backlog, alias, not-security and notified. The state
 and tag filters select one fact and must select the same one; a row matches when some recorded

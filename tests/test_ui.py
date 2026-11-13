@@ -2164,3 +2164,97 @@ def test_inbox_source_text_and_date_filters_exclude_rows(tmp_path):
     assert "CVE-2026-6401" not in client.get("/inbox?q=kernel").text
     assert "CVE-2026-6400" in client.get("/inbox?since=2026-10-21").text
     assert "CVE-2026-6400" not in client.get("/inbox?until=2026-10-20").text
+
+
+def test_a_delivery_event_does_not_deliver_an_identifier_it_only_co_names(tmp_path):
+    """A ``new`` event is the message, not its judgement: only the seen records pointing at it were delivered."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-6500"] = {"at": NOW - 3600, "outcome": "suppressed"}
+    state["seen"]["CVE-2026-6501"] = {"at": NOW, "outcome": "delivered", "delivery": "evt-1"}
+    state.setdefault("deliveries", {})["evt-1"] = {
+        "kind": "new",
+        "tag": "critical",
+        "title": "CRITICAL: CVE-2026-6501 in widget",
+        "link": "https://vendor.example.net/advisories/CVE-2026-6501",
+        "ids": ["CVE-2026-6500", "CVE-2026-6501"],
+        "cves": ["CVE-2026-6501"],
+        "levels": {"CVE-2026-6501": "critical"},
+        "scores": {"CVE-2026-6501": 9.8},
+        "at": NOW,
+        "outcome": "delivered",
+        "delivered_to": ["ops"],
+        "source_id": "vendor-feed",
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get("/inbox").text
+    assert "Also: notified" in page, "the co-named identifier keeps its suppression and shows the mention"
+    delivered = client.get("/inbox?state=delivered").text
+    assert delivered.count("<tr>") - 1 == 1
+    assert "CVE-2026-6501" in delivered
+    assert "CVE-2026-6500" in client.get("/inbox?state=suppressed").text
+
+
+def test_a_message_with_no_new_cves_does_not_own_a_claimed_cve(tmp_path):
+    """An explicit empty judgement (``cves=[]``, ``levels={}``) leaves a co-named CVE as a mention, not work."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-6600"] = seen(NOW - 3600, "delivered")
+    entry = pending_entry("GHSA-aaaa-bbbb-cccc")
+    entry["ids"] = ["GHSA-aaaa-bbbb-cccc", "CVE-2026-6600"]
+    entry["cves"] = []
+    entry["levels"] = {}
+    entry["tag"] = "warning"
+    entry["queued_at"] = NOW - 60
+    entry["source_id"] = "vendor-feed"
+    state["pending"] = [entry]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    pending = client.get("/inbox?state=pending").text
+    assert pending.count("<tr>") - 1 == 1
+    assert "GHSA-aaaa-bbbb-cccc" in pending
+    delivered = client.get("/inbox?state=delivered").text
+    assert delivered.count("<tr>") - 1 == 1
+    assert "Also:" in client.get("/inbox").text
+
+
+def test_a_carried_item_does_not_replace_an_identifier_it_only_co_names(tmp_path):
+    """Carried work is unclassified: naming a delivered advisory must not promote it back into the queue."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-6700"] = seen(NOW - 3600, "delivered")
+    state["carry"] = {
+        "feed-a": [
+            {
+                "guid": "feed-a:tail-1",
+                "title": "Tail item",
+                "link": "https://vendor.example.net/tail-1",
+                "published": NOW - 60,
+                "explicit": ["CVE-2026-6700", "CVE-2026-6701"],
+            }
+        ]
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    delivered = client.get("/inbox?state=delivered").text
+    assert delivered.count("<tr>") - 1 == 1
+    carried = client.get("/inbox?state=carried").text
+    assert carried.count("<tr>") - 1 == 1
+    assert "CVE-2026-6701" in carried
+    assert "Also: carried" in client.get("/inbox").text
+
+
+def test_two_carried_items_with_the_same_title_and_time_keep_both_facts(tmp_path):
+    """Fact identity is message provenance, not (state, time, tag, title): a second item must not vanish."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-6800"] = seen(NOW - 3600, "delivered")
+    shared = {"title": "Same heading", "link": "", "published": NOW - 60}
+    state["carry"] = {
+        "feed-a": [
+            {"guid": "feed-a:one", "explicit": ["CVE-2026-6800", "CVE-2026-6801"], **shared},
+            {"guid": "feed-a:two", "explicit": ["CVE-2026-6800", "CVE-2026-6802"], **shared},
+        ]
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get("/inbox").text
+    assert page.count("<tr>") == 4, "the delivered row and both carried rows are present"
+    assert page.count("carried 2026") == 2, "both carried items are kept on the delivered identifier's row"
