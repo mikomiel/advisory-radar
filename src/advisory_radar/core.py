@@ -415,6 +415,9 @@ class OsvFacts:
     cves: tuple[str, ...]
     cvss: float | None
     complete: bool
+    #: OSV keeps serving a withdrawn record. The lifecycle is retained, but that record is not evidence of a
+    #: current severity: it carries no ``cvss`` and makes no completeness claim.
+    withdrawn: bool = False
 
 
 @dataclass(frozen=True)
@@ -955,7 +958,12 @@ class Intel:
     def ghsa(self, ghsa: str) -> OsvFacts:
         entry = self._fresh(ghsa, False)
         if entry is not None:
-            return OsvFacts(tuple(entry["cves"]), entry["cvss"], bool(entry.get("complete", True)))
+            return OsvFacts(
+                tuple(entry["cves"]),
+                entry["cvss"],
+                bool(entry.get("complete", True)),
+                bool(entry.get("withdrawn", False)),
+            )
         status, document = self._get(OSV_URL + ghsa)
         if status == 404:
             # OSV does not know this advisory. That is not a measurement of zero severity: a LOW sibling must
@@ -974,14 +982,25 @@ class Intel:
                 if isinstance(alias, str) and CVE_RE.fullmatch(alias)
             )
         )
+        # A withdrawn record keeps an RFC3339 ``withdrawn`` timestamp; OSV omits the member otherwise. Only a
+        # valid timestamp is evidence of a withdrawal: a malformed non-empty value is tolerated and read as
+        # active, so it can neither strip this record's severity nor be cached as withdrawn.
+        withdrawn = _is_rfc3339(document.get("withdrawn"))
         specific = document.get("database_specific")
         label = specific.get("severity") if isinstance(specific, dict) else None
-        cvss = OSV_SEVERITY_SCORE.get(label.upper()) if isinstance(label, str) else None
+        cvss = None if withdrawn else (OSV_SEVERITY_SCORE.get(label.upper()) if isinstance(label, str) else None)
         # An advisory with neither a CVE alias nor a usable severity label was not measured: its severity is
-        # unknown, and it must not be suppressed by a LOW sibling.
-        complete = bool(cves) or cvss is not None
-        self._cache[ghsa] = {"at": int(self._clock()), "cves": list(cves), "cvss": cvss, "complete": complete}
-        return OsvFacts(cves, cvss, complete)
+        # unknown, and it must not be suppressed by a LOW sibling. A withdrawn record also makes no completeness
+        # claim, so an item naming it is never suppressed while its lifecycle is unknown to the verdict.
+        complete = not withdrawn and (bool(cves) or cvss is not None)
+        self._cache[ghsa] = {
+            "at": int(self._clock()),
+            "cves": list(cves),
+            "cvss": cvss,
+            "complete": complete,
+            "withdrawn": withdrawn,
+        }
+        return OsvFacts(cves, cvss, complete, withdrawn)
 
 
 # --------------------------------------------------------------------------
@@ -1309,6 +1328,41 @@ def _source_value(source_title: str, source_url: str, feed_host: str) -> str:
     public = _public_https(source_url) and _host(source_url) not in HIDDEN_SOURCE_HOSTS
     site = _autolink(source_url) if public else ""
     return f"{title} — {site}" if title and site else title or site
+
+
+#: RFC3339 date-time grammar, ASCII only: seconds are required, the offset is ``Z`` or a numeric offset whose
+#: hours are 00-23 and minutes 00-59, and RFC3339 allows a lower-case ``t``/``z``. The classes are written out
+#: rather than ``\d`` because ``\d`` matches non-ASCII digits. The calendar values are checked by constructing a
+#: ``datetime``: ``fromisoformat`` would also accept a bare date, an arbitrary single-character separator, a
+#: missing seconds field and an out-of-range offset, none of which RFC3339 allows.
+_RFC3339 = re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.[0-9]+)?"
+    r"(?:[Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
+)
+
+
+def _is_rfc3339(value: object) -> bool:
+    """Whether ``value`` is a valid RFC3339 timestamp.
+
+    The grammar is matched ASCII-only and the calendar values are validated by constructing the moment, so a
+    malformed spelling cannot be mistaken for the fact. A leap second (``:60``) is deliberately not supported:
+    RFC 3339 permits an application to leave leap seconds out, and refusing one can only keep the record active,
+    never strip its severity. A caller reads a lifecycle field with this: a value this parser rejects is not
+    evidence of a withdrawal, and the caller must keep the record active.
+    """
+    if not isinstance(value, str):
+        return False
+    # Validated exactly as sent: RFC3339 has no surrounding whitespace, and a padded value must not be read as
+    # the fact either -- the field is evidence, not user input to tidy.
+    match = _RFC3339.fullmatch(value)
+    if match is None:
+        return False
+    year, month, day, hour, minute, second = (int(part) for part in match.groups())
+    try:
+        datetime.datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return False
+    return True
 
 
 def _day(epoch: float) -> str:
