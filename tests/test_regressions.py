@@ -3123,3 +3123,41 @@ def test_bootstrap_history_does_not_take_a_queued_identifier():
     core.seed(state, [old], NOW)
     assert "CVE-2026-1111" not in state["seen"], "the queued message owns it and will report it"
     assert state["seen"]["CVE-2026-2222"]["outcome"] == "backlog"
+
+
+def test_settlement_is_idempotent_across_a_reload():
+    """Settling a state twice, with a save between, changes nothing: recorded ownership is never rewritten."""
+    state = core.new_state()
+    state["parked"].append(
+        {
+            "kind": "new",
+            "queued_at": NOW - 7200,
+            "tag": "critical",
+            "title": "legacy owner",
+            "body": "",
+            "ids": ["CVE-2026-3333"],
+            "cves": ["CVE-2026-3333"],
+            "levels": {"CVE-2026-3333": "critical"},
+            "source": "s",
+            "link": "https://x.example",
+        }
+    )
+    state["pending"].append(
+        {
+            "kind": "new",
+            "queued_at": NOW - 3600,
+            "fresh": ["CVE-2026-4444"],
+            "tag": "warning",
+            "title": "modern mention",
+            "body": "",
+            "ids": ["CVE-2026-3333", "CVE-2026-4444"],
+            "cves": ["CVE-2026-4444"],
+            "levels": {"CVE-2026-4444": "warning"},
+            "source": "s",
+            "link": "https://x.example",
+        }
+    )
+    core._ensure_ownership(state)
+    once = json.dumps(state, sort_keys=True)
+    core._ensure_ownership(state)
+    assert json.dumps(state, sort_keys=True) == once

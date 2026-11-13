@@ -28,7 +28,7 @@ from advisory_radar.runtime import Runtime
 from advisory_radar.settings import load_settings, settings_path
 from advisory_radar.state import load_state_document, save_state, serialize_json, state_lock
 from advisory_radar.storage import JsonStore
-from advisory_radar.web import _advisory_token, create_app
+from advisory_radar.web import _advisory_token, create_app, inbox_rows
 
 LOG = logging.getLogger("advisory_radar")
 NOW = 1792600000  # 2026-10-21 16:26:40 UTC
@@ -1220,15 +1220,14 @@ def test_the_advisory_page_shows_the_delivery_snapshot(tmp_path):
 
 
 def test_the_advisory_page_finds_a_pending_and_a_parked_message(tmp_path):
+    """An identifier in both a pending and a parked message opens the first claim's page (the parked one)."""
     client, token, _ = make_client(tmp_path, state=advisory_state())
     sign_in(client, token)
-    pending = client.get(f"/advisories/{advisory_token('CVE-2026-3000')}")
-    assert pending.status_code == 200
-    assert "pending" in pending.text
-    assert "2 (last HTTP 500)" in pending.text
-    assert "ops" in pending.text, "a pending message shows the notifiers that already accepted it"
-    assert "KEV-only" in pending.text and "CVE-2026-3001" in pending.text
-    assert "PARKED-DUPLICATE" not in pending.text, "a pending message is found before a parked one"
+    owned = client.get(f"/advisories/{advisory_token('CVE-2026-3000')}")
+    assert owned.status_code == 200
+    assert "parked" in owned.text
+    assert "PARKED-DUPLICATE" in owned.text, "the earlier claim owns the identifier"
+    assert "Parked (UTC)" in owned.text
     parked = client.get(f"/advisories/{advisory_token('CVE-2026-4000')}")
     assert parked.status_code == 200
     assert "parked" in parked.text
@@ -2850,3 +2849,65 @@ def test_settlement_gives_a_legacy_escalation_its_cve_and_detail_page(tmp_path):
     assert page.status_code == 200
     assert "CVE-2026-9200 now critical" in page.text
     assert "Notifications" in page.text
+
+
+def test_a_message_naming_thousands_of_identifiers_keeps_related_lists_bounded(tmp_path):
+    """Related identifiers are a bounded projection: one message must not allocate a tuple per identifier."""
+    identifiers = [f"CVE-2026-{number:05d}" for number in range(5000)]
+    state = core.new_state()
+    state["pending"] = [
+        {
+            "kind": "new",
+            "queued_at": NOW,
+            "fresh": identifiers,
+            "tag": "warning",
+            "title": "One large advisory",
+            "body": "",
+            "ids": identifiers,
+            "cves": [identifiers[0]],
+            "levels": {identifiers[0]: "warning"},
+            "source": "vendor",
+            "link": "https://vendor.example.net/large",
+        }
+    ]
+    rows = inbox_rows(state, now=NOW)
+    assert len(rows) == len(identifiers)
+    assert all(len(row["aliases"]) <= 4 for row in rows)
+    assert all(row["alias_count"] == len(identifiers) - 1 for row in rows)
+
+
+def test_a_migrated_owner_replaces_a_legacy_suppression_on_delivery(tmp_path):
+    """A legacy suppression for an identifier a live message owns is a placeholder: the owner's delivery wins."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-9300"] = {"at": NOW - 60, "outcome": "suppressed"}
+    critical = parked_entry("CVE-2026-9300", tag="critical")
+    critical.pop("fresh", None)
+    critical["queued_at"] = NOW - 7200
+    state["parked"] = [critical]
+    save_state(tmp_path / "state.json", state)
+    assert core.manage_parked_entry(JsonStore(tmp_path / "state.json"), 0, release=True, now=NOW) is True
+    released = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    assert core.deliver(released, [RecordingNotifier("ops")], no_http, NOW) is True
+    record = released["seen"]["CVE-2026-9300"]
+    assert record["outcome"] == "delivered"
+    assert released["deliveries"][record["delivery"]]["tag"] == "critical"
+
+
+def test_the_advisory_link_opens_a_legacy_owner_before_settlement(tmp_path):
+    """A read-only page must resolve legacy ownership without waiting for a pass to migrate the state."""
+    state = core.new_state()
+    legacy = parked_entry("CVE-2026-9400", tag="critical")
+    legacy.pop("fresh", None)
+    legacy["queued_at"] = NOW - 7200
+    state["parked"] = [legacy]
+    mention = pending_entry("CVE-2026-9401")
+    mention.pop("fresh", None)
+    mention["ids"] = ["CVE-2026-9400", "CVE-2026-9401"]
+    mention["queued_at"] = NOW - 3600
+    state["pending"] = [mention]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get(f"/advisories/{advisory_token('CVE-2026-9400')}")
+    assert page.status_code == 200
+    assert "libxml2" in page.text, "the legacy parked owner is the page"
+    assert "nginx" not in page.text

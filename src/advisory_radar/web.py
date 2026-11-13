@@ -634,6 +634,17 @@ def _stored_strings(value: object) -> tuple[str, ...]:
     return ()
 
 
+def _related(identifiers: Iterable[object], *, limit: int = 4) -> tuple[tuple[str, ...], int]:
+    """The related identifiers a row may show, and how many others the message named.
+
+    Returns the first ``limit + 1`` unique identifiers (a row drops its own and still has ``limit``) and the
+    number of other identifiers. The full list is shared, never copied per row: a message may name thousands
+    of advisories, and one tuple per identifier would be quadratic memory for a page that renders a handful.
+    """
+    unique = tuple(dict.fromkeys(item for item in identifiers if isinstance(item, str)))
+    return unique[: limit + 1], max(0, len(unique) - 1)
+
+
 def _queue_time(entry: Mapping) -> int:
     """When a queued message entered the queue, from the best clock the state recorded.
 
@@ -805,6 +816,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
             claim(_stored_strings(entry.get("ids")), kind=_CLAIM_PENDING, at=_queue_time(entry), index=index)
 
     def make(
+        identifier_id: str,
         *,
         state: str,
         at: object,
@@ -814,9 +826,10 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         title: object = "",
         link: object = "",
         source: object = "",
-        aliases: Sequence[object] = (),
+        related: tuple[tuple[str, ...], int] = ((), 0),
         mention: bool = False,
     ) -> dict:
+        head, others = related
         return {
             "state": state,
             "at": _number(at, 0),
@@ -826,7 +839,8 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
             "title": title if isinstance(title, str) else "",
             "link": link if isinstance(link, str) else "",
             "source": source if isinstance(source, str) else "",
-            "aliases": tuple(alias for alias in aliases if isinstance(alias, str)),
+            "aliases": tuple(alias for alias in head if alias != identifier_id)[:4],
+            "alias_count": others,
             "detail": detail,
             "mention": mention,
         }
@@ -850,7 +864,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         if all(existing["origin"] != fact["origin"] for existing in row["facts"]):
             row["facts"].append(fact)
         primary = min(row["facts"], key=lambda item: (item["rank"], -item["at"]))
-        for key in ("state", "at", "tag", "title", "link"):
+        for key in ("state", "at", "tag", "title", "link", "alias_count"):
             row[key] = primary[key]
         row["aliases"] = primary["aliases"]
         row["primary_origin"] = primary["origin"]
@@ -889,6 +903,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         source_id = entry.get("source_id") if isinstance(entry.get("source_id"), str) else ""
         for identifier in identifiers:
             fact = make(
+                identifier,
                 state="held" if held else "pending",
                 at=at,
                 origin=f"pending:{index}",
@@ -896,7 +911,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
                 title=entry.get("title"),
                 link=entry.get("link"),
                 source=source_id,
-                aliases=tuple(other for other in identifiers if other != identifier),
+                related=_related(identifiers),
             )
             if whole or owned(entry, identifier, kind=_CLAIM_PENDING, index=index, at=at):
                 own(identifier, fact)
@@ -911,6 +926,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         source_id = entry.get("source_id") if isinstance(entry.get("source_id"), str) else ""
         for identifier in identifiers:
             fact = make(
+                identifier,
                 state="parked",
                 at=at,
                 origin=f"parked:{index}",
@@ -918,7 +934,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
                 title=entry.get("title"),
                 link=entry.get("link"),
                 source=source_id,
-                aliases=tuple(other for other in identifiers if other != identifier),
+                related=_related(identifiers),
             )
             if whole or owned(entry, identifier, kind=_CLAIM_PARKED, index=index, at=claim_at):
                 own(identifier, fact)
@@ -938,6 +954,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         outcome = record.get("outcome")
         at = _number(record.get("at"), 0)
         fact = make(
+            identifier,
             state=outcome if isinstance(outcome, str) and outcome else "recorded",
             at=at,
             origin=f"seen:{identifier}",
@@ -945,7 +962,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
             title=snapshot.get("title"),
             link=snapshot.get("link"),
             source=snapshot.get("source_id") if isinstance(snapshot.get("source_id"), str) else "",
-            aliases=tuple(other for other in identifiers if other != identifier),
+            related=_related(identifiers),
         )
         # A suppression can record an identifier another message already owns (state written before the
         # writer stopped doing that); then it is history about that identifier, not its current state, and
@@ -975,6 +992,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         source_id = event.get("source_id") if isinstance(event.get("source_id"), str) else ""
         for identifier in identifiers:
             fact = make(
+                identifier,
                 state=state_name,
                 at=event.get("at"),
                 origin=f"event:{event_id}",
@@ -982,7 +1000,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
                 title=event.get("title"),
                 link=event.get("link"),
                 source=source_id,
-                aliases=tuple(other for other in identifiers if other != identifier),
+                related=_related(identifiers),
             )
             if identifier in pointed:
                 continue  # its own seen record already carries this event's outcome
@@ -1005,6 +1023,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
                     (
                         identifier,
                         make(
+                            identifier,
                             state="carried",
                             at=item.get("published"),
                             origin=f"carry:{source_id}:{index}",
@@ -1012,7 +1031,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
                             title=item.get("title"),
                             link=item.get("link"),
                             source=source_id if isinstance(source_id, str) else "",
-                            aliases=tuple(other for other in identifiers if other != identifier),
+                            related=_related(identifiers),
                         ),
                     )
                 )
@@ -2541,9 +2560,10 @@ def create_app(
                     f"<a href='/advisories/{esc(_advisory_token(alias))}'>{esc(alias)}</a>"
                     if alias in detail_ids
                     else esc(alias)
-                    for alias in aliases[:4]
+                    for alias in aliases
                 )
-                more = f" +{len(aliases) - 4}" if len(aliases) > 4 else ""
+                more_count = max(0, _number(row.get("alias_count"), 0) - len(aliases))
+                more = f" +{more_count}" if more_count else ""
                 related = f"<br><span class='muted small'>Related: {shown}{more}</span>"
             also = _inbox_also(row)
             sources = ", ".join(esc(source) for source in row.get("sources") or ()) or "<span class='muted'>—</span>"
@@ -2608,42 +2628,23 @@ def create_app(
         identifier = _advisory_identifier(token)
         state = load_state()
         events = core.delivery_events(state, identifier)
-        seen = state.get("seen")
-        pending = state.get("pending")
-        parked = state.get("parked")
-
-        def owns(entry: object) -> bool:
-            """Whether a queued entry recorded this identifier as one it introduced."""
-            if not isinstance(entry, dict):
-                return False
-            fresh = entry.get("fresh")
-            return isinstance(fresh, (list, tuple)) and identifier in _stored_strings(fresh)
-
-        # A live message that owns the identifier is the actionable fact: an escalation about an already-
-        # delivered CVE must open as the escalation, with the delivered history listed below it. The entry
-        # that recorded the identifier as its own comes next; a parked critical must not open as a pending
-        # warning that happens to mention it.
-        for label, queue in (("parked", parked), ("pending", pending)):
-            for entry in queue if isinstance(queue, list) else ():
-                if owns(entry):
-                    body = _queued_advisory(label, entry, events)
-                    return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
-        if isinstance(seen, dict) and isinstance(seen.get(identifier), dict):
-            record = seen[identifier]
-            deliveries = state.get("deliveries")
-            reference = record.get("delivery")
-            snapshot = (
-                deliveries.get(reference) if isinstance(deliveries, dict) and isinstance(reference, str) else None
-            )
-            body = _seen_advisory(record, snapshot if isinstance(snapshot, dict) else None, events)
+        # The same ownership projection the inbox row was built from, read-only: a live owning message is
+        # the actionable fact (an escalation about an already-delivered CVE opens as the escalation, with the
+        # delivered history listed below it); otherwise the seen record is the identifier's history, and only
+        # then does the legacy claim rule decide between older entries.
+        owner = core.owner_of(state, identifier)
+        if owner is not None:
+            label, record = owner
+            if label == "seen":
+                deliveries = state.get("deliveries")
+                reference = record.get("delivery")
+                snapshot = (
+                    deliveries.get(reference) if isinstance(deliveries, dict) and isinstance(reference, str) else None
+                )
+                body = _seen_advisory(record, snapshot if isinstance(snapshot, dict) else None, events)
+            else:
+                body = _queued_advisory(label, record, events)
             return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
-        for label, queue in (("pending", pending), ("parked", parked)):
-            for entry in queue if isinstance(queue, list) else ():
-                # Only an entry written before ``fresh`` falls back to membership: a modern entry that names
-                # the identifier but does not own it is a mention, and its message is not this advisory.
-                if isinstance(entry, dict) and "fresh" not in entry and identifier in (entry.get("ids") or ()):
-                    body = _queued_advisory(label, entry)
-                    return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
         if events:
             # An Adobe bulletin is recorded only as its delivery event: it never had a seen record, so the
             # event list is the whole history and the page must not answer 404 after its queue entry left.

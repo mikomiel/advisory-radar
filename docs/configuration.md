@@ -291,7 +291,8 @@ is a mention — context that never replaces its own state or severity, so a new
 hide a parked critical or requeue a delivered GHSA. A suppressed message does not record an
 identifier another message owns, so it cannot hide queued work. An escalation or an Adobe
 bulletin is about everything it names and always counts as work, even when the identifier
-already has history. `/advisories/<id>` opens the message that owns the identifier — a parked or queued
+already has history. An entry written before that record is settled with the same earliest-claim
+rule on the next pass, before it can be delivered or dropped. `/advisories/<id>` opens the message that owns the identifier — a parked or queued
 owner before a mention — so the detail page matches the row it was opened from, and a live
 escalation shows the delivery that preceded it below. Each row's severity is the level recorded for that identifier,
 falling back to the message's tag when it has none, so a multi-CVE message with mixed levels

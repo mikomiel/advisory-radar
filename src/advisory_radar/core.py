@@ -1524,7 +1524,13 @@ def _delivered(
             if isinstance(owned, (list, tuple))
             else list(entry["ids"])
         )
-        fresh = [identifier for identifier in candidates if identifier not in state["seen"]]
+        fresh = []
+        for identifier in candidates:
+            record = state["seen"].get(identifier)
+            if record is None or (isinstance(record, dict) and record.get("outcome") not in ("delivered", "dropped")):
+                # A legacy suppression (or another non-delivery disposition) for an identifier this message
+                # owns is a placeholder, not first-seen history: the owner's outcome replaces it.
+                fresh.append(identifier)
         if fresh:
             snapshot_id = _record_event(state, entry, now, outcome, delivered_to)
             for identifier in fresh:
@@ -1638,6 +1644,18 @@ def _suppressed(
 
 #: A legacy claim with no recorded time sorts behind every dated one.
 _LEGACY_UNKNOWN_CLAIM = 1 << 62
+
+
+def _queue_time(entry: object) -> int:
+    """When a queued message entered the queue, from the best clock the state recorded."""
+    source = entry if isinstance(entry, dict) else {}
+    for key in ("queued_at", "first_attempt_at"):
+        value = source.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return 0
+
+
 #: The message kinds that are about every identifier they name: an escalation is one CVE and a bulletin is
 #: its own id. Every other message's ``fresh`` list says which identifiers it introduced.
 WHOLE_MESSAGE_KINDS = ("escalation", "adobe", "adobe-kev")
@@ -1665,14 +1683,6 @@ def _ensure_ownership(state: dict) -> None:
         if isinstance(entry, dict) and isinstance(entry.get("fresh"), (list, tuple)):
             reserved.update(_stored_list(entry.get("fresh")))
 
-    def queue_time(entry: object) -> int:
-        source = entry if isinstance(entry, dict) else {}
-        for key in ("queued_at", "first_attempt_at"):
-            value = source.get(key)
-            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                return value
-        return 0
-
     def claim(identifier: object, *, kind: int, at: object, index: int) -> None:
         if not isinstance(identifier, str) or identifier in reserved:
             return
@@ -1690,11 +1700,11 @@ def _ensure_ownership(state: dict) -> None:
     for index, entry in enumerate(parked):
         if isinstance(entry, dict) and "fresh" not in entry:
             for identifier in _stored_list(entry.get("ids")):
-                claim(identifier, kind=0, at=queue_time(entry), index=index)
+                claim(identifier, kind=0, at=_queue_time(entry), index=index)
     for index, entry in enumerate(pending):
         if isinstance(entry, dict) and "fresh" not in entry:
             for identifier in _stored_list(entry.get("ids")):
-                claim(identifier, kind=1, at=queue_time(entry), index=index)
+                claim(identifier, kind=1, at=_queue_time(entry), index=index)
 
     def record(entries: list, kind: int) -> None:
         for index, entry in enumerate(entries):
@@ -1705,7 +1715,7 @@ def _ensure_ownership(state: dict) -> None:
                 # An escalation or bulletin is about everything it names, whatever the claim competition says.
                 entry["fresh"] = identifiers
                 continue
-            at = queue_time(entry)
+            at = _queue_time(entry)
             stamp = at if at > 0 else _LEGACY_UNKNOWN_CLAIM
             entry["fresh"] = [
                 identifier for identifier in identifiers if claims.get(identifier) == (stamp, kind, index)
@@ -1713,6 +1723,62 @@ def _ensure_ownership(state: dict) -> None:
 
     record(parked, 0)
     record(pending, 1)
+
+
+def owner_of(state: dict, identifier: str) -> tuple[str, dict] | None:
+    """Which message or seen record owns an identifier, read without changing the state.
+
+    Recorded ownership comes first: a whole-message kind owns every identifier it names, and a message owns
+    exactly its ``fresh`` list. Then the seen record, which is the identifier's history. Only then does the
+    legacy claim rule decide between older entries: earliest recorded time, parked before queued, unknown
+    time last. A caller that must not write state -- a page render, before a pass has settled the queue -- gets
+    the same answer the inbox row was built from.
+    """
+    pending = state.get("pending")
+    pending = pending if isinstance(pending, list) else []
+    parked = state.get("parked")
+    parked = parked if isinstance(parked, list) else []
+    seen = state.get("seen")
+    seen = seen if isinstance(seen, dict) else {}
+
+    def recorded(entry: object) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        identifiers = _stored_list(entry.get("ids"))
+        if entry.get("kind") in WHOLE_MESSAGE_KINDS:
+            return identifier in identifiers
+        fresh = entry.get("fresh")
+        return isinstance(fresh, (list, tuple)) and identifier in _stored_list(fresh)
+
+    for label, entries in (("parked", parked), ("pending", pending)):
+        for entry in entries:
+            if recorded(entry):
+                return label, entry
+    record = seen.get(identifier)
+    if isinstance(record, dict):
+        return "seen", record
+
+    claims: dict[str, tuple[int, int, int]] = {}
+    for entries, kind in ((parked, 0), (pending, 1)):
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict) or "fresh" in entry or entry.get("kind") in WHOLE_MESSAGE_KINDS:
+                continue
+            if identifier not in _stored_list(entry.get("ids")):
+                continue
+            stamp = _queue_time(entry)
+            key = (stamp if stamp > 0 else _LEGACY_UNKNOWN_CLAIM, kind, index)
+            current = claims.get(identifier)
+            if current is None or key < current:
+                claims[identifier] = key
+    key = claims.get(identifier)
+    if key is None:
+        return None
+    _, kind, index = key
+    entries = parked if kind == 0 else pending
+    entry = entries[index] if index < len(entries) else None
+    if not isinstance(entry, dict):
+        return None
+    return ("parked" if kind == 0 else "pending"), entry
 
 
 def _claimed(state: dict) -> set[str]:
