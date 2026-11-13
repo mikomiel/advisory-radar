@@ -18,7 +18,8 @@ turns critical, and never re-sends what you already received.
   what one advisory would be judged as and where its message would go
 - Filterable `/alerts` and `/runs` lists with their state in the URL, keyset pagination for
   the alert history, and a per-advisory page (`/advisories/<id>`) showing the stored
-  classification and delivery record. The source filter matches the configured source id,
+  classification, delivery record and later notification events. The source filter matches the
+  configured source id,
   never the advisory heading
 - Web UI + REST API, in-process scheduler (default every 15 min), atomic state on a volume:
   a JSON file by default, SQLite or PostgreSQL when `storage` says so

@@ -332,10 +332,12 @@ advisory heading — `outcome`, `q`, `since` and `until`, the dates as inclusive
 pages by keyset cursor rather than an offset, so a reload, a bookmark or a shared link shows
 the same rows and adding an advisory cannot shift a page. Each row links to the advisory's
 page (the identifier is encoded in the path, so one containing slashes still opens), which
-shows the stored classification and delivery record — tag, source, title, identifiers and
-CVEs, KEV-only CVEs, matched products, per-CVE level and CVSS, and the notifiers that
-accepted the message — and says the details were not recorded for a seen record written by
-an older version, instead of inventing them. The page never renders the message body: a
+shows the stored classification and delivery record — tag, source id and heading, title,
+identifiers and CVEs, KEV-only CVEs, matched products, per-CVE level and CVSS, and the
+notifiers that accepted the message — and says the details were not recorded for a seen
+record written by an older version, instead of inventing them. Later escalation and Adobe
+delivery events are listed below it (an Adobe bulletin has no other record), and `/alerts`
+shows the latest of them under **Recent notifications**. The page never renders the message body: a
 delivered record does not retain it, while a pending or parked entry still carries its body
 in the queue until it leaves. The record is stored once per message and each identifier
 points at it, so a message naming thousands of identifiers does not multiply it.

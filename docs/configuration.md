@@ -265,12 +265,12 @@ fixed cap, and each row links to the advisory's page (the identifier is encoded 
 so a stored GUID or URL containing slashes still opens). An advisory's identity is kept
 exactly as the publisher sent it — only its log and display spelling is escaped — because
 transforming an identity can merge two advisories into one. `/advisories/<id>` shows the stored
-classification — tag, source, title, the identifiers and CVEs, whether any was KEV-only,
-the watchlist products the item matched, the per-CVE levels and CVSS, and the notifiers
-that accepted the message — for a delivered message, a pending one or a parked one. It never
-renders the message body: a delivered record does not retain it, and a pending or parked
-queue entry still carries its own body only until it leaves the queue. The record is stored
-once per delivered message and each identifier points at it, so an advisory that names
+classification — tag, source id and heading, title, the identifiers and CVEs, whether any was
+KEV-only, the watchlist products the item matched, the per-CVE levels and CVSS, and the
+notifiers that accepted the message — for a delivered message, a pending one or a parked one.
+It never renders the message body: a delivered record does not retain it, and a pending or
+parked queue entry still carries its own body only until it leaves the queue. The record is
+stored once per delivered message and each identifier points at it, so an advisory that names
 thousands of identifiers does not multiply it. A record written by an older version says its
 details were not recorded instead of inventing them. `/parked` releases or drops a
 single message per row while keeping the bulk actions, and `/runs` filters by exit code and
@@ -280,6 +280,14 @@ last-pass line: finished, failed, already running, or not available in this proc
 busy or failed request is not read as the previous successful pass. The result travels in a
 signed token that expires after two minutes and is bound to the signed-in session, so a
 missing, stale or other-session token renders no notice.
+
+Every accepted or dropped message is also kept as a delivery event with its own time,
+outcome and accepted destinations. A later escalation adds an event beside the first-seen
+record instead of rewriting it; an Adobe bulletin never becomes a first-seen record, so its
+event is the only history that names it. `/advisories/<id>` lists those events under
+**Notifications**, and `/alerts` shows the latest 20 escalation and Adobe events under
+**Recent notifications**, independent of the filters — the general history still discovers a
+notification after its queue entry has left.
 
 ## Settings without a restart
 

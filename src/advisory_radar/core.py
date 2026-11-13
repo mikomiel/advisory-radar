@@ -1445,15 +1445,16 @@ def _stored_list(value: object) -> list[str]:
     return [item for item in value if isinstance(item, str)]
 
 
-def _delivery_snapshot(entry: dict, delivered_to: Sequence[str]) -> dict:
-    """The compact record of one delivered message, copied off the queue entry so a later edit cannot reach it.
+def _delivery_snapshot(entry: dict, delivered_to: Sequence[str], *, at: int, outcome: str) -> dict:
+    """The compact record of one delivery event, copied off the queue entry so a later edit cannot reach it.
 
     ``tag``/``source_id``/``source``/``levels``/``scores`` are the classification the message was sent with,
-    which the seen record previously dropped, and the identifiers, KEV-only CVEs and matched products answer
-    the rest of the advisory page from the record alone. ``source`` is display text -- a feed item's advisory
-    heading or an Adobe bulletin's name -- while ``source_id`` is the configured source the item was queued
-    from and ``""`` for an escalation or a bulletin, which are not feed items. The body is deliberately
-    absent: it is the rendered text, not a fact.
+    and the identifiers, KEV-only CVEs and matched products answer the rest of the advisory page from the
+    record alone. ``source`` is display text -- a feed item's advisory heading or an Adobe bulletin's name --
+    while ``source_id`` is the configured source the item was queued from and ``""`` for an escalation or a
+    bulletin, which are not feed items. ``at`` and ``outcome`` are the event's own time and result, so a later
+    escalation or drop keeps its event beside the first-seen record instead of overwriting it. The body is
+    deliberately absent: it is the rendered text, not a fact.
     """
     return {
         "tag": entry.get("tag", ""),
@@ -1470,6 +1471,8 @@ def _delivery_snapshot(entry: dict, delivered_to: Sequence[str]) -> dict:
         "levels": dict(entry.get("levels") or {}),
         "scores": dict(entry.get("scores") or {}),
         "delivered_to": list(delivered_to),
+        "at": at,
+        "outcome": outcome,
     }
 
 
@@ -1477,6 +1480,15 @@ def _snapshot_id(snapshot: dict) -> str:
     """A stable id for one delivery snapshot, so its collections are stored once rather than per identifier."""
     material = json.dumps(snapshot, sort_keys=True, default=str)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+def _record_event(state: dict, entry: dict, now: int, outcome: str, delivered_to: Sequence[str]) -> str:
+    """Store one delivery event and return its id; the stored snapshot is never edited afterwards."""
+    snapshot = _delivery_snapshot(entry, delivered_to, at=now, outcome=outcome)
+    deliveries = state.setdefault("deliveries", {})
+    snapshot_id = _snapshot_id(snapshot)
+    deliveries[snapshot_id] = snapshot
+    return snapshot_id
 
 
 def _delivered(
@@ -1487,17 +1499,16 @@ def _delivered(
     ``delivered_to`` names the notifiers that accepted the message; ``deliver`` clears ``sent_to`` from the
     entry before calling this, so the accepted ids are passed in rather than read back off it.
 
-    The snapshot is stored once under ``state["deliveries"]`` and each seen identifier points at it. Copying it
-    into every identifier's record would be quadratic: one accepted message can name thousands of identifiers,
-    each of which would then carry a copy of the full list.
+    Every accepted or dropped message leaves one delivery event under ``state["deliveries"]``; a seen
+    identifier points at the event that first named it, and later escalations or Adobe bulletins add events
+    without rewriting it. Copying an event into every identifier's record would be quadratic: one accepted
+    message can name thousands of identifiers, each of which would then carry a copy of the full list.
     """
-    if entry["kind"] == "new":
-        snapshot = _delivery_snapshot(entry, delivered_to)
+    kind = entry["kind"]
+    if kind == "new":
         fresh = [identifier for identifier in entry["ids"] if identifier not in state["seen"]]
         if fresh:
-            deliveries = state.setdefault("deliveries", {})
-            snapshot_id = _snapshot_id(snapshot)
-            deliveries[snapshot_id] = snapshot
+            snapshot_id = _record_event(state, entry, now, outcome, delivered_to)
             for identifier in fresh:
                 # The first record wins: an identifier keeps what was sent for it first, even when a later
                 # message about the same advisory is dropped or delivered again from another source.
@@ -1526,13 +1537,49 @@ def _delivered(
             if "scores" in entry:  # A message queued before the key existed has no score on record: legacy.
                 record["cvss"] = entry["scores"].get(cve)
             state["watch"][cve] = record
-    elif entry["kind"] == "escalation":
+    elif kind == "escalation":
         watch = state["watch"].get(entry["cves"][0])
         if watch is not None:
             watch["level"] = entry["tag"]
             watch["judged"] = entry["tag"]
             watch["thresholds"] = Thresholds.from_snapshot(entry.get("thresholds")).snapshot()
-    # An Adobe message was recorded in state["adobe"] when it was queued; delivering or dropping it changes nothing.
+        # The escalation is a later notification about an advisory already recorded: the seen record keeps
+        # what was first sent, and this event explains the higher level.
+        _record_event(state, entry, now, outcome, delivered_to)
+    else:
+        # An Adobe bulletin has no seen record at all, so its event is the only persistent history it has; a
+        # drop is a decision that also belongs in that history.
+        _record_event(state, entry, now, outcome, delivered_to)
+
+
+def _event_at(event: Mapping) -> int:
+    """An event's recorded time, or 0 for a legacy or hand-edited value: ordering a page must never raise."""
+    value = event.get("at")
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def delivery_events(state: dict, identifier: str | None = None) -> list[tuple[str, dict]]:
+    """Delivery events newest first, optionally only those naming ``identifier``.
+
+    ``state["deliveries"]`` holds one event per accepted or dropped message: the first-seen snapshot for a new
+    advisory, and an added event for every later escalation or Adobe bulletin. A page reads the whole map once,
+    so a scan is simpler than an index while the state is one JSON document; an entry that is not an object, or
+    a hand-edited one, is skipped rather than allowed to fail the page.
+    """
+    deliveries = state.get("deliveries")
+    if not isinstance(deliveries, dict):
+        return []
+    events: list[tuple[str, dict]] = []
+    for event_id, event in deliveries.items():
+        if not isinstance(event_id, str) or not isinstance(event, dict):
+            continue
+        if identifier is not None:
+            names = (*_stored_list(event.get("ids")), *_stored_list(event.get("cves")))
+            if identifier not in names:
+                continue
+        events.append((event_id, event))
+    events.sort(key=lambda item: (-_event_at(item[1]), item[0]))
+    return events
 
 
 def _suppressed(

@@ -388,6 +388,103 @@ def test_quiet_hours_holding_everything_is_not_a_failed_pass():
     assert all("attempts" not in entry for entry in state["pending"])
 
 
+def test_a_delivered_message_records_one_event_with_its_time_and_outcome():
+    state = core.new_state()
+    state["pending"].append(queued("CVE-2026-1"))
+    assert core.deliver(state, [Recorder()], no_http, NOW) is True
+    record = state["seen"]["CVE-2026-1"]
+    event = state["deliveries"][record["delivery"]]
+    assert event["at"] == NOW and event["outcome"] == "delivered"
+    assert event["delivered_to"] == ["ops"] and event["kind"] == "new"
+    assert [stored["kind"] for _, stored in core.delivery_events(state, "CVE-2026-1")] == ["new"]
+
+
+def test_an_escalation_is_added_beside_the_first_seen_record():
+    state = core.new_state()
+    state["pending"].append(queued("CVE-2026-1"))
+    recorder = Recorder()
+    assert core.deliver(state, [recorder], no_http, NOW) is True
+    first = dict(state["seen"]["CVE-2026-1"])
+    state["pending"].append(
+        {
+            "kind": "escalation",
+            "tag": "critical",
+            "title": "CRITICAL: CVE-2026-1 now CRITICAL",
+            "body": "\n- **Severity:** CVSS 9.8",
+            "ids": ["CVE-2026-1"],
+            "cves": ["CVE-2026-1"],
+            "levels": {},
+            "scores": {"CVE-2026-1": 9.8},
+            "thresholds": [9.0, 0.10, 4.0],
+            "source": "Vendor",
+            "link": "https://vendor.example/CVE-2026-1",
+        }
+    )
+    assert core.deliver(state, [recorder], no_http, NOW + 60) is True
+    assert state["seen"]["CVE-2026-1"] == first, "the first-seen record is never rewritten"
+    assert state["watch"]["CVE-2026-1"]["level"] == "critical"
+    events = core.delivery_events(state, "CVE-2026-1")
+    assert [event["kind"] for _, event in events] == ["escalation", "new"]
+    assert events[0][1]["at"] == NOW + 60 and events[0][1]["outcome"] == "delivered"
+    assert events[0][1]["delivered_to"] == ["ops"]
+
+
+def test_an_adobe_bulletin_keeps_an_event_without_a_seen_record():
+    state = core.new_state()
+    state["pending"].append(
+        {
+            "kind": "adobe",
+            "tag": "critical",
+            "title": "CRITICAL: APSB26-1 Adobe Commerce",
+            "body": "",
+            "ids": ["APSB26-1"],
+            "cves": [],
+            "levels": {},
+            "source": "Adobe Commerce APSB26-1",
+            "link": "https://helpx.adobe.com/security/products/magento/apsb26-1.html",
+        }
+    )
+    assert core.deliver(state, [Recorder()], no_http, NOW) is True
+    assert "APSB26-1" not in state["seen"], "a bulletin never becomes a first-seen record"
+    events = core.delivery_events(state, "APSB26-1")
+    assert len(events) == 1 and events[0][1]["kind"] == "adobe"
+    assert events[0][1]["delivered_to"] == ["ops"]
+    assert core.delivery_events(state, "CVE-2026-404") == []
+
+
+def test_a_dropped_escalation_is_kept_as_a_dropped_event():
+    state = core.new_state()
+    state["watch"]["CVE-2026-1"] = {
+        "since": NOW,
+        "last_eval": NOW,
+        "level": "warning",
+        "judged": "warning",
+        "title": "Vendor",
+        "link": "https://vendor.example/CVE-2026-1",
+        "thresholds": [9.0, 0.10, 4.0],
+    }
+    core._delivered(
+        state,
+        {
+            "kind": "escalation",
+            "tag": "critical",
+            "title": "CRITICAL: CVE-2026-1 now CRITICAL",
+            "body": "",
+            "ids": ["CVE-2026-1"],
+            "cves": ["CVE-2026-1"],
+            "levels": {},
+            "scores": {},
+            "source": "Vendor",
+            "link": "https://vendor.example/CVE-2026-1",
+        },
+        NOW,
+        outcome="dropped",
+    )
+    assert state["seen"] == {}, "a dropped escalation was never sent, so no seen record is invented"
+    events = core.delivery_events(state, "CVE-2026-1")
+    assert events[0][1]["outcome"] == "dropped" and events[0][1]["delivered_to"] == []
+
+
 def test_a_failed_digest_marks_one_attempt_per_covered_entry_and_retries_only_the_failing_channel():
     state = core.new_state()
     state["pending"] = [queued("CVE-2026-1"), queued("CVE-2026-2")]
