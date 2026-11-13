@@ -12,11 +12,17 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from advisory_radar import core
+from advisory_radar import core, pipeline
 from advisory_radar.config import load_config
 from advisory_radar.http import RedactFilter
 from advisory_radar.runtime import Runtime
 from advisory_radar.settings import load_settings, load_settings_document, save_settings, settings_path
+from advisory_radar.sources import (
+    WebhookIdsUnsupported,
+    WebhookSource,
+    WebhookTextNotEncodable,
+    webhook_item_from_payload,
+)
 from advisory_radar.state import load_state_document, save_state, state_lock
 from advisory_radar.web import LoginThrottle, _epoch, _when, create_app, readiness
 
@@ -1312,3 +1318,282 @@ def test_a_legacy_identity_utf8_cannot_encode_still_renders_the_alerts_page(tmp_
     # The API returns the document itself, so it has to survive the same record: the value is preserved and
     # only its JSON spelling is escaped.
     assert client.get("/api/state").status_code == 200
+
+
+# --- the inbound webhook payload contract (#74, #75) ---------------------------------------------
+
+
+WEBHOOK_ENVIRONMENT = {"ADVISORY_RADAR_AUTH_TOKEN": "secret-token", "ADVISORY_RADAR_WEBHOOK_SECRET": "s3cret"}
+WEBHOOK_HEADERS = {"Authorization": "Bearer s3cret", "Content-Type": "application/json"}
+
+
+def webhook_client(tmp_path: Path) -> TestClient:
+    """A client for one configured webhook source; a server fault is a response, never a raised error."""
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
+    app = create_app(Runtime.build(cfg_path, WEBHOOK_ENVIRONMENT), WEBHOOK_ENVIRONMENT)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def post_webhook(tmp_path: Path, payload: object = None, *, content: bytes | None = None):
+    body = content if content is not None else json.dumps(payload).encode()
+    return webhook_client(tmp_path).post("/webhooks/wh", content=body, headers=WEBHOOK_HEADERS)
+
+
+def queued_webhook_item(tmp_path: Path, payload: dict):
+    """POST one accepted payload and return its queued entry and the Item a pass builds from it."""
+    response = post_webhook(tmp_path, payload)
+    assert response.status_code == 200, response.text
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    entry = state["webhook_inbox"]["wh"][0]
+    item = WebhookSource("wh").fetch(lambda *args: (0, {}, b""), state).items[0]
+    return entry, item
+
+
+def test_a_structured_webhook_id_is_queued_and_becomes_the_item_identity(tmp_path):
+    """#74: an id declared in ``ids`` must reach ``Item.explicit``, the field classification and enrichment read."""
+    entry, item = queued_webhook_item(
+        tmp_path, {"title": "Security update", "guid": "stable", "ids": ["CVE-2026-1234"]}
+    )
+    assert entry["explicit_ids"] == ["CVE-2026-1234"]
+    assert item.explicit == ("CVE-2026-1234",)
+
+
+def test_a_structured_id_and_its_prose_equivalent_have_the_same_identity(tmp_path):
+    """The structured payload must reach the same classification/enrichment input as the equivalent prose one."""
+    structured_dir, prose_dir = tmp_path / "structured", tmp_path / "prose"
+    structured_dir.mkdir()
+    prose_dir.mkdir()
+    _, structured = queued_webhook_item(
+        structured_dir, {"title": "Security update", "guid": "stable", "ids": ["CVE-2026-1234"]}
+    )
+    _, prose = queued_webhook_item(
+        prose_dir, {"title": "Security update", "guid": "stable", "summary": "Fixes CVE-2026-1234."}
+    )
+    assert structured.explicit == prose.explicit == ("CVE-2026-1234",)
+
+
+def test_duplicate_and_mixed_webhook_ids_are_merged_once(tmp_path):
+    """Prose and structured ids are one union, normalised and deduplicated, not two channels."""
+    entry, item = queued_webhook_item(
+        tmp_path,
+        {
+            "title": "Vendor advisory about cve-2026-1111",
+            "summary": "also GHSA-AAAA-BBBB-CCCC",
+            "guid": "mixed",
+            "ids": ["CVE-2026-1111", "cve-2026-2222", "CVE-2026-2222", "GHSA-aaaa-bbbb-cccc"],
+        },
+    )
+    expected = ["CVE-2026-1111", "GHSA-aaaa-bbbb-cccc", "CVE-2026-2222"]
+    assert entry["explicit_ids"] == expected
+    assert item.explicit == tuple(expected)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"title": "nightly notes", "guid": "none"},
+        {"title": "nightly notes", "guid": "empty", "ids": []},
+    ],
+)
+def test_a_payload_without_structured_ids_is_still_accepted(tmp_path, payload):
+    """An absent or empty ``ids`` is not a refusal and leaves the entry without an explicit-id list."""
+    entry, item = queued_webhook_item(tmp_path, payload)
+    assert "explicit_ids" not in entry
+    assert item.explicit == ()
+
+
+@pytest.mark.parametrize(
+    "ids",
+    [
+        "CVE-2026-1234",
+        ["not-an-identifier"],
+        ["CVE-2026-123"],
+        ["CVE-2026-1234 trailing"],
+        [7],
+        [None],
+    ],
+)
+def test_an_unsupported_ids_value_is_refused_without_state(tmp_path, ids):
+    """#74: unsupported structured ids fail closed instead of being accepted and silently discarded."""
+    response = post_webhook(tmp_path, {"title": "Security update", "guid": "stable", "ids": ids})
+    assert response.status_code == 400
+    assert response.json()["error"] == "ids must be a list of CVE, GHSA or PSA identifier strings"
+    assert not (tmp_path / "state.json").exists(), "a refused payload writes no state"
+
+
+@pytest.mark.parametrize("ids", ["CVE-2026-1234", ["not-an-identifier"], [7], [None]])
+def test_the_payload_mapper_names_its_ids_refusal(ids):
+    """The refusal type carries the fixed contract message the intake answers with."""
+    with pytest.raises(WebhookIdsUnsupported) as refused:
+        webhook_item_from_payload({"title": "Security update", "ids": ids})
+    assert str(refused.value) == "ids must be a list of CVE, GHSA or PSA identifier strings"
+
+
+def test_changedetection_native_ids_are_honoured(tmp_path):
+    """The native shape declares ids the same way; its diff is prose and is merged too."""
+    entry, item = queued_webhook_item(
+        tmp_path,
+        {
+            "watch_uuid": "u1",
+            "watch_title": "Shop",
+            "watch_url": "https://x.example",
+            "diff": "price changed",
+            "ids": ["GHSA-AAAA-BBBB-CCCC"],
+        },
+    )
+    assert entry["explicit_ids"] == ["GHSA-aaaa-bbbb-cccc"]
+    assert item.explicit == ("GHSA-aaaa-bbbb-cccc",)
+
+
+def test_the_native_webhook_guid_fingerprint_is_pinned(tmp_path):
+    """The digest is an identity, not a security primitive; marking it non-security must not move a guid."""
+    entry, _ = queued_webhook_item(
+        tmp_path,
+        {"watch_uuid": "u1", "watch_title": "Shop", "watch_url": "https://x.example", "diff": "price changed"},
+    )
+    assert entry["guid"] == "wh:cd:25bc42ff2f579075"
+
+
+def test_a_deeply_nested_webhook_payload_is_refused_without_state(tmp_path):
+    """#75: a few thousand nested arrays defeat ``json.loads`` with a RecursionError, which is a client error."""
+    response = post_webhook(tmp_path, content=b"[" * 10000 + b"]" * 10000)
+    assert response.status_code == 400
+    assert "nested" in response.json()["error"]
+    assert not (tmp_path / "state.json").exists()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'{"title": "Vendor \\ud800 advisory"}',
+        b'{"watch_uuid": "u1", "watch_title": "Shop", "diff": "\\ud800 change"}',
+        b'{"watch_uuid": "\\ud800", "watch_title": "Shop", "diff": "change"}',
+        b'{"title": "Vendor advisory", "summary": "\\udfff text"}',
+    ],
+)
+def test_surrogate_webhook_text_is_refused_before_hashing(tmp_path, content):
+    """#75: an escaped lone surrogate is valid JSON, but encoding it to hash the item raises."""
+    response = post_webhook(tmp_path, content=content)
+    assert response.status_code == 400
+    assert response.json()["error"] == "payload text is not valid Unicode"
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_the_payload_mapper_names_its_text_refusal():
+    """The refusal type carries the fixed contract message the intake answers with."""
+    with pytest.raises(WebhookTextNotEncodable) as refused:
+        webhook_item_from_payload({"title": "Vendor \ud800 advisory"})
+    assert str(refused.value) == "payload text is not valid Unicode"
+
+
+def test_an_unknown_payload_refusal_does_not_echo_its_text(tmp_path, monkeypatch):
+    """A refusal the intake does not know by name is a fixed 400, not a 500 and never exception text."""
+    import advisory_radar.sources as sources_module
+
+    class LeakyRefusal(sources_module.WebhookPayloadRefused):
+        message = "internal detail that must not reach the client"
+
+    def refuse(payload):
+        raise LeakyRefusal()
+
+    monkeypatch.setattr(sources_module, "webhook_item_from_payload", refuse)
+    response = post_webhook(tmp_path, {"title": "Security update"})
+    assert response.status_code == 400
+    assert response.json() == {"error": "payload is not acceptable"}
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_a_refused_webhook_payload_leaves_the_state_document_untouched(tmp_path):
+    """Every refusal happens before the state transaction, so no inbox entry and no seen change is written."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-9999"] = {"at": 1792600000, "outcome": "delivered"}
+    save_state(tmp_path / "state.json", state)
+    before = (tmp_path / "state.json").read_bytes()
+    refused = [
+        b"[" * 10000 + b"]" * 10000,
+        b'{"title": "Vendor \\ud800 advisory"}',
+        json.dumps({"title": "advisory", "ids": ["not-an-identifier"]}).encode(),
+    ]
+    for content in refused:
+        assert post_webhook(tmp_path, content=content).status_code == 400
+    assert (tmp_path / "state.json").read_bytes() == before
+
+
+class _RecordingNotifier:
+    id = "recording"
+
+    def __init__(self):
+        self.sent = []
+
+    def send(self, entry, http):
+        self.sent.append(entry)
+        return 200
+
+
+def _webhook_pass_config(tmp_path: Path):
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
+    return load_config(cfg_path, {})
+
+
+def test_a_structured_only_webhook_entry_is_classified_and_released(tmp_path):
+    """#74: classification claims ``item.explicit``, so the inbox cleanup must know the structured ids too."""
+    state = core.new_state()
+    state["seeded"] = {"wh": True}
+    state["webhook_inbox"] = {
+        "wh": [webhook_item_from_payload({"title": "Security update", "guid": "stable", "ids": ["CVE-2026-4242"]})]
+    }
+    cfg = _webhook_pass_config(tmp_path)
+    save_state(cfg.state_path, state)
+    notifier = _RecordingNotifier()
+    code = pipeline.run_pass(
+        cfg,
+        [WebhookSource("wh")],
+        [notifier],
+        http=lambda *args: (404, {}, b""),
+        clock=lambda: 1792600000.0,
+        sleep=lambda seconds: None,
+    )
+    assert code == 0
+    stored = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert "CVE-2026-4242" in stored["seen"], "the structured id must be the claim classification records"
+    assert not (stored.get("webhook_inbox") or {}).get("wh"), "a claimed entry must leave the inbox, not stay forever"
+    delivered = len(notifier.sent)
+    assert delivered == 1
+    # A second pass must neither resend the entry nor retain it again.
+    pipeline.run_pass(
+        cfg,
+        [WebhookSource("wh")],
+        [notifier],
+        http=lambda *args: (404, {}, b""),
+        clock=lambda: 1792600100.0,
+        sleep=lambda seconds: None,
+    )
+    assert len(notifier.sent) == delivered
+    stored = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert not (stored.get("webhook_inbox") or {}).get("wh")
+
+
+def test_a_text_id_webhook_entry_is_still_released(tmp_path):
+    """An entry that names its id only in text keeps the behaviour the cleanup already had."""
+    state = core.new_state()
+    state["seeded"] = {"wh": True}
+    state["webhook_inbox"] = {
+        "wh": [{"guid": "legacy", "title": "Security update CVE-2026-4242", "summary": "", "link": ""}]
+    }
+    cfg = _webhook_pass_config(tmp_path)
+    save_state(cfg.state_path, state)
+    notifier = _RecordingNotifier()
+    code = pipeline.run_pass(
+        cfg,
+        [WebhookSource("wh")],
+        [notifier],
+        http=lambda *args: (404, {}, b""),
+        clock=lambda: 1792600000.0,
+        sleep=lambda seconds: None,
+    )
+    assert code == 0
+    stored = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert "CVE-2026-4242" in stored["seen"]
+    assert not (stored.get("webhook_inbox") or {}).get("wh"), "a text-named id must still release the entry"

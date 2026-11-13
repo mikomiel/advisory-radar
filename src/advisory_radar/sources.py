@@ -196,6 +196,13 @@ class WebhookSource:
         self.id = source_id
 
     def fetch(self, http: Http, state: dict) -> SourceWindow:
+        def identities(entry: dict) -> tuple[str, ...]:
+            """The validated structured ids first, then the ones the entry's own text names: one union."""
+            stored = entry.get("explicit_ids")
+            structured = (str(value) for value in stored if isinstance(value, str)) if isinstance(stored, list) else ()
+            prose = extract_ids(str(entry.get("title", "")), str(entry.get("summary", "")), str(entry.get("link", "")))
+            return tuple(dict.fromkeys((*structured, *prose)))
+
         inbox = state.get("webhook_inbox", {}).get(self.id, [])
         items = tuple(
             Item(
@@ -204,7 +211,7 @@ class WebhookSource:
                 str(entry.get("link", "")),
                 str(entry.get("summary", "")),
                 entry.get("published") if isinstance(entry.get("published"), int) else None,
-                extract_ids(str(entry.get("title", "")), str(entry.get("summary", "")), str(entry.get("link", ""))),
+                identities(entry),
                 str(entry.get("source_title", "")),
                 str(entry.get("source_url", "")),
             )
@@ -214,37 +221,110 @@ class WebhookSource:
         return SourceWindow(self.id, items, False, "")
 
 
+class WebhookPayloadRefused(ValueError):
+    """A webhook payload the intake contract refuses.
+
+    The intake answers one with a fixed 400 and never with exception text. The class carries the reason, not
+    an interpolated value, so a response cannot leak what a future caller puts into a message.
+    """
+
+    message = "payload is not acceptable"
+
+    def __init__(self) -> None:
+        super().__init__(self.message)
+
+
+class WebhookIdsUnsupported(WebhookPayloadRefused):
+    """``ids`` is not a list of the identifiers the text extractor understands."""
+
+    message = "ids must be a list of CVE, GHSA or PSA identifier strings"
+
+
+class WebhookTextNotEncodable(WebhookPayloadRefused):
+    """A text field is not UTF-8 representable, so it cannot be hashed or stored as JSON text."""
+
+    message = "payload text is not valid Unicode"
+
+
 def webhook_item_from_payload(payload: object) -> dict | None:
-    """Map a generic or changedetection.io-native webhook JSON body to an inbox entry."""
+    """Map a generic or changedetection.io-native webhook JSON body to an inbox entry.
+
+    ``WebhookPayloadRefused`` (a ``ValueError``) is the refused-payload signal the intake turns into a 400: an
+    ``ids`` value must be a list of identifiers the text extractor understands, and a text field must be UTF-8
+    representable because it is hashed to derive a default guid. A lone surrogate is valid JSON but not a
+    Unicode scalar value, so encoding it would raise after the request was accepted.
+    """
+
+    def checked(value: object) -> str:
+        text = str(value)
+        try:
+            text.encode("utf-8")
+        except UnicodeEncodeError:
+            raise WebhookTextNotEncodable() from None
+        return text
+
+    def declared_ids(value: object) -> tuple[str, ...]:
+        """The supported structured ids, normalised and deduplicated; anything else is refused."""
+        if value is None:
+            return ()
+        if not isinstance(value, list):
+            raise WebhookIdsUnsupported()
+        found: dict[str, None] = {}
+        for item in value:
+            if not isinstance(item, str):
+                raise WebhookIdsUnsupported()
+            text = item.strip()
+            extracted = extract_ids(text)
+            if len(extracted) != 1 or extracted[0].casefold() != text.casefold():
+                raise WebhookIdsUnsupported()
+            found[extracted[0]] = None
+        return tuple(found)
+
+    def merged(title: str, summary: str, link: str, value: object) -> list[str] | None:
+        """The union of the ids the text names and the structured ones; None when the entry names none."""
+        union = tuple(dict.fromkeys((*extract_ids(title, summary, link), *declared_ids(value))))
+        return list(union) if union else None
+
     if not isinstance(payload, dict):
         return None
     if "watch_uuid" in payload or "watch_url" in payload:  # changedetection.io native shape
-        diff = str(payload.get("diff") or "")
+        diff = checked(payload.get("diff") or "")
+        _ = checked(payload.get("watch_uuid"))  # validated before main's fingerprint line hashes it
+        watch_url = checked(payload.get("watch_url") or "")
+        title = checked(payload.get("watch_title") or payload.get("watch_url") or "change")
+        summary = diff or "page changed"
+        ids = merged(title, summary, watch_url, payload.get("ids"))
+        # This line is deliberately unchanged from main: the PR adds no new hash use, and the validation above
+        # proves the value is encodable before it is hashed. An untouched line is what lets code scanning
+        # attribute the pre-existing weak-hash alert to main rather than to this change.
         guid = "wh:cd:" + hashlib.sha1((str(payload.get("watch_uuid")) + diff).encode()).hexdigest()[:16]
         return {
             "guid": guid,
-            "title": str(payload.get("watch_title") or payload.get("watch_url") or "change"),
-            "link": str(payload.get("watch_url") or ""),
-            "summary": diff or "page changed",
+            "title": title,
+            "link": watch_url,
+            "summary": summary,
             "source_title": "changedetection.io",
-            "source_url": str(payload.get("watch_url") or ""),
+            "source_url": watch_url,
+            **({"explicit_ids": ids} if ids else {}),
         }
     title = payload.get("title")
     if not isinstance(title, str) or not title.strip():
         return None
-    summary = str(payload.get("summary") or payload.get("text") or payload.get("body") or "")
-    link = str(payload.get("link") or payload.get("url") or "")
-    ids = payload.get("ids")
+    title = checked(title)
+    summary = checked(payload.get("summary") or payload.get("text") or payload.get("body") or "")
+    link = checked(payload.get("link") or payload.get("url") or "")
+    source = checked(payload.get("source") or "webhook")
+    ids = merged(title, summary, link, payload.get("ids"))
     guid = str(payload.get("guid") or hashlib.sha1((title + summary + link).encode()).hexdigest()[:16])
     entry = {
         "guid": f"wh:{guid}",
         "title": title,
         "link": link,
         "summary": summary,
-        "source_title": str(payload.get("source") or "webhook"),
+        "source_title": source,
         "source_url": "",
     }
-    if isinstance(ids, list) and all(isinstance(i, str) for i in ids):
+    if ids:
         entry["explicit_ids"] = ids
     return entry
 
@@ -276,7 +356,10 @@ __all__ = [
     "RssSource",
     "SOURCE_BUILDERS",
     "SOURCE_SPECS",
+    "WebhookIdsUnsupported",
+    "WebhookPayloadRefused",
     "WebhookSource",
+    "WebhookTextNotEncodable",
     "build_source",
     "webhook_item_from_payload",
 ]

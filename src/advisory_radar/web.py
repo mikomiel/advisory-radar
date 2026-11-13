@@ -4075,7 +4075,12 @@ def create_app(
         from starlette.concurrency import run_in_threadpool
 
         from . import core as _core
-        from .sources import webhook_item_from_payload
+        from .sources import (
+            WebhookIdsUnsupported,
+            WebhookPayloadRefused,
+            WebhookTextNotEncodable,
+            webhook_item_from_payload,
+        )
 
         secret = env.get("ADVISORY_RADAR_WEBHOOK_SECRET", "")
         if not secret or source_id not in webhook_source_ids():
@@ -4092,12 +4097,25 @@ def create_app(
             return JSONResponse({"error": "payload is not JSON"}, status_code=400)
         try:
             payload = json.loads(text)
+        except RecursionError:
+            # A few thousand nested arrays defeat the decoder with a tiny body; that is a refused request,
+            # not a server fault. ``http.parse_json`` guards the same failure, but its None answer cannot be
+            # told apart from a literal ``null``, which this route maps to a different status below.
+            return JSONResponse({"error": "payload is nested too deeply"}, status_code=400)
         except ValueError:
             return JSONResponse({"error": "payload is not JSON"}, status_code=400)
-        entry = webhook_item_from_payload(payload)
+        try:
+            entry = webhook_item_from_payload(payload)
+        except WebhookIdsUnsupported:
+            # A fixed contract message, never exception text: the response is built from literals only.
+            return JSONResponse({"error": "ids must be a list of CVE, GHSA or PSA identifier strings"}, status_code=400)
+        except WebhookTextNotEncodable:
+            return JSONResponse({"error": "payload text is not valid Unicode"}, status_code=400)
+        except WebhookPayloadRefused:
+            # A named refusal the intake does not know by name is still a client error, never a 500 or a leak.
+            return JSONResponse({"error": "payload is not acceptable"}, status_code=400)
         if entry is None:
             return JSONResponse({"error": "payload has no title"}, status_code=422)
-        entry.pop("explicit_ids", None)  # ids are re-extracted from text at classify time
 
         store = runtime.cfg.store()
 
