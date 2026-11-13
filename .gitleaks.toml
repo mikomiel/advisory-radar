@@ -1,10 +1,16 @@
 # Gitleaks configuration for advisory-radar.
-# Public repo: any real secret fails CI. Placeholders in docs/examples are
-# allowlisted explicitly.
+# Public repo: any real secret fails CI. Placeholders in docs/examples and the
+# synthetic values in test fixtures are allowlisted explicitly.
 title = "advisory-radar gitleaks config"
 
+[extend]
+# A custom config replaces the default rule set unless it is extended: without
+# this the scan has no rules and every result is green. The CI self-test proves
+# a synthetic secret in an earlier commit is still found.
+useDefault = true
+
 [allowlist]
-  description = "Documentation placeholders and this config itself"
+  description = "Documentation placeholders, synthetic test fixtures and this config itself"
   paths = [
     '''README\.md''',
     '''examples/''',
@@ -15,4 +21,7 @@ title = "advisory-radar gitleaks config"
     # placeholder webhook/token shapes used in documentation only
     '''(?i)(webhook|token|secret|password|api[_-]?key)\s*[:=]\s*["']?(your[-_]|xxx|example|changeme|placeholder)''',
     '''https://discord\.com/api/webhooks/000000000000000000/xxxxxxxx''',
+    # synthetic credential values in tests/test_source_admin.py, not real secrets
+    '''AbCdEf123456''',
+    '''abcdef1234567890''',
   ]
