@@ -1,6 +1,6 @@
 [project]
 name = "advisory-radar"
-version = "0.2.1"
+version = "0.2.2"
 description = "Self-hostable security advisory watcher: configurable sources, CVE enrichment, severity decisions, web UI and multi-channel notifications"
 readme = "README.md"
 requires-python = ">=3.13,<3.15"

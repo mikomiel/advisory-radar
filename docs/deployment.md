@@ -200,7 +200,14 @@ so a shortened `poll_interval` does not sleep out the old one. Each settings for
 fingerprint of the
 configuration it was rendered from, so a save from a page that has not seen a newer
 configuration — another save, a YAML edit, or an overlay deleted and recreated — is
-refused (`409`) rather than overwriting it. The notifier form rewrites the whole list, so
+refused (`409`) rather than overwriting it. It also carries the overlay revision, and the
+save takes `settings.json.lock` (the same sidecar lock the state file and the watchlist use)
+around the read, the revision comparison, the increment and the replace, so two processes
+sharing one `/data` volume serialise their writes: both cannot read revision 0 and write
+revision 1, and a form rendered from an older revision is refused with `409` instead of
+replacing the newer document. A shared-volume multi-instance deployment is supported at
+that granularity — settings writes serialise, and each process applies a saved revision only
+when it reloads. The notifier form rewrites the whole list, so
 every existing notifier must already use `${NAME}`/`${NAME_FILE}` references for `url`,
 `key`, `password`, `secret` and `token`; a literal secret in the YAML is refused with an error
 naming that notifier, and has to be moved to the environment first. Pending and parked messages are not touched by a
