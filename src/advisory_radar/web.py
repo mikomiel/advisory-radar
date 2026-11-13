@@ -30,7 +30,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from itsdangerous import BadSignature, URLSafeSerializer
 
-from . import __version__, delivery, feeds, pipeline, watchlist
+from . import __version__, core, delivery, feeds, pipeline, watchlist
 from .catalogue import SOURCE_SPECS
 from .config import (
     DEFAULT_THRESHOLDS,
@@ -689,10 +689,11 @@ def _source_health_state(record: object, interval: object, now: int) -> str:
 _INBOX_FACT_RANK = {"parked": 0, "pending": 1, "held": 1, "carried": 2}
 #: The event outcomes that are a transport result in their own right; anything else is an event notice only.
 _EVENT_STATES = ("delivered", "dropped")
-#: The message kinds that are about every identifier they name: an escalation is one CVE and a bulletin is
-#: its own id. A ``new`` message names everything its text mentioned, so its claim decides ownership. The
-#: same rule applies to delivery events, where a ``new`` event is the message rather than its judgement.
-_WHOLE_KINDS = ("escalation", "adobe", "adobe-kev")
+#: The message kinds that are about every identifier they name, owned by ``core``: an escalation is one CVE
+#: and a bulletin is its own id. A ``new`` message names everything its text mentioned, so its claim decides
+#: ownership. The same rule applies to delivery events, where a ``new`` event is the message rather than its
+#: judgement.
+_WHOLE_KINDS = core.WHOLE_MESSAGE_KINDS
 #: No claim time sorts last: an entry with no recorded time is not assumed to be the oldest.
 _UNKNOWN_CLAIM = 1 << 62
 #: Claim kinds break a same-time tie: parked work needs a decision, then the queue, then history. A

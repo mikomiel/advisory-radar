@@ -1638,6 +1638,9 @@ def _suppressed(
 
 #: A legacy claim with no recorded time sorts behind every dated one.
 _LEGACY_UNKNOWN_CLAIM = 1 << 62
+#: The message kinds that are about every identifier they name: an escalation is one CVE and a bulletin is
+#: its own id. Every other message's ``fresh`` list says which identifiers it introduced.
+WHOLE_MESSAGE_KINDS = ("escalation", "adobe", "adobe-kev")
 
 
 def _ensure_ownership(state: dict) -> None:
@@ -1655,6 +1658,12 @@ def _ensure_ownership(state: dict) -> None:
     seen = state.get("seen")
     seen = seen if isinstance(seen, dict) else {}
     claims: dict[str, tuple[int, int, int]] = {}
+    # Recorded ownership is reserved first: a message that wrote ``fresh`` owns exactly those identifiers, and
+    # a legacy message may not compete for them even if it names them too.
+    reserved: set[str] = set()
+    for entry in (*parked, *pending):
+        if isinstance(entry, dict) and isinstance(entry.get("fresh"), (list, tuple)):
+            reserved.update(_stored_list(entry.get("fresh")))
 
     def queue_time(entry: object) -> int:
         source = entry if isinstance(entry, dict) else {}
@@ -1665,7 +1674,7 @@ def _ensure_ownership(state: dict) -> None:
         return 0
 
     def claim(identifier: object, *, kind: int, at: object, index: int) -> None:
-        if not isinstance(identifier, str):
+        if not isinstance(identifier, str) or identifier in reserved:
             return
         stamp = at if isinstance(at, int) and not isinstance(at, bool) and at > 0 else _LEGACY_UNKNOWN_CLAIM
         key = (stamp, kind, index)
@@ -1676,23 +1685,30 @@ def _ensure_ownership(state: dict) -> None:
     for identifier, record in seen.items():
         if isinstance(record, dict):
             claim(identifier, kind=2, at=record.get("at"), index=0)
+    # Only a legacy entry competes: a message that recorded ``fresh`` already said which ids it owns, and the
+    # rest of its ids are mentions that must not take a claim from a legacy owner.
     for index, entry in enumerate(parked):
-        for identifier in _stored_list(entry.get("ids")) if isinstance(entry, dict) else ():
-            claim(identifier, kind=0, at=queue_time(entry), index=index)
+        if isinstance(entry, dict) and "fresh" not in entry:
+            for identifier in _stored_list(entry.get("ids")):
+                claim(identifier, kind=0, at=queue_time(entry), index=index)
     for index, entry in enumerate(pending):
-        for identifier in _stored_list(entry.get("ids")) if isinstance(entry, dict) else ():
-            claim(identifier, kind=1, at=queue_time(entry), index=index)
+        if isinstance(entry, dict) and "fresh" not in entry:
+            for identifier in _stored_list(entry.get("ids")):
+                claim(identifier, kind=1, at=queue_time(entry), index=index)
 
     def record(entries: list, kind: int) -> None:
         for index, entry in enumerate(entries):
             if not isinstance(entry, dict) or "fresh" in entry:
                 continue
+            identifiers = _stored_list(entry.get("ids"))
+            if entry.get("kind") in WHOLE_MESSAGE_KINDS:
+                # An escalation or bulletin is about everything it names, whatever the claim competition says.
+                entry["fresh"] = identifiers
+                continue
             at = queue_time(entry)
             stamp = at if at > 0 else _LEGACY_UNKNOWN_CLAIM
             entry["fresh"] = [
-                identifier
-                for identifier in _stored_list(entry.get("ids"))
-                if claims.get(identifier) == (stamp, kind, index)
+                identifier for identifier in identifiers if claims.get(identifier) == (stamp, kind, index)
             ]
 
     record(parked, 0)

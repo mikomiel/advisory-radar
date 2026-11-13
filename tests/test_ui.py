@@ -2763,3 +2763,90 @@ def test_the_advisory_link_for_a_parked_escalation_opens_it_with_its_history(tmp
     assert "CVE-2026-8910 now critical" in page.text
     assert "parked" in page.text
     assert "Notifications" in page.text
+
+
+def test_settlement_keeps_a_legacy_owner_ahead_of_a_modern_mention(tmp_path):
+    """Settlement must not let a modern message's co-named ids compete for a legacy owner's identifier."""
+    state = core.new_state()
+    legacy = parked_entry("CVE-2026-9000", tag="critical")
+    legacy.pop("fresh", None)
+    legacy.pop("queued_at", None)
+    legacy["first_attempt_at"] = NOW - 60
+    modern = pending_entry("CVE-2026-9001")
+    modern["ids"] = ["CVE-2026-9000", "CVE-2026-9001"]
+    modern["fresh"] = ["CVE-2026-9001"]
+    modern["cves"] = ["CVE-2026-9001"]
+    modern["levels"] = {"CVE-2026-9001": "warning"}
+    modern["queued_at"] = NOW - 3600
+    state["parked"] = [legacy]
+    state["pending"] = [modern]
+    core._ensure_ownership(state)
+    assert legacy["fresh"] == ["CVE-2026-9000"]
+    assert modern["fresh"] == ["CVE-2026-9001"]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    assert primary_ids(client, "/inbox?state=parked") == {"CVE-2026-9000"}
+    assert primary_ids(client, "/inbox?state=pending") == {"CVE-2026-9001"}
+
+
+def test_settlement_does_not_give_one_identifier_two_owners(tmp_path):
+    """Recorded ownership is reserved: a legacy entry cannot also acquire an identifier a modern message owns."""
+    state = core.new_state()
+    legacy = parked_entry("CVE-2026-9100", tag="critical")
+    legacy.pop("fresh", None)
+    legacy["queued_at"] = NOW - 7200
+    modern = pending_entry("CVE-2026-9101")
+    modern["ids"] = ["CVE-2026-9100", "CVE-2026-9101"]
+    modern["fresh"] = ["CVE-2026-9100"]
+    modern["cves"] = ["CVE-2026-9101"]
+    modern["levels"] = {"CVE-2026-9101": "warning"}
+    state["parked"] = [legacy]
+    state["pending"] = [modern]
+    core._ensure_ownership(state)
+    assert modern["fresh"] == ["CVE-2026-9100"]
+    assert legacy["fresh"] == [], "the recorded owner keeps the identifier"
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    assert primary_ids(client, "/inbox?state=pending") == {"CVE-2026-9100"}
+
+
+def test_settlement_gives_a_legacy_escalation_its_cve_and_detail_page(tmp_path):
+    """An escalation queued before ``fresh`` existed is still about its CVE after settlement."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-9200"] = {"at": NOW - 3600, "outcome": "delivered", "delivery": "evt-3"}
+    state.setdefault("deliveries", {})["evt-3"] = {
+        "kind": "new",
+        "tag": "warning",
+        "title": "WARNING: CVE-2026-9200 in widget",
+        "ids": ["CVE-2026-9200"],
+        "cves": ["CVE-2026-9200"],
+        "levels": {"CVE-2026-9200": "warning"},
+        "at": NOW - 3600,
+        "outcome": "delivered",
+        "delivered_to": ["ops"],
+        "queued_at": NOW - 7200,
+    }
+    state["pending"] = [
+        {
+            "kind": "escalation",
+            "queued_at": NOW - 60,
+            "tag": "critical",
+            "title": "CVE-2026-9200 now critical",
+            "body": "",
+            "ids": ["CVE-2026-9200"],
+            "cves": ["CVE-2026-9200"],
+            "levels": {},
+            "scores": {"CVE-2026-9200": 9.8},
+            "kev": True,
+            "source": "CVE-2026-9200",
+            "link": "https://vendor.example.net/advisories/CVE-2026-9200",
+        }
+    ]
+    core._ensure_ownership(state)
+    assert state["pending"][0]["fresh"] == ["CVE-2026-9200"]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get(f"/advisories/{advisory_token('CVE-2026-9200')}")
+    assert page.status_code == 200
+    assert "CVE-2026-9200 now critical" in page.text
+    assert "Notifications" in page.text
