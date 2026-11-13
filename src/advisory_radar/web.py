@@ -2546,12 +2546,20 @@ def create_app(
                 "<p class='muted small'>Not saved yet: the probe fetched it with the values from the form.</p>"
             )
             # The probed values are carried into a real save, so a working probe is one click from being stored.
+            # The revision the probe form carried travels with them: without it this second form takes the
+            # compatibility path and could overwrite an overlay that moved on since the page was rendered.
+            revision_field = (
+                f"<input type='hidden' name='revision' value='{esc(first(form, 'revision'))}'>"
+                if "revision" in form
+                else ""
+            )
             add_form = (
                 "<h2>Add this source</h2>"
                 "<p class='muted small'>Saving stores these values in the settings overlay; the source is polled "
                 "from the next pass.</p>"
                 f"<form method='post' action='/config/sources'>{csrf_field(request)}"
                 f"<input type='hidden' name='fingerprint' value='{esc(first(form, 'fingerprint'))}'>"
+                f"{revision_field}"
                 f"{submitted_fields(form, 'new:')}"
                 "<button class='btn btn-primary'>Add this source</button></form>"
             )

@@ -33,7 +33,7 @@ from advisory_radar.settings import (
     save_settings,
     settings_path,
 )
-from advisory_radar.state import LockBusy, SourceError, load_state_document, save_state, state_lock
+from advisory_radar.state import LockBusy, SourceError, load_state_document, save_json, save_state, state_lock
 
 NOW = 1792600000
 SECRET = "https://hooks.example.com/SUPERSECRET"
@@ -631,6 +631,46 @@ def test_concurrent_saves_never_reuse_a_revision(tmp_path, monkeypatch):
     assert load_settings_document(overlay_path)["revision"] == 4, "every save must advance the revision once"
 
 
+def test_a_save_waits_for_the_sidecar_lock(tmp_path, monkeypatch):
+    """#77: a save must not complete while another holder has the sidecar lock -- the lock is what makes it one."""
+    path = settings_path(tmp_path / "state.json")
+    writes: list[int] = []
+    original = save_json
+
+    def counting_save(target, document):
+        writes.append(document["revision"])
+        original(target, document)
+
+    monkeypatch.setattr("advisory_radar.settings.save_json", counting_save)
+    attempted, finished = threading.Event(), threading.Event()
+    failures: list[Exception] = []
+
+    def save() -> None:
+        attempted.set()
+        try:
+            save_settings(path, {"poll_interval": "30s"}, now=NOW)
+        except Exception as exc:  # a failure is the test result
+            failures.append(exc)
+        finally:
+            finished.set()
+
+    with state_lock(path):
+        worker = threading.Thread(target=save)
+        worker.start()
+        assert attempted.wait(timeout=5), "the save thread must reach save_settings"
+        # Without the lock this save writes revision 1 within milliseconds; the held lock is the only reason
+        # it cannot. 0.2 s is far longer than one write, and the thread is still alive and unwritten.
+        assert not finished.wait(timeout=0.2), "a save must not finish while another holder has the sidecar lock"
+        assert worker.is_alive()
+        assert writes == [], "nothing may be written before the lock is released"
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "the blocked save must finish once the lock is released"
+    assert failures == []
+    assert writes == [1], "the blocked save writes exactly once, after the lock"
+    assert load_settings_document(path)["revision"] == 1
+    assert load_settings(path) == {"poll_interval": "30s"}
+
+
 def _save_overlay_in_process(path: str, poll_interval: str, barrier, results) -> None:
     """One contender in the cross-process save test: it waits for its peer, then saves, and reports back."""
     barrier.wait(timeout=30)
@@ -643,7 +683,11 @@ def _save_overlay_in_process(path: str, poll_interval: str, barrier, results) ->
 
 
 def test_two_processes_cannot_both_write_revision_one(tmp_path):
-    """#77: the sidecar lock plus the expected revision makes one shared overlay safe across processes."""
+    """#77: two real processes cannot both pass the revision check (the lock-exclusion test above covers the lock).
+
+    The barrier runs before either save, so this pins the cross-process revision refusal; it does not by
+    itself prove a save blocks on the sidecar lock, which ``test_a_save_waits_for_the_sidecar_lock`` does.
+    """
     if "fork" not in multiprocessing.get_all_start_methods():
         pytest.skip("this platform cannot fork, so the two-process contention cannot be reproduced")
     context = multiprocessing.get_context("fork")

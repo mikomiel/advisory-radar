@@ -37,6 +37,7 @@ RSS = b"""<?xml version="1.0"?><rss version="2.0"><channel><title>Vendor</title>
 
 CSRF_RE = re.compile(r'name="csrf" value="([0-9a-f]{64})"')
 FINGERPRINT_RE = re.compile(r"name='fingerprint' value='([0-9a-f]{64})'")
+REVISION_RE = re.compile(r"name='revision' value='(\d+)'")
 TOKEN = "secret"
 
 
@@ -324,6 +325,38 @@ def test_an_unsaved_probe_carries_the_values_into_a_save(tmp_path):
     assert saved.status_code == 303
     runtime.reload(blocking=True)
     assert "nodejs-org" in [source.id for source in runtime.sources]
+
+
+def test_the_add_source_form_carries_the_revision_it_was_probed_from(tmp_path):
+    """#77 review: the probe's second form must forward the revision, or its save skips the stale check."""
+    client, runtime, _ = make_client(tmp_path)
+    csrf, fingerprint = signed_in(client)
+    match = REVISION_RE.search(client.get("/config").text)
+    assert match, "the configuration page must carry the overlay revision"
+    revision = match.group(1)
+    probed = client.post(
+        "/config/sources/probe",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "revision": revision,
+            "new:type": "rss",
+            "new:url": "https://nodejs.org/feed/vulnerability.xml",
+        },
+    )
+    assert probed.status_code == 200
+    fields = dict(re.findall(r"""name=['"]([^'"]+)['"] value=['"]([^'"]*)['"]""", probed.text))
+    assert fields["revision"] == revision, "the add form must carry the revision the probe form did"
+    # Another writer bumps the revision without changing the configuration the add form was rendered from,
+    # so only the forwarded revision can tell that the page has moved on.
+    save_settings(settings_path(runtime.cfg.state_path), {}, now=1)
+    stale = client.post("/config/sources", data=fields, follow_redirects=False)
+    assert stale.status_code == 409
+    assert "The configuration changed since this page was loaded" in stale.text
+    stored = json.loads((tmp_path / "data" / "settings.json").read_text())
+    assert stored["revision"] == 1, "the refused save wrote nothing"
+    assert stored["settings"] == {}
+    assert [source.id for source in runtime.sources] == ["vendor"], "the stale save was not applied"
 
 
 def test_the_probe_names_an_unset_reference_and_never_its_value(tmp_path):

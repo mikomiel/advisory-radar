@@ -117,15 +117,38 @@ def config_form(client: TestClient, token: str = TOKEN) -> tuple[str, str]:
     return csrf, match.group(1)
 
 
+def config_write_forms(page: str) -> dict[str, str]:
+    """The action -> body of every settings-overlay POST form /config renders."""
+    return dict(re.findall(r'<form method="post" action="(/config/[^"]*)">(.*?)</form>', page, re.S))
+
+
 def overlay_form(client: TestClient, token: str = TOKEN) -> tuple[str, str, int]:
-    """Log in and return the form token, the fingerprint and the overlay revision /config rendered."""
+    """Log in and return the form token, the fingerprint and the overlay revision /config rendered.
+
+    Every write form is checked on its own: one shared hidden-input string is easy to leave off one form, and
+    a form without the revision would take the unconditional-write compatibility path.
+    """
     csrf = sign_in(client, token)
     page = client.get("/config").text
+    forms = config_write_forms(page)
+    assert set(forms) == {
+        "/config/settings",
+        "/config/thresholds",
+        "/config/sources",
+        "/config/sources/opml",
+        "/config/notifiers",
+        "/config/routes",
+    }, "the configuration page must render all six overlay forms"
+    revisions = set()
+    for action, body in forms.items():
+        assert FINGERPRINT_RE.search(body), f"{action} must carry the configuration fingerprint"
+        revision = REVISION_RE.search(body)
+        assert revision, f"{action} must carry the overlay revision it was rendered from"
+        revisions.add(revision.group(1))
+    assert len(revisions) == 1, f"every form must be rendered from one revision, got {sorted(revisions)}"
     fingerprint = FINGERPRINT_RE.search(page)
-    revision = REVISION_RE.search(page)
-    assert fingerprint, "every settings form must carry the configuration fingerprint"
-    assert revision, "every settings form must carry the overlay revision it was rendered from"
-    return csrf, fingerprint.group(1), int(revision.group(1))
+    assert fingerprint, "the configuration page must carry the configuration fingerprint"
+    return csrf, fingerprint.group(1), int(revisions.pop())
 
 
 def advisory_token(identifier: str) -> str:
