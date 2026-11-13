@@ -3104,3 +3104,53 @@ def test_whole_message_work_stays_additional_to_a_legacy_owner(tmp_path):
     assert after["critical"] == {"CVE-2026-9800"}
     detail_after = second.get(f"/advisories/{advisory_token('CVE-2026-9800')}").text
     assert "libxml2" in detail_after and "now warning" not in detail_after
+
+
+def test_a_legacy_escalation_does_not_compete_for_an_exclusive_claim(tmp_path):
+    """A pre-`fresh` escalation is additional work; it must not out-claim a legacy parked critical."""
+    state = core.new_state()
+    escalation = {
+        "kind": "escalation",
+        "queued_at": NOW - 7200,
+        "tag": "warning",
+        "title": "CVE-2026-9900 now warning",
+        "body": "",
+        "ids": ["CVE-2026-9900"],
+        "cves": ["CVE-2026-9900"],
+        "levels": {},
+        "source": "CVE-2026-9900",
+        "link": "https://vendor.example.net/advisories/CVE-2026-9900",
+    }
+    parked = parked_entry("CVE-2026-9900", tag="critical")
+    parked.pop("fresh", None)
+    parked["queued_at"] = NOW - 3600
+    parked["parked_at"] = NOW - 300
+    state["pending"] = [escalation]
+    state["parked"] = [parked]
+    state["seen"]["CVE-2026-9900"] = {"at": NOW - 1800, "outcome": "suppressed"}
+
+    def views(client: TestClient) -> dict[str, set[str]]:
+        return {
+            key: primary_ids(client, path)
+            for key, path in (
+                ("parked", "/inbox?state=parked"),
+                ("critical", "/inbox?state=open&tag=critical"),
+                ("pending", "/inbox?state=pending"),
+                ("suppressed", "/inbox?state=suppressed"),
+            )
+        }
+
+    first, token, _ = make_client(tmp_path, state=state)
+    sign_in(first, token)
+    before = views(first)
+    detail_before = first.get(f"/advisories/{advisory_token('CVE-2026-9900')}").text
+
+    core._ensure_ownership(state)
+    assert parked["fresh"] == ["CVE-2026-9900"], "the legacy critical keeps the exclusive claim"
+    assert escalation["fresh"] == ["CVE-2026-9900"], "the escalation still owns its own fact"
+    second, token, _ = make_client(tmp_path, state=state)
+    sign_in(second, token)
+    assert views(second) == before
+    assert before["parked"] == {"CVE-2026-9900"} and before["critical"] == {"CVE-2026-9900"}
+    assert "libxml2" in detail_before
+    assert "libxml2" in second.get(f"/advisories/{advisory_token('CVE-2026-9900')}").text

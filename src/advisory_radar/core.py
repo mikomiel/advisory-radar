@@ -1724,11 +1724,11 @@ def _ensure_ownership(state: dict) -> None:
     # Only a legacy entry competes: a message that recorded ``fresh`` already said which ids it owns, and the
     # rest of its ids are mentions that must not take a claim from a legacy owner.
     for index, entry in enumerate(parked):
-        if isinstance(entry, dict) and "fresh" not in entry:
+        if isinstance(entry, dict) and "fresh" not in entry and entry.get("kind") not in WHOLE_MESSAGE_KINDS:
             for identifier in _stored_list(entry.get("ids")):
                 claim(identifier, kind=0, at=_queue_time(entry), index=index)
     for index, entry in enumerate(pending):
-        if isinstance(entry, dict) and "fresh" not in entry:
+        if isinstance(entry, dict) and "fresh" not in entry and entry.get("kind") not in WHOLE_MESSAGE_KINDS:
             for identifier in _stored_list(entry.get("ids")):
                 claim(identifier, kind=1, at=_queue_time(entry), index=index)
 

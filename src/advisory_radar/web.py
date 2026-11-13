@@ -793,15 +793,16 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         if "fresh" in entry:
             if entry.get("kind") not in _WHOLE_KINDS:
                 fresh_claimed.update(_stored_strings(entry.get("fresh")))
-        else:
+        elif entry.get("kind") not in _WHOLE_KINDS:
             # The claim time is when the message was queued, not when it parked: parking is a later transport
-            # state and must not hand the identifier to a message that arrived in between.
+            # state and must not hand the identifier to a message that arrived in between. A whole-message
+            # entry is additional work, so it never competes for an exclusive claim.
             claim(_stored_strings(entry.get("ids")), kind=_CLAIM_PARKED, at=_queue_time(entry), index=index)
     for index, entry in enumerate(pending):
         if "fresh" in entry:
             if entry.get("kind") not in _WHOLE_KINDS:
                 fresh_claimed.update(_stored_strings(entry.get("fresh")))
-        else:
+        elif entry.get("kind") not in _WHOLE_KINDS:
             claim(_stored_strings(entry.get("ids")), kind=_CLAIM_PENDING, at=_queue_time(entry), index=index)
 
     def make(
