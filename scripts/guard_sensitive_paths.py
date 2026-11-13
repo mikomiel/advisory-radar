@@ -3,8 +3,9 @@
 
 The repository auto-merges an approved pull request whose ``ci`` is green, with
 one exception: **a person merges anything that widens what the automation can
-reach** -- the workflows, the published artifact and its packaging, the secret
-scan configuration, and the test suite that decides what ``ci`` accepts.
+reach** -- the workflows, the published artifact and its packaging, the release
+configuration, the secret scan configuration, and the test suite that decides
+what ``ci`` accepts.
 
 That rule used to live as one ``grep -E`` inside the workflow, where nothing
 could test it and a small regex edit would silently widen auto-merge. It lives
@@ -45,6 +46,11 @@ SENSITIVE_PATTERNS: tuple[str, ...] = (
     r"^\.python-version$",
     r"^\.dockerignore$",
     r"^\.gitleaks\.toml$",
+    # The release files decide the tag a release carries and the version it starts from: the configuration names
+    # the tag format and what a release contains, the manifest the version release-please bumps. That is release
+    # policy, so a person merges it -- and the generated release pull request always changes the manifest.
+    r"^release-please-config\.json$",
+    r"^\.release-please-manifest\.json$",
     r"^tests/",
     # The workflows execute scripts/ on the default branch: this guard, and the approval rule the gate and
     # the merge both apply. Leaving them out of their own guard would let one approved pull request disable
