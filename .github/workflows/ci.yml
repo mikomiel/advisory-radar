@@ -91,6 +91,24 @@ jobs:
           if [ "$code" -eq 1 ]; then echo "::error::leaks found"; cat /tmp/gitleaks-report.json; exit 1; fi
           if [ "$code" -ne 0 ]; then echo "::error::gitleaks exited $code"; cat /tmp/gitleaks-stderr.log; exit "$code"; fi
 
+  py314:
+    name: py314
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
+        with:
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+
+      - name: Install dependencies
+        run: uv sync --frozen --group dev --python 3.14
+
+      - name: Tests
+        run: uv run pytest -q
+
   dependency-review:
     name: dependency-review
     if: github.event_name == 'pull_request'

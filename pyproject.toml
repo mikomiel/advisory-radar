@@ -3,7 +3,12 @@ name = "advisory-radar"
 version = "0.2.0"
 description = "Self-hostable security advisory watcher: configurable sources, CVE enrichment, severity decisions, web UI and multi-channel notifications"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.13,<3.15"
+classifiers = [
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
 license = { text = "MIT" }
 authors = [{ name = "Mikołaj Mielczarek" }]
 dependencies = [
