@@ -1,18 +1,17 @@
 # Gitleaks configuration for advisory-radar.
-# Public repo: any real secret fails CI. Placeholders in docs/examples are
-# allowlisted explicitly.
+# A public repository: the default rule set runs over the whole intended commit range, and a
+# finding fails CI. The only exceptions are the two synthetic credential values that
+# tests/test_source_admin.py feeds to the product; both match the whole value, so a longer
+# credential containing one is still reported. No path is exempt: a credential in a README or
+# an example file is found like any other.
 title = "advisory-radar gitleaks config"
 
+[extend]
+useDefault = true
+
 [allowlist]
-  description = "Documentation placeholders and this config itself"
-  paths = [
-    '''README\.md''',
-    '''examples/''',
-    '''\.gitleaks\.toml''',
-    '''scripts/check_no_estate_identifiers\.py''',
-  ]
+  description = "Synthetic credential values used by the test suite, matched in full only"
   regexes = [
-    # placeholder webhook/token shapes used in documentation only
-    '''(?i)(webhook|token|secret|password|api[_-]?key)\s*[:=]\s*["']?(your[-_]|xxx|example|changeme|placeholder)''',
-    '''https://discord\.com/api/webhooks/000000000000000000/xxxxxxxx''',
+    '''^AbCdEf123456$''',
+    '''^abcdef1234567890$''',
   ]
