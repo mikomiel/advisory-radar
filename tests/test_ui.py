@@ -141,11 +141,22 @@ def seen(at: int, outcome: str = "delivered", **extra) -> dict:
     return {"at": at, "outcome": outcome, **extra}
 
 
-def snapshot(at: int, tag: str, source: str, title: str, cve: str, level: str, score: float, accepted):
+def snapshot(
+    at: int,
+    tag: str,
+    source: str,
+    title: str,
+    cve: str,
+    level: str,
+    score: float,
+    accepted,
+    source_id: str = "",
+):
     return {
         "at": at,
         "outcome": "delivered",
         "tag": tag,
+        "source_id": source_id,
         "source": source,
         "title": title,
         "link": f"https://vendor.example.net/advisories/{cve}",
@@ -208,15 +219,39 @@ def no_http(*args):
 def filter_state() -> dict:
     state = core.new_state()
     state["seen"]["CVE-2026-1000"] = snapshot(
-        NOW, "critical", "Vendor A", "Remote code execution in widget", "CVE-2026-1000", "critical", 9.8, ["ops"]
+        NOW,
+        "critical",
+        "Vendor A",
+        "Remote code execution in widget",
+        "CVE-2026-1000",
+        "critical",
+        9.8,
+        ["ops"],
+        source_id="vendor-a",
     )
     state["seen"]["CVE-2026-2000"] = snapshot(
-        NOW - 3600, "warning", "Vendor B", "Denial of service in parser", "CVE-2026-2000", "warning", 5.3, ["ops"]
+        NOW - 3600,
+        "warning",
+        "Vendor B",
+        "Denial of service in parser",
+        "CVE-2026-2000",
+        "warning",
+        5.3,
+        ["ops"],
+        source_id="vendor-b",
     )
     state["seen"]["GHSA-abcd-efgh"] = seen(NOW - 7200, "suppressed")
     state["seen"]["CVE-2026-LEGACY"] = seen(NOW - 10800, "delivered")
     state["seen"]["APSB26-97"] = snapshot(
-        NOW - 14400, "warning", "Vendor A", "Commerce bulletin", "APSB26-97", "warning", 7.2, ["ops"]
+        NOW - 14400,
+        "warning",
+        "Vendor A",
+        "Commerce bulletin",
+        "APSB26-97",
+        "warning",
+        7.2,
+        ["ops"],
+        source_id="vendor-a",
     )
     return state
 
@@ -226,11 +261,12 @@ def test_each_alert_filter_narrows_the_list_and_survives_a_reload(tmp_path):
     sign_in(client, token)
     cases = (
         ({"tag": "critical"}, ["CVE-2026-1000"]),
-        ({"source": "Vendor B"}, ["CVE-2026-2000"]),
+        ({"source": "vendor-b"}, ["CVE-2026-2000"]),
+        ({"source": "vendor-a"}, ["CVE-2026-1000", "APSB26-97"]),
         ({"outcome": "suppressed"}, ["GHSA-abcd-efgh"]),
         ({"q": "widget"}, ["CVE-2026-1000"]),
         ({"q": "cve-2026-2000"}, ["CVE-2026-2000"]),  # the identifier itself, case-insensitively
-        ({"tag": "critical", "source": "Vendor A", "q": "execution"}, ["CVE-2026-1000"]),
+        ({"tag": "critical", "source": "vendor-a", "q": "execution"}, ["CVE-2026-1000"]),
     )
     for params, expected in cases:
         first = client.get("/alerts", params=params)
@@ -246,11 +282,227 @@ def test_each_alert_filter_narrows_the_list_and_survives_a_reload(tmp_path):
     assert f"href='/advisories/{advisory_token('CVE-2026-1000')}'" in client.get("/alerts").text
 
 
+def test_an_escalation_appears_beside_the_first_record_on_the_advisory_page(tmp_path):
+    """#73: a later escalation is an added notification, not a rewrite of the first-seen record."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-1"] = seen(NOW, "delivered", delivery="first")
+    state["deliveries"] = {
+        "first": {
+            **snapshot(
+                NOW,
+                "warning",
+                "Vendor Feed",
+                "WARNING: CVE-2026-1 in widget",
+                "CVE-2026-1",
+                "warning",
+                7.5,
+                ["ops"],
+                source_id="vendor-feed",
+            ),
+            "ids": ["CVE-2026-1"],
+            "cves": ["CVE-2026-1"],
+        },
+        "later": {
+            **snapshot(
+                NOW + 60,
+                "critical",
+                "Vendor Feed",
+                "CRITICAL: CVE-2026-1 now CRITICAL",
+                "CVE-2026-1",
+                "critical",
+                9.8,
+                ["ops"],
+            ),
+            "ids": ["CVE-2026-1"],
+            "cves": ["CVE-2026-1"],
+            "kind": "escalation",
+        },
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get(f"/advisories/{_advisory_token('CVE-2026-1')}").text
+    assert "Notifications" in page and "escalation" in page
+    # The configured source and the advisory heading are shown as two different facts.
+    assert "Source id" in page and "vendor-feed" in page
+    assert "Heading" in page and "Vendor Feed" in page
+    # The page still shows the first message, and the escalation table does not repeat it.
+    assert "WARNING: CVE-2026-1 in widget" in page
+    section = page.split("Notifications", 1)[1]
+    assert "<td>escalation</td>" in section
+    assert "<td>new</td>" not in section, "the record's own first delivery is the page's first block"
+
+
+@pytest.mark.parametrize("kind", ["adobe", "adobe-kev"])
+def test_an_adobe_event_is_a_page_after_its_queue_entry_is_gone(tmp_path, kind):
+    """#73: an APSB bulletin has no seen record, so its delivery event is what the lookup can find."""
+    state = core.new_state()
+    state["deliveries"] = {
+        "event": {
+            **snapshot(
+                NOW,
+                "critical",
+                "Adobe Commerce APSB26-1",
+                "CRITICAL: APSB26-1 Adobe Commerce",
+                "APSB26-1",
+                "critical",
+                9.8,
+                ["ops"],
+            ),
+            "ids": ["APSB26-1"],
+            "cves": [],
+            "kind": kind,
+        }
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    response = client.get(f"/advisories/{_advisory_token('APSB26-1')}")
+    assert response.status_code == 200
+    assert "Notifications" in response.text and "APSB26-1" in response.text
+    assert "not a feed source" in response.text, "a bulletin names no configured source"
+
+
+def test_recent_notifications_surface_escalation_events_on_the_alerts_page(tmp_path):
+    """#73: the general history discovers an escalation after its queue entry left; new messages stay rows."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-1"] = seen(NOW, "delivered", delivery="first")
+    state["deliveries"] = {
+        "first": {
+            **snapshot(NOW, "warning", "Vendor Feed", "WARNING: CVE-2026-1", "CVE-2026-1", "warning", 7.5, ["ops"]),
+            "ids": ["CVE-2026-1"],
+            "cves": ["CVE-2026-1"],
+        },
+        "later": {
+            **snapshot(
+                NOW + 60, "critical", "Vendor Feed", "CRITICAL: CVE-2026-1", "CVE-2026-1", "critical", 9.8, ["ops"]
+            ),
+            "ids": ["CVE-2026-1"],
+            "cves": ["CVE-2026-1"],
+            "kind": "escalation",
+        },
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get("/alerts").text
+    assert "Recent notifications" in page
+    section = page.split("Recent notifications", 1)[1]
+    assert "escalation" in section and "CVE-2026-1" in section
+    assert "<td>new</td>" not in section, "a first-seen message is a table row, not a recent notification"
+
+
+def test_a_legacy_record_without_events_has_no_notifications_section(tmp_path):
+    state = core.new_state()
+    state["seen"]["CVE-2026-9"] = seen(NOW, "delivered")
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get(f"/advisories/{_advisory_token('CVE-2026-9')}").text
+    assert "Notifications" not in page
+    assert "Recent notifications" not in client.get("/alerts").text
+
+
+def test_a_suppressed_advisory_shows_a_later_escalation(tmp_path):
+    """#73 review: a suppressed record has no snapshot, but the escalation is the whole explanation."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-1"] = seen(NOW, "suppressed")
+    state["deliveries"] = {
+        "later": {
+            **snapshot(
+                NOW + 60, "critical", "Vendor Feed", "CRITICAL: CVE-2026-1", "CVE-2026-1", "critical", 9.8, ["ops"]
+            ),
+            "ids": ["CVE-2026-1"],
+            "cves": ["CVE-2026-1"],
+            "kind": "escalation",
+        }
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get(f"/advisories/{_advisory_token('CVE-2026-1')}").text
+    assert "Notifications" in page and "escalation" in page and "ops" in page
+    assert "suppressed" in page, "the original outcome is preserved, not overwritten"
+
+
+def test_a_legacy_record_shows_a_later_escalation(tmp_path):
+    """A record written before snapshots existed still gains the events that arrived afterwards."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-1"] = seen(NOW, "delivered")
+    state["deliveries"] = {
+        "later": {
+            **snapshot(
+                NOW + 60, "critical", "Vendor Feed", "CRITICAL: CVE-2026-1", "CVE-2026-1", "critical", 9.8, ["ops"]
+            ),
+            "ids": ["CVE-2026-1"],
+            "cves": ["CVE-2026-1"],
+            "kind": "escalation",
+        }
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get(f"/advisories/{_advisory_token('CVE-2026-1')}").text
+    assert "Notifications" in page and "escalation" in page
+
+
+@pytest.mark.parametrize("channel", ["/advisories/CVE-2026-1", "/alerts"])
+def test_a_dropped_event_is_shown_as_dropped(tmp_path, channel):
+    """A dropped event can carry an earlier partial acknowledgement; the outcome must not be inferred from it."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-1"] = seen(NOW, "delivered", delivery="first")
+    state["deliveries"] = {
+        "first": {
+            **snapshot(NOW, "critical", "Vendor Feed", "CRITICAL: CVE-2026-1", "CVE-2026-1", "critical", 9.8, ["ops"]),
+            "ids": ["CVE-2026-1"],
+            "cves": ["CVE-2026-1"],
+        },
+        "later": {
+            **snapshot(
+                NOW + 60, "critical", "Vendor Feed", "CRITICAL: CVE-2026-1", "CVE-2026-1", "critical", 9.8, ["ops"]
+            ),
+            "ids": ["CVE-2026-1"],
+            "cves": ["CVE-2026-1"],
+            "kind": "escalation",
+            "outcome": "dropped",
+        },
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get(channel if channel == "/alerts" else f"/advisories/{_advisory_token('CVE-2026-1')}").text
+    section = page.split("Notifications" if channel != "/alerts" else "Recent notifications", 1)[1]
+    assert "badge-critical'>dropped</span>" in section
+    assert "escalation" in section
+
+
+def test_malformed_delivery_events_do_not_break_the_pages(tmp_path):
+    """#73 review: hand-edited state is scanned for two pages and must never raise or render a repr."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-2"] = seen(NOW, "delivered")
+    state["deliveries"] = {
+        "bad": "not an object",
+        "ok": {"kind": "adobe", "ids": "CVE-2026-1", "at": "soon", "delivered_to": "ops"},
+    }
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    assert client.get("/alerts").status_code == 200
+    assert client.get(f"/advisories/{_advisory_token('CVE-2026-2')}").status_code == 200
+
+
+def test_a_pending_message_names_its_source_id_and_heading(tmp_path):
+    """The delivered, pending and parked pages use the same two provenance labels."""
+    state = core.new_state()
+    state["pending"].append(pending_entry("CVE-2026-50111", source_id="vendor-feed"))
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get(f"/advisories/{_advisory_token('CVE-2026-50111')}").text
+    assert "Source id" in page and "vendor-feed" in page
+    assert "Heading" in page and "Vendor Feed" in page
+
+
 def test_a_legacy_record_is_excluded_by_snapshot_filters_but_found_by_identifier(tmp_path):
     client, token, _ = make_client(tmp_path, state=filter_state())
     sign_in(client, token)
-    for params in ({"tag": "critical"}, {"tag": "warning"}, {"source": "Vendor A"}, {"source": "Vendor B"}):
+    for params in ({"tag": "critical"}, {"tag": "warning"}, {"source": "vendor-a"}, {"source": "vendor-b"}):
         assert "CVE-2026-LEGACY" not in page_ids(client.get("/alerts", params=params).text), params
+    # A legacy record is still listed, and the source filter never matches its heading: the heading is
+    # display text, and an empty value is not that source's id.
+    assert "CVE-2026-LEGACY" in page_ids(client.get("/alerts").text)
+    assert page_ids(client.get("/alerts", params={"source": "Vendor A"}).text) == []
     # Its identifier, its outcome and its date still filter: the record is not hidden, only its missing fields.
     assert page_ids(client.get("/alerts", params={"q": "CVE-2026-LEGACY"}).text) == ["CVE-2026-LEGACY"]
     assert "CVE-2026-LEGACY" in page_ids(client.get("/alerts", params={"outcome": "delivered"}).text)
@@ -258,7 +510,8 @@ def test_a_legacy_record_is_excluded_by_snapshot_filters_but_found_by_identifier
         client.get("/alerts", params={"since": "2026-10-21", "until": "2026-10-21"}).text
     )
     alerts = client.get("/alerts").text
-    assert "A dash means the record predates the delivery snapshot" in alerts
+    assert "A dash means the record carries no value for that column" in alerts
+    assert "never the advisory heading" in alerts
 
 
 def test_since_and_until_include_the_whole_day_at_both_ends(tmp_path):
@@ -400,7 +653,14 @@ def test_the_runs_page_filters_by_exit_code_and_day_and_states_the_cap(tmp_path)
 def test_a_delivered_message_records_the_snapshot_and_keeps_the_first_record():
     state = core.new_state()
     entry = pending_entry("CVE-2026-1")
-    entry.update({"tag": "critical", "title": "CRITICAL: CVE-2026-1 in widget", "levels": {"CVE-2026-1": "critical"}})
+    entry.update(
+        {
+            "tag": "critical",
+            "title": "CRITICAL: CVE-2026-1 in widget",
+            "levels": {"CVE-2026-1": "critical"},
+            "source_id": "vendor-feed",
+        }
+    )
     state["pending"].append(entry)
     ops, phone = RecordingNotifier("ops"), RecordingNotifier("phone")
     assert core.deliver(state, [ops, phone], no_http, NOW) is True
@@ -410,6 +670,8 @@ def test_a_delivered_message_records_the_snapshot_and_keeps_the_first_record():
     delivery = state["deliveries"][record["delivery"]]
     assert delivery == {
         "tag": "critical",
+        # The configured source and the advisory heading are two facts, not one.
+        "source_id": "vendor-feed",
         "source": "Vendor Feed",
         "title": "CRITICAL: CVE-2026-1 in widget",
         "link": "https://vendor.example.net/advisories/CVE-2026-1",
@@ -421,21 +683,33 @@ def test_a_delivered_message_records_the_snapshot_and_keeps_the_first_record():
         "levels": {"CVE-2026-1": "critical"},
         "scores": {"CVE-2026-1": 7.5},
         "delivered_to": ["ops", "phone"],
+        # The event's own time and outcome: the first-seen record keeps its own, separate pair.
+        "at": NOW,
+        "outcome": "delivered",
     }
     assert "body" not in delivery, "the rendered message body is not stored"
 
-    # A later message about the same identifier is delivered too, but the first record is what the page keeps.
+    # A later message about the same identifier is delivered too, but the first record is what the page keeps
+    # and no second event is written: every identifier in it was already known.
     again = pending_entry("CVE-2026-1", tag="warning", title="WARNING: CVE-2026-1 elsewhere")
     state["pending"].append(again)
     assert core.deliver(state, [ops], no_http, NOW) is True
     assert state["seen"]["CVE-2026-1"] == record
+    assert len(state["deliveries"]) == 1, "an already-seen message writes no delivery event"
     assert state["deliveries"][record["delivery"]]["delivered_to"] == ["ops", "phone"]
 
 
 def test_a_message_delivered_by_this_version_appears_and_filters_in_the_list(tmp_path):
     state = core.new_state()
     entry = pending_entry("CVE-2026-1234")
-    entry.update({"tag": "critical", "title": "CRITICAL: CVE-2026-1234 in widget", "source": "Vendor Feed"})
+    entry.update(
+        {
+            "tag": "critical",
+            "title": "CRITICAL: CVE-2026-1234 in widget",
+            "source": "Widget 4.2 released",
+            "source_id": "vendor-feed",
+        }
+    )
     state["pending"].append(entry)
     assert core.deliver(state, [RecordingNotifier("ops")], no_http, NOW) is True
     save_state(tmp_path / "state.json", state)
@@ -444,10 +718,13 @@ def test_a_message_delivered_by_this_version_appears_and_filters_in_the_list(tmp
     sign_in(client, token)
     page = client.get("/alerts").text
     assert "CVE-2026-1234" in page and "CRITICAL: CVE-2026-1234 in widget" in page
-    assert "Vendor Feed" in page and "critical" in page
+    # The table shows the configured source id; the advisory heading is display text and not the filter key.
+    assert "vendor-feed" in page and "critical" in page
+    assert "Widget 4.2 released" not in page
     assert client.get("/alerts", params={"tag": "critical"}).text.count("/advisories/") >= 1
     assert "/advisories/" not in client.get("/alerts", params={"tag": "warning"}).text
-    assert client.get("/alerts", params={"source": "Vendor Feed"}).text.count("/advisories/") >= 1
+    assert client.get("/alerts", params={"source": "vendor-feed"}).text.count("/advisories/") >= 1
+    assert "/advisories/" not in client.get("/alerts", params={"source": "Widget 4.2 released"}).text
     assert client.get("/alerts", params={"q": "widget"}).text.count("/advisories/") >= 1
     # The detail page resolves the same snapshot.
     detail = client.get(f"/advisories/{advisory_token('CVE-2026-1234')}").text
@@ -460,6 +737,7 @@ def test_a_message_delivered_by_this_version_appears_and_filters_in_the_list(tmp
     # Without the snapshot the identifier, outcome and date still filter; the snapshot's fields no longer do.
     assert "/advisories/" not in client.get("/alerts", params={"tag": "critical"}).text
     assert "/advisories/" not in client.get("/alerts", params={"q": "widget"}).text
+    assert "/advisories/" not in client.get("/alerts", params={"source": "vendor-feed"}).text
     assert "/advisories/" in client.get("/alerts", params={"outcome": "delivered"}).text
 
     # A hand-edited delivery reference of the wrong type degrades instead of taking the page down.
@@ -508,6 +786,30 @@ def test_a_dropped_message_is_recorded_with_no_accepted_notifier(tmp_path):
     delivery = stored["deliveries"][record["delivery"]]
     assert delivery["delivered_to"] == []
     assert delivery["tag"] == "critical"
+
+
+# --- /alerts: the source filter addresses the configured source id -----------------------------
+
+
+def test_the_source_filter_addresses_the_configured_source_id_not_the_heading(tmp_path):
+    state = core.new_state()
+    entry = pending_entry("CVE-2026-3300")
+    entry.update({"source": "Widget 4.2 released", "source_id": "vendor-feed"})
+    state["pending"].append(entry)
+    assert core.deliver(state, [RecordingNotifier("ops")], no_http, NOW) is True
+    state["seen"]["CVE-2026-LEGACY"] = seen(NOW - 60, "delivered")
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+
+    # The configured id selects the delivered row; the advisory heading selects nothing.
+    assert page_ids(client.get("/alerts", params={"source": "vendor-feed"}).text) == ["CVE-2026-3300"]
+    assert page_ids(client.get("/alerts", params={"source": "Widget 4.2 released"}).text) == []
+    # The legacy record stays visible unfiltered and the filter excludes it instead of matching it empty.
+    assert {"CVE-2026-3300", "CVE-2026-LEGACY"} <= set(page_ids(client.get("/alerts").text))
+    assert page_ids(client.get("/alerts", params={"source": "vendor-feed"}).text) == ["CVE-2026-3300"]
+    row = client.get("/alerts", params={"source": "vendor-feed"}).text
+    assert "Source id" in row and "<td>vendor-feed</td>" in row
+    assert "Widget 4.2 released" not in row, "the heading is not repeated as the source id"
 
 
 def test_an_identifier_with_slashes_round_trips_through_the_alert_link(tmp_path):

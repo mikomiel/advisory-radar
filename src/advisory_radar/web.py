@@ -535,13 +535,15 @@ def _matches_seen(
 ) -> bool:
     """Whether one seen record passes every filter.
 
-    A record that predates the delivery snapshot carries only ``at``/``outcome``, so a tag, source or
-    title filter excludes it -- matching on an empty value would be a lie. The date range and the text
-    filter still apply, so it stays findable by its identifier.
+    The source filter compares the configured ``source_id`` exactly. It never falls back to ``source``, which
+    is display text -- a feed item's advisory heading -- and matching it would answer a question the record
+    does not hold an answer to. A record that predates the delivery snapshot carries only
+    ``at``/``outcome``, so a tag, source id or title filter excludes it: matching on an empty value would be a
+    lie. The date range and the text filter still apply, so it stays findable by its identifier.
     """
     if filters.get("tag") and record.get("tag") != filters["tag"]:
         return False
-    if filters.get("source") and record.get("source") != filters["source"]:
+    if filters.get("source") and record.get("source_id") != filters["source"]:
         return False
     if filters.get("outcome") and record.get("outcome") != filters["outcome"]:
         return False
@@ -648,6 +650,102 @@ def _levels_table(levels: object, scores: object) -> str:
     )
 
 
+def _linked_ids(values: object) -> str:
+    """A stored identifier list as links to the advisory pages; a non-string is skipped, never displayed."""
+    if not isinstance(values, (list, tuple)) or not values:
+        return "<span class='muted'>(none recorded)</span>"
+    links = [
+        f"<a href='/advisories/{esc(_advisory_token(value))}'>{esc(value)}</a>"
+        for value in values
+        if isinstance(value, str)
+    ]
+    return ", ".join(links) or "<span class='muted'>(none recorded)</span>"
+
+
+def _events_table(events: Sequence[tuple[str, Mapping]]) -> str:
+    """One row per delivery event, in the order given: when, kind, outcome, tag, identifiers and destinations.
+
+    The outcome is rendered per event rather than inferred from the destinations: a dropped message can carry
+    an earlier partial acknowledgement, and a record written before outcomes were stored must say so rather
+    than look delivered.
+    """
+    rows = []
+    for _, event in events:
+        kind = _field(event.get("kind"))
+        tag = _field(event.get("tag"))
+        outcome = _field(event.get("outcome"))
+        accepted = event.get("delivered_to")
+        delivered = (
+            ", ".join(esc(value) for value in accepted if isinstance(value, str)) if isinstance(accepted, list) else ""
+        )
+        source_id = _field(event.get("source_id"))
+        shown_outcome = (
+            _badge(outcome, _outcome_tone(outcome)) if outcome else ("<span class='muted'>not recorded</span>")
+        )
+        rows.append(
+            f"<tr><td class='muted nowrap'>{esc(_when(event.get('at')))}</td>"
+            f"<td>{esc(kind) or '—'}</td>"
+            f"<td>{shown_outcome}</td>"
+            f"<td>{_badge(tag, tag) if tag else '—'}</td>"
+            f"<td>{_linked_ids(event.get('ids'))}</td>"
+            f"<td>{delivered or '—'}</td>"
+            f"<td class='mono'>{esc(source_id) if source_id else '—'}</td></tr>"
+        )
+    return (
+        "<div class='scroll'><table class='levels'><tr><th scope='col'>When (UTC)</th>"
+        "<th scope='col'>Kind</th><th scope='col'>Outcome</th><th scope='col'>Tag</th>"
+        "<th scope='col'>Identifiers</th><th scope='col'>Accepted by</th>"
+        "<th scope='col'>Source id</th></tr>" + "".join(rows) + "</table></div>"
+    )
+
+
+def _notification_history(events: Sequence[tuple[str, Mapping]], *, exclude: str | None = None) -> str:
+    """The later delivery events for one advisory, newest first; empty when there is nothing new to show.
+
+    The event the seen record already points at is excluded: it is the page's first block, not a later
+    notification. A record written before events were timestamped may not name one, and then nothing is hidden.
+    """
+    shown = [(event_id, event) for event_id, event in events if event_id != exclude]
+    if not shown:
+        return ""
+    return (
+        "<h2>Notifications</h2>"
+        "<p class='muted small'>Every recorded delivery for this advisory, newest first: the first message keeps "
+        "its record and later escalations or bulletins are added beside it.</p>" + _events_table(shown)
+    )
+
+
+def _event_advisory(identifier: str, events: Sequence[tuple[str, Mapping]]) -> str:
+    """The detail page for an identifier known only from delivery events (an Adobe bulletin has no seen record)."""
+    newest = events[0][1]
+    tag = _field(newest.get("tag"))
+    title = _field(newest.get("title"))
+    accepted = newest.get("delivered_to")
+    delivered = (
+        ", ".join(esc(value) for value in accepted if isinstance(value, str))
+        if isinstance(accepted, list) and accepted
+        else "<span class='muted'>not recorded</span>"
+    )
+    outcome = _field(newest.get("outcome"))
+    facts = [
+        ("Identifier", esc(identifier)),
+        ("Tag", _badge(tag, tag) if tag else "<span class='muted'>—</span>"),
+        ("Outcome", _badge(outcome, _outcome_tone(outcome)) if outcome else "<span class='muted'>not recorded</span>"),
+        ("Message kind", esc(_field(newest.get("kind"))) or "<span class='muted'>not recorded</span>"),
+        ("Recorded (UTC)", esc(_when(newest.get("at"))) or "<span class='muted'>not recorded</span>"),
+        ("Source id", esc(_field(newest.get("source_id"))) or "<span class='muted'>not a feed source</span>"),
+        ("Identifiers", _linked_ids(newest.get("ids"))),
+        ("Accepted by", delivered),
+        ("Advisory", _external_link(newest.get("link")) or "<span class='muted'>not recorded</span>"),
+    ]
+    return (
+        (f"<p class='lead'><b>{esc(title)}</b></p>" if title else "")
+        + _facts(facts)
+        + _notification_history(events)
+        + "<p class='back'><a href='/alerts'>← Back to alerts</a></p>"
+    )
+
+
 def _facts(facts: Sequence[tuple[str, str]]) -> str:
     """A two-column definition list of already-escaped/rendered values."""
     rows = "".join(f"<div><dt>{esc(name)}</dt><dd>{value}</dd></div>" for name, value in facts)
@@ -737,13 +835,19 @@ def _outcome_tone(outcome: str) -> str:
     return {"delivered": "ok", "dropped": "critical"}.get(outcome, "neutral")
 
 
-def _seen_advisory(record: Mapping, delivery: Mapping | None = None) -> str:
+def _seen_advisory(
+    record: Mapping,
+    delivery: Mapping | None = None,
+    events: Sequence[tuple[str, Mapping]] = (),
+) -> str:
     """The detail page for an identifier the state has seen: the snapshot, or only what an older record held."""
     outcome = _field(record.get("outcome"))
     facts: list[tuple[str, str]] = [
         ("Outcome", _badge(outcome, _outcome_tone(outcome)) if outcome else "<span class='muted'>—</span>"),
         ("Recorded (UTC)", esc(_when(record.get("at"))) or "<span class='muted'>not recorded</span>"),
     ]
+    # The seen record's pointer to the event it already shows; the snapshot itself does not carry it.
+    reference = record.get("delivery")
     record = delivery if isinstance(delivery, Mapping) else record
     back = "<p class='back'><a href='/alerts'>← Back to alerts</a></p>"
     if not any(key in record for key in ("tag", "source", "title", "levels", "scores", "delivered_to")):
@@ -751,7 +855,12 @@ def _seen_advisory(record: Mapping, delivery: Mapping | None = None) -> str:
             "<p>The state holds this identifier, but only its outcome and when it was recorded.</p>"
             "<p class='muted'>The delivered message's details were not recorded: this record was written by an "
             "older version of advisory-radar, or no message was delivered for this identifier. Nothing is "
-            "reconstructed here, and the message body is not retained.</p>" + _facts(facts) + back
+            "reconstructed here, and the message body is not retained.</p>"
+            + _facts(facts)
+            # A suppressed CVE gets no snapshot, so its original record is minimal -- but a later escalation
+            # still added an event, and the page must show it rather than hide the only explanation.
+            + _notification_history(events, exclude=reference if isinstance(reference, str) else None)
+            + back
         )
     accepted = record.get("delivered_to")
     if isinstance(accepted, list) and accepted:
@@ -763,7 +872,10 @@ def _seen_advisory(record: Mapping, delivery: Mapping | None = None) -> str:
     title = _field(record.get("title"))
     facts += [
         ("Tag", esc(_field(record.get("tag"))) or "<span class='muted'>not recorded</span>"),
-        ("Source", esc(_field(record.get("source"))) or "<span class='muted'>not recorded</span>"),
+        # The configured source is provenance; the heading is display text. They are different facts and the
+        # source filter matches only the id.
+        ("Source id", esc(_field(record.get("source_id"))) or "<span class='muted'>not recorded</span>"),
+        ("Heading", esc(_field(record.get("source"))) or "<span class='muted'>not recorded</span>"),
         ("Message kind", esc(_field(record.get("kind"))) or "<span class='muted'>not recorded</span>"),
         ("Identifiers", _identifier_list(record.get("ids"))),
         ("CVEs in this message", _identifier_list(record.get("cves"))),
@@ -777,6 +889,7 @@ def _seen_advisory(record: Mapping, delivery: Mapping | None = None) -> str:
         + _facts(facts)
         + "<h2>CVEs and levels</h2>"
         + _levels_table(record.get("levels"), record.get("scores"))
+        + _notification_history(events, exclude=reference if isinstance(reference, str) else None)
         + back
     )
 
@@ -795,7 +908,8 @@ def _queued_advisory(state_label: str, entry: Mapping) -> str:
     facts = [
         ("State", _badge(state_label, "warning" if state_label == "parked" else "neutral")),
         ("Tag", esc(_field(entry.get("tag"))) or "<span class='muted'>not recorded</span>"),
-        ("Source", esc(_field(entry.get("source"))) or "<span class='muted'>not recorded</span>"),
+        ("Source id", esc(_field(entry.get("source_id"))) or "<span class='muted'>not recorded</span>"),
+        ("Heading", esc(_field(entry.get("source"))) or "<span class='muted'>not recorded</span>"),
         ("Message kind", esc(_field(entry.get("kind"))) or "<span class='muted'>not recorded</span>"),
         ("Identifiers", _identifier_list(entry.get("ids"))),
         ("CVEs in this message", _identifier_list(entry.get("cves"))),
@@ -1650,7 +1764,7 @@ def create_app(
             "<form class='toolbar' method='get' action='/alerts'>"
             f"<label>Tag<select name='tag'>{''.join(option(value, filters['tag']) for value in ('', *TAGS))}"
             "</select></label>"
-            f"<label>Source<input type='text' name='source' value='{esc(filters['source'])}'></label>"
+            f"<label>Source id<input type='text' name='source' value='{esc(filters['source'])}'></label>"
             f"<label>Outcome<select name='outcome'>"
             f"{''.join(option(value, filters['outcome']) for value in ('', *outcome_values))}</select></label>"
             f"<label>Text<input type='text' name='q' value='{esc(filters['q'])}'></label>"
@@ -1664,13 +1778,13 @@ def create_app(
             path = _advisory_token(identifier)
             tag = _field(record.get("tag"))
             outcome = _field(record.get("outcome"))
-            source = _field(record.get("source"))
+            source_id = _field(record.get("source_id"))
             title = _field(record.get("title"))
             tone = {"delivered": " dot-ok", "dropped": " dot-bad"}.get(outcome, "")
             table_rows.append(
                 f"<tr><td><a href='/advisories/{esc(path)}'>{esc(identifier)}</a></td>"
                 f"<td>{_badge(tag, tag) if tag else "<span class='muted'>—</span>"}</td>"
-                f"<td>{esc(source) if source else '—'}</td>"
+                f"<td>{esc(source_id) if source_id else "<span class='muted'>—</span>"}</td>"
                 f"<td>{_short(title) if title else '—'}</td>"
                 f"<td><span class='dot{tone}'></span>{esc(outcome)}</td>"
                 f"<td class='muted nowrap'>{esc(_when(record.get('at')))}</td></tr>"
@@ -1678,7 +1792,7 @@ def create_app(
         if table_rows:
             table = (
                 "<div class='scroll'><table><tr><th scope='col'>ID</th><th scope='col'>Tag</th>"
-                "<th scope='col'>Source</th><th scope='col'>Title</th><th scope='col'>Outcome</th>"
+                "<th scope='col'>Source id</th><th scope='col'>Title</th><th scope='col'>Outcome</th>"
                 "<th scope='col'>First seen (UTC)</th></tr>" + "".join(table_rows) + "</table></div>"
             )
         elif any(filters.values()):
@@ -1691,15 +1805,32 @@ def create_app(
         if following is not None:
             pager.append(f"<a class='btn' href='{esc(link(cursor=_cursor_encode(*following)))}'>Older →</a>")
         body = (
-            filter_form
-            + f"<p class='muted small'>{len(rows)} matching record(s). A dash means the record predates the "
-            "delivery snapshot, so it carries no tag, source or title.</p>" + table
+            filter_form + f"<p class='muted small'>{len(rows)} matching record(s). A dash means the record carries no "
+            "value for that column: one written before the delivery snapshot has no tag, source id or title, "
+            "and a source filter matches only the configured source id, never the advisory heading.</p>" + table
         )
         if pager:
             body += f"<nav class='pager' aria-label='Pages'>{''.join(pager)}</nav>"
         elif cursor is not None or before is not None:
             body += _empty(
                 f"No records on this page. <a href='{esc(link())}'>Newest alerts</a>.",
+            )
+        from . import core
+
+        # Escalations and Adobe bulletins never appear as seen rows: the first is a later notification about an
+        # advisory already listed, the second has no first-seen record at all. Showing their events beside the
+        # table is what lets the general history discover them after the queue entry is gone.
+        recent = [
+            (event_id, event)
+            for event_id, event in core.delivery_events(state)
+            if _field(event.get("kind")) in {"escalation", "adobe", "adobe-kev"}
+        ][:20]
+        if recent:
+            body += (
+                "<h2>Recent notifications</h2>"
+                "<p class='muted small'>Escalation and Adobe delivery events, newest first, independent of the "
+                "filters above. The first-seen record keeps its own row; these events are added beside it and "
+                "never overwrite it.</p>" + _events_table(recent)
             )
         return page("Alerts", body, active="/alerts", actions=sign_out_form(request))
 
@@ -1708,8 +1839,11 @@ def create_app(
         """One advisory, from the seen record first, then a pending message, then a parked one."""
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
+        from . import core
+
         identifier = _advisory_identifier(token)
         state = load_state()
+        events = core.delivery_events(state, identifier)
         seen = state.get("seen")
         if isinstance(seen, dict) and isinstance(seen.get(identifier), dict):
             record = seen[identifier]
@@ -1718,13 +1852,18 @@ def create_app(
             snapshot = (
                 deliveries.get(reference) if isinstance(deliveries, dict) and isinstance(reference, str) else None
             )
-            body = _seen_advisory(record, snapshot if isinstance(snapshot, dict) else None)
+            body = _seen_advisory(record, snapshot if isinstance(snapshot, dict) else None, events)
             return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
         for label, queue in (("pending", state.get("pending")), ("parked", state.get("parked"))):
             for entry in queue if isinstance(queue, list) else ():
                 if isinstance(entry, dict) and identifier in (entry.get("ids") or ()):
                     body = _queued_advisory(label, entry)
                     return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
+        if events:
+            # An Adobe bulletin is recorded only as its delivery event: it never had a seen record, so the
+            # event list is the whole history and the page must not answer 404 after its queue entry left.
+            body = _event_advisory(identifier, events)
+            return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
         # The detail is display text and a JSON encoder cannot write a raw surrogate, so it is escaped here;
         # the identifier itself was already compared exactly above.
         raise HTTPException(status_code=404, detail=f"no advisory {_response_text(identifier)} is recorded")
