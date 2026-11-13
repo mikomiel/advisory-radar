@@ -3125,7 +3125,7 @@ def test_bootstrap_history_does_not_take_a_queued_identifier():
     assert state["seen"]["CVE-2026-2222"]["outcome"] == "backlog"
 
 
-def test_settlement_is_idempotent_across_a_reload():
+def test_settlement_is_idempotent_across_a_serialisation():
     """Settling a state twice, with a save between, changes nothing: recorded ownership is never rewritten."""
     state = core.new_state()
     state["parked"].append(
@@ -3159,5 +3159,7 @@ def test_settlement_is_idempotent_across_a_reload():
     )
     core._ensure_ownership(state)
     once = json.dumps(state, sort_keys=True)
-    core._ensure_ownership(state)
-    assert json.dumps(state, sort_keys=True) == once
+    # A save and a load are a JSON round trip: settlement must produce the same state on the other side.
+    reloaded = json.loads(once)
+    core._ensure_ownership(reloaded)
+    assert json.dumps(reloaded, sort_keys=True) == once

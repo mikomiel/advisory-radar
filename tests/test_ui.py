@@ -1255,11 +1255,12 @@ def test_a_legacy_record_says_the_details_were_not_recorded(tmp_path):
     assert "delivered" in page.text
 
 
-def test_the_seen_record_wins_and_no_message_body_is_rendered(tmp_path):
+def test_the_owning_message_wins_and_no_message_body_is_rendered(tmp_path):
+    """The earlier queued message owns CVE-2026-DUP, so its page is shown; no message body is rendered."""
     client, token, _ = make_client(tmp_path, state=advisory_state())
     sign_in(client, token)
     duplicate = client.get(f"/advisories/{advisory_token('CVE-2026-DUP')}")
-    assert "Seen title" in duplicate.text and "Pending title" not in duplicate.text
+    assert "Pending title" in duplicate.text and "Seen title" not in duplicate.text
     for identifier in ("CVE-2026-3000", "CVE-2026-4000"):
         assert "BODY-MARKER" not in client.get(f"/advisories/{advisory_token(identifier)}").text
     assert "BODY-MARKER" not in client.get("/alerts").text
@@ -2801,12 +2802,31 @@ def test_settlement_does_not_give_one_identifier_two_owners(tmp_path):
     modern["levels"] = {"CVE-2026-9101": "warning"}
     state["parked"] = [legacy]
     state["pending"] = [modern]
+    first, token, _ = make_client(tmp_path, state=state)
+    sign_in(first, token)
+    before = {
+        state: primary_ids(first, path)
+        for state, path in (
+            ("pending", "/inbox?state=pending"),
+            ("parked", "/inbox?state=parked"),
+            ("critical", "/inbox?state=open&tag=critical"),
+        )
+    }
     core._ensure_ownership(state)
     assert modern["fresh"] == ["CVE-2026-9100"]
     assert legacy["fresh"] == [], "the recorded owner keeps the identifier"
-    client, token, _ = make_client(tmp_path, state=state)
-    sign_in(client, token)
-    assert primary_ids(client, "/inbox?state=pending") == {"CVE-2026-9100"}
+    second, token, _ = make_client(tmp_path, state=state)
+    sign_in(second, token)
+    after = {
+        state: primary_ids(second, path)
+        for state, path in (
+            ("pending", "/inbox?state=pending"),
+            ("parked", "/inbox?state=parked"),
+            ("critical", "/inbox?state=open&tag=critical"),
+        )
+    }
+    assert before == after, "settlement must not change a row whose owner was already recorded"
+    assert after["pending"] == {"CVE-2026-9100"}
 
 
 def test_settlement_gives_a_legacy_escalation_its_cve_and_detail_page(tmp_path):
@@ -2854,6 +2874,7 @@ def test_settlement_gives_a_legacy_escalation_its_cve_and_detail_page(tmp_path):
 def test_a_message_naming_thousands_of_identifiers_keeps_related_lists_bounded(tmp_path):
     """Related identifiers are a bounded projection: one message must not allocate a tuple per identifier."""
     identifiers = [f"CVE-2026-{number:05d}" for number in range(5000)]
+    identifiers.append(identifiers[0])  # a duplicate must not inflate the remainder count
     state = core.new_state()
     state["pending"] = [
         {
@@ -2871,9 +2892,14 @@ def test_a_message_naming_thousands_of_identifiers_keeps_related_lists_bounded(t
         }
     ]
     rows = inbox_rows(state, now=NOW)
-    assert len(rows) == len(identifiers)
+    assert len(rows) == len(set(identifiers))
     assert all(len(row["aliases"]) <= 4 for row in rows)
-    assert all(row["alias_count"] == len(identifiers) - 1 for row in rows)
+    assert all(row["identifier"] not in row["aliases"] for row in rows)
+    assert all(row["alias_count"] == len(set(identifiers)) - 1 for row in rows)
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get("/inbox").text
+    assert "+4995" in page, "the row shows four related identifiers and the exact remainder"
 
 
 def test_a_migrated_owner_replaces_a_legacy_suppression_on_delivery(tmp_path):
@@ -2885,6 +2911,10 @@ def test_a_migrated_owner_replaces_a_legacy_suppression_on_delivery(tmp_path):
     critical["queued_at"] = NOW - 7200
     state["parked"] = [critical]
     save_state(tmp_path / "state.json", state)
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    before = client.get(f"/advisories/{advisory_token('CVE-2026-9300')}")
+    assert before.status_code == 200 and "libxml2" in before.text, "the live owner wins before settlement"
     assert core.manage_parked_entry(JsonStore(tmp_path / "state.json"), 0, release=True, now=NOW) is True
     released = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
     assert core.deliver(released, [RecordingNotifier("ops")], no_http, NOW) is True

@@ -1519,9 +1519,10 @@ def _delivered(
         # names an identifier another message owns must not write that identifier's history: the owner's
         # delivery is what the operator is owed, and this message's classification is not about it.
         owned = entry.get("fresh")
+        owned_set = set(owned) if isinstance(owned, (list, tuple)) else None
         candidates = (
-            [identifier for identifier in entry["ids"] if identifier in set(owned)]
-            if isinstance(owned, (list, tuple))
+            [identifier for identifier in entry["ids"] if identifier in owned_set]
+            if owned_set is not None
             else list(entry["ids"])
         )
         fresh = []
@@ -1754,11 +1755,23 @@ def owner_of(state: dict, identifier: str) -> tuple[str, dict] | None:
         for entry in entries:
             if recorded(entry):
                 return label, entry
-    record = seen.get(identifier)
-    if isinstance(record, dict):
-        return "seen", record
 
     claims: dict[str, tuple[int, int, int]] = {}
+    record = seen.get(identifier)
+    if isinstance(record, dict):
+        # The seen record claims at the queue time of the message that recorded it, as the inbox reads it.
+        reference = record.get("delivery")
+        deliveries = state.get("deliveries")
+        snapshot = deliveries.get(reference) if isinstance(deliveries, dict) and isinstance(reference, str) else None
+        at = None
+        if isinstance(snapshot, dict):
+            candidate = snapshot.get("queued_at")
+            if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate > 0:
+                at = candidate
+        if at is None:
+            candidate = record.get("at")
+            at = candidate if isinstance(candidate, int) and not isinstance(candidate, bool) else 0
+        claims[identifier] = (at if at > 0 else _LEGACY_UNKNOWN_CLAIM, 2, 0)
     for entries, kind in ((parked, 0), (pending, 1)):
         for index, entry in enumerate(entries):
             if not isinstance(entry, dict) or "fresh" in entry or entry.get("kind") in WHOLE_MESSAGE_KINDS:
@@ -1774,6 +1787,8 @@ def owner_of(state: dict, identifier: str) -> tuple[str, dict] | None:
     if key is None:
         return None
     _, kind, index = key
+    if kind == 2:
+        return ("seen", record) if isinstance(record, dict) else None
     entries = parked if kind == 0 else pending
     entry = entries[index] if index < len(entries) else None
     if not isinstance(entry, dict):

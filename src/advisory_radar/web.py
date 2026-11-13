@@ -880,11 +880,14 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         if all(existing["origin"] != fact["origin"] for existing in row["facts"]):
             row["facts"].append(fact)
 
-    def owned(entry: Mapping, identifier: str, *, kind: int, index: int, at: int) -> bool:
-        """Whether this message owns the identifier: its recorded fresh ids, or the legacy claim order."""
-        fresh = entry.get("fresh")
-        if isinstance(fresh, (list, tuple)):
-            return identifier in _stored_strings(fresh)
+    def legacy_owned(identifier: str, *, kind: int, index: int, at: int) -> bool:
+        """Whether the legacy claim order gives this message the identifier.
+
+        Recorded ownership is reserved: a message that wrote ``fresh`` keeps its identifiers even if an older
+        entry's text names them, so the legacy branch never duplicates it.
+        """
+        if identifier in fresh_claimed:
+            return False
         stamp = at if at > 0 else _UNKNOWN_CLAIM
         return legacy_claims.get(identifier) == (stamp, kind, index)
 
@@ -897,6 +900,9 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
 
     for index, entry in enumerate(pending):
         identifiers = list(dict.fromkeys(_stored_strings(entry.get("ids"))))
+        related = _related(identifiers)
+        fresh = entry.get("fresh")
+        fresh_set = set(_stored_strings(fresh)) if isinstance(fresh, (list, tuple)) else None
         held = delivery.is_held(now, entry, quiet_hours)
         at = _queue_time(entry)
         whole = entry.get("kind") in _WHOLE_KINDS
@@ -911,15 +917,22 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
                 title=entry.get("title"),
                 link=entry.get("link"),
                 source=source_id,
-                related=_related(identifiers),
+                related=related,
             )
-            if whole or owned(entry, identifier, kind=_CLAIM_PENDING, index=index, at=at):
+            if whole or (
+                identifier in fresh_set
+                if fresh_set is not None
+                else legacy_owned(identifier, kind=_CLAIM_PENDING, index=index, at=at)
+            ):
                 own(identifier, fact)
             else:
                 mentions.append((identifier, fact))
 
     for index, entry in enumerate(parked):
         identifiers = list(dict.fromkeys(_stored_strings(entry.get("ids"))))
+        related = _related(identifiers)
+        fresh = entry.get("fresh")
+        fresh_set = set(_stored_strings(fresh)) if isinstance(fresh, (list, tuple)) else None
         claim_at = _queue_time(entry)
         at = _number(entry.get("parked_at"), 0) or claim_at
         whole = entry.get("kind") in _WHOLE_KINDS
@@ -934,13 +947,18 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
                 title=entry.get("title"),
                 link=entry.get("link"),
                 source=source_id,
-                related=_related(identifiers),
+                related=related,
             )
-            if whole or owned(entry, identifier, kind=_CLAIM_PARKED, index=index, at=claim_at):
+            if whole or (
+                identifier in fresh_set
+                if fresh_set is not None
+                else legacy_owned(identifier, kind=_CLAIM_PARKED, index=index, at=claim_at)
+            ):
                 own(identifier, fact)
             else:
                 mentions.append((identifier, fact))
 
+    snapshot_related: dict[str, tuple[tuple[str, ...], int]] = {}
     for identifier, record in seen.items():
         if not isinstance(identifier, str) or not isinstance(record, dict):
             continue
@@ -950,7 +968,11 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         # same way, so the inbox must not lose a tag and title the state does hold.
         if not isinstance(snapshot, dict):
             snapshot = record
-        identifiers = _stored_strings(snapshot.get("ids"))
+        # One projection per message: a delivery snapshot is shared by every identifier it named, so
+        # rebuilding it here would be quadratic for a message naming thousands of advisories.
+        snapshot_key = reference if isinstance(reference, str) else f"inline:{identifier}"
+        if snapshot_key not in snapshot_related:
+            snapshot_related[snapshot_key] = _related(_stored_strings(snapshot.get("ids")))
         outcome = record.get("outcome")
         at = _number(record.get("at"), 0)
         fact = make(
@@ -962,7 +984,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
             title=snapshot.get("title"),
             link=snapshot.get("link"),
             source=snapshot.get("source_id") if isinstance(snapshot.get("source_id"), str) else "",
-            related=_related(identifiers),
+            related=snapshot_related[snapshot_key],
         )
         # A suppression can record an identifier another message already owns (state written before the
         # writer stopped doing that); then it is history about that identifier, not its current state, and
@@ -978,6 +1000,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
         identifiers = tuple(dict.fromkeys((*_stored_strings(event.get("ids")), *_stored_strings(event.get("cves")))))
         if not identifiers:
             continue
+        related = _related(identifiers)
         pointed = {
             identifier
             for identifier in identifiers
@@ -1000,7 +1023,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
                 title=event.get("title"),
                 link=event.get("link"),
                 source=source_id,
-                related=_related(identifiers),
+                related=related,
             )
             if identifier in pointed:
                 continue  # its own seen record already carries this event's outcome
@@ -1018,6 +1041,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
             explicit = _stored_strings(item.get("explicit"))
             guid = item.get("guid")
             identifiers = explicit or (f"src:{guid}" if isinstance(guid, str) and guid else "",)
+            related = _related(identifiers)
             for identifier in identifiers:
                 carried_facts.append(
                     (
@@ -1031,7 +1055,7 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
                             title=item.get("title"),
                             link=item.get("link"),
                             source=source_id if isinstance(source_id, str) else "",
-                            related=_related(identifiers),
+                            related=related,
                         ),
                     )
                 )
