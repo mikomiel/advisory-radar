@@ -790,14 +790,16 @@ def inbox_rows(state: Mapping, *, now: int, quiet_hours: delivery.QuietHours | N
             claim((identifier,), kind=_CLAIM_SEEN, at=_seen_claim_time(record, deliveries), index=0)
     for index, entry in enumerate(parked):
         if "fresh" in entry:
-            fresh_claimed.update(_stored_strings(entry.get("fresh")))
+            if entry.get("kind") not in _WHOLE_KINDS:
+                fresh_claimed.update(_stored_strings(entry.get("fresh")))
         else:
             # The claim time is when the message was queued, not when it parked: parking is a later transport
             # state and must not hand the identifier to a message that arrived in between.
             claim(_stored_strings(entry.get("ids")), kind=_CLAIM_PARKED, at=_queue_time(entry), index=index)
     for index, entry in enumerate(pending):
         if "fresh" in entry:
-            fresh_claimed.update(_stored_strings(entry.get("fresh")))
+            if entry.get("kind") not in _WHOLE_KINDS:
+                fresh_claimed.update(_stored_strings(entry.get("fresh")))
         else:
             claim(_stored_strings(entry.get("ids")), kind=_CLAIM_PENDING, at=_queue_time(entry), index=index)
 
@@ -2624,7 +2626,9 @@ def create_app(
                     return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
         for label, queue in (("pending", pending), ("parked", parked)):
             for entry in queue if isinstance(queue, list) else ():
-                if isinstance(entry, dict) and identifier in (entry.get("ids") or ()):
+                # Only an entry written before ``fresh`` falls back to membership: a modern entry that names
+                # the identifier but does not own it is a mention, and its message is not this advisory.
+                if isinstance(entry, dict) and "fresh" not in entry and identifier in (entry.get("ids") or ()):
                     body = _queued_advisory(label, entry)
                     return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
         if events:

@@ -3092,3 +3092,34 @@ def test_a_suppressed_item_leaves_an_identifier_another_message_owns():
     core._suppressed(state, ["CVE-2026-1111", "CVE-2026-2222"], verdict, item, {}, NOW, DEFAULT_THRESHOLDS)
     assert "CVE-2026-1111" not in state["seen"], "the queued message owns it and will report it"
     assert state["seen"]["CVE-2026-2222"]["outcome"] == "suppressed"
+
+
+def test_bootstrap_history_does_not_take_a_queued_identifier():
+    """Seeding an old item must not record an identifier a queued message owns, or its delivery event is lost."""
+    state = core.new_state()
+    state["pending"].append(
+        {
+            "kind": "new",
+            "queued_at": NOW,
+            "fresh": ["CVE-2026-1111"],
+            "tag": "warning",
+            "title": "WARNING: CVE-2026-1111 in widget",
+            "body": "",
+            "ids": ["CVE-2026-1111"],
+            "cves": ["CVE-2026-1111"],
+            "levels": {"CVE-2026-1111": "warning"},
+            "source": "s",
+            "link": "https://x.example",
+        }
+    )
+    old = core.Item(
+        "g1",
+        "CVE-2026-1111 and CVE-2026-2222",
+        "https://x.example/a",
+        "",
+        NOW - 40 * 86400,
+        ("CVE-2026-1111", "CVE-2026-2222"),
+    )
+    core.seed(state, [old], NOW)
+    assert "CVE-2026-1111" not in state["seen"], "the queued message owns it and will report it"
+    assert state["seen"]["CVE-2026-2222"]["outcome"] == "backlog"

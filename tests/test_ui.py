@@ -2546,3 +2546,64 @@ def test_the_advisory_link_opens_the_parked_owner_not_a_pending_mention(tmp_path
     assert "libxml2" in page.text, "the parked critical's own message is shown"
     assert "nginx" not in page.text, "the pending warning that merely mentions it is not"
     assert "parked" in page.text and "critical" in page.text
+
+
+def test_the_advisory_link_resolves_a_legacy_owner_over_a_modern_mention(tmp_path):
+    """An upgraded installation keeps a legacy parked owner; a modern co-naming message is still a mention."""
+    state = core.new_state()
+    legacy = parked_entry("CVE-2026-8300", tag="critical")
+    legacy.pop("fresh", None)
+    state["parked"] = [legacy]
+    modern = pending_entry("CVE-2026-8301")
+    modern["ids"] = ["CVE-2026-8300", "CVE-2026-8301"]
+    modern["fresh"] = ["CVE-2026-8301"]
+    modern["cves"] = ["CVE-2026-8301"]
+    modern["levels"] = {"CVE-2026-8301": "warning"}
+    state["pending"] = [modern]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    assert primary_ids(client, "/inbox?state=parked") == {"CVE-2026-8300"}
+    page = client.get(f"/advisories/{advisory_token('CVE-2026-8300')}")
+    assert page.status_code == 200
+    assert "libxml2" in page.text, "the legacy parked owner is the message that owns it"
+    assert "nginx" not in page.text
+
+
+def test_an_escalation_keeps_the_identifiers_delivered_history(tmp_path):
+    """An escalation is about its CVE, so the earlier delivery must stay in the delivered filter."""
+    state = core.new_state()
+    state["seen"]["CVE-2026-8400"] = {"at": NOW - 3600, "outcome": "delivered", "delivery": "evt-1"}
+    state.setdefault("deliveries", {})["evt-1"] = {
+        "kind": "new",
+        "tag": "warning",
+        "title": "WARNING: CVE-2026-8400 in widget",
+        "ids": ["CVE-2026-8400"],
+        "cves": ["CVE-2026-8400"],
+        "levels": {"CVE-2026-8400": "warning"},
+        "at": NOW - 3600,
+        "outcome": "delivered",
+        "delivered_to": ["ops"],
+        "queued_at": NOW - 7200,
+    }
+    state["pending"] = [
+        {
+            "kind": "escalation",
+            "queued_at": NOW - 60,
+            "fresh": ["CVE-2026-8400"],
+            "tag": "critical",
+            "title": "CVE-2026-8400 now critical",
+            "body": "",
+            "ids": ["CVE-2026-8400"],
+            "cves": ["CVE-2026-8400"],
+            "levels": {},
+            "scores": {"CVE-2026-8400": 9.8},
+            "kev": True,
+            "source": "CVE-2026-8400",
+            "link": "https://vendor.example.net/advisories/CVE-2026-8400",
+        }
+    ]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    assert primary_ids(client, "/inbox?state=delivered") == {"CVE-2026-8400"}
+    assert primary_ids(client, "/inbox?state=pending") == {"CVE-2026-8400"}
+    assert "Also: delivered" in client.get("/inbox").text

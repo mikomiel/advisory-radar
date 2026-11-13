@@ -1865,6 +1865,8 @@ def classify_new(
             # Remember the alias so the next pass skips the OSV lookup, or the tracker or ChangeLog fetch. Another
             # branch of the same PHP release claimed these CVEs moments ago: this item is that release, not news.
             for alias in (*ghsas, *(identifier for identifier in explicit if identifier.startswith("DSA-")), *own):
+                if alias in claimed:
+                    continue  # a queued message owns it and will record its own outcome
                 seen.setdefault(alias, {"at": now, "outcome": "alias"})
             continue
         classified += 1
@@ -2981,6 +2983,7 @@ def seed(state: dict, items: Sequence[Item], now: int) -> list[Item]:
     identifier already recorded keeps its first record, including when another source's history names it: the
     first record wins, as it does for every other write to ``seen``.
     """
+    claimed = _claimed(state)
     recent = []
     for item in items:
         # An undated item is unknown, not old: a valid RSS feed may omit dates, and consuming its current
@@ -2989,5 +2992,9 @@ def seed(state: dict, items: Sequence[Item], now: int) -> list[Item]:
             recent.append(item)
             continue
         for identifier in item.explicit or (f"src:{item.guid}",):
+            # Bootstrap history must not take an identifier a queued or parked message owns: that message's
+            # delivery is what the operator is owed, and a backlog record here would swallow its event.
+            if identifier in claimed:
+                continue
             state["seen"].setdefault(identifier, {"at": now, "outcome": "backlog"})
     return recent
