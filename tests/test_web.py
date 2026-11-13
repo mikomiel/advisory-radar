@@ -27,6 +27,8 @@ from advisory_radar.state import SourceError, load_state_document, save_state, s
 from advisory_radar.web import LoginThrottle, _epoch, _when, create_app, readiness
 
 LOG = logging.getLogger("advisory_radar")
+#: Deeper than both the intake's 100-level limit and, on 3.13, the decoder's own limit.
+DEEP_PAYLOAD = b"[" * 10_000 + b"]" * 10_000
 
 
 @pytest.fixture(autouse=True)
@@ -471,6 +473,17 @@ def test_a_deeply_nested_state_does_not_break_the_configuration_page(tmp_path):
     assert (tmp_path / "state.json").read_bytes() == deep
 
 
+def test_readyz_reports_a_deeply_nested_schema_value_without_reseeding(tmp_path):
+    """#81 review: the schema value itself can nest; the refusal must not represent it either."""
+    client, _ = make_client(tmp_path)
+    body = b'{"schema": ' + DEEP_PAYLOAD + b"}"
+    (tmp_path / "state.json").write_bytes(body)
+    with pytest.raises(SourceError):
+        load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    assert (tmp_path / "state.json").read_bytes() == body, "a failed read never reseeds or rewrites the document"
+    assert client.get("/readyz").status_code == 503
+
+
 def test_readiness_uses_the_completion_time_not_the_start(tmp_path):
     """A pass slower than the limit must not be stale the moment it completes."""
     client, _ = make_client(tmp_path, clock=1792600000 + 400)
@@ -586,6 +599,19 @@ def test_a_deeply_nested_overlay_is_reported_on_the_configuration_page(tmp_path)
     assert page.status_code == 200
     assert "The overlay cannot be read" in page.text
     assert overlay.read_bytes() == deep, "rendering the error never rewrites the damaged overlay"
+
+
+def test_a_deeply_nested_schema_value_is_reported_on_the_configuration_page(tmp_path):
+    """#81 review: the same safe banner applies when the overlay's schema value is the deep part."""
+    client, token, runtime = make_app_client(tmp_path)
+    overlay = settings_path(runtime.cfg.state_path)
+    body = b'{"schema": ' + DEEP_PAYLOAD + b', "revision": 1, "settings": {}}'
+    overlay.write_bytes(body)
+    signed_in(client, token)
+    page = client.get("/config")
+    assert page.status_code == 200
+    assert "The overlay cannot be read" in page.text
+    assert overlay.read_bytes() == body, "rendering the error never rewrites the damaged overlay"
 
 
 def test_two_saved_notifiers_survive_while_the_application_is_blocked(tmp_path):

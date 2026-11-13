@@ -15,6 +15,16 @@ class SourceError(RuntimeError):
     """A state document could not be read. Carries what to show a human."""
 
 
+def describe_schema(schema: object) -> str:
+    """Name a declared schema without representing it.
+
+    ``repr`` on a decoded container recurses, and a hand-edited document can nest deeply enough that it raises
+    even though the decoder accepted the value. Only a string -- whose repr is its own text -- is represented;
+    anything else is named by its type.
+    """
+    return f"schema {schema!r}" if isinstance(schema, str) else f"a {type(schema).__name__} schema"
+
+
 def expect_schema(document: dict, expected: str, owner: str) -> dict:
     """Refuse a document unless it declares exactly the schema this reader speaks."""
     if not isinstance(document, dict):
@@ -22,7 +32,7 @@ def expect_schema(document: dict, expected: str, owner: str) -> dict:
     schema = document.get("schema")
     if schema != expected:
         raise SourceError(
-            f"{owner} reports schema {schema!r}, not {expected!r} -- the state file is from another version"
+            f"{owner} reports {describe_schema(schema)}, not {expected!r} -- the state file is from another version"
         )
     return document
 

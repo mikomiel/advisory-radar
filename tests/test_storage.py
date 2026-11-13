@@ -20,7 +20,7 @@ import pytest
 
 from advisory_radar import core, pipeline, storage
 from advisory_radar.config import ConfigError, load_config
-from advisory_radar.state import LockBusy, SourceError, serialize_json
+from advisory_radar.state import LockBusy, SourceError, describe_schema, expect_schema, serialize_json
 
 DOCUMENT = {
     "schema": storage.DEFAULT_SCHEMA,
@@ -46,6 +46,16 @@ def test_the_json_store_round_trips_the_document(tmp_path):
     assert store.load() is None
     store.save(DOCUMENT)
     assert store.load() == DOCUMENT
+
+
+def test_a_deeply_nested_schema_value_is_named_not_represented():
+    """#81 review: ``repr`` on a decoded container can recurse, so a non-string schema is named by its type."""
+    deep: object = []
+    for _ in range(10_000):
+        deep = [deep]
+    with pytest.raises(SourceError, match="reports a list schema"):
+        expect_schema({"schema": deep}, storage.DEFAULT_SCHEMA, "advisory state")
+    assert describe_schema("other.v9") == "schema 'other.v9'", "a string schema keeps its exact repr"
 
 
 def test_the_json_store_refuses_a_foreign_schema(tmp_path):
