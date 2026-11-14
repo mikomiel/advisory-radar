@@ -81,11 +81,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def release_files(new: str = "0.2.0", old: str = "0.1.0") -> list[dict]:
-    """The four files a generated release changes, with the one-line diff release-please writes in each.
+    """The five files a generated release changes, with the one-line diff release-please writes in each.
 
     Captured from the estate's own generated release pull request (mikomiel/ci-burst #102, same pinned action and
-    the same configuration shape): each version-carrying file replaces exactly one line, the changelog only gains
-    its new section, and all three versions agree.
+    the same configuration shape): each version-carrying file replaces exactly one line, the lockfile replaces the
+    ``advisory-radar`` package's own version, the changelog only gains its new section, and all versions agree.
     """
     return [
         {
@@ -115,6 +115,16 @@ def release_files(new: str = "0.2.0", old: str = "0.1.0") -> list[dict]:
             "additions": 1,
             "deletions": 1,
             "patch": f'@@ -1,3 +1,3 @@\n """advisory-radar."""\n \n-__version__ = "{old}"\n+__version__ = "{new}"\n',
+        },
+        {
+            "filename": "uv.lock",
+            "previous_filename": None,
+            "additions": 1,
+            "deletions": 1,
+            "patch": (
+                f'@@ -5,7 +5,7 @@\n [[package]]\n name = "advisory-radar"\n'
+                f'-version = "{old}"\n+version = "{new}"\n source = {{ editable = "." }}\n'
+            ),
         },
     ]
 
@@ -452,6 +462,28 @@ def test_a_release_that_is_not_only_the_version_bump_keeps_the_review_requiremen
         "an extra path": files + [{"filename": "docs/sources.md", "previous_filename": None}],
         "a renamed file": with_file(files, "pyproject.toml", previous_filename="docs/pyproject.toml"),
         "a changelog that gained nothing": with_file(files, "CHANGELOG.md", additions=0),
+        "a lockfile dependency version": with_file(
+            files,
+            "uv.lock",
+            patch=(
+                '@@ -20,7 +20,7 @@\n [[package]]\n name = "fastapi"\n'
+                '-version = "0.1.0"\n+version = "0.2.0"\n source = { registry = "https://pypi.org/simple" }\n'
+            ),
+        ),
+        "a lockfile line with no package context": with_file(
+            files,
+            "uv.lock",
+            patch='@@ -7,1 +7,1 @@\n-version = "0.1.0"\n+version = "0.2.0"\n',
+        ),
+        "a lockfile that disagrees": with_file(
+            files,
+            "uv.lock",
+            patch=(
+                '@@ -5,7 +5,7 @@\n [[package]]\n name = "advisory-radar"\n'
+                '-version = "0.1.0"\n+version = "0.9.9"\n source = { editable = "." }\n'
+            ),
+        ),
+        "no lockfile": [item for item in files if item["filename"] != "uv.lock"],
     }
     for label, changed in cases.items():
         assert decisions([release_entry(files=changed, changed=len(changed))])[HEAD][0] == "pending", label
@@ -460,8 +492,14 @@ def test_a_release_that_is_not_only_the_version_bump_keeps_the_review_requiremen
 def test_the_release_shape_follows_the_release_configuration():
     """The exemption's literals mirror two files; a drift in either must fail here, not silently stop matching."""
     config = json.loads((ROOT / "release-please-config.json").read_text(encoding="utf-8"))
-    package = config["packages"]["."]["package-name"]
-    assert f"release-please--branches--main--components--{package}" == plan.RELEASE_BRANCH
+    package = config["packages"]["."]
+    assert f"release-please--branches--main--components--{package['package-name']}" == plan.RELEASE_BRANCH
+    extra = package.get("extra-files")
+    assert isinstance(extra, list) and len(extra) == 1, "one extra file: the lockfile"
+    assert extra[0]["type"] == "toml" and extra[0]["path"] == "uv.lock"
+    assert plan.RELEASE_PACKAGE in extra[0]["jsonpath"], "the bump must target this package, not a dependency"
+    assert package["package-name"] == plan.RELEASE_PACKAGE
+    assert {item["filename"] for item in release_files()} == plan.RELEASE_PATHS
     # The tag is `vX.Y.Z` because release.yml triggers on that and ignores a component prefix.
     assert config["include-v-in-tag"] is True
     assert config["include-component-in-tag"] is False

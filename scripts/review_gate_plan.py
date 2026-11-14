@@ -15,7 +15,7 @@ repository as the list endpoint reported them. Flattening renames is this script
 
 Two entries may be published as ``success`` without an independent approval, and only by their exact shape: a
 Dependabot update that touches nothing but dependency manifests, and the release pull request release-please
-generates from merged commits -- recognised by its branch, author, the four files it manages *and* a patch that is
+generates from merged commits -- recognised by its branch, author, the five files it manages *and* a patch that is
 only the version bump those files carry. Neither can be auto-merged: the merge workflow still asks
 :mod:`review_state` for an eligible approval at the exact head, and both always change a path
 ``guard_sensitive_paths.py`` reserves for a person.
@@ -76,11 +76,15 @@ RELEASE_VERSION_FILES = {
     "pyproject.toml": r'version = "(\d+\.\d+\.\d+)"',
     "src/advisory_radar/__init__.py": r'__version__ = "(\d+\.\d+\.\d+)"',
 }
+#: The package whose own ``version`` line the release writes in ``uv.lock``. A dependency version that happened to
+#: match is not the generator's output, so the lockfile rule also checks the package name the patch carries.
+RELEASE_PACKAGE = "advisory-radar"
+RELEASE_LOCKFILE = "uv.lock"
 #: The changelog must gain its generated section. Its prose is documentation, not something this automation can
-#: reach, so "present, with additions" is all that is asked. Every one of these four files must appear, and no
+#: reach, so "present, with additions" is all that is asked. Every one of these five files must appear, and no
 #: other path may.
 RELEASE_CHANGELOG = "CHANGELOG.md"
-RELEASE_PATHS = frozenset(RELEASE_VERSION_FILES) | {RELEASE_CHANGELOG}
+RELEASE_PATHS = frozenset(RELEASE_VERSION_FILES) | {RELEASE_CHANGELOG, RELEASE_LOCKFILE}
 
 
 def _changed_names(entry: dict) -> list[str]:
@@ -204,12 +208,37 @@ def _bumped_version(entry: dict, path: str, pattern: str) -> str | None:
     return new.group(1)
 
 
+def _lock_bumped_version(entry: dict) -> str | None:
+    """The ``advisory-radar`` package version the release writes in ``uv.lock``, or None for any other edit.
+
+    The one-line rule alone would also accept a dependency's version line, so the patch must place the replaced
+    line under this package's ``name``. The name is a context line of the hunk (git shows three either side); a
+    patch without it fails closed rather than guessing.
+    """
+    version = _bumped_version(entry, RELEASE_LOCKFILE, r'version = "(\d+\.\d+\.\d+)"')
+    if version is None:
+        return None
+    patch = _changed_file(entry, RELEASE_LOCKFILE).get("patch")
+    if not isinstance(patch, str):
+        return None
+    package: str | None = None
+    for line in patch.split("\n"):
+        if line.startswith(" ") or line.startswith("+"):
+            match = re.fullmatch(r'\s*name = "([^"]+)"', line[1:])
+            if match is not None:
+                package = match.group(1)
+        elif line.startswith("-") and re.fullmatch(r'version = "(\d+\.\d+\.\d+)"', line[1:]):
+            # The version line being replaced belongs to the last package named above it in the hunk.
+            return version if package == RELEASE_PACKAGE else None
+    return None
+
+
 def release_scope(entry: dict) -> bool:
-    """Whether this entry is the generator's output: its identity, all four release files, and one version bump.
+    """Whether this entry is the generator's output: its identity, all five release files, and one version bump.
 
     Fails closed everywhere: an unreadable or incomplete file list, a path outside the release-managed set, a
     missing release file, a changelog that gained nothing, a version file whose diff is not the one line, versions
-    that disagree, or a patch the compare did not carry.
+    that disagree, a lockfile line under another package, or a patch the compare did not carry.
     """
     if not release_candidate(entry) or not _complete(entry):
         return False
@@ -219,7 +248,9 @@ def release_scope(entry: dict) -> bool:
     if changelog is None or not isinstance(changelog.get("additions"), int) or changelog["additions"] < 1:
         return False
     versions = {_bumped_version(entry, path, pattern) for path, pattern in RELEASE_VERSION_FILES.items()}
-    return None not in versions and len(versions) == 1
+    if None in versions or len(versions) != 1:
+        return False
+    return _lock_bumped_version(entry) == next(iter(versions))
 
 
 def merge(

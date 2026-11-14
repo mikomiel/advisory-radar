@@ -73,11 +73,13 @@ as a status:
   more than a branch name. The identity: the head branch
   `release-please--branches--main--components--advisory-radar` in this repository, the
   `RELEASE_PLEASE_TOKEN` owner as author, not a draft. The changes: every path the immutable
-  `base...head` comparison names is one of the four files the release manages
+  `base...head` comparison names is one of the five files the release manages
   (`.release-please-manifest.json`, `CHANGELOG.md`, `pyproject.toml`,
-  `src/advisory_radar/__init__.py`) and all four are present; the changelog gains its section;
-  and each version-carrying file's patch is *exactly* its one `version` line replaced, with
-  the three versions agreeing and the version actually changing. The changed-file count must
+  `src/advisory_radar/__init__.py`, `uv.lock`) and all five are present; the changelog gains
+  its section; each version-carrying file's patch is *exactly* its one `version` line
+  replaced, and the lockfile's line must sit under the `advisory-radar` package (a dependency
+  version that happened to match is not the generator's output); the four versions agree and
+  the version actually changes. The changed-file count must
   also prove the list complete for the same two commits. A dependency added beside the
   version, an import appended to the version line, a second changed line, a path outside the
   set, a missing patch (the gate carries one only for a change of at most four lines) or an
