@@ -7,6 +7,13 @@
   "packages": {
     ".": {
       "package-name": "advisory-radar",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='advisory-radar')].version"
+        }
+      ],
       "changelog-sections": [
         { "type": "feat", "section": "Added" },
         { "type": "fix", "section": "Fixed" },

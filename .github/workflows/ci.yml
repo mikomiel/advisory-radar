@@ -32,6 +32,12 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen --group dev
 
+      - name: Lockfile is current
+        # release-please bumps pyproject.toml and, through release-please-config.json, uv.lock. A release PR
+        # that skipped the lock would otherwise leave `uv lock --check` broken on main until the next feature
+        # branch relocked it; this makes that release PR fail here instead.
+        run: uv lock --check
+
       - name: Ruff lint
         run: uv run ruff check .
 

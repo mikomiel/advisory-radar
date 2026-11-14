@@ -4,7 +4,7 @@ requires-python = ">=3.13, <3.15"
 
 [[package]]
 name = "advisory-radar"
-version = "0.2.1"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
