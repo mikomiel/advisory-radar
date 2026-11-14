@@ -331,12 +331,22 @@ def test_a_generated_release_pull_request_is_published_as_success(tmp_path):
                 "deletions": 1,
                 "patch": '@@ -1,3 +1,3 @@\n """advisory-radar."""\n-__version__ = "0.1.0"\n+__version__ = "0.2.0"\n',
             },
+            {
+                "filename": "uv.lock",
+                "previous_filename": None,
+                "additions": 1,
+                "deletions": 1,
+                "patch": (
+                    '@@ -5,7 +5,7 @@\n [[package]]\n name = "advisory-radar"\n'
+                    '-version = "0.1.0"\n+version = "0.2.0"\n source = { editable = "." }\n'
+                ),
+            },
         ]
     )
     code, posted = _gate(
         tmp_path,
         pulls=pull_line(40, HEAD, BASE, branch=RELEASE_BRANCH),
-        live=f"{HEAD}\t{BASE}\t4",
+        live=f"{HEAD}\t{BASE}\t5",
         compare=comparison,
     )
     assert code == 0
@@ -394,6 +404,17 @@ def raw_comparison() -> dict:
                 "deletions": 1,
                 "patch": '@@ -1,3 +1,3 @@\n """advisory-radar."""\n-__version__ = "0.1.0"\n+__version__ = "0.2.0"\n',
             },
+            {
+                "filename": "uv.lock",
+                "previous_filename": None,
+                "status": "modified",
+                "additions": 1,
+                "deletions": 1,
+                "patch": (
+                    '@@ -5,7 +5,7 @@\n [[package]]\n name = "advisory-radar"\n'
+                    '-version = "0.1.0"\n+version = "0.2.0"\n source = { editable = "." }\n'
+                ),
+            },
         ]
     }
 
@@ -403,7 +424,7 @@ def test_the_real_comparison_projection_feeds_the_release_proof(tmp_path):
     code, posted = _gate(
         tmp_path,
         pulls=pull_line(40, HEAD, BASE, branch=RELEASE_BRANCH),
-        live=f"{HEAD}\t{BASE}\t4",
+        live=f"{HEAD}\t{BASE}\t5",
         raw_compare=raw_comparison(),
     )
     assert code == 0

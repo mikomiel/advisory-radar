@@ -78,7 +78,7 @@ and `src/advisory_radar/__init__.py`, the generated `CHANGELOG.md` section, and
   person merges it. Its `review` status is published as `success` without an
   independent App review, because release-please opens it from the token owner's
   account and no authoring session exists to request one. That exemption is
-  recognised by the generator's exact output — branch, author, the four release
+  recognised by the generator's exact output — branch, author, the five release
   files and a diff that is only the version bump — and is described in
   [docs/review-and-merge.md](docs/review-and-merge.md).
 - The merge creates the `vX.Y.Z` tag and the GitHub Release. The tag starts the
