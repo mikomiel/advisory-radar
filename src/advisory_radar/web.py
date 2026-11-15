@@ -4170,10 +4170,10 @@ def create_app(
         banner = ""
         if saved is not None:
             if live_now and saved == live_revision:
-                banner += _notice(f"Revision {saved} saved and live.", "ok")
+                banner += _notice(f"Revision {esc(saved)} saved and live.", "ok")
             else:
                 banner += _notice(
-                    f"Revision {saved} saved but not live yet (live revision {live_revision}); "
+                    f"Revision {esc(saved)} saved but not live yet (live revision {esc(live_revision)}); "
                     "press Reload once the running pass finishes.",
                     "warning",
                 )
@@ -5118,7 +5118,10 @@ def create_app(
         try:
             state = load_state()
         except (SourceError, StoreUnavailable) as exc:
-            return PlainTextResponse(f"not ready: {exc}", status_code=503)
+            # The probe is unauthenticated: the reason stays in the log, as /metrics does, because the error text
+            # can carry the state path or a store detail that an anonymous caller has no use for.
+            LOG.warning("readyz: state unreadable: %s", exc)
+            return PlainTextResponse("not ready: the state document cannot be read", status_code=503)
         ok, reason = readiness(runtime.cfg, state, int(clock()))
         return PlainTextResponse(reason, status_code=200 if ok else 503)
 
