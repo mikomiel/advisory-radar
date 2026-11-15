@@ -532,6 +532,7 @@ def test_readyz_reports_a_state_path_that_is_a_directory(tmp_path):
     response = client.get("/readyz")
     assert response.status_code == 503
     assert response.text.startswith("not ready:")
+    assert str(tmp_path) not in response.text, "the unauthenticated probe never echoes the state path"
     assert "advisory_radar_ready 0" in client.get("/metrics").text
 
 
