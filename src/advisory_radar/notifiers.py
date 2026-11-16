@@ -1,4 +1,4 @@
-"""Built-in notifier plugins: Apprise gateway, Discord webhook, generic webhook.
+"""Built-in notifier plugins: Apprise gateway, Discord webhook, generic webhook, log.
 
 A generic ``webhook`` notifier may carry a ``secret``. With one set, every request is signed so a receiver
 can tell a message this instance sent from one an attacker composed against the same URL:
@@ -41,9 +41,11 @@ import time
 import urllib.parse
 from collections.abc import Callable
 
-from .http import Http
+from .http import Http, log_safe
 
-LOG = logging.getLogger(__name__)
+#: The application logger: ``pipeline.attach_redaction`` installs the secret filter on it, and a logger
+#: filter does not reach records created on a child logger, so a notifier must not log through its own.
+LOG = logging.getLogger("advisory_radar")
 
 #: The request headers a configured ``headers`` mapping may not spoof: the notifier writes them after merging
 #: that mapping, case-insensitively, so a receiver can rely on the one value the code computed.
@@ -99,6 +101,21 @@ class DiscordWebhookNotifier:
     def send(self, entry: dict, http: Http) -> int:
         content = f"**{entry['title']}**{entry['body']}"
         return _post_json(http, self.url, {}, {"content": content[:1900]})
+
+
+class LogNotifier:
+    """Writes each message to the application log and delivers nothing, so a shadow run can record deliveries."""
+
+    def __init__(self, notifier_id: str) -> None:
+        self.id = notifier_id
+
+    def send(self, entry: dict, http: Http) -> int:
+        # Title and body are feed text. ``log_safe`` keeps the record on one line and is the escaped spelling
+        # ``RedactFilter`` knows; ``%r`` would quote-escape a credential into a spelling it does not.
+        LOG.info(
+            "log notifier %s: [%s] %s %s", self.id, entry["tag"], log_safe(entry["title"]), log_safe(entry["body"])
+        )
+        return 200
 
 
 class WebhookNotifier:
@@ -311,6 +328,7 @@ NOTIFIER_BUILDERS = {
         starttls=_bool(cfg.get("use_tls", True), "use_tls"),
         implicit_tls=_bool(cfg.get("implicit_tls", False), "implicit_tls"),
     ),
+    "log": lambda cfg, env: LogNotifier(cfg["id"]),
 }
 
 

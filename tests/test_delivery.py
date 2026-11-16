@@ -7,11 +7,13 @@ state file, no notifier and no HTTP. The delivery tests below drive ``core.deliv
 from __future__ import annotations
 
 import datetime
+import logging
 
 import pytest
 
 from advisory_radar import core, delivery
 from advisory_radar.config import DEFAULT_THRESHOLDS
+from advisory_radar.notifiers import build_notifier
 
 
 def entry(
@@ -640,3 +642,56 @@ def test_a_legacy_entry_records_its_first_attempt_as_the_claim_clock():
     assert core.deliver(state, [Recorder("ops")], no_http, NOW) is True
     record = state["seen"]["CVE-2026-1"]
     assert state["deliveries"][record["delivery"]]["queued_at"] == NOW - 7200
+
+
+def test_the_log_notifier_writes_the_message_and_delivers_nothing(caplog):
+    """A shadow run logs each message: it calls no channel, and it reports success so the state records it."""
+    notifier = build_notifier({"id": "s", "type": "log"}, {})
+    assert notifier.id == "s"
+
+    def no_http_call(*args):
+        raise AssertionError("the log notifier must not call http")
+
+    message = entry("CRITICAL: shadow run advisory", tag="critical")
+    message["body"] = "first line\nINFO forged second line"
+    with caplog.at_level(logging.INFO, logger="advisory_radar"):
+        assert notifier.send(message, no_http_call) == 200
+    assert "CRITICAL: shadow run advisory" in caplog.text
+    assert "[critical]" in caplog.text
+    # The body is feed text: a newline in it stays escaped inside the one record.
+    assert len(caplog.records) == 1
+    assert "\n" not in caplog.records[0].getMessage()
+
+
+def test_the_log_notifier_output_passes_through_secret_redaction(caplog):
+    """A configured secret inside an advisory link must not reach the log through the shadow notifier."""
+    from advisory_radar.pipeline import LOG as APP_LOG
+    from advisory_radar.pipeline import attach_redaction
+
+    # A quote and a backslash-free apostrophe: a repr would escape the apostrophe into a spelling the filter
+    # does not know, so the body carries both quote characters, as a rendered summary can.
+    secret = "synthetic'feed-token-0123456789abcdef"
+    redactor = attach_redaction([secret])
+    try:
+        notifier = build_notifier({"id": "s", "type": "log"}, {})
+        message = entry("WARNING: advisory", tag="warning")
+        message["body"] = f'A "quoted excerpt"\nhttps://feeds.example.com/item?token={secret}'
+        with caplog.at_level(logging.INFO, logger="advisory_radar"):
+            assert notifier.send(message, lambda *args: 0) == 200
+    finally:
+        APP_LOG.removeFilter(redactor)
+    assert "feed-token-0123456789abcdef" not in caplog.text
+    assert "[redacted]" in caplog.text
+    assert "WARNING: advisory" in caplog.text
+
+
+def test_a_shadow_delivery_through_the_log_notifier_is_recorded():
+    """The shadow run's point: the state records the delivery, so switching channels later replays nothing."""
+    state = core.new_state()
+    state["pending"] = [queued("CVE-2026-1")]
+    notifier = build_notifier({"id": "shadow", "type": "log"}, {})
+    assert core.deliver(state, [notifier], no_http, NOW) is True
+    assert state["pending"] == []
+    record = state["seen"]["CVE-2026-1"]
+    assert record["outcome"] == "delivered"
+    assert state["deliveries"][record["delivery"]]["delivered_to"] == ["shadow"]
