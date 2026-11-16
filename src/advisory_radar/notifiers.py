@@ -41,7 +41,7 @@ import time
 import urllib.parse
 from collections.abc import Callable
 
-from .http import Http
+from .http import Http, log_safe
 
 #: The application logger: ``pipeline.attach_redaction`` installs the secret filter on it, and a logger
 #: filter does not reach records created on a child logger, so a notifier must not log through its own.
@@ -110,7 +110,11 @@ class LogNotifier:
         self.id = notifier_id
 
     def send(self, entry: dict, http: Http) -> int:
-        LOG.info("log notifier %s: [%s] %r %r", self.id, entry["tag"], entry["title"], entry["body"])
+        # Title and body are feed text. ``log_safe`` keeps the record on one line and is the escaped spelling
+        # ``RedactFilter`` knows; ``%r`` would quote-escape a credential into a spelling it does not.
+        LOG.info(
+            "log notifier %s: [%s] %s %s", self.id, entry["tag"], log_safe(entry["title"]), log_safe(entry["body"])
+        )
         return 200
 
 
