@@ -78,6 +78,7 @@ def test_the_release_workflow_is_called_only_when_the_merge_landed():
     assert merge_at < true_at < cleanup_at < comment_at, "write true at the merge, before cleanup"
     assert run.count('echo "merged=true" >> "$GITHUB_OUTPUT"') == 1
     assert run.count('echo "merged=false" >> "$GITHUB_OUTPUT"') == 1
+
     release_job = merge["jobs"]["release"]
     assert release_job["needs"] == "merge"
     # The output alone decides; !cancelled() keeps a landed merge releasable after a later failure.
@@ -146,3 +147,17 @@ def test_the_release_may_sign_and_publish_the_attestation():
     effective = signing[0].get("permissions", workflow_permissions)
     assert effective.get("id-token") == "write", "sigstore signing needs the OIDC token"
     assert effective.get("attestations") == "write"
+
+
+def test_the_merge_workflow_may_close_the_issues_its_body_names():
+    """GitHub closes a linked issue only for the identity that merges with `issues: write`.
+
+    Without the scope the auto-close is skipped silently and the tracking issue stays open until
+    someone notices -- measured on merge-guard, where human merges closed their issue one second
+    after the merge and bot merges did not (mikomiel/merge-guard#62).
+    """
+    merge = yaml.safe_load((WORKFLOWS / "automerge.yml").read_text())
+    # A job-level mapping replaces the workflow-level one rather than merging with it, so it is the
+    # effective grant; asserting only the workflow mapping would miss an override on the merge job.
+    effective = merge["jobs"]["merge"].get("permissions", merge["permissions"])
+    assert effective.get("issues") == "write"
