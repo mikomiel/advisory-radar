@@ -653,6 +653,30 @@ def test_the_log_notifier_writes_the_message_and_delivers_nothing(caplog):
         raise AssertionError("the log notifier must not call http")
 
     message = entry("CRITICAL: shadow run advisory", tag="critical")
-    with caplog.at_level(logging.INFO, logger="advisory_radar.notifiers"):
+    message["body"] = "first line\nINFO forged second line"
+    with caplog.at_level(logging.INFO, logger="advisory_radar"):
         assert notifier.send(message, no_http_call) == 200
     assert "CRITICAL: shadow run advisory" in caplog.text
+    assert "[critical]" in caplog.text
+    # The body is feed text: a newline in it stays escaped inside the one record.
+    assert len(caplog.records) == 1
+    assert "\n" not in caplog.records[0].getMessage()
+
+
+def test_the_log_notifier_output_passes_through_secret_redaction(caplog):
+    """A configured secret inside an advisory link must not reach the log through the shadow notifier."""
+    from advisory_radar.pipeline import LOG as APP_LOG
+    from advisory_radar.pipeline import attach_redaction
+
+    secret = "synthetic-feed-token-0123456789abcdef"
+    redactor = attach_redaction([secret])
+    try:
+        notifier = build_notifier({"id": "s", "type": "log"}, {})
+        message = entry("WARNING: advisory", tag="warning")
+        message["body"] = f"https://feeds.example.com/item?token={secret}"
+        with caplog.at_level(logging.INFO, logger="advisory_radar"):
+            assert notifier.send(message, lambda *args: 0) == 200
+    finally:
+        APP_LOG.removeFilter(redactor)
+    assert secret not in caplog.text
+    assert "WARNING: advisory" in caplog.text

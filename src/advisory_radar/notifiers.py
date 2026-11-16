@@ -43,7 +43,9 @@ from collections.abc import Callable
 
 from .http import Http
 
-LOG = logging.getLogger(__name__)
+#: The application logger: ``pipeline.attach_redaction`` installs the secret filter on it, and a logger
+#: filter does not reach records created on a child logger, so a notifier must not log through its own.
+LOG = logging.getLogger("advisory_radar")
 
 #: The request headers a configured ``headers`` mapping may not spoof: the notifier writes them after merging
 #: that mapping, case-insensitively, so a receiver can rely on the one value the code computed.
