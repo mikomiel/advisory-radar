@@ -146,6 +146,24 @@ The key is YAML-only. The overlay cannot move the store, and a reload refuses a 
 not part of the document, which is why `state_path` is still required when the document lives
 elsewhere.
 
+Whichever store holds it, a document that cannot be locked or written (a full disk, a read-only
+volume, a bad permission on the JSON file) fails the pass with `the state store at <path> is
+unavailable`; the JSON file store reports it the way the SQLite store always has, not as a
+traceback. The store then keeps the last document that was saved. A save can fail after the
+pass's messages went out, so the next pass starts from that older document. The JSON file is
+replaced atomically: the new bytes are synced, renamed over the old file, and the directory is
+then synced, so a document a save returned for survives a power cut. The directory sync is best
+effort, because a filesystem that cannot sync a directory keeps the guarantee it had before. It
+is a second flush per save, which costs real time on a slow disk.
+
+The JSON state file is written on one line, without indentation, because it is the one document
+that grows. A file written indented by an earlier version is read as it is and rewritten compactly
+by the next save, and `python -m json.tool state.json` indents it again for reading. The files
+people open and edit, `settings.json` and `watchlist.json`, stay indented, and the SQLite and
+PostgreSQL stores keep the indented text. The KEV cache beside the state file is written the same
+compact way. It is a convenience and not part of the document: when it cannot be written the pass
+logs a warning and uses the catalog it has just downloaded.
+
 `advisory-radar migrate --config /config/config.yml --to sqlite:////data/state.db` copies
 the document read through the configured store into another one. It refuses a target that
 already holds a document and prints both stores, never the URL, which can carry a password.
@@ -164,8 +182,8 @@ on the target database first.
 `/config` writes `settings.json` beside `state_path` on `/data` (`/data/settings.json`
 in the container, `~/.local/share/advisory-radar/settings.json` for the rootless
 quadlet). It is created with mode `0600`, owned by the container user, and replaced
-atomically (a temporary file in the same directory, `fsync`, `os.replace`), so a
-half-written file cannot brick a start. It is not part of the state document, whichever
+atomically (a temporary file in the same directory, `fsync`, `os.replace`, then a best-effort
+`fsync` of the directory), so a half-written file cannot brick a start. It is not part of the state document, whichever
 store holds that. `/config` stays read-only: the overlay holds
 only ten keys — `notifiers`, per-source `enabled`/`tag`/`thresholds`/`interval`, the sources it
 adds itself (`sources_added`), `poll_interval`, `hidden_source_hosts`, the routing
@@ -322,7 +340,8 @@ only the advisories that destination still needs.
 outside it) during which **non-critical** messages wait in `pending`; they are not failed
 attempts and go out after the window. A critical message is never held, and a held message does
 not take one of the pass's delivery slots, so a queue of them cannot delay a critical advisory
-behind it. An empty value turns
+behind it; when more are queued than a pass may deliver, the critical ones are taken first
+(see `configuration.md`). An empty value turns
 the window off, and `00:00-00:00` is an empty window. The window is read in the process's local
 timezone, which is UTC in the container unless `TZ` is set. Both keys are overlay-writable.
 

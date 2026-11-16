@@ -35,6 +35,15 @@ cannot redirect the reader to a host an attacker picked, and a feed genuinely se
 another host is configured directly. The second keeps the existing guard rail against a
 router page or the metadata service, because the page — not the operator — chose that URL.
 
+A feed is read whole, so what a publisher can make this reader spend is bounded. A body above
+8 MiB is refused unread, a feed or a page alike and whatever format it claims (the HTTP layer
+itself stops any response at 64 MiB). Markup nested more than 100 levels deep inside an entry,
+and an OPML folder tree that deep, is refused as an unreadable document instead of followed. A
+document refused for either reason fails that source's pass and is reported on `/sources`, like
+any other feed this reader cannot read. A date that names no zone (an ISO 8601 date without an
+offset, a bare date, an RFC 822 date without a zone or with `-0000`) is read as UTC, never in
+the host's local zone, so the same feed is dated the same way on every host.
+
 Every source may carry `interval: 30m` (the same `<n><s|m|h>` spelling as
 `poll_interval`) to be fetched at its own pace; without one it follows the global
 interval. The interval throttles the fetch only: re-evaluation, escalation and delivery
@@ -42,6 +51,19 @@ still run for every source on every pass, so a slow feed never delays an alert. 
 that fails is retried on the next pass instead of waiting out the interval, so one
 transient error cannot become an outage. `interval` is accepted by every kind in
 addition to the keys in the table.
+
+Every HTTP request the program makes, a source fetch as much as a lookup or a notification sent
+over HTTP, ends when one network operation (connect, send, one read) waits 30 seconds, and when
+the whole request has taken 120 seconds. The second limit is the one that matters for a server
+that answers a few bytes at a time: the first never trips for it, and the pass, with the state
+lock it holds, would wait as long as the server liked. A request ended this way is an
+unreachable source for that pass, like any other network error. The 120 seconds are counted
+from the start of the connection attempt, but they are checked only between the reads of the
+response body. A request already waiting inside one read can end up to 30 seconds after them,
+and the deadline does not interrupt the connection attempt or the wait for the response
+headers: a server that sends its headers a few bytes at a time is held back only by the
+30-second limit on each wait, and its request is ended at the first body read after the 120
+seconds. Email through SMTP is not an HTTP request and has the 30-second limit alone.
 
 A pasted OPML 2.0 subscription list is imported with **Add feeds from OPML** in the same
 section: every `<outline>` with an `xmlUrl` becomes an `rss` source, folders are
@@ -132,4 +154,13 @@ non-string (400). A JSON object with no `title` is 422. `guid` is kept verbatim
 and escaped when rendered, so a legacy sender that supplies a lone surrogate
 there keeps working. The bearer secret, the 64 KiB body bound and the inbox
 limit are unchanged.
+
+Two answers say nothing about the payload: they mean "not queued, try again". While a pass
+holds the state lock (it holds it for its whole transaction, so for as long as the pass runs)
+the endpoint answers `503` with `{"error": "busy, retry"}` and `Retry-After: 30`, and when the
+inbox is full it answers `429` with `Retry-After: 60` until a pass has processed some entries.
+Neither response queues anything and this side keeps no copy, so the retry belongs to the
+sender: a sender that treats a `503` or a `429` as final loses that advisory. Retry after the
+`Retry-After` interval. A `400`, `401`, `404`, `413` or `422` will not succeed when the same
+request is sent again.
 

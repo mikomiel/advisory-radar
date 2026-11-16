@@ -8,8 +8,10 @@ foreign schema is refused, the bytes on disk are private, and the lock excludes 
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
+import os
 import sqlite3
 import stat
 import sys
@@ -75,6 +77,52 @@ def test_the_json_store_writes_the_document_0600(tmp_path):
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
+def test_the_json_store_writes_the_state_on_one_line(tmp_path):
+    """The state document is the one that grows, and every pass writes all of it, so it is not padded."""
+    path = tmp_path / "state.json"
+    storage.JsonStore(path).save(DOCUMENT)
+    text = path.read_text(encoding="utf-8")
+    assert text.endswith("\n") and "\n" not in text[:-1], "one line, no indentation"
+    assert json.loads(text) == DOCUMENT
+    assert len(text) < len(serialize_json(DOCUMENT))
+
+
+def test_an_indented_state_file_from_an_earlier_version_is_read_and_rewritten_compactly(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(serialize_json(DOCUMENT), encoding="utf-8")  # the indented text earlier versions wrote
+    store = storage.JsonStore(path)
+    assert store.load() == DOCUMENT, "the old text is read as it is"
+    store.save(DOCUMENT)
+    assert "\n" not in path.read_text(encoding="utf-8")[:-1], "the next save rewrites it on one line"
+    assert store.load() == DOCUMENT
+
+
+def test_serialize_json_compact_is_the_same_document_without_indentation():
+    compact = serialize_json(DOCUMENT, compact=True)
+    assert compact == json.dumps(DOCUMENT, sort_keys=True, separators=(",", ":")) + "\n"
+    assert json.loads(compact) == json.loads(serialize_json(DOCUMENT))
+
+
+def test_a_document_people_edit_keeps_its_indentation(tmp_path):
+    """Only the state is compact. The overlay and the watchlist are the files a person opens to read or fix, and
+    each one's size check measures the text its own save writes, so both stay on the indented default."""
+    from advisory_radar.settings import save_settings
+    from advisory_radar.watchlist import save_watchlist
+
+    overlay = tmp_path / "settings.json"
+    save_settings(overlay, {"poll_interval": "30s"}, now=1)
+    watchlist = tmp_path / "watchlist.json"
+    document = {
+        "schema": "security-watchlist.v1",
+        "debian_source_packages": ["*"],
+        "excluded_products": [],
+        "products": [{"id": "nodejs", "aliases": ["node.js"], "domains": ["nodejs.org"]}],
+    }
+    save_watchlist(watchlist, lambda current: document, expected="")
+    for path in (overlay, watchlist):
+        assert "\n  " in path.read_text(encoding="utf-8"), f"{path.name} stays indented"
+
+
 def test_the_json_store_lock_is_the_state_lock(tmp_path):
     path = tmp_path / "state.json"
     with storage.JsonStore(path).lock():
@@ -83,6 +131,117 @@ def test_the_json_store_lock_is_the_state_lock(tmp_path):
             pass
     with storage.JsonStore(path).lock(blocking=False):
         pass
+
+
+def test_a_directory_the_json_store_cannot_write_is_unavailable(tmp_path):
+    # The SQLite store answers a parent that is a regular file with the store refusal; so must the JSON store,
+    # or a pass over it dies with a traceback where the SQLite pass reports a failure.
+    blocker = tmp_path / "data"
+    blocker.write_text("not a directory")
+    with pytest.raises(storage.StoreUnavailable) as caught:
+        storage.JsonStore(blocker / "state.json").save(DOCUMENT)
+    assert "unavailable" in str(caught.value) and not isinstance(caught.value, OSError)
+
+
+def test_a_json_lock_that_cannot_be_taken_is_a_store_error(tmp_path):
+    blocker = tmp_path / "data"
+    blocker.write_text("not a directory")
+    with pytest.raises(storage.StoreUnavailable), storage.JsonStore(blocker / "state.json").lock():
+        pass
+
+
+def test_the_json_lock_does_not_translate_a_fault_of_its_body(tmp_path):
+    """Only acquiring the lock is a store fault: what the caller does while holding it keeps its own error."""
+    path = tmp_path / "state.json"
+    with pytest.raises(OSError, match="the body's own fault") as caught, storage.JsonStore(path).lock():
+        raise OSError("the body's own fault")
+    assert not isinstance(caught.value, storage.StoreUnavailable)
+    with storage.JsonStore(path).lock(blocking=False):
+        pass  # the lock was released on the way out
+
+
+def test_a_full_disk_while_saving_fails_the_pass_instead_of_raising(tmp_path, monkeypatch, caplog):
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(f"sources: []\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
+    cfg = load_config(config_path, {})
+    cfg.store().save(core.new_state())  # a stored document, so the pass gets as far as its first save
+
+    def full(path, document):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(storage, "save_state", full)
+    with caplog.at_level(logging.ERROR):
+        code = pipeline.run_pass(cfg, [], [], http=lambda method, url, headers, body: (404, {}, b""))
+    assert code == 1, "a store that cannot be written is a failed pass, not a traceback"
+    assert "unavailable" in caplog.text and "No space left on device" in caplog.text
+
+
+class _SyncRecorder:
+    """The order of file sync, rename and directory sync during a save, and the directory descriptors left open.
+
+    ``fail_sync`` makes the directory refuse to sync and ``fail_open`` makes it refuse to open: the two ways a
+    filesystem or a platform can decline the one step that is only best effort.
+    """
+
+    def __init__(self, monkeypatch, *, fail_sync: bool = False, fail_open: bool = False) -> None:
+        self.events: list[str] = []
+        self.open_directories: set[int] = set()
+        real_fsync, real_replace, real_open, real_close = os.fsync, os.replace, os.open, os.close
+
+        def fsync(descriptor):
+            is_directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
+            self.events.append("sync directory" if is_directory else "sync file")
+            if is_directory and fail_sync:
+                raise OSError(errno.EINVAL, "this filesystem cannot sync a directory")
+            real_fsync(descriptor)
+
+        def replace(source, destination):
+            self.events.append("rename")
+            real_replace(source, destination)
+
+        def open_(path, flags, *args, **kwargs):
+            is_directory = os.path.isdir(path)
+            if is_directory and fail_open:
+                raise OSError(errno.EACCES, "a directory this process may not open")
+            descriptor = real_open(path, flags, *args, **kwargs)
+            if is_directory:
+                self.open_directories.add(descriptor)
+            return descriptor
+
+        def close(descriptor):
+            self.open_directories.discard(descriptor)
+            real_close(descriptor)
+
+        monkeypatch.setattr(os, "fsync", fsync)
+        monkeypatch.setattr(os, "replace", replace)
+        monkeypatch.setattr(os, "open", open_)
+        monkeypatch.setattr(os, "close", close)
+
+
+def test_a_saved_document_is_followed_by_a_sync_of_its_directory(real_directory_sync, tmp_path, monkeypatch):
+    """The rename is atomic but lives in the directory until it is flushed: a power cut right after a save could
+    otherwise bring back the previous document although the new file's bytes were synced."""
+    recorded = _SyncRecorder(monkeypatch)
+    storage.JsonStore(tmp_path / "state.json").save(DOCUMENT)
+    assert recorded.events == ["sync file", "rename", "sync directory"]
+    assert not recorded.open_directories
+    assert json.loads((tmp_path / "state.json").read_text()) == DOCUMENT
+
+
+def test_a_directory_that_cannot_be_synced_does_not_fail_the_save(real_directory_sync, tmp_path, monkeypatch):
+    """Some filesystems refuse to sync a directory. The document is already in place, so the save stands."""
+    recorded = _SyncRecorder(monkeypatch, fail_sync=True)
+    storage.JsonStore(tmp_path / "state.json").save(DOCUMENT)
+    assert recorded.events == ["sync file", "rename", "sync directory"]
+    assert not recorded.open_directories, "the directory descriptor is closed even when its sync fails"
+    assert json.loads((tmp_path / "state.json").read_text()) == DOCUMENT
+
+
+def test_a_directory_that_cannot_be_opened_does_not_fail_the_save(real_directory_sync, tmp_path, monkeypatch):
+    recorded = _SyncRecorder(monkeypatch, fail_open=True)
+    storage.JsonStore(tmp_path / "state.json").save(DOCUMENT)
+    assert recorded.events == ["sync file", "rename"]
+    assert json.loads((tmp_path / "state.json").read_text()) == DOCUMENT
 
 
 # --------------------------------------------------------------------------

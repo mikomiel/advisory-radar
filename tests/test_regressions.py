@@ -117,8 +117,11 @@ def test_pass_skips_when_another_pass_holds_the_lock(tmp_path):
     assert not notifier.sent
 
 
-def test_a_blocking_pass_still_reports_one_when_the_lock_times_out(tmp_path, monkeypatch):
-    """The CLI and scheduler keep their ``1 = failed`` contract; only the non-blocking web path has a skip code."""
+def test_a_blocking_pass_still_reports_one_when_the_store_refuses_the_lock(tmp_path, monkeypatch):
+    """The CLI and scheduler keep their ``1 = failed`` contract; only the non-blocking web path has a skip code.
+
+    No store times a blocking acquisition out, so this is a store that refuses the lock outright.
+    """
     cfg = config(tmp_path)
 
     class BusyStore:
@@ -3163,3 +3166,320 @@ def test_settlement_is_idempotent_across_a_serialisation():
     reloaded = json.loads(once)
     core._ensure_ownership(reloaded)
     assert json.dumps(reloaded, sort_keys=True) == once
+
+
+# ---------------------------------------------------------------------------
+# Pipeline robustness and delivery correctness review
+
+
+def _health(ok_at: int, *, ok: bool = False) -> dict:
+    """One ``source_health`` record the way ``pipeline._record_health`` writes it."""
+    return {"at": ok_at, "ok": ok, "ok_at": ok_at, "items": 0, "error": "" if ok else "OSError: down"}
+
+
+def _seeded_state(source_health: dict | None = None) -> dict:
+    state = core.new_state()
+    state["seeded"] = {"s1": True}
+    if source_health is not None:
+        state["source_health"] = source_health
+    return state
+
+
+def test_an_advisory_published_during_an_outage_is_news_not_backlog(tmp_path):
+    """A source down for longer than BACKLOG_AGE returns what it missed; age alone must not call that history."""
+    cfg = config(tmp_path)
+    cfg.store().save(_seeded_state({"s1": _health(NOW - 10 * core.DAY)}))
+    missed = core.Item(
+        "missed", "vendor advisory missed", "https://vendor.example.com/m", "notes", NOW - 9 * core.DAY, ()
+    )
+    notifier = Notifier()
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [missed])],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert [entry["title"] for entry in notifier.sent] == ["WARNING: vendor advisory missed"]
+    seen = cfg.store().load()["seen"]
+    assert seen["src:s1:missed"]["outcome"] == "delivered", (
+        "an item the outage hid is reported, not recorded as history"
+    )
+
+
+def test_history_older_than_the_last_success_is_still_backlog_after_an_outage(tmp_path):
+    cfg = config(tmp_path)
+    cfg.store().save(_seeded_state({"s1": _health(NOW - 10 * core.DAY)}))
+    old = core.Item("old", "vendor advisory old", "https://vendor.example.com/o", "notes", NOW - 30 * core.DAY, ())
+    notifier = Notifier()
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [old])],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert notifier.sent == []
+    assert cfg.store().load()["seen"]["src:s1:old"]["outcome"] == "backlog"
+
+
+def test_a_source_that_never_answered_keeps_the_age_rule(tmp_path):
+    """No recorded success (a re-enabled source has its health dropped) means age alone decides, as before."""
+    cfg = config(tmp_path)
+    cfg.store().save(_seeded_state())
+    nine_days = core.Item(
+        "nine", "vendor advisory nine", "https://vendor.example.com/n", "notes", NOW - 9 * core.DAY, ()
+    )
+    notifier = Notifier()
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [nine_days])],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert notifier.sent == []
+    assert cfg.store().load()["seen"]["src:s1:nine"]["outcome"] == "backlog"
+
+
+class _NoLookups(core.Intel):
+    def __init__(self) -> None:
+        super().__init__(None, {}, lambda: float(NOW), lambda s: None)
+
+
+def _classify(state: dict, published: int, **extra) -> core.Item:
+    entry = core.Item("g1", "vendor advisory", "https://vendor.example.com/a", "notes", published, ())
+    core.classify_new(
+        state,
+        [entry],
+        _NoLookups(),
+        frozenset(),
+        True,
+        NOW,
+        "vendor.example.com",
+        core.Policy(("curl",), (), ()),
+        thresholds=DEFAULT_THRESHOLDS,
+        **extra,
+    )
+    return entry
+
+
+def test_the_outage_slack_decides_the_boundary_of_history():
+    """History is older than BACKLOG_AGE and published before the last success minus one day of slack."""
+    last_ok = NOW - 10 * core.DAY
+    edge = last_ok - core.BACKLOG_OUTAGE_SLACK
+    news, history = core.new_state(), core.new_state()
+    _classify(news, edge, last_ok=last_ok)
+    _classify(history, edge - 1, last_ok=last_ok)
+    assert len(news["pending"]) == 1, "published exactly at the edge is news"
+    assert history["pending"] == [] and history["seen"]["src:g1"]["outcome"] == "backlog"
+
+
+def test_the_age_rule_alone_applies_without_a_last_success():
+    state = core.new_state()
+    _classify(state, NOW - 8 * core.DAY, last_ok=0)
+    assert state["pending"] == [] and state["seen"]["src:g1"]["outcome"] == "backlog"
+
+
+def test_a_last_success_in_the_future_cannot_turn_history_into_news():
+    """A clock that stepped backwards must not make every old item look like one an outage hid."""
+    state = core.new_state()
+    _classify(state, NOW - 30 * core.DAY, last_ok=NOW + 365 * core.DAY)
+    assert state["pending"] == [] and state["seen"]["src:g1"]["outcome"] == "backlog"
+
+
+def test_the_tail_left_by_a_full_queue_gets_the_same_outage_decision():
+    """The tail past the delivery room is decided by the same rule, so the carry holds only news."""
+    last_ok = NOW - 10 * core.DAY
+    state = core.new_state()
+    # Undated items sort first and fill the room, so the two dated items below are the tail.
+    undated = [core.Item(f"u{n}", f"undated {n}", "https://vendor.example.com/u", "n", None, ()) for n in range(6)]
+    missed = core.Item("missed", "missed", "https://vendor.example.com/m", "n", NOW - 9 * core.DAY, ())
+    old = core.Item("old", "old", "https://vendor.example.com/o", "n", NOW - 30 * core.DAY, ())
+    left = core.classify_new(
+        state,
+        [*undated, missed, old],
+        _NoLookups(),
+        frozenset(),
+        True,
+        NOW,
+        "vendor.example.com",
+        core.Policy(("curl",), (), ()),
+        thresholds=DEFAULT_THRESHOLDS,
+        last_ok=last_ok,
+    )
+    assert {entry.guid for entry in left} == {"u5", "missed"}, "news the room could not take is carried"
+    assert state["seen"]["src:old"]["outcome"] == "backlog", "history in the tail is still recorded, never carried"
+
+
+def _kev_http(*cves: str):
+    body = json.dumps({"catalogVersion": "1", "vulnerabilities": [{"cveID": cve} for cve in cves]}).encode()
+
+    def http(method, url, headers, payload):
+        return 200, {"ETag": "e1"}, body
+
+    return http
+
+
+def test_a_failed_kev_cache_write_still_returns_the_fresh_catalog(tmp_path, caplog):
+    """The cache is an optimisation: a write fault must not discard the catalog that was just fetched."""
+    from advisory_radar.kev import load_kev
+
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a file where the cache directory should be")
+    with caplog.at_level("WARNING", logger="advisory_radar"):
+        cves, known = load_kev(_kev_http("CVE-2026-1111"), blocker / "kev.json", save=True)
+    assert cves == frozenset({"CVE-2026-1111"}) and known is True
+    assert "could not be written" in caplog.text and str(blocker) in caplog.text
+
+
+def test_the_kev_cache_is_written_on_one_line_and_read_back(tmp_path):
+    """The cache is saved like the state document, so it is not padded, and the next fetch still reads it."""
+    from advisory_radar.kev import load_kev
+
+    cache = tmp_path / "kev.json"
+    load_kev(_kev_http("CVE-2026-1111", "CVE-2026-2222"), cache, save=True)
+    assert "\n" not in cache.read_text(encoding="utf-8")[:-1], "one line"
+
+    def not_modified(method, url, headers, payload):
+        assert headers["If-None-Match"] == "e1", "the validator stored in the compact cache is sent back"
+        return 304, {}, b""
+
+    cves, known = load_kev(not_modified, cache, save=False)
+    assert cves == frozenset({"CVE-2026-1111", "CVE-2026-2222"}) and known is True
+
+
+def test_a_pass_survives_an_unwritable_kev_cache(tmp_path):
+    cfg = config(tmp_path)
+    (tmp_path / "kev.json").mkdir()  # the cache cannot be replaced by a file, so the write fails
+    notifier = Notifier()
+
+    def http(method, url, headers, payload):
+        if "cisa.gov" in url:
+            return _kev_http("CVE-2026-4242")(method, url, headers, payload)
+        return http_for({})(method, url, headers, payload)
+
+    code = pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [item("g1", "vendor note")])],
+        [notifier],
+        http=http,
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 0, "an unwritable cache is a warning, never a failed pass"
+    assert len(notifier.sent) == 1
+
+
+class _Clock:
+    """A monotonic clock a test moves by hand, installed as the ``time`` the HTTP transport reads."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class _Dribble:
+    """A response body a peer sends one byte at a time, each read costing simulated seconds, with no socket.
+
+    ``read`` behaves as ``http.client`` does: it keeps reading until it has the requested bytes or the peer
+    closes, however many reads (and however much time) that takes. ``read1`` returns after one read.
+    """
+
+    status = 200
+    headers: dict = {}
+
+    def __init__(self, clock: _Clock, seconds_per_byte: float, size: int = 2000) -> None:
+        self.clock = clock
+        self.seconds_per_byte = seconds_per_byte
+        self.left = size
+        self.reads = 0
+
+    def read1(self, size: int = -1) -> bytes:
+        if self.left <= 0:
+            return b""
+        self.reads += 1
+        self.clock.now += self.seconds_per_byte
+        self.left -= 1
+        return b"x"
+
+    def read(self, size: int = -1) -> bytes:
+        body = b""
+        while (size < 0 or len(body) < size) and (chunk := self.read1(1)):
+            body += chunk
+        return body
+
+    def close(self) -> None:  # ``HTTPError`` closes the body it wraps when it is collected
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+
+def _http_with(monkeypatch, opened):
+    """``urllib_http`` over a fake opener and a hand-moved clock; returns the clock."""
+    import types
+
+    from advisory_radar import http as transport
+
+    clock = _Clock()
+    monkeypatch.setattr(transport, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+    monkeypatch.setattr(transport._OPENER, "open", opened)
+    return clock, transport
+
+
+def test_a_body_that_dribbles_past_the_deadline_is_a_network_error(monkeypatch):
+    """HTTP_TIMEOUT bounds one socket operation; a peer sending a byte every few seconds must still be cut off."""
+    body: _Dribble | None = None
+
+    def opened(request, timeout):
+        nonlocal body
+        body = _Dribble(clock, seconds_per_byte=10.0)
+        return body
+
+    clock, transport = _http_with(monkeypatch, opened)
+    assert transport.urllib_http("GET", "https://feeds.example.com/slow", {}, None) == (0, {}, b"")
+    assert body is not None and body.reads <= transport.HTTP_DEADLINE // 10 + 1, "it stopped reading at the deadline"
+
+
+def test_the_deadline_counts_the_time_spent_before_the_first_byte(monkeypatch):
+    """The clock starts before the connection, so a slow connect or header wait spends the same budget. Nothing
+    interrupts that wait (only HTTP_TIMEOUT bounds each step of it): the request ends at the first body read."""
+
+    def opened(request, timeout):
+        clock.now += transport.HTTP_DEADLINE + 1  # connecting and waiting for the headers took that long
+        return _Dribble(clock, seconds_per_byte=0.0, size=10)
+
+    clock, transport = _http_with(monkeypatch, opened)
+    assert transport.urllib_http("GET", "https://feeds.example.com/late", {}, None) == (0, {}, b"")
+
+
+def test_a_refusal_that_dribbles_its_body_keeps_its_status(monkeypatch):
+    import urllib.error
+
+    def opened(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url, 503, "busy", {"Retry-After": "30"}, _Dribble(clock, seconds_per_byte=10.0)
+        )
+
+    clock, transport = _http_with(monkeypatch, opened)
+    status, headers, payload = transport.urllib_http("GET", "https://feeds.example.com/busy", {}, None)
+    assert status == 503 and headers == {"Retry-After": "30"}, "the refusal is the answer; only its body was lost"
+    assert payload == b""
+
+
+def test_a_body_inside_the_deadline_is_returned_whole_and_bounded_by_the_limit(monkeypatch):
+    clock, transport = _http_with(monkeypatch, lambda request, timeout: _Dribble(clock, 0.01, size=100))
+    monkeypatch.setattr(transport, "MAX_RESPONSE_BYTES", 10)
+    status, _, payload = transport.urllib_http("GET", "https://feeds.example.com/big", {}, None)
+    assert status == 200 and payload == b"x" * 11, "callers rely on receiving MAX_RESPONSE_BYTES + 1 bytes"
+    monkeypatch.setattr(transport, "MAX_RESPONSE_BYTES", 1000)
+    assert transport.urllib_http("GET", "https://feeds.example.com/small", {}, None)[2] == b"x" * 100

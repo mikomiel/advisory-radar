@@ -11,7 +11,8 @@ file baked into the image). The correctness rules are carried over unchanged:
   older than PARK_AFTER, is parked, never discarded on its own;
 * a full export window that shares no entry with the previous one is a window
   gap and fails the pass (items may have been missed);
-* an item older than BACKLOG_AGE at first sight is history, never alerted;
+* an item older than BACKLOG_AGE at first sight is history, never alerted, unless its source could not be
+  read when it appeared (see ``classify_new``);
 * watched CVEs are re-scored once a day and escalated at most once per level;
 * a failed lookup never suppresses and never promotes an item;
 * vendor text is Markdown-neutralised before rendering; secrets are redacted
@@ -91,6 +92,9 @@ REEVAL_WINDOW = 14 * DAY
 SEED_WINDOW = DAY
 #: An item older than this at first sight is recorded as ``backlog``, not alerted (see ``classify_new``).
 BACKLOG_AGE = 7 * DAY
+#: An item published after the source's last successful read, less this slack, appeared while the source could
+#: not be read. Age alone then says nothing about whether it is history (see ``_is_history``).
+BACKLOG_OUTAGE_SLACK = DAY
 DELIVERY_CAP = 5
 #: A pending message that fails this many attempts, or whose first attempt is older than PARK_AFTER, is parked.
 #: A notifier may answer 4xx when one of its own legs fails while others already posted. This cap is therefore
@@ -1589,7 +1593,10 @@ def _delivered(
             state["watch"][cve] = record
     elif kind == "escalation":
         watch = state["watch"].get(entry["cves"][0])
-        if watch is not None:
+        if watch is not None and outcome == "delivered":
+            # Like a new message, a dropped escalation was never sent: the watch must keep the level the reader
+            # was last told. Advancing it would make the next re-score treat the escalation as old news and never
+            # owe it again; left alone, the next daily re-score queues it again while the CVE is still watched.
             watch["level"] = entry["tag"]
             watch["judged"] = entry["tag"]
             watch["thresholds"] = Thresholds.from_snapshot(entry.get("thresholds")).snapshot()
@@ -1890,6 +1897,24 @@ def _log_id(value: str) -> str:
     return log_safe(value)
 
 
+def _is_history(item: Item, now: int, last_ok: int, trusted: Collection[str]) -> bool:
+    """Whether an item at first sight is old news: older than BACKLOG_AGE and not hidden by an outage.
+
+    ``last_ok`` is the epoch of the source's last successful read, 0 when it never answered (or was removed or
+    disabled and came back: its health record is dropped while it does not run). A source that was down for
+    longer than BACKLOG_AGE returns, on recovery, the advisories published while it was down; age alone would
+    record every one of them as history and the operator would never hear of them. An item published after
+    ``last_ok`` less BACKLOG_OUTAGE_SLACK cannot have been in a window an earlier pass read, so it is news
+    however old it now is. The slack covers a publisher that dates an entry slightly before the pass that first
+    listed it. A ``last_ok`` of 0 keeps the age rule unchanged, and one in the future (a clock that stepped
+    back) is clamped to ``now``, so it can never turn history into news. A carried item (``trusted``) was
+    recent when it first arrived and is never history.
+    """
+    if item.published is None or item.guid in trusted or now - item.published <= BACKLOG_AGE:
+        return False
+    return last_ok <= 0 or item.published < min(last_ok, now) - BACKLOG_OUTAGE_SLACK
+
+
 def classify_new(
     state: dict,
     items: Sequence[Item],
@@ -1906,8 +1931,13 @@ def classify_new(
     thresholds: Thresholds,
     quiet_hours: delivery.QuietHours | None = None,
     language: str = DEFAULT_LANGUAGE,
+    last_ok: int = 0,
 ) -> list[Item]:
     """Queue the items nobody has seen, oldest first, until the delivery cap or the lookup budget is reached.
+
+    An item older than ``BACKLOG_AGE`` at first sight is history: recorded as ``backlog``, never alerted. It is
+    not history when it was published after ``last_ok``, the source's last successful read, less
+    ``BACKLOG_OUTAGE_SLACK``: the source could not be read when it appeared (see ``_is_history``).
 
     ``share`` bounds how much of the pending room one source may take, so a busy first source cannot fill the
     queue and leave later sources unclassified pass after pass.
@@ -1949,7 +1979,7 @@ def classify_new(
     deferred: list[Item] = []
     ordered = sorted(items, key=lambda candidate: candidate.published or 0)
     for position, item in enumerate(ordered):
-        if item.published is not None and now - item.published > BACKLOG_AGE and item.guid not in trusted:
+        if _is_history(item, now, last_ok, trusted):
             # History is decided before capacity: a full queue must not push an old item into carry, where
             # the next pass would treat it as recent.
             first_sight = item.explicit or (f"src:{item.guid}",)
@@ -1965,7 +1995,7 @@ def classify_new(
             carryable: list[Item] = []
             for rest in ordered[position:]:
                 first = list(rest.explicit or (f"src:{rest.guid}",))
-                if rest.published is not None and now - rest.published > BACKLOG_AGE and rest.guid not in trusted:
+                if _is_history(rest, now, last_ok, trusted):
                     unclaimed_rest = [identifier for identifier in first if identifier not in claimed]
                     for identifier in unclaimed_rest:
                         seen[identifier] = {"at": now, "outcome": "backlog"}
@@ -1986,7 +2016,7 @@ def classify_new(
         # already-claimed id is still backlog, and only its unclaimed ids are recorded.
         first_sight = list(explicit or (f"src:{item.guid}",))
         # A carried item was recent when it first arrived, so age must not turn it into history later.
-        if item.published is not None and now - item.published > BACKLOG_AGE and item.guid not in trusted:
+        if _is_history(item, now, last_ok, trusted):
             unclaimed = [identifier for identifier in first_sight if identifier not in claimed]
             for identifier in unclaimed:
                 seen[identifier] = {"at": now, "outcome": "backlog"}
@@ -2827,14 +2857,19 @@ def deliver(
 ) -> bool:
     """Deliver up to DELIVERY_CAP pending messages; False on a failed pass.
 
+    The window is the queue taken critical-first (:func:`_critical_first`): a stable sort, so each class keeps
+    its queue order and a queue without a critical message is offered exactly as before. A critical advisory
+    therefore never waits behind a window's worth of warnings, and a warning a channel refuses cannot stop the
+    pass before it.
+
     ``routes`` and ``default`` narrow the channels per message (see :func:`routing.select`); both empty keeps
-    the pre-routing behaviour of every enabled notifier. A failed message stays at the head and stops the pass,
-    so order is kept. Its MAX_DELIVERY_ATTEMPTS-th failed attempt, or a first attempt older than PARK_AFTER,
-    parks it instead (see ``_park``) and the pass goes on with the next message, unless the parked list is full:
-    then it stays at the head and stops the pass. A message that already failed MAX_DELIVERY_ATTEMPTS times is
-    never posted again, so a full parked list cannot turn into a duplicate post on every pass. A selection that
-    names no built notifier is a configuration fault: it logs an error, fails the pass and leaves the message
-    queued, never marked delivered.
+    the pre-routing behaviour of every enabled notifier. A failed message stays pending and stops the pass, so
+    nothing behind it in the window is tried. Its MAX_DELIVERY_ATTEMPTS-th failed attempt, or a first attempt
+    older than PARK_AFTER, parks it instead (see ``_park``) and the pass goes on with the next message, unless
+    the parked list is full: then it stays pending and stops the pass. A message that already failed
+    MAX_DELIVERY_ATTEMPTS times is never posted again, so a full parked list cannot turn into a duplicate post
+    on every pass. A selection that names no built notifier is a configuration fault: it logs an error, fails
+    the pass and leaves the message queued, never marked delivered.
 
     With ``digest`` and ``quiet_hours`` both unset this is the message-by-message loop it has always been,
     kept whole in :func:`_deliver_each` so turning the features off changes no request, no state field and no
@@ -2880,6 +2915,30 @@ def deliver(
     )
 
 
+def _critical_first(entries: Sequence[dict]) -> list[dict]:
+    """The queue in the order a pass offers it to its delivery window: critical messages first.
+
+    A stable sort, so each class keeps its queue order and a queue without a critical message is offered exactly
+    as before. Without it, a window's worth of warnings queued ahead of a critical advisory takes every slot, and a
+    warning that a channel refuses at the head stops the pass before the critical advisory is tried at all. The
+    stored queue is not reordered: this is only the window. The predicate is the one ``delivery.is_held`` uses,
+    because a message tagged ``critical`` is the one kind quiet hours never hold.
+    """
+    return sorted(entries, key=lambda entry: entry.get("tag") != "critical")
+
+
+def _worst_failure(statuses: Sequence[int]) -> int:
+    """The status to record for an entry that did not reach every channel: the highest one that was not a success.
+
+    ``statuses`` holds every channel's answer, successes included, and ``max`` over all of them would report a
+    channel that accepted the message (a 200 or a 204) as the reason it is still pending. The operator reads
+    this value on the advisory page and in the parked-message log line, so only a status that is a failure may
+    be recorded. 0 means no answer at all (a network error or a raising notifier) and is also a failure; the
+    default is 0 for the case no failure is on record.
+    """
+    return max((status for status in statuses if not 200 <= status < 300), default=0)
+
+
 def _deliver_each(
     state: dict,
     notifiers: Sequence,
@@ -2891,8 +2950,11 @@ def _deliver_each(
     default: Sequence[str],
     enabled_ids: list[str],
 ) -> bool:
-    """The pre-digest delivery loop, kept whole: one message at a time, each with its own routing and attempts."""
-    for entry in list(state["pending"][:DELIVERY_CAP]):
+    """The pre-digest delivery loop, kept whole: one message at a time, each with its own routing and attempts.
+
+    The window is the first DELIVERY_CAP entries of the queue taken critical-first (:func:`_critical_first`).
+    """
+    for entry in _critical_first(state["pending"])[:DELIVERY_CAP]:
         entry.setdefault("first_attempt_at", now)
         if entry.get("attempts", 0) >= MAX_DELIVERY_ATTEMPTS:  # only a full parked list leaves one here
             if _park(state, entry, entry.get("last_status", 0), now):
@@ -2943,7 +3005,7 @@ def _deliver_each(
                 " ".join(entry["title"].split()),
             )
             continue
-        status = max(statuses)  # 0 is a network error and the worst outcome
+        status = _worst_failure(statuses)
         entry["sent_to"] = sorted(already)
         entry["attempts"] = entry.get("attempts", 0) + 1
         entry["last_status"] = status
@@ -2980,16 +3042,18 @@ def _deliver_grouped(
     """Deliver this pass's messages by routing group, batching each group through :func:`delivery.plan`.
 
     The delivery window is filled from entries this pass may actually send, not from the head of the queue:
-    a held entry is skipped and leaves its slot to the next entry, so five held warnings cannot hide a
-    critical advisory queued behind them. Held entries stay in ``pending`` and are looked at again on a later
-    pass. The walk is done before the first POST so a group is complete when it is planned: a later advisory
-    that routes to the same channels belongs in the same digest. Groups are keyed by the set of destination
-    ids, so two rules that name the same notifiers in another order share one digest, and the entries keep
-    the order in which they first appeared. A selection that names no built notifier therefore fails the pass
-    before any of this pass's messages is posted, and every message stays pending.
+    the queue is taken critical-first (:func:`_critical_first`), and a held entry is skipped and leaves its
+    slot to the next entry, so neither five held warnings nor five sendable ones can hide a critical advisory
+    queued behind them. Held entries stay in ``pending`` and are looked at again on a later pass.
+
+    The walk is done before the first POST so a group is complete when it is planned: a later advisory that
+    routes to the same channels belongs in the same digest. Groups are keyed by the set of destination ids, so
+    two rules that name the same notifiers in another order share one digest, and the entries keep the order
+    of the window. A selection that names no built notifier therefore fails the pass before any of this pass's
+    messages is posted, and every message stays pending.
     """
     window = []
-    for entry in state["pending"]:
+    for entry in _critical_first(state["pending"]):
         if len(window) >= DELIVERY_CAP:
             break
         if delivery.is_held(now, entry, quiet_hours):
@@ -3118,7 +3182,7 @@ def _deliver_batch(
             continue
         status = failure_status[index]
         if status is None:  # a pending entry always has a destination that refused or failed it
-            status = max(statuses)
+            status = _worst_failure(statuses)
         entry["attempts"] = entry.get("attempts", 0) + 1
         entry["last_status"] = status
     blocked = False

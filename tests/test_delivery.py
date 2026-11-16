@@ -340,7 +340,8 @@ def test_three_queued_advisories_become_one_digest_post():
     assert message["kind"] == "digest"
     assert message["tag"] == "critical"
     assert message["title"] == "CRITICAL: digest of 3 advisories"
-    assert message["ids"] == ["CVE-2026-1", "CVE-2026-2", "CVE-2026-3"]
+    # The delivery window offers a critical advisory first, so it leads the digest; the warnings keep queue order.
+    assert message["ids"] == ["CVE-2026-2", "CVE-2026-1", "CVE-2026-3"]
     assert state["pending"] == []
     assert set(state["seen"]) == {"CVE-2026-1", "CVE-2026-2", "CVE-2026-3"}
     assert all(state["seen"][cve]["outcome"] == "delivered" for cve in state["seen"])
@@ -485,6 +486,83 @@ def test_a_dropped_escalation_is_kept_as_a_dropped_event():
     assert state["seen"] == {}, "a dropped escalation was never sent, so no seen record is invented"
     events = core.delivery_events(state, "CVE-2026-1")
     assert events[0][1]["outcome"] == "dropped" and events[0][1]["delivered_to"] == []
+
+
+def _escalation(cve: str = "CVE-2026-1", tag: str = "critical", thresholds: list[float] | None = None) -> dict:
+    return {
+        "kind": "escalation",
+        "tag": tag,
+        "title": f"{tag.upper()}: {cve} now {tag.upper()}",
+        "body": "",
+        "ids": [cve],
+        "cves": [cve],
+        "levels": {},
+        "scores": {},
+        "thresholds": thresholds or [9.0, 0.10, 4.0],
+        "source": "Vendor",
+        "link": f"https://vendor.example/{cve}",
+    }
+
+
+def test_a_dropped_escalation_leaves_the_watch_at_the_level_the_reader_was_told():
+    """Nothing was sent, so the watch must not record that a critical message was (the escalation branch)."""
+    state = core.new_state()
+    watch = {
+        "since": NOW,
+        "last_eval": NOW,
+        "level": "warning",
+        "judged": "warning",
+        "title": "Vendor",
+        "link": "https://vendor.example/CVE-2026-1",
+        "thresholds": [9.0, 0.10, 4.0],
+    }
+    state["watch"]["CVE-2026-1"] = dict(watch)
+    core._delivered(state, _escalation(thresholds=[7.0, 0.20, 3.0]), NOW, outcome="dropped")
+    assert state["watch"]["CVE-2026-1"] == watch, "level, judgement and rules stay as they were before the drop"
+
+
+def test_a_delivered_escalation_still_advances_the_watch():
+    state = core.new_state()
+    state["watch"]["CVE-2026-1"] = {
+        "since": NOW,
+        "last_eval": NOW,
+        "level": "warning",
+        "judged": "warning",
+        "title": "Vendor",
+        "link": "https://vendor.example/CVE-2026-1",
+        "thresholds": [9.0, 0.10, 4.0],
+    }
+    core._delivered(state, _escalation(thresholds=[7.0, 0.20, 3.0]), NOW, outcome="delivered", delivered_to=["ops"])
+    watch = state["watch"]["CVE-2026-1"]
+    assert (watch["level"], watch["judged"], watch["thresholds"]) == ("critical", "critical", [7.0, 0.20, 3.0])
+
+
+def test_a_dropped_escalation_is_queued_again_by_the_next_rescore():
+    """The operator discarded a message, not the fact: the watch still lacks the escalation, so a re-score owes it."""
+    cve = "CVE-2026-5555"
+    state = core.new_state()
+    state["watch"][cve] = {
+        "since": NOW - 3 * 86400,
+        "last_eval": NOW - 2 * 86400,
+        "level": "warning",
+        "title": "original advisory",
+        "link": "https://vendor.example.com/adv",
+    }
+
+    class Intel:
+        def cves(self, cves, force=False, deferred=None):
+            return {name: core.CveFacts(None, None, None, None, False) for name in cves}
+
+    kev = frozenset({cve})
+    core.reevaluate(state, Intel(), kev, True, NOW, "", thresholds=DEFAULT_THRESHOLDS)
+    (escalation,) = state["pending"]
+    state["pending"].clear()
+    core._delivered(state, escalation, NOW, outcome="dropped")
+    assert state["pending"] == []
+    core.reevaluate(state, Intel(), kev, True, NOW + core.REEVAL_INTERVAL, "", thresholds=DEFAULT_THRESHOLDS)
+    assert [(queued_again["kind"], queued_again["cves"]) for queued_again in state["pending"]] == [
+        ("escalation", [cve])
+    ], "the escalation the operator dropped is owed again"
 
 
 def test_a_failed_digest_marks_one_attempt_per_covered_entry_and_retries_only_the_failing_channel():
@@ -695,3 +773,120 @@ def test_a_shadow_delivery_through_the_log_notifier_is_recorded():
     record = state["seen"]["CVE-2026-1"]
     assert record["outcome"] == "delivered"
     assert state["deliveries"][record["delivery"]]["delivered_to"] == ["shadow"]
+
+
+def test_a_failed_attempt_records_the_failing_status_not_one_a_channel_accepted():
+    """The status the operator sees on a pending message says why it failed, not that another channel took it."""
+    state = core.new_state()
+    state["pending"] = [queued("CVE-2026-1")]
+    accepted, unreachable = Recorder("accepted", status=204), Recorder("unreachable", status=0)
+    assert core.deliver(state, [accepted, unreachable], no_http, NOW) is False
+    entry = state["pending"][0]
+    assert entry["last_status"] == 0, "a network error is the failure; 204 only says another channel accepted"
+    assert entry["sent_to"] == ["accepted"]
+
+
+def test_a_refusal_is_recorded_beside_a_channel_that_accepted():
+    state = core.new_state()
+    state["pending"] = [queued("CVE-2026-1")]
+    accepted, refusing = Recorder("accepted", status=200), Recorder("refusing", status=503)
+    assert core.deliver(state, [accepted, refusing], no_http, NOW) is False
+    assert state["pending"][0]["last_status"] == 503
+
+
+def test_the_grouped_path_records_the_failing_status_too():
+    state = core.new_state()
+    state["pending"] = [queued("CVE-2026-1")]
+    accepted, unreachable = Recorder("accepted", status=204), Recorder("unreachable", status=0)
+    assert core.deliver(state, [accepted, unreachable], no_http, NOW, digest=True) is False
+    assert state["pending"][0]["last_status"] == 0
+
+
+def test_a_parked_message_shows_the_status_of_the_channel_that_failed():
+    state = core.new_state()
+    state["pending"] = [queued("CVE-2026-1")]
+    accepted, unreachable = Recorder("accepted", status=204), Recorder("unreachable", status=0)
+    for attempt in range(core.MAX_DELIVERY_ATTEMPTS):
+        core.deliver(state, [accepted, unreachable], no_http, NOW + attempt)
+    assert state["pending"] == [] and [entry["last_status"] for entry in state["parked"]] == [0]
+
+
+def _titles(recorder: Recorder) -> list[str]:
+    return [message["title"] for message in recorder.sent]
+
+
+def _warnings_then_a_critical() -> dict:
+    """Five warnings queued ahead of one critical advisory: the whole delivery window is already taken."""
+    state = core.new_state()
+    state["pending"] = [queued(f"CVE-2026-{number}") for number in range(1, core.DELIVERY_CAP + 1)]
+    state["pending"].append(queued("CVE-2026-9000", "critical"))
+    return state
+
+
+def test_a_critical_queued_behind_a_full_window_of_warnings_goes_first():
+    state = _warnings_then_a_critical()
+    ops = Recorder()
+    assert core.deliver(state, [ops], no_http, NOW) is True
+    assert ops.sent[0]["tag"] == "critical", "the critical advisory is not made to wait a pass behind the warnings"
+    assert [entry["ids"][0] for entry in state["pending"]] == [f"CVE-2026-{core.DELIVERY_CAP}"], (
+        "the window is still the cap, and the warning left over is the newest one"
+    )
+
+
+def test_the_window_keeps_the_queue_order_within_each_class():
+    state = core.new_state()
+    state["pending"] = [
+        queued("CVE-2026-1"),
+        queued("CVE-2026-2", "critical"),
+        queued("CVE-2026-3"),
+        queued("CVE-2026-4", "critical"),
+    ]
+    ops = Recorder()
+    assert core.deliver(state, [ops], no_http, NOW) is True
+    assert [message["ids"][0] for message in ops.sent] == ["CVE-2026-2", "CVE-2026-4", "CVE-2026-1", "CVE-2026-3"]
+
+
+def test_the_stored_queue_is_not_reordered_by_the_window():
+    state = core.new_state()
+    state["pending"] = [queued("CVE-2026-1"), queued("CVE-2026-2", "critical"), queued("CVE-2026-3")]
+    ops = Recorder(status=500)  # nothing is accepted, so every entry stays queued
+    assert core.deliver(state, [ops], no_http, NOW) is False
+    assert [entry["ids"][0] for entry in state["pending"]] == ["CVE-2026-1", "CVE-2026-2", "CVE-2026-3"]
+
+
+class _RefusesWarnings(Recorder):
+    """A channel that rejects one message by its content, as an endpoint with a length or format limit does."""
+
+    def send(self, entry: dict, http) -> int:
+        super().send(entry, http)
+        return 400 if entry["tag"] == "warning" else 200
+
+
+def test_a_refused_warning_at_the_head_does_not_stop_the_critical_behind_it():
+    state = core.new_state()
+    state["pending"] = [queued("CVE-2026-1"), queued("CVE-2026-2", "critical")]
+    ops = _RefusesWarnings()
+    assert core.deliver(state, [ops], no_http, NOW) is False
+    assert [message["tag"] for message in ops.sent] == ["critical", "warning"]
+    assert state["seen"]["CVE-2026-2"]["outcome"] == "delivered", (
+        "the critical was tried before the refusal stopped the pass"
+    )
+    assert [entry["ids"][0] for entry in state["pending"]] == ["CVE-2026-1"]
+
+
+def test_a_critical_behind_a_full_window_goes_first_when_quiet_hours_are_set_but_closed():
+    state = _warnings_then_a_critical()
+    ops = Recorder()
+    window = delivery.parse_quiet_hours("22:00-07:00")
+    assert core.deliver(state, [ops], no_http, local_at(12), quiet_hours=window) is True
+    assert ops.sent[0]["tag"] == "critical"
+    assert len(state["pending"]) == 1
+
+
+def test_a_critical_behind_a_full_window_goes_first_in_a_digest():
+    state = _warnings_then_a_critical()
+    ops = Recorder()
+    assert core.deliver(state, [ops], no_http, NOW, digest=True) is True
+    assert len(ops.sent) == 1 and ops.sent[0]["ids"][0] == "CVE-2026-9000"
+    assert len(ops.sent[0]["ids"]) == core.DELIVERY_CAP, "the cap still bounds what one pass covers"
+    assert len(state["pending"]) == 1

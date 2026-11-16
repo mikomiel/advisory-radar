@@ -7,6 +7,7 @@ import ipaddress
 import json
 import logging
 import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,7 +22,17 @@ Http = Callable[[str, str, Mapping[str, str], bytes | None], tuple[int, dict[str
 
 #: urllib buffers at most this many bytes plus one, so no response exhausts memory.
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+#: The longest one socket operation (connect, send, a single read) may wait.
 HTTP_TIMEOUT = 30
+#: How long a response body may take to arrive, counted from just before the connection attempt. The timeout above
+#: bounds one operation, so a peer that sends a byte every few seconds never trips it and could hold a pass, and
+#: the state lock around it, for as long as it likes. The deadline is enforced only between body reads, never
+#: during the connect or the wait for the headers: a request already waiting inside one read can end up to
+#: ``HTTP_TIMEOUT`` later than this, and a peer that dribbles its headers is held back only by ``HTTP_TIMEOUT`` on
+#: each wait and ended at the first body read after the deadline.
+HTTP_DEADLINE = 120
+#: One read of a body. Small enough that the deadline is checked often, large enough not to cost many calls.
+_READ_CHUNK = 64 * 1024
 
 
 #: Longest message one finished log record may carry. Identities come from a feed, so a publisher can otherwise
@@ -111,6 +122,26 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirects)
 
 
+def _read_within(response, limit: int, deadline: float) -> bytes:
+    """At most ``limit`` bytes of a response body, or ``TimeoutError`` once the monotonic ``deadline`` has passed.
+
+    ``read(n)`` keeps reading until it has ``n`` bytes or the peer closes, however many socket operations that
+    takes, so a peer that dribbles bytes is never stopped by the per-operation timeout. ``read1`` returns after
+    at most one underlying read, which is what lets the deadline be checked between reads.
+    """
+    chunks: list[bytes] = []
+    remaining = limit
+    while remaining > 0:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("the response body did not finish before the deadline")
+        chunk = response.read1(min(_READ_CHUNK, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
 def urllib_http(
     method: str, url: str, headers: Mapping[str, str], body: bytes | None
 ) -> tuple[int, dict[str, str], bytes]:
@@ -124,17 +155,22 @@ def urllib_http(
         # ``urllib`` opens its other handlers too -- ``file://`` would read a local file as a feed. Every source
         # and notifier this program talks to is HTTP(S), so any other scheme is a refused request, not a fetch.
         return 0, {}, b""
+    # Taken before the connection is opened, so the time spent connecting and waiting for the headers counts
+    # against it, although nothing checks it until the body is being read.
+    deadline = time.monotonic() + HTTP_DEADLINE
     try:
         # Built inside the guard: a malformed URL raises a ValueError whose text carries the URL, and a URL
         # can carry a token.
         request = urllib.request.Request(url, data=body, headers={"User-Agent": USER_AGENT, **headers}, method=method)
         with _OPENER.open(request, timeout=HTTP_TIMEOUT) as response:
-            return response.status, dict(response.headers), response.read(MAX_RESPONSE_BYTES + 1)
+            # A body that outlasts the deadline is a network error like any other (``TimeoutError`` is an
+            # ``OSError``): no partial body is returned, because a truncated document is not the document.
+            return response.status, dict(response.headers), _read_within(response, MAX_RESPONSE_BYTES + 1, deadline)
     except urllib.error.HTTPError as exc:
         try:
-            payload = exc.read(MAX_RESPONSE_BYTES + 1)
+            payload = _read_within(exc, MAX_RESPONSE_BYTES + 1, deadline)
         except (OSError, http.client.HTTPException):
-            payload = b""
+            payload = b""  # the refusal's status is still the answer; only its body was lost
         return exc.code, dict(exc.headers or {}), payload
     except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
         # The exception text may carry the URL, and the URL may carry a token.

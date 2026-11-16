@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import datetime
+import time
+
 import pytest
 
 from advisory_radar import feeds
@@ -492,3 +495,152 @@ def test_feed_text_utf8_cannot_encode_is_replaced_rather_than_raised():
     export = feeds.parse_json_feed(document)
     export.items[0].title.encode("utf-8")
     assert "advisory" in export.items[0].title
+
+
+# --- bounds on what a publisher can make this reader spend --------------------------------------------
+
+#: The documented size cap (docs/sources.md), spelled out so that changing it means changing the docs too.
+FEED_CAP = 8 * 1024 * 1024
+
+
+def _padded(document: bytes, size: int) -> bytes:
+    """``document`` followed by whitespace up to ``size`` bytes: still the same well-formed feed."""
+    return document + b" " * (size - len(document))
+
+
+def _atom_with_content(content: bytes) -> bytes:
+    return (
+        b'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><title>Vendor</title>'
+        b"<entry><id>urn:uuid:1</id><title>Security advisory</title>"
+        b'<content type="xhtml">' + content + b"</content></entry></feed>"
+    )
+
+
+def test_the_feed_size_cap_is_the_documented_one():
+    assert feeds.MAX_FEED_BYTES == FEED_CAP
+
+
+@pytest.mark.parametrize("document", [RSS, JSON_FEED, ATOM], ids=["rss", "json-feed", "atom"])
+def test_parse_any_refuses_a_feed_over_the_size_cap(document):
+    """An XML tree costs many times its source in memory, and the transport only stops a body at 64 MiB."""
+    with pytest.raises(feeds.FeedError, match="larger than 8 MiB"):
+        feeds.parse_any(_padded(document, FEED_CAP + 1))
+
+
+@pytest.mark.parametrize("document", [RSS, JSON_FEED], ids=["rss", "json-feed"])
+def test_parse_any_reads_a_feed_of_exactly_the_size_cap(document):
+    assert feeds.parse_any(_padded(document, FEED_CAP)).items
+
+
+def test_fetch_any_refuses_an_oversized_answer_before_parsing_it():
+    """The size check precedes the HTML sniff, which would otherwise parse the whole body as XML first."""
+
+    def http(method, url, headers, body):
+        return 200, {"ETag": '"big"'}, _padded(RSS, FEED_CAP + 1)
+
+    with pytest.raises(feeds.FeedError, match="larger than 8 MiB"):
+        feeds.fetch_any(http, "https://vendor.example.com/feed.xml")
+
+
+def test_fetch_any_refuses_an_oversized_page_instead_of_discovering_a_feed_in_it(monkeypatch):
+    monkeypatch.setattr(feeds, "private_destination", lambda url: False)  # keeps the test off real DNS
+    calls = []
+
+    def http(method, url, headers, body):
+        calls.append(url)
+        return 200, {}, _padded(PAGE, FEED_CAP + 1)
+
+    with pytest.raises(feeds.FeedError, match="larger than 8 MiB"):
+        feeds.fetch_any(http, PAGE_URL)
+    assert calls == [PAGE_URL], "no hop is made from a page this reader refuses to open"
+
+
+def test_fetch_any_refuses_an_oversized_feed_behind_the_autodiscovery_hop(monkeypatch):
+    monkeypatch.setattr(feeds, "private_destination", lambda url: False)
+
+    def http(method, url, headers, body):
+        if url == PAGE_URL:
+            return 200, {}, PAGE
+        return 200, {}, _padded(RSS, FEED_CAP + 1)
+
+    with pytest.raises(feeds.FeedError, match="larger than 8 MiB"):
+        feeds.fetch_any(http, PAGE_URL)
+
+
+def test_markup_nested_too_deeply_is_a_feed_error_not_a_recursion_error():
+    """The text walk recurses once per level, so a tiny entry could end it with ``RecursionError``."""
+    deep = _atom_with_content(b"<div>" * 5000 + b"x" + b"</div>" * 5000)
+    for reader in (feeds.parse_rss, feeds.parse_any):
+        with pytest.raises(feeds.FeedError, match="nested too deeply"):
+            reader(deep)
+
+
+def test_markup_nested_to_the_depth_limit_is_still_read():
+    depth = feeds.MAX_XML_DEPTH
+    content = b"<div>" * depth + b"x" + b"</div>" * depth
+    assert feeds.parse_rss(_atom_with_content(content)).items[0].summary == "x"
+    with pytest.raises(feeds.FeedError, match="nested too deeply"):
+        feeds.parse_rss(_atom_with_content(b"<div>" + content + b"</div>"))
+
+
+def test_an_opml_document_nested_too_deeply_is_a_feed_error_not_a_recursion_error():
+    """The import form answers a ``FeedError`` with a 400; a ``RecursionError`` would be a 500."""
+    document = b'<opml version="2.0"><body>' + b"<outline>" * 5000 + b"</outline>" * 5000 + b"</body></opml>"
+    with pytest.raises(feeds.FeedError, match="nested too deeply"):
+        feeds.parse_opml(document)
+
+
+# --- dates that name no zone ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def host_zone(monkeypatch):
+    """The host's local zone set to UTC+5, so a date read in local time differs from the same date read as UTC.
+
+    A POSIX ``TZ`` string needs no tz database. ``tzset`` is what makes the C library re-read it.
+    """
+    if not hasattr(time, "tzset"):
+        pytest.skip("this platform cannot change its local zone")
+    monkeypatch.setenv("TZ", "ABC-5")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+def _utc(year, month, day, hour=0, minute=0):
+    return int(datetime.datetime(year, month, day, hour, minute, tzinfo=datetime.UTC).timestamp())
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2026-10-21T10:00:00", _utc(2026, 10, 21, 10)),  # ISO 8601 without an offset
+        ("2026-10-21", _utc(2026, 10, 21)),  # a bare date
+        ("Wed, 21 Oct 2026 10:00:00", _utc(2026, 10, 21, 10)),  # RFC 822 without a zone
+        ("Wed, 21 Oct 2026 10:00:00 -0000", _utc(2026, 10, 21, 10)),  # RFC 2822 "UTC, zone unknown"
+    ],
+)
+def test_a_date_that_names_no_zone_is_read_as_utc_whatever_the_host_zone(host_zone, raw, expected):
+    """The host's zone says nothing about the publisher's: reading it that way moves the date by the offset, and
+    a first-sight item near the backlog age then flips between alert and history depending on where this runs."""
+    assert feeds._epoch_of(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2026-10-21T10:00:00Z", _utc(2026, 10, 21, 10)),
+        ("2026-10-21T10:00:00+02:00", _utc(2026, 10, 21, 8)),
+        ("Wed, 21 Oct 2026 10:00:00 +0000", _utc(2026, 10, 21, 10)),
+        ("Wed, 21 Oct 2026 10:00:00 EST", _utc(2026, 10, 21, 15)),
+    ],
+)
+def test_a_date_that_names_its_zone_keeps_it_whatever_the_host_zone(host_zone, raw, expected):
+    assert feeds._epoch_of(raw) == expected
+
+
+def test_an_atom_entry_without_an_offset_is_published_at_the_utc_time(host_zone):
+    atom = ATOM.replace(b"<published>2026-10-21T10:00:00Z</published>", b"<published>2026-10-21T10:00:00</published>")
+    assert atom != ATOM, "the fixture must have changed"
+    assert feeds.parse_rss(atom).items[0].published == _utc(2026, 10, 21, 10)

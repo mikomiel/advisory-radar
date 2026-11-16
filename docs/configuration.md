@@ -124,6 +124,10 @@ what you were actually told
 apart from what the numbers now say, so a KEV hit or a CISA active flag that arrives later
 still escalates — that is evidence, not a rule.
 
+An escalation counts as told only when a channel accepted it. If the message is dropped
+instead, the entry keeps the level you were last told, so the next daily re-evaluation queues
+the escalation again for as long as the CVE is watched.
+
 `/thresholds`, linked from `/config`, previews one advisory: give it a CVSS, an EPSS, its
 KEV and SSVC state, a source, a product and the advisory's identifiers, and it shows the
 level, the reason, the exact metrics line and note the message would carry, and which route
@@ -230,6 +234,13 @@ so the Settings form on `/config` changes them without a restart.
 A `log` notifier (`type: log`) needs no url or secret. It writes each message to the application log
 and delivers nothing, but it reports success, so the state records every message as delivered. Use it
 for a shadow run: the instance evaluates what it would send before real channels are configured.
+
+A pass delivers a bounded number of queued advisories. When more are queued than that, it takes
+the critical ones first and fills the rest of its window in queue order, so a long queue of
+warnings cannot hold a critical advisory behind the limit, and a warning that a channel refuses
+cannot stop the pass before a critical one has been tried. A digest is built from the same
+window. The stored queue keeps its order, and a queue with no critical advisory is delivered
+exactly as before.
 
 A generic `webhook` notifier may carry a signing secret, referenced from the environment:
 
@@ -443,6 +454,27 @@ document read through the configured store into another one, and prints both sto
 the URL, which can carry a password. It refuses a target that already holds a document, so a
 wrong `--to` cannot overwrite a live state, and it leaves the source in place: set `storage:`
 to the new store and restart once the copy looks right.
+
+## First sight, backlog and outages
+
+A source is bootstrapped the first time it answers, once per source: an item published within
+the last day is queued as news, and everything older is recorded as `backlog` and never alerted,
+so installing the program or adding a feed does not replay its history. An item with no date is
+unknown rather than old, so it is queued. A source that was down on the first pass is
+bootstrapped when it first answers.
+
+After that, an item the state has never seen is news unless it is already old: one first seen
+more than 7 days after its publication date is recorded as `backlog` too, and never alerted.
+
+An outage changes that rule. A source that could not be read for longer than 7 days returns,
+once it recovers, the advisories published while it was down, and age alone would file every
+one of them as history. So the pass compares the item with the source's last successful read:
+an item is `backlog` only when it is older than 7 days **and** was published more than one day
+before that read. Anything newer was not in a window an earlier pass read, so it is alerted
+however old it now is. The day covers a publisher that dates an entry slightly before the pass
+that first listed it. A source that has never been read successfully, or that was removed or
+disabled and later brought back (its health record is dropped while it does not run), keeps the
+plain 7-day rule, and an item carried over from an earlier pass is never history.
 
 ## Gap detection
 
