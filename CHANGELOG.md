@@ -11,6 +11,13 @@ release decision: the `vX.Y.Z` tag it creates is what builds and publishes
 section by hand -- [CONTRIBUTING.md](CONTRIBUTING.md#releases) owns the release
 boundary.
 
+## [0.3.1](https://github.com/mikomiel/advisory-radar/compare/v0.3.0...v0.3.1) (2026-11-15)
+
+
+### Fixed
+
+* **web:** keep store errors out of /readyz and escape revision banners ([#129](https://github.com/mikomiel/advisory-radar/issues/129)) ([55a24bc](https://github.com/mikomiel/advisory-radar/commit/55a24bc438b1fa49ec5fa62d2017b6880f5fdf27))
+
 ## [0.3.0](https://github.com/mikomiel/advisory-radar/compare/v0.2.2...v0.3.0) (2026-11-13)
 
 
