@@ -6,6 +6,7 @@ import hashlib
 import logging
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import replace
 
 from . import core, watchlist
 from .config import Config, secret_values
@@ -121,16 +122,7 @@ def _namespaced(item: core.Item, source_id: str) -> core.Item:
     would let two distinct advisories share one identity, and the second would look already claimed and be
     dropped silently.
     """
-    return core.Item(
-        f"{source_id}:{item.guid}",
-        item.title,
-        item.link,
-        item.summary,
-        item.published,
-        item.explicit,
-        item.source_title,
-        item.source_url,
-    )
+    return replace(item, guid=f"{source_id}:{item.guid}")
 
 
 def _source_windows(state: dict) -> dict:

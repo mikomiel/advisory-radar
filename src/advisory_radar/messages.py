@@ -2,9 +2,9 @@
 
 ``language`` in ``config.yml`` picks the language of every human-readable string the product writes into a
 notification: the level word of a title, the labels of the fact list, the notes that explain a verdict, the
-action line, the digest wording, the Adobe bulletin messages and the ``test-notify`` message. Text that came
-from a feed or a vendor page is never translated: it is not in the catalogue and passes through unchanged. The
-web UI is English whatever the setting.
+action line, the digest wording, the Adobe bulletin messages, the words the service itself writes for a changed
+web page and the ``test-notify`` message. Text that came from a feed or a vendor page is never translated: it
+is not in the catalogue and passes through unchanged. The web UI is English whatever the setting.
 
 The routing tag a notifier receives (``critical`` or ``warning``) is not text. ``routing`` matches on it, so it
 stays English in every language and only the ``level.*`` words a reader sees are translated.
@@ -66,6 +66,13 @@ _EN = {
     # The excerpt of a release item that its source page enriched; the versions or lines follow.
     "excerpt.php": "PHP security release; fixed versions: {versions}",
     "excerpt.nodejs": "Node.js security release; lines: {lines}",
+    # The words the service writes for a changed web page, when the page has no text of its own to show: the
+    # summary of a changedetection.io watch, and the title and summary of a webhook payload that names no watch
+    # or carries no diff. An item stores the key and its fields, so the language is chosen when the message is
+    # written, not when the source is read.
+    "item.summary.page_changed": "Page changed (last_changed={changed}).",
+    "item.summary.no_diff": "page changed",
+    "item.title.change": "change",
     # A digest. The title is ``<LEVEL>: <this>``; the count picks the singular or the plural form.
     "digest.title.one": "digest of {count} advisory",
     "digest.title.other": "digest of {count} advisories",
@@ -114,7 +121,7 @@ _PL = {
         "**Działanie:** jeśli wersja z biuletynu jest już wdrożona, nic do zrobienia; jeśli nie, załataj priorytetowo."
     ),
     "metrics.none": "brak",
-    "metrics.cvss_approximate": "{score} (etykieta OSV, przybliżone)",
+    "metrics.cvss_approximate": "{score} (etykieta OSV, ocena przybliżona)",
     "judge.unknown": "nieznana (brak identyfikatora CVE i brak oceny w OSV)",
     "judge.ghsa_severity": "ważność GHSA wg OSV {score} (przybliżona); {line}",
     "judge.more_cves": "{cve}: {line} (+{count} CVE więcej)",
@@ -131,11 +138,14 @@ _PL = {
         "Zmiana: pojawiła się ocena CVSS ≥ {cvss} dla ataku zdalnego bez logowania i bez udziału użytkownika."
     ),
     "escalation.heading": "{cve} teraz {level}",
-    "escalation.before.suppressed": "zapisane jako LOW i niewysłane",
+    "escalation.before.suppressed": "zapisane z niską ważnością i niewysłane",
     "escalation.before.sent": "wysłane jako ostrzeżenie",
     "escalation.excerpt": "Wcześniej {before} ({day}): {title}",
     "excerpt.php": "Wydanie bezpieczeństwa PHP; poprawione wersje: {versions}",
     "excerpt.nodejs": "Wydanie bezpieczeństwa Node.js; linie: {lines}",
+    "item.summary.page_changed": "Strona uległa zmianie (last_changed={changed}).",
+    "item.summary.no_diff": "strona uległa zmianie",
+    "item.title.change": "zmiana",
     # "zestawienie" takes the genitive: one form for a single advisory, one for every other count.
     "digest.title.one": "zestawienie {count} biuletynu",
     "digest.title.other": "zestawienie {count} biuletynów",

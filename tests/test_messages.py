@@ -10,6 +10,7 @@ notifier routes on it and it must stay English.
 from __future__ import annotations
 
 import json
+import logging
 import string
 from pathlib import Path
 
@@ -19,13 +20,20 @@ from advisory_radar import adobe, cli, core, delivery, messages, pipeline
 from advisory_radar.config import DEFAULT_THRESHOLDS, ConfigError, load_config
 from advisory_radar.runtime import Runtime
 from advisory_radar.settings import save_settings, settings_path
-from advisory_radar.sources import RssSource
+from advisory_radar.sources import ChangedetectionSource, RssSource, WebhookSource, webhook_item_from_payload
 from advisory_radar.state import save_state
 from advisory_radar.watchlist import load_policy
 
 NOW = 1792600000  # 2026-10-21 16:26:40 UTC
 DAY = 86400
 FEED_URL = "https://feeds.example.com/rss"
+RSS_SOURCE = f"  - id: test\n    type: rss\n    url: {FEED_URL}\n"
+CD_URL = "https://changes.example.net"
+CD_SOURCE = f"  - id: cd\n    type: changedetection\n    url: {CD_URL}\n    api_key: k\n"
+WEBHOOK_SOURCE = "  - id: wh\n    type: webhook\n"
+#: When the watch last changed: an hour ago, so the item is news and not history.
+CHANGED = NOW - 3600
+SHOP = "https://shop.example.com/item"
 #: A vector with AV:N, PR:N and UI:N, which makes a CVSS of 9.0 or more critical by the remote rule.
 REMOTE = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N"
 LOCAL = "CVSS:3.1/AV:L/AC:L/PR:L/UI:N"
@@ -39,8 +47,11 @@ ADOBE_PAGE = "https://helpx.adobe.com/security/products/magento/"
 # --- helpers ---------------------------------------------------------------------------------
 
 
-def write_config(tmp_path: Path, extra: str = "", notifiers: str = ONE_NOTIFIER) -> Path:
-    """A one-source configuration (and the watchlist it names); ``extra`` is appended as top-level YAML."""
+def write_config(tmp_path: Path, extra: str = "", notifiers: str = ONE_NOTIFIER, source: str = RSS_SOURCE) -> Path:
+    """A one-source configuration (and the watchlist it names); ``extra`` is appended as top-level YAML.
+
+    The source is the RSS feed unless ``source`` is another YAML list entry.
+    """
     (tmp_path / "watchlist.json").write_text(
         json.dumps(
             {
@@ -53,8 +64,7 @@ def write_config(tmp_path: Path, extra: str = "", notifiers: str = ONE_NOTIFIER)
     )
     path = tmp_path / "config.yml"
     path.write_text(
-        f"sources:\n  - id: test\n    type: rss\n    url: {FEED_URL}\n{notifiers}"
-        f"state_path: {tmp_path}/state.json\nwatchlist: {tmp_path}/watchlist.json\n{extra}"
+        f"sources:\n{source}{notifiers}state_path: {tmp_path}/state.json\nwatchlist: {tmp_path}/watchlist.json\n{extra}"
     )
     return path
 
@@ -135,6 +145,42 @@ def lines(*parts: str) -> str:
     return "\n".join(("", *parts))
 
 
+def serve_watch(changed: int = CHANGED):
+    """changedetection.io answering one watch that last changed at ``changed``; ``serve`` answers the rest."""
+    rest = serve(b"")
+
+    def http(method, url, headers, payload):
+        if url.startswith(f"{CD_URL}/api/v1/watch"):
+            watch = {
+                "uuid": "uuid-1",
+                "title": "Shop item",
+                "link": SHOP,
+                "paused": False,
+                "notification_muted": False,
+                "last_changed": changed,
+            }
+            return 200, {}, json.dumps({"uuid-1": watch}).encode()
+        return rest(method, url, headers, payload)
+
+    return http
+
+
+def run_sources(cfg, sources, http, notifier: Notifier) -> int:
+    return pipeline.run_pass(cfg, sources, [notifier], http=http, clock=lambda: float(NOW), sleep=lambda s: None)
+
+
+def webhook_pass(tmp_path: Path, language: str, entries: list[dict]) -> Notifier:
+    """One pass over a webhook inbox that holds ``entries``, saved to the state file as the intake saves them."""
+    cfg = load_config(write_config(tmp_path, f"language: {language}\n", source=WEBHOOK_SOURCE), {})
+    state = core.new_state()
+    state["seeded"] = {"wh": True}
+    state["webhook_inbox"] = {"wh": entries}
+    save_state(cfg.state_path, state)
+    notifier = Notifier()
+    assert run_sources(cfg, [WebhookSource("wh")], serve(b""), notifier) == 0
+    return notifier
+
+
 CRITICAL_PL = lines(
     "- **Ważność:** CVSS 9.8 · EPSS 0.50 (p99) · SSVC brak",
     "- **Identyfikatory:** CVE-2026-4242",
@@ -209,6 +255,97 @@ ADOBE_KEV_PL = lines(
     "",
     f"- **Biuletyn:** <{ADOBE_PAGE}apsb26-01.html>",
 )
+# The words a source writes itself. The excerpt is escaped like every excerpt, so ``_`` and the brackets carry a
+# backslash. None of these items names a CVE, so each is a warning of unknown severity.
+PAGE_CHANGE_EN = lines(
+    "- **Severity:** unknown (no CVE id and no OSV score)",
+    "- **Published:** 2026-10-21",
+    "",
+    f"> Page changed \\(last\\_changed={CHANGED}\\).",
+    "",
+    "**Action:** check whether the vulnerable version is deployed.",
+    "",
+    f"- **Advisory:** <{SHOP}>",
+    f"- **Source:** Shop item — <{SHOP}>",
+)
+PAGE_CHANGE_PL = lines(
+    "- **Ważność:** nieznana (brak identyfikatora CVE i brak oceny w OSV)",
+    "- **Opublikowano:** 2026-10-21",
+    "",
+    f"> Strona uległa zmianie \\(last\\_changed={CHANGED}\\).",
+    "",
+    "**Działanie:** sprawdź, czy wdrożono podatną wersję.",
+    "",
+    f"- **Biuletyn:** <{SHOP}>",
+    f"- **Źródło:** Shop item — <{SHOP}>",
+)
+#: A native webhook payload with a title and a URL but no diff.
+NO_DIFF_EN = lines(
+    "- **Severity:** unknown (no CVE id and no OSV score)",
+    "",
+    "> page changed",
+    "",
+    "**Action:** check whether the vulnerable version is deployed.",
+    "",
+    f"- **Advisory:** <{SHOP}>",
+    f"- **Source:** changedetection.io — <{SHOP}>",
+)
+NO_DIFF_PL = lines(
+    "- **Ważność:** nieznana (brak identyfikatora CVE i brak oceny w OSV)",
+    "",
+    "> strona uległa zmianie",
+    "",
+    "**Działanie:** sprawdź, czy wdrożono podatną wersję.",
+    "",
+    f"- **Biuletyn:** <{SHOP}>",
+    f"- **Źródło:** changedetection.io — <{SHOP}>",
+)
+#: A native webhook payload with no diff, no title and no URL.
+NO_TITLE_EN = lines(
+    "- **Severity:** unknown (no CVE id and no OSV score)",
+    "",
+    "> page changed",
+    "",
+    "**Action:** check whether the vulnerable version is deployed.",
+    "",
+    "- **Source:** changedetection.io",
+)
+NO_TITLE_PL = lines(
+    "- **Ważność:** nieznana (brak identyfikatora CVE i brak oceny w OSV)",
+    "",
+    "> strona uległa zmianie",
+    "",
+    "**Działanie:** sprawdź, czy wdrożono podatną wersję.",
+    "",
+    "- **Źródło:** changedetection.io",
+)
+#: The escalation of an advisory that was measured LOW, so it was recorded and never sent.
+FROM_SUPPRESSED_EN = lines(
+    "- **Severity:** CVSS 3.0 · EPSS 0.01 (p30) · SSVC none · KEV",
+    "- **IDs:** CVE-2026-4242",
+    "- **Note:** Change: CVE added to the CISA KEV catalog (exploited in the wild).",
+    "",
+    "> Previously recorded as LOW and not sent \\(2026-10-21\\): Vendor advisory CVE-2026-4242",
+    "",
+    "**Action:** if the advisory version is already deployed, nothing to do; otherwise patch promptly.",
+    "",
+    "- **Advisory:** <https://vendor.example.com/a1>",
+)
+FROM_SUPPRESSED_PL = lines(
+    "- **Ważność:** CVSS 3.0 · EPSS 0.01 (p30) · SSVC brak · KEV",
+    "- **Identyfikatory:** CVE-2026-4242",
+    "- **Uwaga:** Zmiana: CVE trafiło do katalogu CISA KEV (wykorzystywane w praktyce).",
+    "",
+    "> Wcześniej zapisane z niską ważnością i niewysłane \\(2026-10-21\\): Vendor advisory CVE-2026-4242",
+    "",
+    "**Działanie:** jeśli wersja z biuletynu jest już wdrożona, nic do zrobienia; jeśli nie, załataj priorytetowo.",
+    "",
+    "- **Biuletyn:** <https://vendor.example.com/a1>",
+)
+PAGE_CHANGE = [
+    ("en", "WARNING: Shop item — changedetection.io", PAGE_CHANGE_EN),
+    ("pl", "OSTRZEŻENIE: Shop item — changedetection.io", PAGE_CHANGE_PL),
+]
 
 
 # --- the catalogue ---------------------------------------------------------------------------
@@ -460,6 +597,108 @@ def test_the_routing_tag_stays_english_so_a_tag_route_still_matches(tmp_path):
     ]
 
 
+@pytest.mark.parametrize(("language", "title", "body"), PAGE_CHANGE, ids=["en", "pl"])
+def test_a_polled_page_change_speaks_the_configured_language(tmp_path, language, title, body):
+    """The summary of a changedetection.io change is the service's own text; the watch title is the sender's."""
+    cfg = load_config(write_config(tmp_path, f"language: {language}\n", source=CD_SOURCE), {})
+    notifier = Notifier()
+    assert run_sources(cfg, [ChangedetectionSource("cd", CD_URL, "k")], serve_watch(), notifier) == 0
+    assert one_message(notifier) == ("warning", title, body)
+
+
+@pytest.mark.parametrize(("language", "title", "body"), PAGE_CHANGE, ids=["en", "pl"])
+def test_a_carried_page_change_keeps_the_words_the_source_wrote(tmp_path, language, title, body):
+    """A candidate left for a later pass is stored as JSON; what makes its summary translatable must survive that."""
+    source = ChangedetectionSource("cd", CD_URL, "k")
+    [item] = source.fetch(serve_watch(), {}).items
+    cfg = load_config(write_config(tmp_path, f"language: {language}\n", source=CD_SOURCE), {})
+    state = core.new_state()
+    state["seeded"] = {"cd": True}
+    state["carry"] = {"cd": [core.item_to_state(item)]}
+    state["changedetection"] = {"cd": {"uuid-1": CHANGED}}  # nothing new to poll: only the carried row is left
+    save_state(cfg.state_path, state)
+    notifier = Notifier()
+    assert run_sources(cfg, [source], serve_watch(), notifier) == 0
+    assert one_message(notifier) == ("warning", title, body)
+
+
+@pytest.mark.parametrize(
+    ("language", "payload", "title", "body"),
+    [
+        ("en", {"watch_uuid": "u1", "watch_title": "Shop", "watch_url": SHOP}, "WARNING: Shop", NO_DIFF_EN),
+        ("pl", {"watch_uuid": "u1", "watch_title": "Shop", "watch_url": SHOP}, "OSTRZEŻENIE: Shop", NO_DIFF_PL),
+        ("en", {"watch_uuid": "u2"}, "WARNING: change", NO_TITLE_EN),
+        ("pl", {"watch_uuid": "u2"}, "OSTRZEŻENIE: zmiana", NO_TITLE_PL),
+    ],
+    ids=["no-diff-en", "no-diff-pl", "no-title-en", "no-title-pl"],
+)
+def test_a_native_webhook_change_speaks_the_configured_language(tmp_path, language, payload, title, body):
+    """With no diff, or with neither a watch title nor a URL, the words are the service's and not the sender's."""
+    notifier = webhook_pass(tmp_path, language, [webhook_item_from_payload(payload)])
+    assert one_message(notifier) == ("warning", title, body)
+
+
+@pytest.mark.parametrize(("language", "title"), [("en", "WARNING: change"), ("pl", "OSTRZEŻENIE: change")])
+def test_sender_words_that_equal_the_services_own_are_not_translated(tmp_path, language, title):
+    """The marker says who wrote the words; the words themselves decide nothing."""
+    payload = {"watch_uuid": "u3", "watch_title": "change", "diff": "page changed"}
+    notifier = webhook_pass(tmp_path, language, [webhook_item_from_payload(payload)])
+    tag, sent_title, body = one_message(notifier)
+    assert (tag, sent_title) == ("warning", title)
+    assert "> page changed" in body.splitlines()
+
+
+def test_an_inbox_entry_stored_before_the_marker_existed_keeps_its_stored_words(tmp_path):
+    """An earlier version stored the English words and no marker: the entry is read as stored, never guessed at."""
+    legacy = {
+        "guid": "wh:cd:legacy",
+        "title": "Shop",
+        "link": SHOP,
+        "summary": "page changed",
+        "source_title": "changedetection.io",
+        "source_url": SHOP,
+    }
+    tag, title, body = one_message(webhook_pass(tmp_path, "pl", [legacy]))
+    assert (tag, title) == ("warning", "OSTRZEŻENIE: Shop")
+    assert "> page changed" in body.splitlines()
+
+
+def test_a_stored_marker_this_version_cannot_write_is_ignored(tmp_path, caplog):
+    """State may come from another version or a hand edit: a key the catalogue lacks must not fail every pass."""
+    entry = {
+        **webhook_item_from_payload({"watch_uuid": "u1", "watch_title": "Shop", "watch_url": SHOP}),
+        "title_key": "item.title.retired",
+        "summary_key": "item.summary.retired",
+    }
+    caplog.set_level(logging.WARNING, logger="advisory_radar")
+    tag, title, body = one_message(webhook_pass(tmp_path, "pl", [entry]))
+    assert (tag, title) == ("warning", "OSTRZEŻENIE: Shop")
+    assert "> page changed" in body.splitlines()
+    assert "cannot write" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("language", "title", "body"),
+    [
+        ("en", "CRITICAL: CVE-2026-4242 now CRITICAL", FROM_SUPPRESSED_EN),
+        ("pl", "KRYTYCZNE: CVE-2026-4242 teraz krytyczne", FROM_SUPPRESSED_PL),
+    ],
+    ids=["en", "pl"],
+)
+def test_an_escalation_of_a_suppressed_advisory_in_each_language(tmp_path, language, title, body):
+    cfg = load_config(write_config(tmp_path, f"language: {language}\n"), {})
+    advisory, intel = feed(("a1", "CVE-2026-4242")), {"CVE-2026-4242": (3.0, LOCAL, "0.01", "0.30")}
+    notifier = Notifier()
+    assert run_pass(cfg, serve(advisory, intel), notifier) == 0
+    # A completely measured LOW advisory is recorded and watched, never sent.
+    assert notifier.sent == []
+    assert cfg.store().load()["watch"]["CVE-2026-4242"]["level"] == "suppressed"
+    # Two days later CISA lists the CVE: the reader who was never told about it is told now.
+    assert run_pass(cfg, serve(advisory, intel, kev=("CVE-2026-4242",)), notifier, now=NOW + 2 * DAY) == 0
+    [escalation] = notifier.sent
+    assert (escalation["tag"], escalation["title"], escalation["body"]) == ("critical", title, body)
+
+
 # --- the rest of the Polish text, one branch at a time ---------------------------------------
 
 
@@ -519,7 +758,7 @@ def test_a_long_id_list_the_published_day_a_note_and_a_source_in_polish(monkeypa
             {},
             (
                 "warning",
-                "CVSS 6.0 (etykieta OSV, przybliżone) · EPSS brak · SSVC brak",
+                "CVSS 6.0 (etykieta OSV, ocena przybliżona) · EPSS brak · SSVC brak",
                 "Niepełne dane o ważności; traktowane jako nieznane.",
             ),
         ),
@@ -720,3 +959,65 @@ def test_a_polish_digest_that_hits_the_character_budget_still_fits_it():
     listed = [line for line in message["body"].splitlines() if line.startswith("- **")]
     assert 0 < len(listed) < len(crowded)
     assert message["body"].splitlines()[-1] == f"(+{len(crowded) - len(listed)} więcej poza listą)"
+
+
+# --- what an item and its stored row hold ----------------------------------------------------
+
+
+def test_the_catalogue_writes_the_words_the_sources_stored_before_the_option_existed():
+    assert (
+        messages.text("en", "item.summary.page_changed", changed=CHANGED) == f"Page changed (last_changed={CHANGED})."
+    )
+    assert messages.text("en", "item.summary.no_diff") == "page changed"
+    assert messages.text("en", "item.title.change") == "change"
+
+
+def test_a_polled_item_names_its_summary_and_still_stores_the_english_words():
+    [item] = ChangedetectionSource("cd", CD_URL, "k").fetch(serve_watch(), {}).items
+    assert item.summary == f"Page changed (last_changed={CHANGED})."
+    assert (item.title_key, item.summary_key, item.text_fields) == (
+        "",
+        "item.summary.page_changed",
+        (("changed", str(CHANGED)),),
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "marked"),
+    [
+        ({"watch_uuid": "u"}, {"title_key": "item.title.change", "summary_key": "item.summary.no_diff"}),
+        ({"watch_uuid": "u", "watch_url": SHOP}, {"summary_key": "item.summary.no_diff"}),
+        ({"watch_uuid": "u", "watch_title": "Shop", "diff": "price changed"}, {}),
+        ({"watch_uuid": "u", "watch_title": "change", "diff": "page changed"}, {}),
+        ({"title": "Vendor advisory"}, {}),
+    ],
+    ids=["no-title-no-diff", "url-no-diff", "sender-words", "sender-words-equal-ours", "generic"],
+)
+def test_the_mapper_marks_only_the_words_it_wrote(payload, marked):
+    entry = webhook_item_from_payload(payload)
+    assert {key: value for key, value in entry.items() if key.endswith("_key")} == marked
+
+
+def test_the_mapper_still_stores_the_english_words():
+    entry = webhook_item_from_payload({"watch_uuid": "u"})
+    assert (entry["title"], entry["summary"]) == ("change", "page changed")
+
+
+def test_a_plain_item_is_carried_exactly_as_it_always_was():
+    item = core.Item("g", "t", "https://x.example", "s", 5, ("CVE-2026-1",))
+    assert core.item_to_state(item) == {
+        "guid": "g",
+        "title": "t",
+        "link": "https://x.example",
+        "summary": "s",
+        "published": 5,
+        "explicit": ["CVE-2026-1"],
+        "source_title": "",
+        "source_url": "",
+    }
+    assert core.item_from_state(core.item_to_state(item)) == item
+
+
+def test_an_item_that_names_its_words_survives_a_json_round_trip():
+    [item] = ChangedetectionSource("cd", CD_URL, "k").fetch(serve_watch(), {}).items
+    assert core.item_from_state(json.loads(json.dumps(core.item_to_state(item)))) == item

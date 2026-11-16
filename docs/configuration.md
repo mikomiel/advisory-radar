@@ -266,8 +266,13 @@ language: pl                 # en (the default) or pl
 English is the wording the service has always used, so a configuration without the key sends
 exactly the messages earlier versions sent. Only text the service writes is translated. The
 heading and excerpt of an advisory come from its feed and stay as the publisher wrote them, apart
-from the short excerpt the service writes for a PHP or Node.js release it read from the release
-page. Identifiers and the names CVSS, EPSS, SSVC, KEV and GHSA are never translated.
+from three things the service writes itself: the short excerpt for a PHP or Node.js release it
+read from the release page, the summary of a changed changedetection.io watch
+(`Page changed (last_changed=...)`), and the words of a native changedetection.io webhook payload
+that names neither a watch title nor a URL (the title `change`) or that carries no diff (the
+summary `page changed`). A watch title or a diff the sender supplies is the sender's text and is
+never translated, even when it reads the same. Identifiers and the names CVSS, EPSS, SSVC, KEV
+and GHSA are never translated.
 
 The `tag` of a message (`critical` or `warning`) is a routing value, not text, so it stays
 English in every language. A [routing](#routing) rule that matches `tag: critical` and a notifier

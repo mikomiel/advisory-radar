@@ -220,6 +220,13 @@ class Item:
     #: The feed the entry came from (``origin.title``, ``origin.htmlUrl``). Never the feed URL: it can be private.
     source_title: str = ""
     source_url: str = ""
+    #: ``title`` and ``summary`` always hold words, in English, for matching and for the web UI. When the service
+    #: wrote those words itself and not the publisher, these name the ``messages`` key of each and the fields
+    #: it takes, so a notification writes them in the configured language (see ``item_headline``). Publisher text
+    #: has no key and is never translated. A tuple of pairs, because an item is frozen.
+    title_key: str = ""
+    summary_key: str = ""
+    text_fields: tuple[tuple[str, str], ...] = ()
 
 
 def _normalise_id(match: str) -> str:
@@ -319,6 +326,18 @@ def headline(title: str, summary: str) -> tuple[str, str]:
     if summary.startswith(title):
         return title, summary[len(title) :].strip()
     return title, summary
+
+
+def item_headline(item: Item, language: str) -> tuple[str, str]:
+    """``headline`` of an item, with the words the service wrote itself taken from the catalogue in ``language``.
+
+    The keys are resolved first because ``headline`` drops a summary that starts with the title, and it must
+    compare the words a reader will see. An item with no key is publisher text and passes through unchanged.
+    """
+    fields = dict(item.text_fields)
+    title = messages.text(language, item.title_key, **fields) if item.title_key else item.title
+    summary = messages.text(language, item.summary_key, **fields) if item.summary_key else item.summary
+    return headline(title, summary)
 
 
 def _matches_product(text: str, host: str, product) -> bool:
@@ -1622,6 +1641,8 @@ def _suppressed(
     now: int,
     thresholds: Thresholds,
     source_id: str = "",
+    *,
+    language: str = DEFAULT_LANGUAGE,
 ) -> None:
     claimed = _claimed(state)
     for identifier in ids:
@@ -1636,7 +1657,7 @@ def _suppressed(
             "last_eval": now,
             "level": level,
             "judged": level,
-            "title": headline(item.title, item.summary)[0],
+            "title": item_headline(item, language)[0],
             "link": item.link,
             "cvss": scores.get(cve),
             "thresholds": thresholds.snapshot(),
@@ -2108,14 +2129,14 @@ def classify_new(
         epss = {cve: facts[cve].epss for cve, _ in verdict.levels}
         kev_membership = None if not kev_known else any(cve in kev for cve, _ in verdict.levels)
         if verdict.tag == "suppressed":
-            _suppressed(state, ids, verdict, item, scores, now, thresholds, source_id=source_id)
+            _suppressed(state, ids, verdict, item, scores, now, thresholds, source_id=source_id, language=language)
         else:
             # The identifiers this message introduces: the ones it owns, as opposed to the ids its text
             # merely mentions because another message already owns them. The inbox keeps them apart so a
             # co-named advisory cannot inherit this message's state or severity.
             fresh_ids = [identifier for identifier in ids if identifier not in claimed]
             shown_ids = [identifier for identifier in fresh_ids if not identifier.startswith("src:")]
-            heading, excerpt = headline(item.title, item.summary)
+            heading, excerpt = item_headline(item, language)
             if release is not None:
                 excerpt = messages.text(language, "excerpt.php", versions=", ".join(release.versions))
             elif page is not None and page.lines:
@@ -2720,8 +2741,12 @@ def adobe_pass(
 
 
 def item_to_state(item: Item) -> dict:
-    """A candidate carried to the next pass; a rotating feed would otherwise drop it unrecorded."""
-    return {
+    """A candidate carried to the next pass; a rotating feed would otherwise drop it unrecorded.
+
+    The keys that name the words the service wrote are stored only when set, so the row of an ordinary item is
+    the row it always was.
+    """
+    row = {
         "guid": item.guid,
         "title": item.title,
         "link": item.link,
@@ -2731,6 +2756,39 @@ def item_to_state(item: Item) -> dict:
         "source_title": item.source_title,
         "source_url": item.source_url,
     }
+    if item.title_key:
+        row["title_key"] = item.title_key
+    if item.summary_key:
+        row["summary_key"] = item.summary_key
+    if item.text_fields:
+        row["text_fields"] = dict(item.text_fields)
+    return row
+
+
+def stored_text_keys(row: Mapping[str, object]) -> dict[str, object]:
+    """The ``Item`` keywords a stored row names its own words with, or none if this version cannot write them.
+
+    A carried row and a webhook inbox entry are JSON that another version or a hand edit may have written. A key
+    the catalogue lacks, or fields that do not fill it, would raise when the message is written, inside a pass,
+    and again on every pass after it. So each stored key is tried once here, in the default language (every
+    language holds the same keys and placeholders), and a row that fails keeps the English words it stored and
+    says so in the log. A row stored before these keys existed names none and is read exactly as it was.
+    """
+    keys = {name: row[name] for name in ("title_key", "summary_key") if row.get(name)}
+    if not keys:
+        return {}
+    stored = row.get("text_fields")
+    fields = tuple((str(name), str(value)) for name, value in stored.items()) if isinstance(stored, dict) else ()
+    try:
+        for key in keys.values():
+            messages.text(DEFAULT_LANGUAGE, key, **dict(fields))
+    except (KeyError, TypeError):
+        LOG.warning(
+            "item %s names words this version cannot write; its stored words are used",
+            _log_id(str(row.get("guid", ""))),
+        )
+        return {}
+    return {**keys, **({"text_fields": fields} if fields else {})}
 
 
 def item_from_state(row: object) -> Item:
@@ -2746,6 +2804,7 @@ def item_from_state(row: object) -> Item:
         tuple(str(value) for value in explicit) if isinstance(explicit, list) else (),
         str(data.get("source_title", "")),
         str(data.get("source_url", "")),
+        **stored_text_keys(data),
     )
 
 
