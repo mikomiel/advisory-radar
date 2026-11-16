@@ -13,6 +13,7 @@ import json
 import logging
 import string
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -92,7 +93,8 @@ def serve(
     intel = intel or {}
 
     def http(method, url, headers, payload):
-        if "cveawg.mitre.org" in url:
+        host = urlsplit(url).hostname or ""
+        if host == "cveawg.mitre.org":
             cve = url.rsplit("/", 1)[1]
             cvss, vector, _, _ = intel[cve]
             metrics = [{"cvssV3_1": {"baseScore": cvss, "vectorString": vector}}]
@@ -101,12 +103,12 @@ def serve(
                 "containers": {"cna": {"metrics": metrics}},
             }
             return 200, {}, json.dumps(document).encode()
-        if "api.first.org" in url:
+        if host == "api.first.org":
             rows = [
                 {"cve": cve, "epss": epss, "percentile": pct} for cve, (_, _, epss, pct) in intel.items() if cve in url
             ]
             return 200, {}, json.dumps({"data": rows}).encode()
-        if "cisa.gov" in url:
+        if host == "www.cisa.gov":
             catalog = {"catalogVersion": "1", "vulnerabilities": [{"cveID": cve} for cve in kev]}
             return 200, {"ETag": "k"}, json.dumps(catalog).encode()
         if url == FEED_URL:
