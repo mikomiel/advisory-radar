@@ -1594,7 +1594,8 @@ SOURCE_FORM_KEYS = tuple(
 #: Keys every source kind accepts, whether or not the catalogue names them: a per-source poll pace is not a
 #: property of a kind, so it is offered once rather than repeated in every ``SourceSpec``.
 SOURCE_UNIVERSAL_KEYS = ("interval",)
-#: The one secret-bearing key the "new notifier" row fills, per type. ``apprise`` (url+password) and
+#: The one secret-bearing key the "new notifier" row fills, per type; ``None`` for a kind that carries no
+#: credential (``log``), which the row adds from its id and type alone. ``apprise`` (url+password) and
 #: ``gotify`` (url+token) need two references each, so they are added by editing the YAML. A webhook's
 #: optional signing ``secret`` has its own field instead.
 NEW_NOTIFIER_REFERENCE = {
@@ -1603,6 +1604,7 @@ NEW_NOTIFIER_REFERENCE = {
     "ntfy": "url",
     "webhook": "url",
     "smtp": "password",
+    "log": None,
 }
 #: Every page is server-rendered HTML with one inline stylesheet: no scripts, no fonts, no external origins.
 #: A page that needs any of those widens this deliberately, in the same change that adds it.
@@ -3949,7 +3951,7 @@ def create_app(
             kind = first(form, "new:type").strip()
             reference = first(form, "new:reference").strip()
             secret_key = NEW_NOTIFIER_REFERENCE.get(kind)
-            if kind and secret_key is None and kind in NOTIFIER_BUILDERS:
+            if kind and kind in NOTIFIER_BUILDERS and kind not in NEW_NOTIFIER_REFERENCE:
                 return page(
                     "Not saved",
                     f"<p>A {esc(kind)} notifier needs more than one reference; this form collects one. "
