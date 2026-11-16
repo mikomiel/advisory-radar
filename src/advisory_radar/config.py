@@ -10,6 +10,7 @@ doing nothing.
 from __future__ import annotations
 
 import copy
+import ipaddress
 import math
 import os
 import re
@@ -33,6 +34,100 @@ class ConfigError(ValueError):
     pass
 
 
+def read_secret_file(path: str | None, reference: str) -> str:
+    """The text of a secret file with its surrounding whitespace removed.
+
+    Every way the read can fail is a :class:`ConfigError` that names ``reference`` (``${NAME_FILE}`` or the
+    ``NAME_FILE`` variable) and nothing else. Neither the path nor the content may reach the message: an
+    operator can point a ``*_FILE`` variable at the secret itself by mistake, an ``OSError`` quotes the path,
+    a ``UnicodeDecodeError`` quotes the offending byte, and this error is printed before any redaction exists.
+    An empty file is refused, because it would load an empty credential and fail later, far from its cause.
+    """
+    if not path:
+        raise ConfigError(f"{reference}: no readable file")
+    try:
+        # ``is_file`` keeps a FIFO or a device from blocking the read: only a regular file is a secret file. It sits
+        # inside the ``try`` because Python 3.13 re-raises the ``OSError`` of a failed stat (a name that is too long,
+        # a directory that cannot be searched) with the path in its message; 3.14 returns ``False``.
+        if not Path(path).is_file():
+            raise ConfigError(f"{reference}: no readable file")
+        contents = Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        raise ConfigError(f"{reference}: no readable file") from None
+    except UnicodeDecodeError:
+        raise ConfigError(f"{reference}: the file is not UTF-8 text") from None
+    if not contents:
+        raise ConfigError(f"{reference}: the file is empty")
+    return contents
+
+
+#: The shortest process secret (the web auth token, the webhook intake secret) a start accepts. The session cookie
+#: is signed with the token, so a short one is a guessable key; ``openssl rand -hex 24`` makes twice this.
+MIN_SECRET_LENGTH = 24
+
+
+def env_secret(env: Mapping[str, str], name: str, *, minimum: int = 0) -> str:
+    """A process secret from ``NAME`` or from the file ``NAME_FILE`` names; ``''`` when neither is set.
+
+    This is the one resolver for the environment-only secrets, so the ``_FILE`` form (the Docker and Podman
+    secrets pattern, which keeps the value out of a process listing) behaves as it does inside a ``${NAME_FILE}``
+    reference: the file's surrounding whitespace is dropped and every failed read is a :class:`ConfigError` that
+    names the variable and never the path or the content. An empty variable counts as unset, which is how a
+    compose file passes a variable it was not given. Setting both forms is an error rather than a precedence an
+    operator must remember. ``minimum`` refuses a value shorter than that, naming the variable that supplied it
+    and never echoing the value.
+    """
+    direct = env.get(name, "")
+    path = env.get(f"{name}_FILE", "")
+    if direct and path:
+        raise ConfigError(f"{name} and {name}_FILE are both set; set one of them")
+    source = f"{name}_FILE" if path else name
+    value = read_secret_file(path, source) if path else direct
+    if value and len(value) < minimum:
+        raise ConfigError(
+            f"{source}: the secret must be at least {minimum} characters; generate one with: openssl rand -hex 24"
+        )
+    return value
+
+
+#: The addresses whose ``X-Forwarded-For`` the server believes when ``ADVISORY_RADAR_FORWARDED_ALLOW_IPS`` is
+#: unset: a proxy on the same host. uvicorn's default is the same, but it is passed explicitly so its own
+#: ``FORWARDED_ALLOW_IPS`` variable, which nothing here documents, is never consulted.
+DEFAULT_FORWARDED_ALLOW_IPS = ("127.0.0.1", "::1")
+FORWARDED_ALLOW_IPS_VARIABLE = "ADVISORY_RADAR_FORWARDED_ALLOW_IPS"
+
+
+def forwarded_allow_ips(env: Mapping[str, str]) -> list[str]:
+    """The reverse-proxy addresses the server may believe about the client, from ``ADVISORY_RADAR_FORWARDED_ALLOW_IPS``.
+
+    Behind a reverse proxy every connection comes from the proxy, so the login throttle sees one peer for every
+    client unless the server reads the client from ``X-Forwarded-For`` -- which it does only for a connection
+    from an address listed here. The value is a comma-separated list of addresses and networks; unset or blank
+    means loopback only. A list that would trust every client is refused (``*``, ``0.0.0.0/0``, ``::/0``): any
+    peer could then pick its own throttle key and the address a request is logged under. An entry uvicorn
+    cannot parse is refused as well, because uvicorn keeps it as a literal that never matches and the operator
+    would be left trusting no proxy without being told.
+    """
+    entries = [item.strip() for item in env.get(FORWARDED_ALLOW_IPS_VARIABLE, "").split(",") if item.strip()]
+    for entry in entries:
+        if entry == "*":
+            raise ConfigError(
+                f"{FORWARDED_ALLOW_IPS_VARIABLE}: '*' would trust every client; list the proxy's addresses"
+            )
+        try:
+            # The same parse uvicorn applies: a network when it holds a "/", an address otherwise.
+            parsed = ipaddress.ip_network(entry) if "/" in entry else ipaddress.ip_address(entry)
+        except ValueError:
+            raise ConfigError(
+                f"{FORWARDED_ALLOW_IPS_VARIABLE}: {entry!r} is not an IP address or a network such as 192.0.2.0/24"
+            ) from None
+        if isinstance(parsed, ipaddress.IPv4Network | ipaddress.IPv6Network) and parsed.prefixlen == 0:
+            raise ConfigError(
+                f"{FORWARDED_ALLOW_IPS_VARIABLE}: {entry!r} would trust every client; list the proxy's addresses"
+            )
+    return entries or list(DEFAULT_FORWARDED_ALLOW_IPS)
+
+
 def _expand(value: object, env: dict[str, str], resolved: list[str] | None = None, *, lenient: bool = False) -> object:
     if isinstance(value, str):
 
@@ -40,17 +135,16 @@ def _expand(value: object, env: dict[str, str], resolved: list[str] | None = Non
             name = match.group(1)
             file_mode = match.group(0).endswith("_FILE}")
             if file_mode:
-                path = env.get(name + "_FILE") or env.get(name)
-                if path and Path(path).is_file():
-                    contents = Path(path).read_text(encoding="utf-8").strip()
-                    if resolved is not None:
-                        resolved.append(contents)  # the value, not the path, is what must be redacted
-                    return contents
-                if lenient:
-                    return match.group(0)  # a state-only command never builds the plugin that reads it
-                # The variable's value is not in the message: an operator can point a *_FILE variable at the
-                # secret itself by mistake, and this error is printed before any redaction exists.
-                raise ConfigError(f"${{{name}_FILE}}: no readable file")
+                # ``name`` already ends in ``_FILE`` (the group is greedy), so the reference is named as written.
+                try:
+                    contents = read_secret_file(env.get(name + "_FILE") or env.get(name), match.group(0))
+                except ConfigError:
+                    if lenient:
+                        return match.group(0)  # a state-only command never builds the plugin that reads it
+                    raise
+                if resolved is not None:
+                    resolved.append(contents)  # the value, not the path, is what must be redacted
+                return contents
             if name not in env:
                 if lenient:
                     return match.group(0)  # state-only commands never build the plugin that would use it
@@ -190,6 +284,9 @@ class Config:
     adobe_commerce: bool = False
     #: A free NVD API key: raises the anonymous 5-per-30 s limit to 50 and shortens the pace in ``core.Intel``.
     nvd_api_key: str = ""
+    #: The environment variables the settings overlay may reference, as family names (``X`` and ``X_FILE`` are
+    #: one). YAML-only and empty by default: see :func:`unlisted_overlay_references`.
+    overlay_references: frozenset[str] = frozenset()
     #: Whether a source added from the settings overlay may point into a private network. Off by default: the
     #: check is an operator-controlled guard rail against pointing this instance at a router page by mistake,
     #: turned off for an installation whose sources live on the LAN. It is not an isolation boundary -- see
@@ -289,6 +386,7 @@ _TOP_KEYS = {
     "digest",
     "quiet_hours",
     "language",
+    "overlay_references",
 }
 #: The keys a routing rule itself may carry; the match keys and the tag set are ``routing.py``'s.
 _ROUTE_KEYS = frozenset({"match", "notifiers"})
@@ -327,6 +425,97 @@ def _reference_names(value: object) -> set[str]:
     if isinstance(value, dict):
         return set().union(*(_reference_names(item) for item in value.values())) if value else set()
     return set()
+
+
+_VARIABLE_NAME = re.compile(r"[A-Z_][A-Z0-9_]*")
+
+
+def _overlay_references(document: dict) -> frozenset[str]:
+    """The variable names the YAML lets the settings overlay reference; none unless the file lists some.
+
+    ``overlay_references`` is not an overlay key, so a browser session cannot widen its own reach. A name is a
+    variable family like everywhere else here: ``X`` and ``X_FILE`` allow the same variable.
+    """
+    raw = document.get("overlay_references")
+    if raw is None:
+        return frozenset()
+    valid = isinstance(raw, list) and all(isinstance(name, str) and _VARIABLE_NAME.fullmatch(name) for name in raw)
+    _require(valid, "overlay_references must be a list of environment variable names, e.g. [FEED_TOKEN]")
+    return frozenset(_base_name(name) for name in raw)
+
+
+def _list_twin(item: object, position: int, twin: object) -> object:
+    """The YAML value that owns one overlay list item, or ``None``.
+
+    A plugin entry is owned by the YAML entry with the same id *and* type; a string, by being a member of the
+    YAML list; anything else (a routing rule) by its position.
+    """
+    if not isinstance(twin, list):
+        return None
+    if isinstance(item, dict) and isinstance(item.get("id"), str):
+        return next(
+            (
+                entry
+                for entry in twin
+                if isinstance(entry, dict) and entry.get("id") == item["id"] and entry.get("type") == item.get("type")
+            ),
+            None,
+        )
+    if isinstance(item, str):
+        return item if item in twin else None
+    return twin[position] if position < len(twin) else None
+
+
+def _walk_references(value: object, twin: object, allowed: frozenset[str], found: set[str]) -> None:
+    if isinstance(value, str):
+        if value != twin:  # the YAML's own string, at the place the YAML wrote it, is not the overlay's reference
+            found.update(name for name in _reference_names(value) if name not in allowed)
+    elif isinstance(value, dict):
+        for key, item in value.items():  # a mapping key is literal text: ``_expand`` never expands one
+            _walk_references(item, twin.get(key) if isinstance(twin, dict) else None, allowed, found)
+    elif isinstance(value, list):
+        for position, item in enumerate(value):
+            _walk_references(item, _list_twin(item, position, twin), allowed, found)
+
+
+def unlisted_overlay_references(settings: dict, document: dict, allowed: frozenset[str]) -> list[str]:
+    """The variables an overlay references that the YAML did not list under ``overlay_references``, sorted.
+
+    ``${NAME}`` reads *any* variable of the process, and the overlay is written from a browser session: left
+    open, an authenticated session could send the auth token, a database password or another channel's
+    credential to a URL or a mail host of its choosing. So every string of the overlay is checked, not only a
+    credential position -- a reference in a path, a host list or a route is still a value the next request or
+    error message can carry. Only names are returned; a value never appears.
+
+    The one exemption is the YAML's own string at the same place: the settings forms store whole entries,
+    YAML-owned references included, and switching one notifier off must not need its variable listed. "The
+    same place" is the same notifier (id and type) and the same key, or the same source id and key, with the
+    string equal character for character; a copy anywhere else is the overlay's own use. ``sources_added`` has
+    no YAML twin, because the YAML owns membership.
+    """
+    sources = document.get("sources")
+    twins: dict[str, object] = {
+        key: document.get(key)
+        for key in (
+            "notifiers",
+            "poll_interval",
+            "hidden_source_hosts",
+            "routes",
+            "default",
+            "thresholds",
+            "digest",
+            "quiet_hours",
+        )
+    }
+    twins["sources"] = (
+        {entry["id"]: entry for entry in sources if isinstance(entry, dict) and isinstance(entry.get("id"), str)}
+        if isinstance(sources, list)
+        else {}
+    )
+    found: set[str] = set()
+    for key, value in settings.items():
+        _walk_references(value, twins.get(key), allowed, found)
+    return sorted(found)
 
 
 #: Every key any built-in source kind declares as a credential. The collector uses the union rather than the
@@ -434,23 +623,37 @@ def _merge_settings(document: dict, settings: dict) -> None:
     from .settings import validate_settings  # lazy: settings.py imports ConfigError from this module
 
     validate_settings(settings)
+    allowed = _overlay_references(document)
+    unlisted = unlisted_overlay_references(settings, document, allowed)
+    if unlisted:
+        # Names only: a variable's name is configuration, what it holds may be a credential, and this message is
+        # shown on the settings page and logged before any redaction exists.
+        raise ConfigError(
+            "settings: the overlay references variables the YAML does not list under overlay_references: "
+            f"{', '.join(unlisted)}"
+        )
     if "notifiers" in settings:
         # A full replacement is how a notifier is added, edited or disabled from the overlay. ``headers`` is a
         # mapping the overlay may not store at all, and a signing ``secret`` is a credential the overlay may
         # store only as a reference. Either can stay in the YAML, so both are carried over by id: editing
         # enablement or an ordinary field must not silently drop authentication headers or unsign a webhook.
         carried_keys = ("headers", "secret")
-        carried_by_id = {
-            entry["id"]: {key: entry[key] for key in carried_keys if key in entry}
+        yaml_notifiers = [
+            entry
             for entry in (document.get("notifiers") or [])
             if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+        ]
+        carried_by_id = {
+            entry["id"]: {key: entry[key] for key in carried_keys if key in entry} for entry in yaml_notifiers
         }
+        owners = {entry["id"]: entry for entry in yaml_notifiers}
         merged = []
         for entry in settings["notifiers"]:
             entry = dict(entry) if isinstance(entry, dict) else entry
             if isinstance(entry, dict):
                 for key, value in (carried_by_id.get(entry.get("id")) or {}).items():
                     entry.setdefault(key, value)
+                _pin_credential_destination(entry, owners.get(entry.get("id")))
             merged.append(entry)
         document["notifiers"] = merged
     if "sources" in settings:
@@ -482,6 +685,35 @@ def _merge_settings(document: dict, settings: dict) -> None:
         elif raw_thresholds is None:
             document["thresholds"] = dict(settings["thresholds"])
         # A block that is not a mapping is refused by the validator; an overlay cannot repair it.
+
+
+#: Per notifier type, the keys that say where a credential is sent when the overlay may write them as plain
+#: text. Every other type sends its credential to a ``url`` that is itself a reference-only key
+#: (``NOTIFIER_SECRET_KEYS``), which the ``overlay_references`` allowlist already governs; only SMTP names its
+#: server in ``host``/``port`` and its TLS mode in ``use_tls``/``implicit_tls``, none of them a reference.
+#: ``tests/test_settings_overlay.py`` pins this table against every notifier builder, so a new type has to be
+#: classified here before it can ship.
+CREDENTIAL_DESTINATION_KEYS = {"smtp": ("host", "port", "use_tls", "implicit_tls")}
+
+
+def _pin_credential_destination(entry: dict, owner: dict | None) -> None:
+    """Keep a YAML-owned credential where the YAML sends it, whatever the overlay says.
+
+    The settings form stores the whole notifier, including the ``password`` reference the YAML wrote, and that
+    reference is the YAML's own. If the same entry could also change the server and drop TLS, one edit would
+    send the file's password to any host in plaintext. So for an entry that is the same id and type as a YAML
+    notifier owning a ``password``, the destination keys come from the YAML -- their absence included, so a
+    TLS default cannot be switched off by writing a value the file never set. This overwrites, unlike the
+    ``setdefault`` that carries ``headers`` and ``secret``: those are credentials the overlay may not write,
+    these are values it may.
+    """
+    if owner is None or entry.get("type") != owner.get("type") or "password" not in owner:
+        return
+    for key in CREDENTIAL_DESTINATION_KEYS.get(str(owner.get("type")), ()):
+        if key in owner:
+            entry[key] = owner[key]
+        else:
+            entry.pop(key, None)
 
 
 def _merge_sources(raw: object, overlay: dict) -> object:
@@ -627,16 +859,28 @@ def _routing(document: dict, notifiers: list[dict], *, strict: bool = True) -> t
     return tuple(routes), default
 
 
+#: The longest pace a poll interval may name. The scheduler waits on ``Event.wait``, which raises
+#: ``OverflowError`` for a timeout beyond what the platform clock holds; a week is far below that and is as
+#: slow as an advisory scanner is useful, so a typo cannot park the instance for a year.
+MAX_INTERVAL_SECONDS = 7 * 86400
+_INTERVAL_UNIT = {"s": 1, "m": 60, "h": 3600}
+
+
 def _interval_seconds(raw: object, where: str) -> int:
     """An ``<n><s|m|h>`` interval as seconds; the value itself never reaches the message.
 
     An interval can be written with a ``${NAME}`` reference, which expands to a string of unknown content, and
     this message is logged before any redaction exists. One parser serves the global ``poll_interval`` and the
-    per-source ``interval`` so the two cannot accept different spellings.
+    per-source ``interval`` so the two cannot accept different spellings or different limits (``0`` is
+    refused, and so is anything over seven days).
     """
     match = re.fullmatch(r"(\d+)([smh])", str(raw))
     _require(match is not None, f"{where} must look like 15m, 30s or 12h")
-    seconds = int(match.group(1)) * {"s": 1, "m": 60, "h": 3600}[match.group(2)]
+    digits = match.group(1).lstrip("0") or "0"
+    # The length is judged before the number is built: ``int`` refuses more than 4300 digits with a bare
+    # ``ValueError``, and seven digits already exceed the cap in any unit.
+    seconds = int(digits) * _INTERVAL_UNIT[match.group(2)] if len(digits) <= 6 else MAX_INTERVAL_SECONDS + 1
+    _require(seconds <= MAX_INTERVAL_SECONDS, f"{where} must be at most 168h (7 days)")
     _require(seconds > 0, f"{where} must be greater than zero")
     return seconds
 
@@ -657,6 +901,7 @@ def config_from_document(
     sources = document.get("sources") or []
     notifiers = document.get("notifiers") or []
     credential_names = _credential_names(document)
+    overlay_references = _overlay_references(document)  # read before expansion: a name is never a reference
     _require(isinstance(sources, list) and isinstance(notifiers, list), "sources/notifiers must be lists")
     for entry in (*sources, *notifiers):
         _require(
@@ -840,6 +1085,7 @@ def config_from_document(
         default_notifiers=default_notifiers,
         web_host=web_host,
         web_port=int(web_port),
+        overlay_references=overlay_references,
         raw=document,
         secret_names=secret_names,
         secret_values=secret_values,

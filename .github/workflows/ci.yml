@@ -74,9 +74,11 @@ jobs:
           mkdir -p "$tmp/config" "$tmp/data"
           printf 'sources: []\nnotifiers: []\nstate_path: /data/state.json\nweb:\n  port: 8080\n' > "$tmp/config/config.yml"
           chmod -R a+rwX "$tmp"
+          # `run` refuses a login token shorter than 24 characters. A fresh random one per run keeps a literal
+          # secret out of the repository and out of the secret scan.
           docker run -d --name radar-ci -p 18080:8080 \
             -v "$tmp/config:/config:ro" -v "$tmp/data:/data" \
-            -e ADVISORY_RADAR_AUTH_TOKEN=ci-token advisory-radar:ci
+            -e ADVISORY_RADAR_AUTH_TOKEN="$(openssl rand -hex 24)" advisory-radar:ci
           for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:18080/healthz >/dev/null; then break; fi
             sleep 2

@@ -8,13 +8,23 @@ per-source enrichment clocks, secret collection and the persisted run record.
 from __future__ import annotations
 
 import copy
+import errno
 import json
+import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 from advisory_radar import core, pipeline
-from advisory_radar.config import DEFAULT_THRESHOLDS, collect_secrets, load_config
+from advisory_radar.config import (
+    DEFAULT_THRESHOLDS,
+    MIN_SECRET_LENGTH,
+    ConfigError,
+    collect_secrets,
+    env_secret,
+    load_config,
+)
 from advisory_radar.notifiers import AppriseNotifier, DiscordWebhookNotifier, build_notifier
 from advisory_radar.sources import RssSource
 from advisory_radar.state import LockBusy, state_lock
@@ -97,6 +107,181 @@ def test_web_ui_refuses_an_empty_auth_token(tmp_path):
 
     with pytest.raises(ValueError):
         create_app(config(tmp_path), {})
+
+
+#: A token and a webhook secret of the length ``openssl rand -hex 24`` makes half of: the shortest accepted.
+MINIMUM_SECRET = "k" * 24
+
+
+@pytest.mark.parametrize("token", ["Zq", "Zq7-ci-tok", "Zq" + "x" * 21], ids=["2", "10", "23"])
+def test_web_ui_refuses_a_short_auth_token(tmp_path, token):
+    """A one-character token was accepted, and the session cookie is signed with it (W7)."""
+    from advisory_radar.web import create_app
+
+    with pytest.raises(ConfigError) as raised:
+        create_app(config(tmp_path), {"ADVISORY_RADAR_AUTH_TOKEN": token})
+    message = str(raised.value)
+    assert "ADVISORY_RADAR_AUTH_TOKEN" in message and "at least 24" in message
+    assert "openssl rand -hex 24" in message, "the refusal says how to make a token that is accepted"
+    assert token not in message, "a refused secret is never echoed"
+
+
+def test_web_ui_accepts_an_auth_token_of_exactly_the_minimum_length(tmp_path):
+    from advisory_radar.web import create_app
+
+    create_app(config(tmp_path), {"ADVISORY_RADAR_AUTH_TOKEN": MINIMUM_SECRET})
+
+
+CI_WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+SMOKE_STEP = "Container image builds and starts"
+
+
+def smoke_test_token(run: str) -> str:
+    """The login token the image smoke test would hand the container, as the container would read it.
+
+    Two shapes are recognised: a literal, and ``"$(openssl rand -hex N)"``, which is N bytes written as 2N hex
+    characters. Anything else cannot be judged from the text, so it is refused here instead of being assumed
+    long enough.
+    """
+    generated = re.search(r'-e ADVISORY_RADAR_AUTH_TOKEN="\$\(openssl rand -hex (\d+)\)"', run)
+    if generated:
+        return "f" * (2 * int(generated[1]))
+    literal = re.search(r"-e ADVISORY_RADAR_AUTH_TOKEN=([\w.~+-]+)(?=\s)", run)
+    assert literal, 'the smoke test must pass the token as a literal or as "$(openssl rand -hex N)"'
+    return literal[1]
+
+
+def test_the_ci_image_smoke_test_starts_the_container_with_a_token_run_accepts():
+    """``run`` refuses a short token, so a smoke test that still passes one never gets /healthz answered (W7).
+
+    The token is judged by the same ``env_secret`` call that ``create_app`` makes, so tightening the minimum again
+    fails here before it fails the required ``ci`` check on a pull request.
+    """
+    steps = [
+        step
+        for step in yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]["ci"]["steps"]
+        if step.get("name") == SMOKE_STEP
+    ]
+    assert len(steps) == 1, "the ci job must have exactly one image smoke-test step"
+    env = {"ADVISORY_RADAR_AUTH_TOKEN": smoke_test_token(steps[0]["run"])}
+    try:
+        env_secret(env, "ADVISORY_RADAR_AUTH_TOKEN", minimum=MIN_SECRET_LENGTH)
+    except ConfigError as exc:
+        pytest.fail(f"the container would exit 1 and /healthz would never answer: {exc}")
+
+
+def test_web_ui_refuses_a_short_webhook_secret_but_not_an_absent_one(tmp_path):
+    """A set webhook secret is held to the token's rule; an unset one still just disables the intake (W7)."""
+    from advisory_radar.web import create_app
+
+    base = {"ADVISORY_RADAR_AUTH_TOKEN": MINIMUM_SECRET}
+    with pytest.raises(ConfigError) as raised:
+        create_app(config(tmp_path), {**base, "ADVISORY_RADAR_WEBHOOK_SECRET": "Zq-short"})
+    assert "ADVISORY_RADAR_WEBHOOK_SECRET" in str(raised.value) and "Zq-short" not in str(raised.value)
+    assert "openssl rand -hex 24" in str(raised.value)
+    create_app(config(tmp_path), base)
+    create_app(config(tmp_path), {**base, "ADVISORY_RADAR_WEBHOOK_SECRET": ""})
+    create_app(config(tmp_path), {**base, "ADVISORY_RADAR_WEBHOOK_SECRET": "w" * 24})
+
+
+def sign_in_status(client, token: str) -> int:
+    return client.post("/login", data={"token": token}, follow_redirects=False).status_code
+
+
+def test_the_auth_token_may_come_from_a_file(tmp_path):
+    """There was no ``_FILE`` form: the token had to sit in the environment, where a process listing shows it (W8b)."""
+    from fastapi.testclient import TestClient
+
+    from advisory_radar.web import create_app
+
+    token_file = tmp_path / "token"
+    token_file.write_text("f" * 24 + "\n")  # an editor or `echo` leaves a newline; it is not part of the secret
+    client = TestClient(create_app(config(tmp_path), {"ADVISORY_RADAR_AUTH_TOKEN_FILE": str(token_file)}))
+    assert sign_in_status(client, "f" * 24) == 303
+    assert sign_in_status(client, "g" * 24) == 200, "a wrong token is shown the sign-in form again"
+
+
+def test_the_auth_token_is_read_once_at_startup(tmp_path):
+    """The login compare re-read the variable on every request, so it could drift from the cookie key (W8b)."""
+    from fastapi.testclient import TestClient
+
+    from advisory_radar.web import create_app
+
+    token_file = tmp_path / "token"
+    token_file.write_text("o" * 24)
+    client = TestClient(create_app(config(tmp_path), {"ADVISORY_RADAR_AUTH_TOKEN_FILE": str(token_file)}))
+    token_file.write_text("n" * 24)  # a rotation takes a restart, like every other startup-bound value
+    assert sign_in_status(client, "n" * 24) == 200
+    assert sign_in_status(client, "o" * 24) == 303
+
+
+def test_the_auth_token_and_its_file_together_are_refused(tmp_path):
+    from advisory_radar.web import create_app
+
+    token_file = tmp_path / "token"
+    token_file.write_text("b" * 24)
+    env = {"ADVISORY_RADAR_AUTH_TOKEN": "Zq" + "a" * 22, "ADVISORY_RADAR_AUTH_TOKEN_FILE": str(token_file)}
+    with pytest.raises(ConfigError) as raised:
+        create_app(config(tmp_path), env)
+    message = str(raised.value)
+    assert "ADVISORY_RADAR_AUTH_TOKEN" in message and "ADVISORY_RADAR_AUTH_TOKEN_FILE" in message
+    assert "both" in message
+    assert "Zq" + "a" * 22 not in message and "b" * 24 not in message and str(token_file) not in message
+
+
+@pytest.mark.parametrize(
+    ("contents", "reason"),
+    [
+        (b"", "the file is empty"),
+        (b" \r\n", "the file is empty"),
+        (b"\xff\xfe" + b"x" * 30, "the file is not UTF-8 text"),
+        (None, "no readable file"),
+    ],
+    ids=["empty", "blank", "not-utf8", "absent"],
+)
+def test_an_unusable_auth_token_file_is_refused_naming_the_variable_only(tmp_path, contents, reason):
+    """Every failed read is a ``ConfigError`` that names ``ADVISORY_RADAR_AUTH_TOKEN_FILE`` and nothing else (W8b)."""
+    from advisory_radar.web import create_app
+
+    token_file = tmp_path / "token"
+    if contents is not None:
+        token_file.write_bytes(contents)
+    with pytest.raises(ConfigError) as raised:
+        create_app(config(tmp_path), {"ADVISORY_RADAR_AUTH_TOKEN_FILE": str(token_file)})
+    assert str(raised.value) == f"ADVISORY_RADAR_AUTH_TOKEN_FILE: {reason}"
+
+
+@pytest.mark.parametrize("name", ["ADVISORY_RADAR_AUTH_TOKEN", "ADVISORY_RADAR_WEBHOOK_SECRET"])
+def test_a_short_secret_in_a_file_is_refused_naming_the_file_variable(tmp_path, name):
+    from advisory_radar.web import create_app
+
+    short = tmp_path / "short"
+    short.write_text("Zq-short\n")
+    # The other secret is valid, so the refusal can only be about this one.
+    other = {} if name == "ADVISORY_RADAR_AUTH_TOKEN" else {"ADVISORY_RADAR_AUTH_TOKEN": MINIMUM_SECRET}
+    with pytest.raises(ConfigError) as raised:
+        create_app(config(tmp_path), {**other, f"{name}_FILE": str(short)})
+    assert str(raised.value).startswith(f"{name}_FILE:")
+    assert "Zq-short" not in str(raised.value)
+
+
+def test_run_exits_with_a_config_error_instead_of_a_traceback_on_a_short_token(tmp_path, monkeypatch, caplog):
+    """The refusal is a startup error like any other: logged as ``config: ...``, exit code 1, no server (W7)."""
+    import logging
+
+    from advisory_radar import cli
+
+    cfg_path = tmp_path / "c.yml"
+    cfg_path.write_text(f"sources: []\nnotifiers: []\nstate_path: {tmp_path / 'state.json'}\n")
+
+    def serve(*args, **kwargs):
+        raise AssertionError("a refused token must not start the server")
+
+    monkeypatch.setattr("uvicorn.run", serve)
+    with caplog.at_level(logging.ERROR, logger=cli.LOG.name):
+        code = cli.main(["--config", str(cfg_path), "run"], env={"ADVISORY_RADAR_AUTH_TOKEN": "Zq-short"})
+    assert code == 1
+    assert "config: ADVISORY_RADAR_AUTH_TOKEN" in caplog.text and "Zq-short" not in caplog.text
 
 
 def test_pass_skips_when_another_pass_holds_the_lock(tmp_path):
@@ -448,6 +633,112 @@ def test_file_backed_secret_values_are_redacted(tmp_path):
     assert "SUPERSECRET" not in record.getMessage()
 
 
+def file_reference_config(tmp_path):
+    """A configuration whose one notifier reads its url from ``${HOOK_FILE}``."""
+    cfg_path = tmp_path / "c.yml"
+    cfg_path.write_text(
+        "sources: []\nnotifiers:\n  - id: d\n    type: discord_webhook\n    url: ${HOOK_FILE}\n"
+        f"state_path: {tmp_path / 'state.json'}\n"
+    )
+    return cfg_path
+
+
+def test_an_undecodable_secret_file_is_a_config_error_that_names_the_reference_only(tmp_path):
+    """A secret file holding bytes that are not UTF-8 raised a bare ``UnicodeDecodeError`` (W8).
+
+    That exception's text quotes the offending byte, so it would also have put part of the secret in the log.
+    """
+    secret_file = tmp_path / "hook"
+    secret_file.write_bytes(b"https://hooks.example.com/\xff\xfeSUPERSECRET")
+    with pytest.raises(ConfigError) as raised:
+        load_config(file_reference_config(tmp_path), {"HOOK_FILE": str(secret_file)})
+    assert "${HOOK_FILE}" in str(raised.value) and "UTF-8" in str(raised.value)
+    assert "SUPERSECRET" not in str(raised.value) and "xff" not in str(raised.value).lower()
+    assert str(secret_file) not in str(raised.value), "the path may itself be the secret, so it is never printed"
+
+
+def test_an_unreadable_secret_file_is_a_config_error_that_names_the_reference_only(tmp_path, monkeypatch):
+    """``PermissionError`` escaped as an ``OSError`` that quotes the path (W8).
+
+    The suite runs as root, which ignores file modes, so the read is made to fail the way an unreadable file does.
+    """
+    secret_file = tmp_path / "hook"
+    secret_file.write_text("https://hooks.example.com/SUPERSECRET")
+    real = Path.read_text
+
+    def denied(self, *args, **kwargs):
+        if self == secret_file:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", denied)
+    with pytest.raises(ConfigError) as raised:
+        load_config(file_reference_config(tmp_path), {"HOOK_FILE": str(secret_file)})
+    assert str(raised.value).startswith("${HOOK_FILE}: no readable file")
+    assert str(secret_file) not in str(raised.value) and "SUPERSECRET" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("code", "reason"),
+    [(errno.ENAMETOOLONG, "File name too long"), (errno.EACCES, "Permission denied")],
+    ids=["name-too-long", "permission-denied"],
+)
+def test_a_secret_file_whose_stat_fails_is_a_config_error_that_names_the_reference_only(
+    tmp_path, monkeypatch, code, reason
+):
+    """Python 3.13's ``Path.is_file`` re-raises an ``OSError`` that quotes the path; 3.14 returns ``False`` (W8).
+
+    The image runs 3.13, where the check sat outside the ``try`` and a long or unsearchable path ended the start
+    with a traceback that prints the path. The stat is made to fail the way 3.13 does, so the test holds on both.
+    """
+    secret_file = tmp_path / "hook"
+    secret_file.write_text("https://hooks.example.com/SUPERSECRET")
+    real = Path.is_file
+
+    def failing(self, *args, **kwargs):
+        if self == secret_file:
+            raise OSError(code, reason, str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_file", failing)
+    with pytest.raises(ConfigError) as raised:
+        load_config(file_reference_config(tmp_path), {"HOOK_FILE": str(secret_file)})
+    assert str(raised.value) == "${HOOK_FILE}: no readable file"
+    assert str(secret_file) not in str(raised.value) and "SUPERSECRET" not in str(raised.value)
+
+
+@pytest.mark.parametrize("contents", ["", "\n", "  \r\n\t "])
+def test_an_empty_secret_file_is_refused_instead_of_loading_an_empty_secret(tmp_path, contents):
+    """An empty file resolved to ``''`` and the notifier came up with no credential at all (W8)."""
+    secret_file = tmp_path / "hook"
+    secret_file.write_text(contents)
+    with pytest.raises(ConfigError) as raised:
+        load_config(file_reference_config(tmp_path), {"HOOK_FILE": str(secret_file)})
+    assert "${HOOK_FILE}: the file is empty" in str(raised.value)
+
+
+def test_a_missing_secret_file_names_the_reference_as_written(tmp_path):
+    """``${X_FILE}`` is read through the variable ``X_FILE``; the message used to name ``${X_FILE_FILE}`` (W8)."""
+    with pytest.raises(ConfigError) as raised:
+        load_config(file_reference_config(tmp_path), {"HOOK_FILE": str(tmp_path / "absent")})
+    assert str(raised.value) == "${HOOK_FILE}: no readable file"
+    with pytest.raises(ConfigError) as unset:
+        load_config(file_reference_config(tmp_path), {})
+    assert str(unset.value) == "${HOOK_FILE}: no readable file"
+
+
+def test_a_state_only_command_tolerates_any_unusable_secret_file(tmp_path):
+    """``lenient`` leaves the reference alone for every way a file can fail, as it already did for a missing one."""
+    cfg_path = file_reference_config(tmp_path)
+    bad = tmp_path / "bad"
+    bad.write_bytes(b"\xff\xfe")
+    empty = tmp_path / "empty"
+    empty.write_text("")
+    for path in (bad, empty, tmp_path / "absent"):
+        cfg = load_config(cfg_path, {"HOOK_FILE": str(path)}, lenient=True)
+        assert cfg.notifiers[0]["url"] == "${HOOK_FILE}", path.name
+
+
 def test_a_malformed_kev_catalog_is_not_trusted(tmp_path):
     from advisory_radar.kev import KEV_CACHE_SCHEMA, load_kev
     from advisory_radar.state import save_state
@@ -646,7 +937,7 @@ def test_stopping_the_server_does_not_run_another_pass(tmp_path, monkeypatch):
     )
     calls: list[int] = []
 
-    def fake_run(app, host=None, port=None, log_level=None):
+    def fake_run(app, host=None, port=None, log_level=None, **kwargs):
         for _ in range(200):  # let the scheduler take its first pass, then stop like a SIGTERM would
             if calls:
                 return None
@@ -655,10 +946,68 @@ def test_stopping_the_server_does_not_run_another_pass(tmp_path, monkeypatch):
 
     monkeypatch.setattr("uvicorn.run", fake_run)
     monkeypatch.setattr(cli.pipeline, "run_pass", lambda *a, **k: calls.append(1) or 0)
-    monkeypatch.setenv("ADVISORY_RADAR_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("ADVISORY_RADAR_AUTH_TOKEN", MINIMUM_SECRET)
     code = cli.main(["--config", str(cfg_path), "run"])
     assert code == 0
     assert len(calls) == 1, "shutdown must not start an extra pass"
+
+
+FORWARDED = "ADVISORY_RADAR_FORWARDED_ALLOW_IPS"
+
+
+def run_with_stub_server(tmp_path, monkeypatch, env: dict[str, str]):
+    """Run ``advisory-radar run`` against a stub server; return the exit code and the keywords it was started with."""
+    from advisory_radar import cli
+
+    cfg_path = tmp_path / "c.yml"
+    cfg_path.write_text(f"sources: []\nnotifiers: []\nstate_path: {tmp_path / 'state.json'}\n")
+    started: dict = {}
+
+    def stub_run(app, **kwargs):
+        started.update(kwargs)
+
+    monkeypatch.setattr("uvicorn.run", stub_run)
+    monkeypatch.setattr(cli.pipeline, "run_pass", lambda *args, **kwargs: 0)
+    code = cli.main(["--config", str(cfg_path), "run"], env={"ADVISORY_RADAR_AUTH_TOKEN": MINIMUM_SECRET, **env})
+    return code, started
+
+
+def test_run_starts_the_server_with_an_explicit_loopback_default(tmp_path, monkeypatch):
+    """Without a value uvicorn reads its own ``FORWARDED_ALLOW_IPS``, which this project does not document (W2)."""
+    monkeypatch.setenv("FORWARDED_ALLOW_IPS", "*")
+    code, started = run_with_stub_server(tmp_path, monkeypatch, {})
+    assert code == 0
+    assert started["forwarded_allow_ips"] == ["127.0.0.1", "::1"], "an explicit value, so uvicorn's variable is unused"
+
+
+def test_run_trusts_the_proxies_the_documented_variable_names(tmp_path, monkeypatch):
+    """Behind a reverse proxy every login came from the proxy's address, so one throttle served every client (W2)."""
+    code, started = run_with_stub_server(tmp_path, monkeypatch, {FORWARDED: "192.0.2.10, 198.51.100.0/24,"})
+    assert code == 0
+    assert started["forwarded_allow_ips"] == ["192.0.2.10", "198.51.100.0/24"]
+    code, started = run_with_stub_server(tmp_path, monkeypatch, {FORWARDED: "2001:db8::1"})
+    assert started["forwarded_allow_ips"] == ["2001:db8::1"]
+    code, started = run_with_stub_server(tmp_path, monkeypatch, {FORWARDED: " "})
+    assert started["forwarded_allow_ips"] == ["127.0.0.1", "::1"], "a blank value is an unset one"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["*", "0.0.0.0/0", "::/0", "192.0.2.10,*", "proxy.example.net", "192.0.2.999", "192.0.2.0/33", "192.0.2.10/24"],
+)
+def test_run_refuses_a_forwarded_list_that_trusts_everyone_or_that_uvicorn_would_drop(
+    tmp_path, monkeypatch, caplog, value
+):
+    """uvicorn turns a malformed entry into a literal that never matches, so a typo would trust no proxy (W2)."""
+    import logging
+
+    from advisory_radar import cli
+
+    with caplog.at_level(logging.ERROR, logger=cli.LOG.name):
+        code, started = run_with_stub_server(tmp_path, monkeypatch, {FORWARDED: value})
+    assert code == 1
+    assert started == {}, "the server must not start with a trust list that was refused"
+    assert f"config: {FORWARDED}:" in caplog.text
 
 
 def test_a_kev_hit_escalates_even_when_the_scored_lookups_fail():
@@ -2259,8 +2608,10 @@ def test_the_config_page_does_not_print_a_source_token(tmp_path):
         "notifiers: []\nstate_path: " + str(tmp_path / "state.json") + "\n"
     )
     cfg = load_config(path, {})
-    client = TestClient(create_app(cfg, {"ADVISORY_RADAR_AUTH_TOKEN": "t"}))
-    client.post("/login", data={"token": "t"}, follow_redirects=False)
+    # The cookie flag follows the environment the app is given (W12), so a plain-HTTP client opts out in it.
+    env = {"ADVISORY_RADAR_AUTH_TOKEN": MINIMUM_SECRET, "ADVISORY_RADAR_INSECURE_COOKIES": "1"}
+    client = TestClient(create_app(cfg, env))
+    client.post("/login", data={"token": MINIMUM_SECRET}, follow_redirects=False)
     body = client.get("/config").text
     assert "SECRET123" not in body and "SECRET456" not in body and "pw@" not in body
     assert "feeds.example.com" in body

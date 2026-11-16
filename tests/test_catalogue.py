@@ -27,6 +27,8 @@ from advisory_radar.web import create_app
 
 SOURCES = Path(__file__).parent.parent / "docs" / "sources.md"
 ENV_PLACEHOLDER = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
+#: A web auth token of the length a start accepts (at least 24 characters).
+TOKEN = "secret-token-0123456789abcdef"
 RSS = b"""<?xml version="1.0"?>
 <rss version="2.0"><channel><title>Vendor</title><link>https://vendor.example.net/</link>
 <item><title>CVE-2026-1111 fixed in libfoo</title><link>https://vendor.example.net/adv/1</link>
@@ -331,13 +333,13 @@ def test_the_sources_doc_table_matches_the_registry():
 
 def sources_client(tmp_path: Path) -> TestClient:
     path = config_file(tmp_path, [{"id": "vendor", "type": "rss", "url": "https://feeds.example.net/security.xml"}])
-    app = create_app(load_config(path, {}), {"ADVISORY_RADAR_AUTH_TOKEN": "secret"})
+    app = create_app(load_config(path, {}), {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN})
     return TestClient(app)
 
 
 def test_sources_page_lists_the_catalogue_for_a_signed_in_user(tmp_path):
     client = sources_client(tmp_path)
-    response = client.post("/login", data={"token": "secret"}, follow_redirects=False)
+    response = client.post("/login", data={"token": TOKEN}, follow_redirects=False)
     assert response.status_code == 303
     client.cookies.set("advisory_radar_session", response.cookies.get("advisory_radar_session"))
     page = client.get("/sources")

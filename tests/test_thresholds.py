@@ -22,7 +22,7 @@ from advisory_radar.state import save_state, state_lock
 from advisory_radar.watchlist import Policy
 from advisory_radar.web import create_app
 
-TOKEN = "secret-token"
+TOKEN = "secret-token-0123456789abcdef"
 NOW = 1792600000  # 2026-10-21 16:26:40 UTC
 DAY = 86400
 CSRF_RE = re.compile(r'name="csrf" value="([0-9a-f]{64})"')

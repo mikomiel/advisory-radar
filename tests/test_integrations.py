@@ -18,6 +18,9 @@ from advisory_radar.sources import ChangedetectionSource, WebhookSource, webhook
 from advisory_radar.web import create_app
 
 LOG = logging.getLogger("advisory_radar")
+#: A web auth token and a webhook secret of the length a start accepts (at least 24).
+TOKEN = "secret-token-0123456789abcdef"
+WEBHOOK_SECRET = "webhook-secret-0123456789abcdef"
 
 
 @pytest.fixture(autouse=True)
@@ -142,7 +145,7 @@ def test_webhook_payload_mapping():
 def test_webhook_intake_and_source_roundtrip(tmp_path):
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
-    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_WEBHOOK_SECRET": "s3cret"}
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, "ADVISORY_RADAR_WEBHOOK_SECRET": WEBHOOK_SECRET}
     app = create_app(Runtime.build(cfg_path, environment), environment)
     client = TestClient(app)
     # an unconfigured source id is refused outright, before any authentication is considered
@@ -153,7 +156,7 @@ def test_webhook_intake_and_source_roundtrip(tmp_path):
     response = client.post(
         "/webhooks/wh",
         json={"title": "Vendor advisory CVE-2026-7777", "text": "fixes CVE-2026-7777", "url": "https://v.example/a"},
-        headers={"Authorization": "Bearer s3cret"},
+        headers={"Authorization": f"Bearer {WEBHOOK_SECRET}"},
     )
     assert response.status_code == 200
     state = json.loads((tmp_path / "state.json").read_text())
@@ -167,7 +170,7 @@ def test_a_webhook_guid_that_cannot_be_encoded_is_still_accepted(tmp_path):
     """The entry is persisted first; its guid must not then turn an accepted request into a 500."""
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
-    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_WEBHOOK_SECRET": "s3cret"}
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, "ADVISORY_RADAR_WEBHOOK_SECRET": WEBHOOK_SECRET}
     app = create_app(Runtime.build(cfg_path, environment), environment)
     client = TestClient(app)
     # An escaped unpaired surrogate is valid JSON but not a Unicode scalar value, so a response that encodes it
@@ -175,7 +178,7 @@ def test_a_webhook_guid_that_cannot_be_encoded_is_still_accepted(tmp_path):
     response = client.post(
         "/webhooks/wh",
         content=b'{"title": "Vendor advisory", "guid": "\\ud800legacy"}',
-        headers={"Authorization": "Bearer s3cret", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {WEBHOOK_SECRET}", "Content-Type": "application/json"},
     )
     assert response.status_code == 200
     assert response.json()["queued"] == "wh:\ud800legacy"
@@ -187,13 +190,13 @@ def test_a_webhook_body_that_is_not_valid_utf8_is_refused(tmp_path):
     """The guid is an identity; ``json.loads`` on bytes would accept WTF-8 that a save then rewrites."""
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
-    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_WEBHOOK_SECRET": "s3cret"}
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, "ADVISORY_RADAR_WEBHOOK_SECRET": WEBHOOK_SECRET}
     app = create_app(Runtime.build(cfg_path, environment), environment)
     client = TestClient(app)
     response = client.post(
         "/webhooks/wh",
         content=b'{"title": "Vendor advisory", "guid": "' + b"\xed\xa0\x80\xed\xb0\x80" + b'"}',
-        headers={"Authorization": "Bearer s3cret", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {WEBHOOK_SECRET}", "Content-Type": "application/json"},
     )
     assert response.status_code == 400
     assert not (tmp_path / "state.json").exists(), "a refused intake writes nothing"
@@ -371,11 +374,11 @@ def test_a_full_webhook_inbox_refuses_rather_than_discards(tmp_path):
 
     path = tmp_path / "c.yml"
     path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
-    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_WEBHOOK_SECRET": "s"}
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, "ADVISORY_RADAR_WEBHOOK_SECRET": WEBHOOK_SECRET}
     runtime = Runtime.build(path, environment)
     app = create_app(runtime, environment)
     client = TestClient(app)
-    headers = {"Authorization": "Bearer s"}
+    headers = {"Authorization": f"Bearer {WEBHOOK_SECRET}"}
     for index in range(500):
         response = client.post("/webhooks/wh", json={"title": f"advisory {index}"}, headers=headers)
         assert response.status_code == 200
@@ -395,7 +398,7 @@ def test_an_oversized_login_body_is_refused_before_buffering(tmp_path):
 
     path = tmp_path / "c.yml"
     path.write_text(f"sources: []\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
-    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t"}
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN}
     client = TestClient(create_app(Runtime.build(path, environment), environment))
     big = b"token=" + b"x" * (LOGIN_BODY_LIMIT + 1)
     assert client.post("/login", content=big).status_code == 413

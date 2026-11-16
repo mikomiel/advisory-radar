@@ -36,7 +36,8 @@ another host is configured directly. The second keeps the existing guard rail ag
 router page or the metadata service, because the page — not the operator — chose that URL.
 
 Every source may carry `interval: 30m` (the same `<n><s|m|h>` spelling as
-`poll_interval`) to be fetched at its own pace; without one it follows the global
+`poll_interval`, and at most `168h`, seven days, for both, so a typo cannot park the scheduler)
+to be fetched at its own pace; without one it follows the global
 interval. The interval throttles the fetch only: re-evaluation, escalation and delivery
 still run for every source on every pass, so a slow feed never delays an alert. A fetch
 that fails is retried on the next pass instead of waiting out the interval, so one
@@ -49,9 +50,16 @@ descended into, and a feed already configured or repeated in the document is ski
 counted. Each URL is checked exactly as a single add is, and a document that cannot be
 read, holds no feed, or names one unusable address is refused without writing anything.
 The outline title is not stored: the existing URL-host id derivation and the watch tag
-keep the meanings they already have.
+keep the meanings they already have. A document is someone else's text, so it is judged first:
+one import takes at most 100 feeds (split a larger list and import the parts), and a feed URL
+that contains `$` refuses the whole document, because an imported `${NAME}` would read a secret out
+of the environment on the strength of a pasted file. A literal `$` is written `%24`. Each
+distinct feed URL is resolved at most once, before the settings lock is taken, so a slow lookup
+does not stall other saves.
 
-A source added on that page may not point into a private network: the form refuses
+A source added on that page may carry `$` in its `url` only as one whole `${NAME}` reference
+that the YAML lists under `overlay_references`; any other `$` is refused (write it as `%24`), as
+`configuration.md` explains. It may not point into a private network either: the form refuses
 an address that resolves to loopback or to an internal range, unless the YAML sets
 `allow_private_sources: true`. A configured YAML source is never subject to the
 check, so a FreshRSS or changedetection.io instance on the LAN stays a supported
