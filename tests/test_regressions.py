@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -3358,7 +3359,7 @@ def test_a_pass_survives_an_unwritable_kev_cache(tmp_path):
     notifier = Notifier()
 
     def http(method, url, headers, payload):
-        if "cisa.gov" in url:
+        if urlsplit(url).hostname == "www.cisa.gov":
             return _kev_http("CVE-2026-4242")(method, url, headers, payload)
         return http_for({})(method, url, headers, payload)
 
