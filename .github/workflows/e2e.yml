@@ -1,0 +1,330 @@
+# End to end: start both shipped deployment paths from the image this pull request builds.
+#
+# ci.yml proves that the image builds and answers /healthz. It does not run what README.md and docs/deployment.md
+# tell a user to run, so a compose file or a Podman unit that no longer starts the image would still pass it.
+# Each job here builds the image from the checkout, never from a registry (the image under test is the one this
+# change produced), then starts it exactly as the guide says and checks what a user depends on: the running image,
+# the user it runs as, /healthz, a writable /data and state that survives a restart.
+#
+#   compose         the README quickstart, in an empty scratch directory
+#   podman-quadlet  the shipped unit, installed unmodified into a rootless user's systemd
+#
+# The podman-quadlet job runs on the Podman that the ubuntu-24.04 runner image carries (4.9.3 when this was written;
+# the image has changed it before), so every run prints the version and the quadlet generator's reading of the unit.
+name: e2e
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compose:
+    name: compose
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The job never pushes, so it keeps no token in .git/config.
+          persist-credentials: false
+
+      - name: Quickstart files in a scratch directory
+        # README.md#quickstart, command for command, in a directory that holds nothing else. A user has the compose
+        # file and the example configuration, not this checkout, so a file the checkout happens to carry (a .env, a
+        # data directory) must not be able to make the run pass. ADVISORY_RADAR_TAG is the compose file's own pin:
+        # it points the file at the image the next step builds.
+        run: |
+          set -euo pipefail
+          scratch=$(mktemp -d)
+          cp docker-compose.yml "$scratch/"
+          cd "$scratch"
+          mkdir -p config
+          cp "$GITHUB_WORKSPACE/examples/config.yml" config/config.yml
+          printf 'ADVISORY_RADAR_AUTH_TOKEN=%s\n' "$(openssl rand -hex 24)" > .env
+          printf 'ADVISORY_RADAR_TAG=e2e\n' >> .env
+          chmod 600 .env
+          echo "E2E_DIR=$scratch" >> "$GITHUB_ENV"
+
+      - name: Build the image from this checkout
+        # The compose file decides the image reference. Reading the resolved reference back from compose, instead of
+        # repeating it here, keeps this job from drifting away from the file it tests. Building the checkout under
+        # that exact reference is what lets `up --pull never` start the code under test and nothing else.
+        run: |
+          set -euo pipefail
+          image=$(cd "$E2E_DIR" && docker compose config --images)
+          case "$image" in
+            '' | *$'\n'*)
+              echo "::error::docker-compose.yml must name exactly one image, got: $image"
+              exit 1 ;;
+            *:e2e) ;;
+            *)
+              echo "::error::$image does not follow ADVISORY_RADAR_TAG, so a local build cannot stand in for it"
+              exit 1 ;;
+          esac
+          echo "image under test: $image"
+          docker build -t "$image" .
+          echo "E2E_IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$image")" >> "$GITHUB_ENV"
+
+      - name: docker compose up -d --wait
+        # The README's command with two guards. --pull never: the image is local, so a build that was not tagged for
+        # the compose file fails here instead of quietly pulling the last release. --wait returns once the image's
+        # own health check passes, which costs one 30 s interval; its timeout turns a container that never gets
+        # there into a failure.
+        run: |
+          set -euo pipefail
+          cd "$E2E_DIR"
+          docker compose up -d --wait --wait-timeout 180 --pull never
+
+      - name: Running container is the built image, as UID 10001, answering /healthz
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          cd "$E2E_DIR"
+          container=$(docker compose ps --quiet advisory-radar)
+          running=$(docker inspect --format '{{.Image}}' "$container")
+          [ "$running" = "$E2E_IMAGE_ID" ] || fail "the container runs $running, not the built image $E2E_IMAGE_ID"
+          body=$(curl -fsS --max-time 10 http://127.0.0.1:8080/healthz)
+          [ "$body" = ok ] || fail "/healthz answered '$body', expected 'ok'"
+          # PID 1 is the application itself: its real, effective, saved and filesystem UIDs, not just the user
+          # `exec` picks.
+          uids=$(docker compose exec -T advisory-radar grep '^Uid:' /proc/1/status)
+          read -r _ real effective saved filesystem <<< "$uids"
+          expected="10001 10001 10001 10001"
+          [ "$real $effective $saved $filesystem" = "$expected" ] || fail "PID 1 has '$uids', expected $expected"
+          exec_uid=$(docker compose exec -T advisory-radar id -u)
+          [ "$exec_uid" = 10001 ] || fail "docker compose exec runs as UID $exec_uid, expected 10001"
+
+      - name: State on the fresh named volume survives docker compose restart
+        # The image owns /data for UID 10001 and a new named volume copies that owner. If the Dockerfile stopped
+        # doing that, the write below would be refused: the failure this job exists to catch.
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          cd "$E2E_DIR"
+          container=$(docker compose ps --quiet advisory-radar)
+          data_mount='{{range .Mounts}}{{if eq .Destination "/data"}}{{.Type}}{{end}}{{end}}'
+          type=$(docker inspect --format "$data_mount" "$container")
+          [ "$type" = volume ] || fail "/data is a '$type' mount, expected the named volume"
+          docker compose exec -T advisory-radar stat -c '/data is %u:%g, mode %a' /data
+          docker compose exec -T advisory-radar sh -c 'printf persisted > /data/e2e-probe'
+          started=$(docker inspect --format '{{.State.StartedAt}}' "$container")
+          docker compose restart
+          restarted=$(docker inspect --format '{{.State.StartedAt}}' "$container")
+          [ "$restarted" != "$started" ] || fail "docker compose restart did not restart the container"
+          # Restart resets the health status, and the first probe comes one interval later; `up --wait` is the
+          # documented way to wait for it.
+          docker compose up -d --wait --wait-timeout 180 --pull never
+          health=$(docker inspect --format '{{.State.Health.Status}}' "$container")
+          [ "$health" = healthy ] || fail "after the restart the container is '$health', expected 'healthy'"
+          body=$(curl -fsS --max-time 10 http://127.0.0.1:8080/healthz)
+          [ "$body" = ok ] || fail "/healthz answered '$body' after the restart, expected 'ok'"
+          probe=$(docker compose exec -T advisory-radar cat /data/e2e-probe)
+          [ "$probe" = persisted ] || fail "the file written before the restart reads '$probe' after it"
+
+      - name: Container state and logs
+        if: failure()
+        run: |
+          set -euo pipefail
+          # A diagnostic that fails must not hide the ones after it.
+          show() { echo "::group::$*"; "$@" || echo "(exit status $?)"; echo "::endgroup::"; }
+          show docker ps --all
+          if [ -n "${E2E_DIR:-}" ]; then
+            cd "$E2E_DIR"
+            show docker compose ps --all
+            show docker compose logs --no-color --timestamps
+          fi
+
+      - name: docker compose down -v
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${E2E_DIR:-}" ]; then
+            cd "$E2E_DIR"
+            docker compose down -v
+          fi
+
+  podman-quadlet:
+    name: podman-quadlet
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Podman version
+        # The unit is tested on the Podman the runner image ships. A newer one is not installed: Ubuntu's archive offers
+        # only the 4.9 series for 24.04, and no simple, pinned, official route to a newer Podman is known (it would take
+        # an unofficial repository or a source build). A key of the unit that this Podman does not know fails the
+        # generator step below and names the key. What to do then is a decision about the unit, not an edit made here.
+        run: |
+          set -euo pipefail
+          podman --version
+
+      - name: Start the systemd user manager
+        # A quadlet is a user unit and a CI runner has no login session, so no user manager runs. Lingering starts
+        # one without a login, as docs/deployment.md#prerequisites tells a headless host. This is the only sudo in
+        # the job: Podman itself runs as the runner user. XDG_RUNTIME_DIR goes to every later step because Podman
+        # keeps its runtime state there: the Podman that the user manager runs for the unit and the Podman these
+        # steps run must agree on it, or they would not see each other's containers.
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$(id -un)"
+          runtime_dir=/run/user/$(id -u)
+          export XDG_RUNTIME_DIR=$runtime_dir
+          for _ in $(seq 1 60); do
+            if systemctl --user show-environment > /dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          systemctl --user show-environment > /dev/null
+          echo "XDG_RUNTIME_DIR=$runtime_dir" >> "$GITHUB_ENV"
+
+      - name: Install the unit and the files it expects
+        # docs/deployment.md#podman-quadlet-rootless, command for command. The unit is copied and never edited, so
+        # what passes here is what a user installs; `cmp` makes that a fact of this run.
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/advisory-radar ~/.local/share/advisory-radar ~/.config/containers/systemd
+          cp examples/config.yml ~/.config/advisory-radar/config.yml
+          printf 'ADVISORY_RADAR_AUTH_TOKEN=%s\n' "$(openssl rand -hex 24)" > ~/.config/advisory-radar.env
+          chmod 600 ~/.config/advisory-radar.env
+          cp deploy/podman/advisory-radar.container ~/.config/containers/systemd/
+          cmp deploy/podman/advisory-radar.container ~/.config/containers/systemd/advisory-radar.container
+
+      - name: What the quadlet generator makes of the unit
+        # The generator exits non-zero and names the key when this Podman does not know one, so a unit that needs
+        # a newer Podman than the runner has fails here with the reason. The output is the evidence for the version
+        # printed above.
+        run: |
+          set -euo pipefail
+          /usr/libexec/podman/quadlet -dryrun -user
+
+      - name: Build the image from this checkout under the unit's Image= name
+        # Rootless, as the user the unit runs as, so the unit's Podman finds the image in the same storage. Tagging it
+        # with the exact Image= value means the start below pulls nothing and runs this build. The value is read from
+        # the shipped unit, so it cannot drift from it.
+        run: |
+          set -euo pipefail
+          image=$(sed -n 's/^Image=//p' deploy/podman/advisory-radar.container)
+          case "$image" in
+            '' | *$'\n'*)
+              echo "::error::the unit must set Image= exactly once, got: $image"
+              exit 1 ;;
+          esac
+          echo "image under test: $image"
+          podman build --tag "$image" .
+          echo "E2E_IMAGE_ID=$(podman image inspect --format '{{.Id}}' "$image")" >> "$GITHUB_ENV"
+
+      - name: systemctl --user start advisory-radar
+        # The unit allows itself 15 minutes to start, for a slow first pull. Nothing is pulled here, so five minutes
+        # is generous, and a start that hangs fails this step and still reaches the diagnostics below.
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          systemctl --user daemon-reload
+          systemctl --user start advisory-radar
+
+      - name: Wait until the container is healthy
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          url=http://127.0.0.1:8080/healthz
+          # The web UI answers within seconds of the start.
+          for _ in $(seq 1 60); do
+            if curl -fsS --max-time 5 "$url" > /dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          curl -fsS --max-time 5 "$url" > /dev/null || fail "$url does not answer two minutes after the start"
+          # The health status needs a probe result, and Podman schedules the first one a full interval (30 s) after
+          # the start. The manual probe runs only once the web UI is known to answer, so it cannot fail and count
+          # against the unit's three retries.
+          status=unknown
+          for attempt in $(seq 1 24); do
+            status=$(podman inspect --format '{{.State.Health.Status}}' advisory-radar)
+            echo "health status: $status"
+            if [ "$status" = healthy ]; then break; fi
+            if [ "$attempt" -eq 12 ]; then
+              echo "no result after a minute: the health timer may not run on this host, so run the probe once by hand"
+              if podman healthcheck run advisory-radar; then echo "the probe passed"; fi
+            fi
+            sleep 5
+          done
+          [ "$status" = healthy ] || fail "the container is '$status' two minutes after the web UI answered"
+
+      - name: Running container is the built image, as UID 10001 mapped onto the runner user
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          running=$(podman inspect --format '{{.Image}}' advisory-radar)
+          [ "$running" = "$E2E_IMAGE_ID" ] || fail "the container runs $running, not the built image $E2E_IMAGE_ID"
+          body=$(curl -fsS --max-time 10 http://127.0.0.1:8080/healthz)
+          [ "$body" = ok ] || fail "/healthz answered '$body', expected 'ok'"
+          # Inside the container the application is UID 10001 ...
+          uids=$(podman exec advisory-radar grep '^Uid:' /proc/1/status)
+          read -r _ real effective saved filesystem <<< "$uids"
+          expected="10001 10001 10001 10001"
+          [ "$real $effective $saved $filesystem" = "$expected" ] || fail "PID 1 has '$uids', expected $expected"
+          exec_uid=$(podman exec advisory-radar id -u)
+          [ "$exec_uid" = 10001 ] || fail "podman exec runs as UID $exec_uid, expected 10001"
+          # ... and from the host, where UserNS=keep-id maps that UID onto this user.
+          pid=$(podman inspect --format '{{.State.Pid}}' advisory-radar)
+          host_uids=$(grep '^Uid:' "/proc/$pid/status")
+          read -r _ host_uid _ <<< "$host_uids"
+          [ "$host_uid" = "$(id -u)" ] || fail "host UID is $host_uid, not $(id -u): keep-id did not map the image user"
+          # What the container writes into the state directory belongs to the runner user. The directory alone proves
+          # nothing: this job created it.
+          state=$HOME/.local/share/advisory-radar
+          podman exec advisory-radar sh -c 'printf persisted > /data/e2e-probe'
+          for path in "$state" "$state/e2e-probe"; do
+            owner=$(stat --format %u "$path")
+            [ "$owner" = "$(id -u)" ] || fail "$path belongs to UID $owner, expected $(id -u)"
+          done
+
+      - name: State survives systemctl --user restart
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          url=http://127.0.0.1:8080/healthz
+          before=$(podman inspect --format '{{.Id}}' advisory-radar)
+          systemctl --user restart advisory-radar
+          after=$(podman inspect --format '{{.Id}}' advisory-radar)
+          [ "$before" != "$after" ] || fail "systemctl --user restart did not replace the container"
+          for _ in $(seq 1 60); do
+            if curl -fsS --max-time 5 "$url" > /dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          body=$(curl -fsS --max-time 5 "$url") || fail "$url does not answer two minutes after the restart"
+          [ "$body" = ok ] || fail "/healthz answered '$body' after the restart, expected 'ok'"
+          on_host=$(cat "$HOME/.local/share/advisory-radar/e2e-probe")
+          [ "$on_host" = persisted ] || fail "the file on the host reads '$on_host' after the restart"
+          in_container=$(podman exec advisory-radar cat /data/e2e-probe)
+          [ "$in_container" = persisted ] || fail "the file in the new container reads '$in_container'"
+
+      - name: Service, generated unit and container diagnostics
+        if: failure()
+        run: |
+          set -euo pipefail
+          # A diagnostic that fails must not hide the ones after it: `systemctl status` exits 3 for a failed unit.
+          show() { echo "::group::$*"; "$@" || echo "(exit status $?)"; echo "::endgroup::"; }
+          show podman --version
+          show systemctl --user status advisory-radar --no-pager
+          show journalctl --user -u advisory-radar --no-pager
+          show /usr/libexec/podman/quadlet -dryrun -user
+          show podman ps --all
+          show podman logs advisory-radar
+          show podman inspect --format '{{json .State.Health}}' advisory-radar
+          show podman info
+          # The usual reasons a rootless Podman cannot start a container on a runner: no user namespace, no sub-ids
+          # for this user, or a missing helper that the Podman package only recommends.
+          show sysctl kernel.apparmor_restrict_unprivileged_userns
+          show grep "^$(id -un):" /etc/subuid /etc/subgid
+          show dpkg --list uidmap slirp4netns passt dbus-user-session

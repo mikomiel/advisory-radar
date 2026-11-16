@@ -24,27 +24,41 @@ deduplicated alert per new advisory to the channels you choose.
 
 ## Quickstart
 
-Create the mounts and the configuration the container expects, then start it:
+Create the configuration directory and the login token, then start it:
 
 ```bash
-mkdir -p config data
-cp examples/config.yml config/config.yml   # edit sources/notifiers
-printf 'ADVISORY_RADAR_AUTH_TOKEN=%s\n' "$(openssl rand -hex 24)" > .env   # plus your notifier secrets
-docker compose up -d
+mkdir -p config
+cp examples/config.yml config/config.yml   # then edit the sources; its one notifier ships disabled
+printf 'ADVISORY_RADAR_AUTH_TOKEN=%s\n' "$(openssl rand -hex 24)" > .env
+chmod 600 .env
+docker compose up -d --wait
 ```
+
+A fresh copy starts with only that token: the example's notifier (`discord`) is disabled,
+so nothing is sent until you enable one. To deliver alerts, add its variable to `.env`
+(`DISCORD_WEBHOOK_URL=...`), delete `enabled: false` from that entry in `config/config.yml`
+and run `docker compose up -d` again. `--wait` returns once the container reports healthy;
+if it does not, `docker compose logs advisory-radar` says why.
 
 `docker compose up -d` pulls `ghcr.io/mikomiel/advisory-radar:latest`, which the
 `v*.*.*` tag workflow publishes ([Status](#status); `0.1.0` was the first public
-release). To run this checkout instead, build that tag first with
-`docker build -t ghcr.io/mikomiel/advisory-radar:latest .`.
+release). The compose file and the Podman quadlet need an image that has the `healthcheck`
+command and a `/data` owned by the image's user, which releases up to 0.3.1 lack: use a
+later release, or build this checkout first with
+`docker build -t ghcr.io/mikomiel/advisory-radar:latest .`. To follow one release instead of
+`latest`, set `ADVISORY_RADAR_TAG=vX.Y.Z` in `.env`
+([image tags](docs/deployment.md#image-tags-updates-and-rollback)).
 
-Open http://localhost:8080 and sign in with the token in `.env`. The session
-cookie is `Secure` by default, so a plain-HTTP local instance needs
-`ADVISORY_RADAR_INSECURE_COOKIES=1` in `.env`, or TLS terminated in front of it
-(see [the deployment configuration](docs/deployment.md#configuration)).
+Open http://localhost:8080 and sign in with the token in `.env`. The compose file
+publishes the port on the loopback address only. The session cookie is `Secure` by
+default, so a plain-HTTP trial needs `ADVISORY_RADAR_INSECURE_COOKIES=1` in `.env`, and an
+instance you keep running needs TLS terminated in front of it
+(see [exposing the web UI](docs/deployment.md#exposing-the-web-ui)).
 
 Configuration is `config/config.yml` on the read-only `/config` mount, and state
-lives in `./data`; start from [examples/config.yml](examples/config.yml) and read
+lives in the `advisory-radar-data` volume, which is `/data` in the container
+([a directory works too](docs/deployment.md#state-in-a-directory-instead-of-a-volume));
+start from [examples/config.yml](examples/config.yml) and read
 [docs/configuration.md](docs/configuration.md). Secrets come from environment
 variables or a `${NAME_FILE}` reference to a file, never from committed files.
 [docs/deployment.md](docs/deployment.md) is the canonical deployment procedure,
@@ -81,9 +95,10 @@ uv run python -m advisory_radar --help
 
 Python 3.13 and 3.14 are supported and tested; the range is declared in `pyproject.toml`.
 
-Conventional Commits; every PR runs lint, tests, a secret scan and a
-no-internal-identifiers scan on free GitHub-hosted runners; `main` is protected
-(requires green CI and a review).
+Conventional Commits; every PR runs lint, tests, a secret scan, a
+no-internal-identifiers scan and an end-to-end start of the Compose and Podman
+deployments on free GitHub-hosted runners; `main` is protected (requires green
+CI and a review).
 
 ## Security
 

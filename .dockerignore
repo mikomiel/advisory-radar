@@ -1,0 +1,22 @@
+# What the build sends to the container engine. The Dockerfile copies only pyproject.toml, uv.lock, README.md,
+# LICENSE and src/, so nothing below can reach the image today; this file keeps it that way if a later COPY is
+# widened, and it stops local secrets and state from being uploaded to a remote builder at all.
+
+# Version control and local environments
+.git
+.venv
+.uv
+
+# Caches. `**/` matches at any depth, which a bare name does not.
+**/__pycache__
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Local state, configuration and secrets (the quickstart creates all three beside the Dockerfile)
+data
+config
+.env
+.env.*
+*.db
+*.db-journal

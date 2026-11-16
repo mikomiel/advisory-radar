@@ -1,36 +1,293 @@
 # Deployment
 
-advisory-radar ships as one rootless-friendly container. Pick one:
+advisory-radar ships as one rootless-friendly container that runs as UID 10001.
+Docker Compose and rootless Podman are both supported.
+
+CI starts both paths end to end with [`e2e.yml`](../.github/workflows/e2e.yml): one job follows
+the Compose commands below, the other installs the unmodified Podman unit for a rootless user on
+the Podman that the runner provides (its log prints the version). Each job builds the image from
+the change under test, then checks that the container runs that image as UID 10001, answers
+`/healthz`, can write `/data` and keeps its state across a restart.
+
+Pick one:
 
 ## Docker Compose
 
 ```bash
-mkdir -p config data
-cp examples/config.yml config/config.yml   # edit sources/notifiers
-printf 'ADVISORY_RADAR_AUTH_TOKEN=%s\n' "$(openssl rand -hex 24)" > .env   # plus your notifier secrets
-docker compose up -d
+mkdir -p config
+cp examples/config.yml config/config.yml   # edit the sources; the example's one notifier ships disabled
+printf 'ADVISORY_RADAR_AUTH_TOKEN=%s\n' "$(openssl rand -hex 24)" > .env
+chmod 600 .env
+docker compose up -d --wait
 ```
 
-The image runs as UID 10001 by default; the compose file overrides it to your own
-UID/GID so `./data` stays writable (`ADVISORY_RADAR_UID` / `ADVISORY_RADAR_GID` if
-your ids are not 1000). If you would rather keep the image's user, make the
-directory writable for it: `sudo install -d -m 0750 -o 10001 -g 10001 data`.
+The login token is the only variable a fresh copy needs. The example configuration ships
+its notifier (`discord`) disabled, so the first start does not need a webhook: nothing is
+sent, advisories stay queued, and each pass logs `no enabled notifiers` while any wait. To
+deliver, add the notifier's variable to `.env` (`DISCORD_WEBHOOK_URL=...`), delete
+`enabled: false` from that entry in `config/config.yml` and run `docker compose up -d` again.
+
+`--wait` returns once the container reports healthy. If it does not, `docker compose ps`
+shows its state and `docker compose logs advisory-radar` says why (a configuration error is
+logged there). Open the UI at <http://localhost:8080>. The session cookie is `Secure`, so a
+plain-HTTP trial needs `ADVISORY_RADAR_INSECURE_COOKIES=1` in `.env` (see
+[Exposing the web UI](#exposing-the-web-ui)).
+
+What the compose file sets, and why:
+
+| Setting | Effect |
+|---|---|
+| `image: ghcr.io/mikomiel/advisory-radar:${ADVISORY_RADAR_TAG:-latest}` | the newest stable release, unless `.env` pins a tag ([Image tags, updates and rollback](#image-tags-updates-and-rollback)) |
+| `advisory-radar-data:/data` | a named volume for the state. The image creates `/data` owned by UID 10001 and a new volume copies that owner, so it is writable with no chown and no `user:` override |
+| `./config:/config:ro` | your `config.yml`, read-only |
+| `127.0.0.1:8080:8080` | the UI answers on this host only ([Exposing the web UI](#exposing-the-web-ui)) |
+| `cap_drop: [ALL]` and `no-new-privileges` | the process is unprivileged and needs no capability |
+| `healthcheck` | the image's own probe, `advisory-radar healthcheck` ([Health checks](#health-checks)) |
+
+`web.port` in `config.yml` (8080 in the example) is the container port the mapping targets.
+The health check follows it, so change the mapping when you change the port.
+
+### State in a directory instead of a volume
+
+Mount a directory (`./data:/data`) instead of the named volume when you want to see, copy
+or back up the state with ordinary tools, or when you are upgrading from the earlier compose
+file: it mounted `./data` and ran the container as 1000:1000 unless you set
+`ADVISORY_RADAR_UID` and `ADVISORY_RADAR_GID`, so your state is in that directory and the new
+named volume starts empty. The directory has to be writable for whoever runs the container.
+Either give it to the image's user:
+
+```bash
+sudo install -d -m 0750 -o 10001 -g 10001 data
+```
+
+or run the container as your own account: put your ids in `.env`, and uncomment the `user:`
+line in the compose file.
+
+```bash
+mkdir -p data
+printf 'ADVISORY_RADAR_UID=%s\nADVISORY_RADAR_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+```
 
 ## Podman (quadlet, rootless)
 
 ```bash
 mkdir -p ~/.config/advisory-radar ~/.local/share/advisory-radar ~/.config/containers/systemd
-cp examples/config.yml ~/.config/advisory-radar/config.yml
+cp examples/config.yml ~/.config/advisory-radar/config.yml   # edit the sources; the notifier ships disabled
 printf 'ADVISORY_RADAR_AUTH_TOKEN=%s\n' "$(openssl rand -hex 24)" > ~/.config/advisory-radar.env
 chmod 600 ~/.config/advisory-radar.env
 cp deploy/podman/advisory-radar.container ~/.config/containers/systemd/
 systemctl --user daemon-reload && systemctl --user start advisory-radar
+systemctl --user status advisory-radar   # the log: journalctl --user -u advisory-radar
 ```
+
+There is no `systemctl enable` step: the Quadlet generator turns the unit's `[Install]`
+section into the boot wiring when it generates the service. Notifier variables go in the same
+env file as the token, as in the compose `.env` above.
 
 The quadlet runs with `UserNS=keep-id:uid=10001,gid=10001`, which maps the
 image's user to yours so both `~/.config/advisory-radar` (read-only config) and
 `~/.local/share/advisory-radar` (state) are usable without a chown. It mounts
-`~/.config/advisory-radar`, the same directory the commands above create.
+`~/.config/advisory-radar`, the same directory the commands above create. The env file sits
+beside that directory, not in it, so it is not mounted into the container.
+
+The unit also drops every capability (`DropCapability=ALL`), sets `NoNewPrivileges=true`,
+publishes the UI on `127.0.0.1:8080` only and runs the image's own probe
+(`HealthCmd=advisory-radar healthcheck`, see [Health checks](#health-checks)). It sets
+`RestartSec=10` and `TimeoutStartSec=900`: a configuration error then repeats every ten
+seconds in the journal instead of stopping for good once systemd's start limit trips, and the
+first start has fifteen minutes to pull the image instead of the default 90 seconds.
+
+### Prerequisites
+
+- **Podman 4.5 or newer.** Quadlet starts at 4.4 and gained keys release by release. This unit
+  needs 4.5: that release added the health check keys (`HealthCmd=` and the other `Health*`
+  keys) and the UID and GID options of `UserNS=keep-id`. The unit
+  is checked against the Quadlet generator of Podman 5.4.2: use that or newer. A Podman that does
+  not know a key skips the whole unit and starts nothing. `/usr/libexec/podman/quadlet -dryrun -user`
+  prints the reason (`unsupported key '...'`) or the service it would generate; the path of
+  that binary differs between distributions.
+- **Lingering.** A user unit stops when the user's last session ends and does not start at
+  boot until you run `sudo loginctl enable-linger <user>` once.
+- **A shell that reaches the user manager.** `systemctl --user` and `journalctl --user` talk
+  to the user's systemd instance. A login over SSH or on a console has it. After `su` or
+  `sudo -iu <user>` it is usually missing (`Failed to connect to bus`): open the shell with
+  `sudo machinectl shell <user>@`, or export `XDG_RUNTIME_DIR=/run/user/$(id -u)` first (that
+  directory exists while the user is logged in or lingering).
+- **Sub-ids.** Rootless Podman maps the container's other ids through the user's ranges in
+  `/etc/subuid` and `/etc/subgid` (`grep <user> /etc/subuid /etc/subgid` shows them;
+  `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 <user>` adds an
+  example range; pick one that no other user holds). In an unprivileged LXC container the
+  ranges must lie inside the ids the container itself was given: a range that reaches beyond
+  them makes the first `podman run` fail while it sets up the user namespace, and the error
+  mentions `newuidmap`. When you cannot give the user a range that fits, use the rootful
+  variant below.
+
+### Rootful variant
+
+Run Podman as root and let the image keep its non-root user when a user namespace is not
+available: the sub-id ranges above do not fit, or nobody wants a lingering user. Copy the unit
+to `/etc/containers/systemd/` and change five lines, because `%h` is root's home in a system
+unit and `UserNS=keep-id` exists only for rootless Podman. Create the directories first, with
+the data directory owned by the image's user and the env file beside the configuration
+directory, not in it:
+
+```bash
+sudo install -d -o 10001 -g 10001 -m 0750 /var/lib/advisory-radar
+sudo install -d /etc/advisory-radar
+sudo cp examples/config.yml /etc/advisory-radar/config.yml
+printf 'ADVISORY_RADAR_AUTH_TOKEN=%s\n' "$(openssl rand -hex 24)" | sudo install -m 600 /dev/stdin /etc/advisory-radar.env
+sudo cp deploy/podman/advisory-radar.container /etc/containers/systemd/
+```
+
+| In the copied unit | Becomes |
+|---|---|
+| `Volume=%h/.config/advisory-radar:/config:ro` | `Volume=/etc/advisory-radar:/config:ro` |
+| `Volume=%h/.local/share/advisory-radar:/data` | `Volume=/var/lib/advisory-radar:/data` |
+| `UserNS=keep-id:uid=10001,gid=10001` | `User=10001` and `Group=10001` (two lines) |
+| `EnvironmentFile=%h/.config/advisory-radar.env` | `EnvironmentFile=/etc/advisory-radar.env` |
+| `WantedBy=default.target` | `WantedBy=multi-user.target` |
+
+Then `sudo systemctl daemon-reload && sudo systemctl start advisory-radar`. The unit is a
+system service, so the status and the log are `systemctl status advisory-radar` and
+`journalctl -u advisory-radar`, and it needs neither lingering nor a user manager. Run
+`/usr/libexec/podman/quadlet -dryrun` (no `-user`) to see the service it generates: the
+paths are the absolute ones above and the container starts with `--user 10001:10001`.
+
+## Image tags, updates and rollback
+
+A release tag `vX.Y.Z` publishes `ghcr.io/mikomiel/advisory-radar:vX.Y.Z`, and a stable
+release also moves `latest`; a pre-release never does. The compose file and the quadlet in
+this repository rely on two things the image gained with them, the `healthcheck` command and
+a `/data` owned by UID 10001. Releases up to 0.3.1 have neither, so run a later release or
+build this checkout (`docker build -t ghcr.io/mikomiel/advisory-radar:latest .`).
+
+**Pin a release.** With `latest`, any pull can change the application, so pin the tag you
+have read the notes for ([CHANGELOG.md](../CHANGELOG.md)). In Compose set
+`ADVISORY_RADAR_TAG=vX.Y.Z` in `.env`; in the quadlet set
+`Image=ghcr.io/mikomiel/advisory-radar:vX.Y.Z`. A tag can in principle be moved; to pin the
+exact bytes use the digest (`docker buildx imagetools inspect <image>:vX.Y.Z` prints it) as
+`ghcr.io/mikomiel/advisory-radar@sha256:<digest>` in the compose `image:` line or in `Image=`.
+
+**Verify a release.** Every release image carries a build provenance attestation signed by
+the release workflow. Check a tag before you first run it:
+
+```bash
+gh attestation verify oci://ghcr.io/mikomiel/advisory-radar:vX.Y.Z --repo mikomiel/advisory-radar
+```
+
+**Update.** Read the release notes, then copy the data first: stop the service and copy the
+data volume or directory. A release that changes the state schema writes a document an older
+release refuses to read (`the state file is from another version`), so the copy is also your
+way back.
+
+- Compose: set the new tag in `.env`, then `docker compose pull && docker compose up -d --wait`.
+  With `latest` the same two commands fetch whatever is newest.
+- Podman, pinned tag: edit `Image=` in `~/.config/containers/systemd/advisory-radar.container`,
+  then `systemctl --user daemon-reload && systemctl --user restart advisory-radar`. The
+  restart pulls the new tag, which can take a while (`TimeoutStartSec=900`).
+- Podman, `latest`: `podman pull ghcr.io/mikomiel/advisory-radar:latest` first. The restart
+  alone does not, because the image is already present.
+
+**Roll back.** Put the previous tag (or digest) back and run the update commands again. If
+the newer release already wrote the state, restore the copy you took before the update
+first.
+
+`podman auto-update` is opt-in and the quadlet does not enable it. It re-pulls the tag a unit
+names, so turning it on (`AutoUpdate=registry` and the `podman-auto-update.timer`) means
+following that tag unattended: on `latest` every stable release is applied without a review,
+and on a pinned `vX.Y.Z` it changes nothing. Enable it only for a tag policy you have
+chosen on purpose.
+
+## Exposing the web UI
+
+The compose file and the quadlet publish the UI on `127.0.0.1:8080`, so only the host itself
+reaches it. The UI has a login and no TLS of its own, and its session cookie is `Secure`.
+Earlier versions of these files published on every interface: if you reached the UI from
+another machine, that stops working after you update them, by design.
+
+To reach it from other machines, put a TLS-terminating reverse proxy on the host and forward
+to `127.0.0.1:8080`, then set `ADVISORY_RADAR_PUBLIC_HTTPS=1` so the UI sends HSTS. Keep the
+published address on loopback: the proxy reaches it there and nothing else needs to. A proxy
+that runs as a container in the same compose project can reach the service as
+`advisory-radar:8080` over the compose network, and then the `ports:` entry can go.
+
+Change the address to `0.0.0.0` only when something else decides who can connect. With
+Docker, a host firewall such as `ufw` is not that: published ports bypass its rules. The
+application throttles failed logins per connecting address, which behind a proxy is the
+proxy's address, so add rate limiting at the proxy if you need a limit per client.
+
+A plain-HTTP trial on one machine works with `ADVISORY_RADAR_INSECURE_COOKIES=1` in `.env`
+(Compose) or in the env file (Podman). Do not keep that setting on an instance anyone else
+can reach.
+
+## Keeping secrets out of .env
+
+A mode 600 `.env` is enough on a host only you use. To keep a secret out of it:
+
+- **Notifier and source secrets** already take a file. Write `${DISCORD_WEBHOOK_URL_FILE}`
+  instead of `${DISCORD_WEBHOOK_URL}` in `config.yml`, and set `DISCORD_WEBHOOK_URL_FILE` to
+  the path of a file that holds the value (see [Configuration](#configuration)).
+- **The login token** can come from a file through `ADVISORY_RADAR_AUTH_TOKEN_FILE`. That
+  variable needs a release that reads it; releases up to 0.3.1 read only
+  `ADVISORY_RADAR_AUTH_TOKEN`, so check [CHANGELOG.md](../CHANGELOG.md) before you rely on
+  it. Until then keep the token in `.env`, or use a Podman secret as below.
+
+For a file secret with Compose, create the file where only you can reach it. The container's
+user is UID 10001, not you, so the file itself has to be readable by others; the directory
+around it keeps that from exposing the file on the host:
+
+```bash
+mkdir -m 0700 secrets
+printf '%s' "$(openssl rand -hex 24)" | install -m 0444 /dev/stdin secrets/advisory_radar_token
+```
+
+Then remove `ADVISORY_RADAR_AUTH_TOKEN` from `.env` and uncomment the three marked pieces in
+`docker-compose.yml`: `ADVISORY_RADAR_AUTH_TOKEN_FILE: /run/secrets/advisory_radar_token`
+under `environment:`, `secrets: [advisory_radar_token]` under the service, and the top-level
+`secrets:` block that points at `./secrets/advisory_radar_token`. The same shape works for a
+notifier's `..._FILE` variable.
+
+For Podman, a secret of type `env` hands the value to the container as the environment
+variable, so it leaves the env file but not the container's environment. Create it from
+your terminal, without the value in a command line or the shell history, and enable the
+commented `Secret=` line in the unit:
+
+```bash
+read -rsp 'Login token: ' token; echo      # bash
+printf '%s' "$token" | podman secret create advisory-radar-token -
+unset token
+# in the unit, after removing ADVISORY_RADAR_AUTH_TOKEN from the env file:
+# Secret=advisory-radar-token,type=env,target=ADVISORY_RADAR_AUTH_TOKEN
+```
+
+The rootful variant uses the same commands with `sudo`; a secret belongs to the user whose
+Podman creates it.
+
+## Health checks
+
+The image, the compose file and the quadlet all run one probe, `advisory-radar healthcheck`.
+It reads `web.port` from the configuration (`ADVISORY_RADAR_CONFIG`, which the image sets to
+`/config/config.yml`), asks `http://127.0.0.1:<port>/healthz` and exits 0 on a `200`. On
+anything else (a refused connection, no answer within 3 seconds, another status, a
+configuration it cannot read) it exits 1 and prints the reason, which the container runtime
+keeps as the health log (`State.Health` in `docker inspect` and `podman inspect`).
+
+The probe sends no credential, reads no secret and ignores proxy variables, and it only
+ever talks to the loopback address of its own container. Because it reads no secret, a
+`${VARIABLE}` that only a notifier needs cannot turn a running service unhealthy.
+
+It is a liveness check: it passes while the process answers HTTP. `/readyz` is the check for
+whether passes keep finishing (see [Monitoring](#monitoring-beszel-and-friends)). Run it by
+hand:
+
+```bash
+docker compose exec advisory-radar advisory-radar healthcheck
+podman exec advisory-radar advisory-radar healthcheck   # or: podman healthcheck run advisory-radar
+```
+
+If you start the image with another configuration path, set `ADVISORY_RADAR_CONFIG` to it
+instead of passing `--config` on the command line: the probe reads the variable, so a flag
+would leave it looking at a different file than the service.
 
 ## Kubernetes
 
@@ -91,7 +348,7 @@ container needs:
 | plus one per referenced secret | e.g. `DISCORD_WEBHOOK_URL`, `APPRISE_PASSWORD`, `FRESHRSS_TOKEN` |
 
 Volumes: `/config` (read-only) and `/data` (the state file, `settings.json`, the KEV cache and, with no
-`watchlist:` key, `watchlist.json`). An
+`watchlist:` key, `watchlist.json`), which the image creates owned by UID 10001 with mode `0750`. An
 advisory's identity is kept exactly as the publisher sent it — only its log and display spelling
 is escaped — because transforming an identity can merge two advisories into one.
 
@@ -116,7 +373,7 @@ the intake.
 The UI is protected by the login token, a `SameSite=Lax` + `Secure` + `HttpOnly`
 session cookie, a per-session form token on every state-changing POST, and a
 throttle on failed logins (five per five minutes per peer address). Put it behind
-a TLS-terminating reverse proxy; the session cookie is only sent over HTTPS unless
+a TLS-terminating reverse proxy ([Exposing the web UI](#exposing-the-web-ui)); the session cookie is only sent over HTTPS unless
 `ADVISORY_RADAR_INSECURE_COOKIES=1`.
 
 ### Storage

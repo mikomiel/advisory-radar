@@ -16,11 +16,18 @@ sources:
 notifiers:
   - id: discord
     type: discord_webhook
+    enabled: false
     url: ${DISCORD_WEBHOOK_URL}
 # optional: scope alerts to what you run (see below); with no key the
 # document is watchlist.json beside state_path, and /watchlist edits it
 watchlist: /data/watchlist.json
 ```
+
+The example's notifier ships disabled, so a fresh copy starts with only the login token and
+needs no webhook. A disabled entry is not built and its `${...}` references are not resolved.
+While every notifier is disabled nothing is sent: advisories stay queued, and each pass logs
+`no enabled notifiers` while any wait. To turn it on, set `DISCORD_WEBHOOK_URL`, delete the
+`enabled: false` line and restart the container.
 
 ## Watchlist
 

@@ -59,9 +59,15 @@ sources:
 # every advisory that arrives is judged.
 # watchlist: /data/watchlist.json
 
+# The one notifier below ships disabled, so a fresh copy of this file starts with only ADVISORY_RADAR_AUTH_TOKEN set.
+# While every notifier is disabled nothing is sent: advisories stay queued (the dashboard and /metrics show the
+# queue), each pass logs "no enabled notifiers" while any wait, and they go out once a notifier is enabled. To turn
+# this one on, put DISCORD_WEBHOOK_URL in .env, delete the `enabled: false` line and restart the container. A
+# disabled entry's ${...} references are not resolved.
 notifiers:
   - id: discord
     type: discord_webhook
+    enabled: false
     url: ${DISCORD_WEBHOOK_URL}
   # - id: apprise
   #   type: apprise
