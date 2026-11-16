@@ -20,7 +20,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import tzinfo
 
+from . import messages
 from .http import MESSAGE_LIMIT
+from .messages import DEFAULT_LANGUAGE
 
 #: At most this many advisories are listed in one digest. The character budget below is what protects the
 #: tightest channel -- ``DiscordWebhookNotifier`` truncates its content at 1900 characters without saying so,
@@ -147,7 +149,7 @@ def _line_ids(entry: dict) -> str:
     return f" ({text})"
 
 
-def _digest_body(lines: Sequence[str], omitted: int) -> str:
+def _digest_body(lines: Sequence[str], omitted: int, language: str) -> str:
     """The digest body: one line per advisory, then how many were left out.
 
     It starts with a newline for the same reason ``core.render`` does: every channel either prefixes the
@@ -155,7 +157,7 @@ def _digest_body(lines: Sequence[str], omitted: int) -> str:
     """
     body = "\n" + "\n".join(lines)
     if omitted:
-        body += f"\n(+{omitted} more not listed)"
+        body += "\n" + messages.text(language, "digest.omitted", count=omitted)
     return body
 
 
@@ -175,17 +177,21 @@ def _union_ids(entries: Sequence[dict]) -> list[str]:
     return union
 
 
-def _digest_line(entry: dict) -> str:
+def _digest_line(entry: dict, language: str) -> str:
     """One advisory as a Markdown bullet: its title, then its identifiers when they are short enough to help."""
-    return f"- **{_one_line(entry.get('title')) or '(untitled advisory)'}**{_line_ids(entry)}"
+    untitled = messages.text(language, "digest.untitled")
+    return f"- **{_one_line(entry.get('title')) or untitled}**{_line_ids(entry)}"
 
 
-def digest_message(entries: Sequence[dict]) -> dict:
+def digest_message(entries: Sequence[dict], *, language: str = DEFAULT_LANGUAGE) -> dict:
     """One queue-entry-shaped message covering every entry; delivery posts it through the existing interface.
 
     The title states the count and the severity a digest of these entries carries: ``critical`` when any
     covered entry is critical, ``warning`` otherwise -- a digest is one message, so it can only be as urgent
-    as its most urgent advisory. The body lists one line per advisory, capped by :data:`DIGEST_MAX_LINES` and
+    as its most urgent advisory. ``language`` is the language of the digest's own words (``messages``): the
+    title, the line of an entry without a title and the count of those left out. The ``tag`` stays English,
+    and an entry's own title is shown as it was rendered when it was queued. The body lists one line per
+    advisory, capped by :data:`DIGEST_MAX_LINES` and
     by the character budget the tightest built-in channel accepts; the entries that do not fit are counted in
     a final line rather than dropped silently, and they are still covered by the digest.
 
@@ -198,18 +204,20 @@ def digest_message(entries: Sequence[dict]) -> dict:
         raise ValueError("a digest needs at least one advisory")
     tag = "critical" if any(entry.get("tag") == "critical" for entry in entries) else "warning"
     count = len(entries)
-    title = f"{tag.upper()}: digest of {count} {'advisory' if count == 1 else 'advisories'}"
+    title = messages.level_title(
+        language, tag, messages.text(language, "digest.title.one" if count == 1 else "digest.title.other", count=count)
+    )
     budget = DIGEST_BODY_LIMIT - len(title)
-    lines = [_digest_line(entry) for entry in entries[:DIGEST_MAX_LINES]]
+    lines = [_digest_line(entry, language) for entry in entries[:DIGEST_MAX_LINES]]
     omitted = count - len(lines)
     # Trim from the end rather than skipping a line in the middle: the digest stays in queue order, and the
     # final count still accounts for every advisory the message covers.
-    while lines and len(_digest_body(lines, omitted)) > budget:
+    while lines and len(_digest_body(lines, omitted, language)) > budget:
         lines.pop()
         omitted += 1
     return {
         "title": title,
-        "body": _digest_body(lines, omitted),
+        "body": _digest_body(lines, omitted, language),
         "tag": tag,
         "kind": "digest",
         "ids": _union_ids(entries),
@@ -238,6 +246,7 @@ def plan(
     digest: bool = False,
     quiet: QuietHours | None = None,
     tz: tzinfo | None = None,
+    language: str = DEFAULT_LANGUAGE,
 ) -> list[Batch]:
     """What one pass sends now, in queue order; held entries are absent and therefore stay queued.
 
@@ -245,7 +254,8 @@ def plan(
     entry becomes its own batch with ``message=None`` and is posted exactly as it was rendered, so the feature
     can be enabled without changing any channel's message. ``quiet`` holds the entries :func:`is_held` says
     are non-critical inside the window -- including warnings that would otherwise join a digest, while a
-    critical entry in the same pass still goes out at once.
+    critical entry in the same pass still goes out at once. ``language`` is the language of the digest's own
+    words (see :func:`digest_message`).
 
     The function is deterministic and order-preserving: the same entries, epoch and options always produce
     the same batches, and a batch lists its entries in the order it received them. It reads only its
@@ -258,5 +268,5 @@ def plan(
     if not sendable:
         return []
     if digest:
-        return [Batch(entries=tuple(sendable), message=digest_message(sendable))]
+        return [Batch(entries=tuple(sendable), message=digest_message(sendable, language=language))]
     return [Batch(entries=(entry,), message=None) for entry in sendable]

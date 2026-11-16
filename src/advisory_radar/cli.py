@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
-from . import core, pipeline
+from . import core, messages, pipeline
 from .catalogue import SOURCE_SPECS
 from .config import Config, ConfigError, load_config, secret_values
 from .http import Http, urllib_http
@@ -333,11 +333,12 @@ def main(
         return 1
     try:
         if args.command == "test-notify":
+            language = runtime.cfg.language
             entry = {
                 "kind": "test",
                 "tag": "warning",
-                "title": "WARNING: advisory-radar test notification",
-                "body": "\n- **Severity:** test\n- **Note:** if you read this, delivery works.",
+                "title": messages.level_title(language, "warning", messages.text(language, "test.title")),
+                "body": "\n" + messages.text(language, "test.body"),
                 "ids": ["TEST"],
                 "cves": [],
                 "levels": {},

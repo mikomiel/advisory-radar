@@ -97,6 +97,11 @@ notifiers:
 # digest: true
 # quiet_hours: 22:00-07:00
 
+# The language of the notifications: en (the default) or pl. The routing tag a notifier receives
+# (critical or warning) stays English whatever you choose, so routes and tag filters keep working.
+# YAML-only: /config does not edit it. A reload (the button or SIGHUP) applies it from the next pass.
+# language: pl
+
 # Optional routing: rules are checked in order and the first match wins, so the most
 # specific rule goes first. Every key present in one rule must match; a numeric predicate
 # (min_cvss, epss_gte) and kev read only what the classification measured, and a message with

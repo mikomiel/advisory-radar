@@ -252,6 +252,36 @@ and comparing `"sha256=" + digest` with the header using `hmac.compare_digest`; 
 would leak timing information. With no secret, no signature headers are sent and the request is
 byte-for-byte the one earlier versions sent.
 
+## Message language
+
+`language` sets the language of the words the service writes into a notification: the level word
+of the title, the labels and notes of the body, the action line, escalation and digest messages,
+the Adobe Commerce bulletin messages and the `test-notify` message. The values are `en` (the
+default) and `pl`, in lowercase. Any other value is refused when the configuration loads.
+
+```yaml
+language: pl                 # en (the default) or pl
+```
+
+English is the wording the service has always used, so a configuration without the key sends
+exactly the messages earlier versions sent. Only text the service writes is translated. The
+heading and excerpt of an advisory come from its feed and stay as the publisher wrote them, apart
+from the short excerpt the service writes for a PHP or Node.js release it read from the release
+page. Identifiers and the names CVSS, EPSS, SSVC, KEV and GHSA are never translated.
+
+The `tag` of a message (`critical` or `warning`) is a routing value, not text, so it stays
+English in every language. A [routing](#routing) rule that matches `tag: critical` and a notifier
+that reads the tag from the payload behave the same whatever `language` says. Only the level word
+in the title (`CRITICAL`, `KRYTYCZNE`) changes.
+
+The key is YAML-only: `/config` does not edit it, and a settings overlay that carries it is
+refused. A reload (the button or `SIGHUP`) applies a change from the next pass, without a restart.
+A message is written when it is queued, so a message already waiting keeps the language it was
+written in. The words of a digest itself (its title and the `(+N more not listed)` line) are
+written when it is sent and follow the setting at that time, while the advisory lines inside it
+are the queued titles. The web UI stays English whatever the setting is, and shows a queued
+message's title as it was written.
+
 ## Advisories, filters and the queue
 
 `/alerts` filters the seen advisories by severity tag, the configured source id the message

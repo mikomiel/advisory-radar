@@ -200,6 +200,8 @@ def _run_pass(
         LOG.error("%s; the pass did not run", exc)
         return 1
     core.HIDDEN_SOURCE_HOSTS = cfg.hidden_source_hosts
+    # The language of the text the four steps below write (``messages``).
+    language_kwargs = {"language": cfg.language}
 
     state = core.new_state() if stored is None else stored
     # A pass may deliver or drop an entry written before ownership was recorded; settle that before anything
@@ -223,7 +225,15 @@ def _run_pass(
     # Every clause of the decision reads a source's own numbers, so both entry points take the resolved block:
     # the global one is the fallback, never a second opinion about a source that states its own.
     core.reevaluate(
-        state, intel, kev, kev_known, now, "", thresholds=cfg.thresholds, source_thresholds=cfg.source_thresholds
+        state,
+        intel,
+        kev,
+        kev_known,
+        now,
+        "",
+        thresholds=cfg.thresholds,
+        source_thresholds=cfg.source_thresholds,
+        **language_kwargs,
     )
 
     fetched_ids: set[str] = set()
@@ -368,6 +378,7 @@ def _run_pass(
             # Admission counts only what delivery may send now, so a queue held by quiet hours cannot block a
             # newly arrived critical advisory.
             quiet_hours=cfg.quiet_hours,
+            **language_kwargs,
         )
         if left:
             carried[source.id] = [core.item_to_state(item) for item in left]
@@ -451,7 +462,7 @@ def _run_pass(
         kept = {guid for guid in (state.get(key) or {}) if guid.split(":", 1)[0] not in fetched_ids or guid in live}
         core._prune_enrich_clock(state, key, kept)
 
-    adobe_ok = core.adobe_pass(state, http, kev, kev_known, now) if cfg.adobe_commerce else True
+    adobe_ok = core.adobe_pass(state, http, kev, kev_known, now, **language_kwargs) if cfg.adobe_commerce else True
 
     if dry_run:
         for entry in state["pending"][: core.DELIVERY_CAP]:
@@ -478,6 +489,7 @@ def _run_pass(
             default=cfg.default_notifiers,
             digest=cfg.digest,
             quiet_hours=cfg.quiet_hours,
+            **language_kwargs,
         )
     store.save(state)
     newly_parked = len(state["parked"]) - parked_before
