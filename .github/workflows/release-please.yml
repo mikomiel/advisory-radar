@@ -9,10 +9,11 @@
 # `scripts/guard_sensitive_paths.py` never lets `automerge` take it: a person merges it.
 #
 # The push trigger alone is not enough. Ordinary pull requests are merged by `automerge` with the default
-# `GITHUB_TOKEN`, and GitHub suppresses a workflow an event from that token would start. The `workflow_run`
-# trigger observes the completion of that trusted default-branch automation instead, and the guard keeps it
-# to the default branch. `workflow_dispatch` is the manual reconciliation path, accepted only from the
-# default branch so that a branch's copy of this privileged workflow never runs against the secret.
+# `GITHUB_TOKEN`, and GitHub suppresses a workflow an event from that token would start. `automerge`
+# therefore calls this workflow when its own run landed a pull request, so a sweep that merges nothing
+# costs no release run. `workflow_run` is not a trigger here: it fires on every completion, merged or not.
+# `workflow_dispatch` is the manual reconciliation path, accepted only from the default branch so that a
+# branch's copy of this privileged workflow never runs against the secret.
 #
 # The token is a fine-grained personal access token with Contents: write and Pull requests: write on this
 # repository, stored as RELEASE_PLEASE_TOKEN. The default `GITHUB_TOKEN` cannot be used: the tag and release
@@ -23,9 +24,7 @@ name: release-please
 on:
   push:
     branches: [main]
-  workflow_run:
-    workflows: [automerge]
-    types: [completed]
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -38,10 +37,8 @@ concurrency:
 jobs:
   release-please:
     if: >-
-      (github.event_name != 'workflow_run'
-      || github.event.workflow_run.head_branch == 'main')
-      && (github.event_name != 'workflow_dispatch'
-      || github.ref == 'refs/heads/main')
+      github.event_name != 'workflow_dispatch'
+      || github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

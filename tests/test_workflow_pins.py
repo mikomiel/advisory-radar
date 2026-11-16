@@ -43,9 +43,55 @@ def test_every_action_reference_is_a_pinned_commit():
     for name, text in workflow_texts():
         for match in USES.finditer(text):
             reference = match.group(1)
+            if reference.startswith("./"):
+                # A reusable workflow in this repository runs the default-branch file the caller
+                # already trusts, so it has no release to pin; name the only one allowed.
+                assert reference == "./.github/workflows/release-please.yml", f"{name}: {reference}"
+                continue
             assert PINNED.fullmatch(reference), f"{name}: {reference} is a mutable reference"
             line = text[match.start() : text.index("\n", match.start())]
             assert re.search(r"#\s*v\d", line), f"{name}: {reference} is pinned without its version comment"
+
+
+def test_the_release_workflow_is_called_only_when_the_merge_landed():
+    """`workflow_run` fires on every completion of the sweep, merged or not.
+
+    The sweep completes on a schedule and after every gate or CI pass, so observing its completion
+    cost one release run per completion rather than per merge. The merge step now reports whether
+    it landed a pull request and the release workflow is called from that result.
+    """
+    merge = yaml.safe_load((WORKFLOWS / "automerge.yml").read_text())
+    job = merge["jobs"]["merge"]
+    assert job["outputs"] == {"merged": "${{ steps.merge.outputs.merged }}"}
+    step = next(item for item in job["steps"] if item.get("id") == "merge")
+    # The shell owns the outcome, and the order matters: a default written before the loop, the
+    # true written at the merge itself. A later candidate's failure must not lose a landed merge,
+    # which is why the true is written before the branch cleanup and the comment can fail.
+    run = step["run"]
+    default_at = run.index('echo "merged=false" >> "$GITHUB_OUTPUT"')
+    loop_at = run.index("mapfile -t candidates")
+    merge_at = run.index('if gh pr merge "$pr"')
+    true_at = run.index('echo "merged=true" >> "$GITHUB_OUTPUT"')
+    cleanup_at = run.index("delete_merged_branch.py")
+    comment_at = run.index("gh pr comment")
+    assert default_at < loop_at, "the default must precede the loop"
+    assert merge_at < true_at < cleanup_at < comment_at, "write true at the merge, before cleanup"
+    assert run.count('echo "merged=true" >> "$GITHUB_OUTPUT"') == 1
+    assert run.count('echo "merged=false" >> "$GITHUB_OUTPUT"') == 1
+    release_job = merge["jobs"]["release"]
+    assert release_job["needs"] == "merge"
+    # The output alone decides; !cancelled() keeps a landed merge releasable after a later failure.
+    assert release_job["if"] == "${{ !cancelled() && needs.merge.outputs.merged == 'true' }}"
+    assert release_job["uses"] == "./.github/workflows/release-please.yml"
+    assert release_job["secrets"] == "inherit"
+    assert release_job["permissions"] == {"contents": "write", "pull-requests": "write"}
+
+    release_please = yaml.safe_load((WORKFLOWS / "release-please.yml").read_text())
+    declared = release_please.get("on", release_please.get(True))
+    assert declared["push"] == {"branches": ["main"]}
+    assert "workflow_call" in declared
+    assert "workflow_dispatch" in declared
+    assert "workflow_run" not in declared
 
 
 def test_every_job_runs_on_a_pinned_os_release():

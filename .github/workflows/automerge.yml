@@ -60,6 +60,10 @@ env:
 
 jobs:
   merge:
+    # The only fact the release workflow needs. A sweep that merges nothing
+    # leaves it "false", so it costs no release run.
+    outputs:
+      merged: ${{ steps.merge.outputs.merged }}
     runs-on: ubuntu-24.04
     steps:
       # The guard and approval rules live in tested scripts on the default branch -- the same trust level this
@@ -70,11 +74,15 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
       - name: Merge approved pull requests whose required check is green at the same head
+        id: merge
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          # The default is written before the loop and a merge overwrites it immediately, so a
+          # later candidate's failure can neither lose a merge that landed nor invent one.
+          echo "merged=false" >> "$GITHUB_OUTPUT"
           # gh paginates internally up to this bound, which is far above any realistic queue; the comment is a
           # bound, not "to completion".
           # An enumeration failure must fail the job: inside process substitution its exit status is lost and
@@ -178,6 +186,9 @@ jobs:
             # --match-head-commit: if the head moved between the checks above and this call, GitHub refuses
             # instead of merging a commit the reviewer never saw.
             if gh pr merge "$pr" --repo "$REPO" --squash --match-head-commit "$head"; then
+              # Persist the outcome at the merge, before the branch cleanup and the comment
+              # below can fail the step: the release of a landed merge must not depend on them.
+              echo "merged=true" >> "$GITHUB_OUTPUT"
               echo "merged #$pr at $head (approval by $REVIEWER_LOGIN)"
               # The branch is deleted by a tested script, not from this line: the repository setting did not
               # cover a merge made through the API, and the script's delete is a lease on this exact head, so a
@@ -197,3 +208,16 @@ jobs:
               echo "skip #$pr: GitHub refused the merge (protection, or a check changed)"
             fi
           done
+
+  release:
+    # Called, not observed: a `workflow_run` trigger on this workflow fired on
+    # every completion, merged or not, which cost one release run per sweep and
+    # per gate pass. `!cancelled()` lets the release run when the merge job ended
+    # red after landing a merge; the output alone still decides.
+    needs: merge
+    if: ${{ !cancelled() && needs.merge.outputs.merged == 'true' }}
+    uses: ./.github/workflows/release-please.yml
+    secrets: inherit
+    permissions:
+      contents: write
+      pull-requests: write
