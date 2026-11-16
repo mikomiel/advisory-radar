@@ -6,6 +6,7 @@ import hashlib
 import logging
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import replace
 
 from . import core, watchlist
 from .config import Config, secret_values
@@ -121,16 +122,7 @@ def _namespaced(item: core.Item, source_id: str) -> core.Item:
     would let two distinct advisories share one identity, and the second would look already claimed and be
     dropped silently.
     """
-    return core.Item(
-        f"{source_id}:{item.guid}",
-        item.title,
-        item.link,
-        item.summary,
-        item.published,
-        item.explicit,
-        item.source_title,
-        item.source_url,
-    )
+    return replace(item, guid=f"{source_id}:{item.guid}")
 
 
 def _source_windows(state: dict) -> dict:
@@ -200,6 +192,8 @@ def _run_pass(
         LOG.error("%s; the pass did not run", exc)
         return 1
     core.HIDDEN_SOURCE_HOSTS = cfg.hidden_source_hosts
+    # The language of the text the four steps below write (``messages``).
+    language_kwargs = {"language": cfg.language}
 
     state = core.new_state() if stored is None else stored
     # A pass may deliver or drop an entry written before ownership was recorded; settle that before anything
@@ -223,7 +217,15 @@ def _run_pass(
     # Every clause of the decision reads a source's own numbers, so both entry points take the resolved block:
     # the global one is the fallback, never a second opinion about a source that states its own.
     core.reevaluate(
-        state, intel, kev, kev_known, now, "", thresholds=cfg.thresholds, source_thresholds=cfg.source_thresholds
+        state,
+        intel,
+        kev,
+        kev_known,
+        now,
+        "",
+        thresholds=cfg.thresholds,
+        source_thresholds=cfg.source_thresholds,
+        **language_kwargs,
     )
 
     fetched_ids: set[str] = set()
@@ -368,6 +370,7 @@ def _run_pass(
             # Admission counts only what delivery may send now, so a queue held by quiet hours cannot block a
             # newly arrived critical advisory.
             quiet_hours=cfg.quiet_hours,
+            **language_kwargs,
         )
         if left:
             carried[source.id] = [core.item_to_state(item) for item in left]
@@ -451,7 +454,7 @@ def _run_pass(
         kept = {guid for guid in (state.get(key) or {}) if guid.split(":", 1)[0] not in fetched_ids or guid in live}
         core._prune_enrich_clock(state, key, kept)
 
-    adobe_ok = core.adobe_pass(state, http, kev, kev_known, now) if cfg.adobe_commerce else True
+    adobe_ok = core.adobe_pass(state, http, kev, kev_known, now, **language_kwargs) if cfg.adobe_commerce else True
 
     if dry_run:
         for entry in state["pending"][: core.DELIVERY_CAP]:
@@ -478,6 +481,7 @@ def _run_pass(
             default=cfg.default_notifiers,
             digest=cfg.digest,
             quiet_hours=cfg.quiet_hours,
+            **language_kwargs,
         )
     store.save(state)
     newly_parked = len(state["parked"]) - parked_before

@@ -860,7 +860,7 @@ def test_an_adobe_only_configuration_bootstraps(tmp_path, monkeypatch):
     cfg = load_config(cfg_path, {})
     called = []
 
-    def fake_adobe(state, http, kev, kev_known, now):
+    def fake_adobe(state, http, kev, kev_known, now, **kwargs):
         called.append(now)
         return True
 

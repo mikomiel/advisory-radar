@@ -106,7 +106,9 @@ reports a truncated window.
 changedetection.io native form, recognised by `watch_uuid` or `watch_url`
 (`watch_title`, `watch_url`, `diff`, `ids`). The generic form requires a
 non-empty `title`; the native form titles itself from `watch_title`, then
-`watch_url`, then `change`.
+`watch_url`, then `change`. That `change`, and the summary `page changed` of a native payload
+with no `diff`, are the service's own words and follow the
+[message language](configuration.md#message-language).
 
 `ids` is optional in both forms and may be omitted, `null` or empty. A non-empty
 value must be a list of strings, and each element must be exactly one identifier

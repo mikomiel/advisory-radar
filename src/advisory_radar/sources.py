@@ -5,11 +5,21 @@ from __future__ import annotations
 import hashlib
 import urllib.parse
 
-from . import feeds
+from . import feeds, messages
 from .catalogue import SOURCE_SPECS
-from .core import Item, _host, dsa_id, extract_ids
+from .core import Item, _host, dsa_id, extract_ids, stored_text_keys
 from .http import Http, json_text, parse_json
 from .plugins import Source, SourceWindow
+
+
+def _english(key: str, **fields: str) -> str:
+    """The catalogue words of ``key`` in English, which is how an item holds the words the service wrote.
+
+    ``title`` and ``summary`` are read for matching and shown in the web UI, so they hold one language. The item
+    (or the stored inbox entry) also names the key, and the notification is written from that in the configured
+    language: see ``core.item_headline``.
+    """
+    return messages.text(messages.DEFAULT_LANGUAGE, key, **fields)
 
 
 def _url_digest(url: str) -> str:
@@ -161,7 +171,8 @@ class ChangedetectionSource:
             pending_cursors[uuid] = changed
             title = str(watch.get("title") or watch.get("page_title") or uuid)
             link = str(watch.get("link") or watch.get("url") or "")
-            summary = f"Page changed (last_changed={changed})."
+            fields = {"changed": str(changed)}
+            summary = _english("item.summary.page_changed", **fields)
             explicit = extract_ids(title, summary, link)
             items.append(
                 Item(
@@ -173,6 +184,8 @@ class ChangedetectionSource:
                     explicit,
                     title,
                     link,
+                    summary_key="item.summary.page_changed",
+                    text_fields=tuple(fields.items()),
                 )
             )
         self._pending_cursors = pending_cursors
@@ -214,6 +227,7 @@ class WebhookSource:
                 identities(entry),
                 str(entry.get("source_title", "")),
                 str(entry.get("source_url", "")),
+                **stored_text_keys(entry),
             )
             for entry in inbox
             if isinstance(entry, dict)
@@ -291,9 +305,16 @@ def webhook_item_from_payload(payload: object) -> dict | None:
         diff = checked(payload.get("diff") or "")
         _ = checked(payload.get("watch_uuid"))  # validated before main's fingerprint line hashes it
         watch_url = checked(payload.get("watch_url") or "")
-        title = checked(payload.get("watch_title") or payload.get("watch_url") or "change")
-        summary = diff or "page changed"
+        named = payload.get("watch_title") or payload.get("watch_url")
+        title = checked(named or _english("item.title.change"))
+        summary = diff or _english("item.summary.no_diff")
         ids = merged(title, summary, watch_url, payload.get("ids"))
+        # Words the service wrote (no title or URL, no diff) carry their catalogue key, so the notification can
+        # write them in the configured language; the sender's own words carry none and are never translated.
+        written = {
+            **({} if named else {"title_key": "item.title.change"}),
+            **({} if diff else {"summary_key": "item.summary.no_diff"}),
+        }
         # This line is deliberately unchanged from main: the PR adds no new hash use, and the validation above
         # proves the value is encodable before it is hashed. An untouched line is what lets code scanning
         # attribute the pre-existing weak-hash alert to main rather than to this change.
@@ -305,6 +326,7 @@ def webhook_item_from_payload(payload: object) -> dict | None:
             "summary": summary,
             "source_title": "changedetection.io",
             "source_url": watch_url,
+            **written,
             **({"explicit_ids": ids} if ids else {}),
         }
     title = payload.get("title")

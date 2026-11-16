@@ -21,6 +21,7 @@ import yaml
 
 from .catalogue import SOURCE_SPECS
 from .delivery import QuietHours, parse_quiet_hours
+from .messages import DEFAULT_LANGUAGE, LANGUAGES
 from .routing import MATCH_KEYS, SEVERITY_TAGS
 from .storage import Store, store_for
 from .watchlist import WATCHLIST_NAME
@@ -206,6 +207,9 @@ class Config:
     #: The local-time window in which non-critical messages wait in the queue; ``None`` is no window. Held
     #: entries stay pending and are released after the window ends, never counted as a failed attempt.
     quiet_hours: QuietHours | None = None
+    #: The language of every notification's text (``messages.LANGUAGES``). The routing tag a notifier receives stays
+    #: English. YAML-only: the overlay does not write it, and a reload applies it from the next pass.
+    language: str = DEFAULT_LANGUAGE
     #: Ordered routing rules, first match wins. Empty means every message goes to every enabled notifier,
     #: exactly as it did before routing existed.
     routes: tuple[dict, ...] = ()
@@ -284,6 +288,7 @@ _TOP_KEYS = {
     "thresholds",
     "digest",
     "quiet_hours",
+    "language",
 }
 #: The keys a routing rule itself may carry; the match keys and the tag set are ``routing.py``'s.
 _ROUTE_KEYS = frozenset({"match", "notifiers"})
@@ -752,6 +757,10 @@ def config_from_document(
             quiet_hours = parse_quiet_hours(raw_quiet_hours)
         except ValueError as exc:
             raise ConfigError(str(exc)) from exc
+    # The language of the notification text. Like every option here it can arrive as a ${NAME} reference, and this
+    # message is logged before redaction exists, so it names the accepted codes and never repeats the value.
+    language = document.get("language", DEFAULT_LANGUAGE)
+    _require(isinstance(language, str) and language in LANGUAGES, f"language must be one of {', '.join(LANGUAGES)}")
 
     web = document.get("web") or {}
     _require(isinstance(web, dict), "web must be a mapping")
@@ -826,6 +835,7 @@ def config_from_document(
         source_thresholds=source_thresholds,
         digest=digest,
         quiet_hours=quiet_hours,
+        language=language,
         routes=routes,
         default_notifiers=default_notifiers,
         web_host=web_host,

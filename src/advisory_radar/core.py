@@ -36,11 +36,12 @@ from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from . import adobe, delivery, routing
+from . import adobe, delivery, messages, routing
 from .config import DEFAULT_THRESHOLDS, Thresholds
 from .feeds import FeedExport
 from .feeds import parse_feed as parse_greader
 from .http import MESSAGE_LIMIT, Http, inert, log_safe, parse_json
+from .messages import DEFAULT_LANGUAGE
 from .state import SourceError
 from .storage import Store, StoreUnavailable
 from .watchlist import Policy, Product
@@ -128,8 +129,8 @@ MAX_NVD_CALLS = 10
 #: fault.
 MAX_TRACKER_FETCHES = 10
 #: A DSA, PHP or Node.js release item whose enrichment page fails stays unseen and is retried every pass for this long
-#: after its first failure (``state["enrich_retry"]``); then it is sent once as unknown severity with
-#: ``ENRICH_FAILED_NOTE``.
+#: after its first failure (``state["enrich_retry"]``); then it is sent once as unknown severity with the
+#: ``note.enrich_failed`` note.
 ENRICH_RETRY_SECONDS = 2 * 3600
 #: A Node.js security release post whose fetched page names no CVE waits this long, counted from the first such page
 #: (``state["enrich_pending"]``, apart from the ``enrich_retry`` clock so that a later page fault cannot shorten it),
@@ -147,20 +148,10 @@ def _rank(level: object) -> int:
     return RANK.get(level, 0) if isinstance(level, str) else 0
 
 
-#: The level words a message shows. The tag sent to notifiers (``critical``, ``warning``) and the levels kept
-#: in state stay English.
-LEVEL_LABEL = {"critical": "CRITICAL", "warning": "WARNING"}
-EPSS_NOTE = "Likely exploitation (EPSS), unconfirmed."
-ENRICH_FAILED_NOTE = "The CVE list could not be read from the source; severity unknown."
-ACTION = "**Action:** check whether the vulnerable version is deployed."
-#: An escalation reaches readers who already acted on the first message.
-ESCALATION_ACTION = "**Action:** if the advisory version is already deployed, nothing to do; otherwise patch promptly."
-#: The excerpt of a PHP release item that the ChangeLog enriched; the versions follow, newest first.
-PHP_EXCERPT = "PHP security release; fixed versions: "
-#: The excerpt of a Node.js security release item whose page names its release lines.
-NODEJS_EXCERPT = "Node.js security release; lines: "
-ADOBE_DECISION = "**Decision needed:** check whether downstream users must be notified (patching may be on their side)"
-NO_DETAILS = "no details"
+#: The English level words, keyed by the tags a message can carry (``routing.SEVERITY_TAGS`` is pinned to the keys).
+#: The tag sent to notifiers (``critical``, ``warning``) and the levels kept in state stay English in every
+#: language. What a message shows is the word ``messages`` holds for the language the configuration picks.
+LEVEL_LABEL = {tag: messages.text(DEFAULT_LANGUAGE, f"level.{tag}") for tag in ("critical", "warning")}
 #: Detail pages fetched (and messages queued) for new bulletins in one pass; the rest stay unseen for the next.
 MAX_ADOBE_NEW = 5
 #: A new bulletin whose detail page cannot be read waits this long (retried every pass) for it before its message goes
@@ -229,6 +220,13 @@ class Item:
     #: The feed the entry came from (``origin.title``, ``origin.htmlUrl``). Never the feed URL: it can be private.
     source_title: str = ""
     source_url: str = ""
+    #: ``title`` and ``summary`` always hold words, in English, for matching and for the web UI. When the service
+    #: wrote those words itself and not the publisher, these name the ``messages`` key of each and the fields
+    #: it takes, so a notification writes them in the configured language (see ``item_headline``). Publisher text
+    #: has no key and is never translated. A tuple of pairs, because an item is frozen.
+    title_key: str = ""
+    summary_key: str = ""
+    text_fields: tuple[tuple[str, str], ...] = ()
 
 
 def _normalise_id(match: str) -> str:
@@ -328,6 +326,18 @@ def headline(title: str, summary: str) -> tuple[str, str]:
     if summary.startswith(title):
         return title, summary[len(title) :].strip()
     return title, summary
+
+
+def item_headline(item: Item, language: str) -> tuple[str, str]:
+    """``headline`` of an item, with the words the service wrote itself taken from the catalogue in ``language``.
+
+    The keys are resolved first because ``headline`` drops a summary that starts with the title, and it must
+    compare the words a reader will see. An item with no key is publisher text and passes through unchanged.
+    """
+    fields = dict(item.text_fields)
+    title = messages.text(language, item.title_key, **fields) if item.title_key else item.title
+    summary = messages.text(language, item.summary_key, **fields) if item.summary_key else item.summary
+    return headline(title, summary)
 
 
 def _matches_product(text: str, host: str, product) -> bool:
@@ -1018,41 +1028,42 @@ def critical_reason(facts: CveFacts, kev: bool, *, thresholds: Thresholds) -> st
     return None
 
 
-def remote_note(thresholds: Thresholds = DEFAULT_THRESHOLDS) -> str:
+def remote_note(thresholds: Thresholds = DEFAULT_THRESHOLDS, *, language: str = DEFAULT_LANGUAGE) -> str:
     """The note the remote rule carries, naming the CVSS bar actually configured.
 
     A literal "CVSS >= 9.0" would be a lie the moment the threshold is saved as anything else, and the note is
     the only place a reader learns which rule decided.
     """
-    return f"CVSS >= {thresholds.critical_cvss}, remote attack, no privileges, no user interaction (CVSS vector)."
+    return messages.text(language, "note.remote", cvss=thresholds.critical_cvss)
 
 
-def reason_note(reason: str | None, thresholds: Thresholds = DEFAULT_THRESHOLDS) -> str:
+def reason_note(
+    reason: str | None, thresholds: Thresholds = DEFAULT_THRESHOLDS, *, language: str = DEFAULT_LANGUAGE
+) -> str:
     """The note a critical verdict carries, or the empty string for a reason that needs none.
 
     ``kev`` and ``ssvc`` are observed exploitation and speak for themselves; ``remote`` and ``epss`` are forecasts
     and name the configured bar, because the same advisory is a warning under a stricter threshold.
     """
     if reason == "remote":
-        return remote_note(thresholds)
+        return remote_note(thresholds, language=language)
     if reason == "epss":
-        return EPSS_NOTE
+        return messages.text(language, "note.epss")
     return ""
 
 
-def change_note(reason: str | None, thresholds: Thresholds = DEFAULT_THRESHOLDS) -> str:
+def change_note(
+    reason: str | None, thresholds: Thresholds = DEFAULT_THRESHOLDS, *, language: str = DEFAULT_LANGUAGE
+) -> str:
     """The note an escalation carries: what changed since the first message, not why the CVE is critical."""
     if reason == "kev":
-        return "Change: CVE added to the CISA KEV catalog (exploited in the wild)."
+        return messages.text(language, "change.kev")
     if reason == "ssvc":
-        return "Change: CISA recorded active exploitation (SSVC)."
+        return messages.text(language, "change.ssvc")
     if reason == "epss":
-        return f"Change: exploitation likelihood (EPSS) at or above {thresholds.critical_epss}; unconfirmed."
+        return messages.text(language, "change.epss", epss=thresholds.critical_epss)
     if reason == "remote":
-        return (
-            f"Change: a CVSS >= {thresholds.critical_cvss} score appeared for a remote, unauthenticated, "
-            "no-interaction attack."
-        )
+        return messages.text(language, "change.remote", cvss=thresholds.critical_cvss)
     return ""
 
 
@@ -1082,15 +1093,21 @@ def metrics_line(
     kev: bool,
     *,
     approximate: bool = False,
+    language: str = DEFAULT_LANGUAGE,
 ) -> str:
-    parts = [
-        "CVSS " + (f"{cvss:.1f}" + (" (OSV label, approximate)" if approximate else "") if cvss is not None else "none")
-    ]
+    none = messages.text(language, "metrics.none")
+    if cvss is None:
+        score = none
+    elif approximate:
+        score = messages.text(language, "metrics.cvss_approximate", score=f"{cvss:.1f}")
+    else:
+        score = f"{cvss:.1f}"
+    parts = [f"CVSS {score}"]
     if epss is None:
-        parts.append("EPSS none")
+        parts.append(f"EPSS {none}")
     else:
         parts.append(f"EPSS {epss:.2f}" + (f" (p{int(percentile * 100)})" if percentile is not None else ""))
-    parts.append(f"SSVC {ssvc or 'none'}")
+    parts.append(f"SSVC {ssvc or none}")
     if kev:
         parts.append("KEV")
     return " · ".join(parts)
@@ -1124,47 +1141,47 @@ def judge(
     osv_scores_are_aliased: bool = False,
     *,
     thresholds: Thresholds,
+    language: str = DEFAULT_LANGUAGE,
 ) -> Verdict:
     """Item verdict from the CVEs it names; the CVE that decides is the one shown.
 
     ``osv_complete`` is False when an OSV lookup for one of the item's GHSA ids did not answer:
     that advisory was never measured, so the item can be a warning or critical but never suppressed.
+    ``language`` is the language of the verdict's own text (the severity line and the note); the tag and the
+    levels are the same in every language.
     """
-    incomplete_note = "Incomplete severity data; treated as unknown."
+    incomplete_note = messages.text(language, "note.incomplete")
+
+    def osv_line(score: float | None) -> str:
+        """The severity line of an item whose only evidence is an OSV label's score."""
+        return metrics_line(score, None, None, None, False, approximate=True, language=language)
+
     if not cves:
         if independent_ghsa_cvss is not None:
             # An alias-free advisory carries its own severity, whatever else the item mentions. Once it
             # exists, the aggregate score is not used: part of it may belong to an already-claimed CVE.
             if independent_ghsa_cvss >= thresholds.critical_cvss:
-                return Verdict(
-                    "critical", (), metrics_line(independent_ghsa_cvss, None, None, None, False, approximate=True), ""
-                )
+                return Verdict("critical", (), osv_line(independent_ghsa_cvss), "")
             if osv_complete and independent_ghsa_cvss < thresholds.suppress_below_cvss:
-                return Verdict(
-                    "suppressed", (), metrics_line(independent_ghsa_cvss, None, None, None, False, approximate=True), ""
-                )
+                return Verdict("suppressed", (), osv_line(independent_ghsa_cvss), "")
             return Verdict(
                 "warning",
                 (),
-                metrics_line(independent_ghsa_cvss, None, None, None, False, approximate=True),
+                osv_line(independent_ghsa_cvss),
                 "" if osv_complete else incomplete_note,
             )
         if osv_scores_are_aliased:
             # Every scored advisory aliases a CVE that is not being judged here (it was already claimed), so
             # the OSV label is not independent evidence about this item: keep it visible as unknown.
-            line = metrics_line(osv_cvss, None, None, None, False, approximate=True)
+            line = osv_line(osv_cvss)
             return Verdict("warning", (), line, incomplete_note)
         # With no CVE named, every OSV score here belongs to an advisory that has no CVE alias, so its
         # severity decides on its own: a CRITICAL label is critical, not merely a warning.
         if osv_cvss is not None and osv_cvss >= thresholds.critical_cvss:
-            return Verdict("critical", (), metrics_line(osv_cvss, None, None, None, False, approximate=True), "")
+            return Verdict("critical", (), osv_line(osv_cvss), "")
         if osv_complete and osv_cvss is not None and osv_cvss < thresholds.suppress_below_cvss:
-            return Verdict("suppressed", (), metrics_line(osv_cvss, None, None, None, False, approximate=True), "")
-        line = (
-            "unknown (no CVE id and no OSV score)"
-            if osv_cvss is None
-            else metrics_line(osv_cvss, None, None, None, False, approximate=True)
-        )
+            return Verdict("suppressed", (), osv_line(osv_cvss), "")
+        line = messages.text(language, "judge.unknown") if osv_cvss is None else osv_line(osv_cvss)
         return Verdict("warning", (), line, "" if osv_complete else incomplete_note)
     fallbacks = osv_fallbacks or {}
     judged = {
@@ -1218,18 +1235,19 @@ def judge(
         chosen.ssvc,
         shown in kev,
         approximate=chosen.cvss is None and shown_fallback is not None,
+        language=language,
     )
     if ghsa_decides:
         # The deciding evidence is the GHSA's OSV label, not the CVE we happen to show beside it.
-        line = f"OSV GHSA severity {independent_ghsa_cvss:g} (approximate); {line}"
+        line = messages.text(language, "judge.ghsa_severity", score=f"{independent_ghsa_cvss:g}", line=line)
     if len(cves) > 1:
-        line = f"{shown}: {line} (+{len(cves) - 1} more CVEs)"
+        line = messages.text(language, "judge.more_cves", cve=shown, line=line, count=len(cves) - 1)
     unscored = sum(1 for cve in cves if not facts[cve].complete)
     if unscored:
-        line += f" (+{unscored} CVEs unscored)"
-    note = reason_note(judged[shown][1], thresholds)
+        line = messages.text(language, "judge.unscored", line=line, count=unscored)
+    note = reason_note(judged[shown][1], thresholds, language=language)
     if ghsa_decides:
-        note = "An advisory in this item without a CVE id decides the severity."
+        note = messages.text(language, "note.ghsa_decides")
     if tag == "warning" and (not osv_complete or any(not facts[cve].complete for cve in cves)):
         note = incomplete_note
     return Verdict(tag, levels, line, note, skipped_cves)
@@ -1367,6 +1385,14 @@ def _day(epoch: float) -> str:
     return datetime.datetime.fromtimestamp(epoch, datetime.UTC).strftime("%Y-%m-%d")
 
 
+def _shown_ids(identifiers: Sequence[str], language: str) -> str:
+    """The first ``MAX_SHOWN_IDS`` identifiers, then how many more there are."""
+    shown = ", ".join(identifiers[:MAX_SHOWN_IDS])
+    if len(identifiers) <= MAX_SHOWN_IDS:
+        return shown
+    return messages.text(language, "ids.more", ids=shown, count=len(identifiers) - MAX_SHOWN_IDS)
+
+
 def render(
     tag: str,
     heading: str,
@@ -1379,41 +1405,40 @@ def render(
     feed_host: str,
     source_title: str = "",
     source_url: str = "",
-    action: str = ACTION,
+    action: str | None = None,
+    *,
+    language: str = DEFAULT_LANGUAGE,
 ) -> tuple[str, str]:
     """(title, body): the body is Markdown for chat channels, in four blocks.
 
     The body starts with a newline, so the title stays a paragraph of its own on both: chat renderers prefix
     ``**title**: `` to the text or send ``title`` + CRLF + the body. Then a bullet list of
-    the labelled facts; the excerpt as one blockquote paragraph; ``action`` (``**Action:**``; an escalation passes
-    ``ESCALATION_ACTION``) as a paragraph; and a bullet list with the link (an ``<https://…>`` autolink) and the
-    source.
+    the labelled facts; the excerpt as one blockquote paragraph; ``action`` (``**Action:**``; ``None`` is the
+    standard line, and an escalation passes its own) as a paragraph; and a bullet list with the link (an
+    ``<https://…>`` autolink) and the source.
 
-    Labels are English. ``heading``, ``summary`` and ``source_title`` are feed text: they pass through ``_md``
+    Labels and the standard action line are in ``language`` (``messages``), and ``line`` and ``note`` arrive
+    already written in it. ``heading``, ``summary`` and ``source_title`` are feed text: they pass through ``_md``
     (control characters dropped, every Markdown character escaped, one line) and then ``inert`` (mentions
     broken); the excerpt first loses its ``#`` heading markers and backticks (``_EXCERPT_NOISE``). The link is
     printed only when it is a public https URL. Message text that the worker wrote itself
     is not escaped. Title and body fit one Discord message.
     """
-    title = _cap(inert(f"{LEVEL_LABEL[tag].upper()}: {_md(heading)}").rstrip(), 200)
-    facts = [_fact("Severity", line)]
+    title = _cap(inert(messages.level_title(language, tag, _md(heading))).rstrip(), 200)
+    facts = [_fact(messages.text(language, "label.severity"), line)]
     if ids:  # A kernel advisory can name 100+ CVEs; the full list is on the vendor page.
-        facts.append(
-            _fact(
-                "IDs",
-                ", ".join(ids[:MAX_SHOWN_IDS])
-                + (f" (+{len(ids) - MAX_SHOWN_IDS} more)" if len(ids) > MAX_SHOWN_IDS else ""),
-            )
-        )
+        facts.append(_fact(messages.text(language, "label.ids"), _shown_ids(ids, language)))
     if published is not None:
-        facts.append(_fact("Published", _day(published)))
+        facts.append(_fact(messages.text(language, "label.published"), _day(published)))
     if note:
-        facts.append(_fact("Note", note))
+        facts.append(_fact(messages.text(language, "label.note"), note))
     links = []
     if _public_https(link) and _host(link) not in HIDDEN_SOURCE_HOSTS:
-        links.append(_fact("Advisory", _autolink(link)))
+        links.append(_fact(messages.text(language, "label.advisory"), _autolink(link)))
     if source := _source_value(source_title, source_url, feed_host):
-        links.append(_fact("Source", source))
+        links.append(_fact(messages.text(language, "label.source"), source))
+    if action is None:
+        action = messages.text(language, "action")
     fixed = ["\n".join(facts), action, *(["\n".join(links)] if links else [])]
     room = MESSAGE_LIMIT - 100 - len(title) - len("\n" + "\n\n".join(fixed)) - len("\n\n> ")
     excerpt = _cap(_md(_EXCERPT_NOISE.sub("", summary)), min(500, room)) if room > 40 else ""
@@ -1616,6 +1641,8 @@ def _suppressed(
     now: int,
     thresholds: Thresholds,
     source_id: str = "",
+    *,
+    language: str = DEFAULT_LANGUAGE,
 ) -> None:
     claimed = _claimed(state)
     for identifier in ids:
@@ -1630,7 +1657,7 @@ def _suppressed(
             "last_eval": now,
             "level": level,
             "judged": level,
-            "title": headline(item.title, item.summary)[0],
+            "title": item_headline(item, language)[0],
             "link": item.link,
             "cvss": scores.get(cve),
             "thresholds": thresholds.snapshot(),
@@ -1878,6 +1905,7 @@ def classify_new(
     source_id: str = "",
     thresholds: Thresholds,
     quiet_hours: delivery.QuietHours | None = None,
+    language: str = DEFAULT_LANGUAGE,
 ) -> list[Item]:
     """Queue the items nobody has seen, oldest first, until the delivery cap or the lookup budget is reached.
 
@@ -1888,6 +1916,9 @@ def classify_new(
     delivery would send now count towards the cap: a queue held by the window must not take the room a newly
     arrived critical advisory needs, and a message queued below is counted by the same rule, so a warning
     queued during the window still consumes none of it. ``delivery.is_held`` is the one owner of "held".
+
+    ``language`` is the language the queued messages are written in (``messages``). A message is rendered once,
+    here, so it keeps the language it was queued in when the setting changes later.
 
     ``source_id`` is the configured ``source.id`` the items came from, and each queued message records it with
     the watchlist products the item matched. Routing reads both; a message queued elsewhere (an escalation, an
@@ -2086,9 +2117,10 @@ def classify_new(
             independent_ghsa_cvss=independent_ghsa_cvss,
             osv_scores_are_aliased=aliased_scored and not independent_scored,
             thresholds=thresholds,
+            language=language,
         )
         if unenriched and verdict.tag == "warning":
-            verdict = replace(verdict, note=ENRICH_FAILED_NOTE)
+            verdict = replace(verdict, note=messages.text(language, "note.enrich_failed"))
         # The CVSS each watched CVE had when its message was queued: a later escalation by the remote rule needs it.
         scores = {cve: facts[cve].cvss for cve, _ in verdict.levels}
         # What a route predicate may read, and only that: the EPSS each judged CVE was measured at, and whether
@@ -2097,18 +2129,18 @@ def classify_new(
         epss = {cve: facts[cve].epss for cve, _ in verdict.levels}
         kev_membership = None if not kev_known else any(cve in kev for cve, _ in verdict.levels)
         if verdict.tag == "suppressed":
-            _suppressed(state, ids, verdict, item, scores, now, thresholds, source_id=source_id)
+            _suppressed(state, ids, verdict, item, scores, now, thresholds, source_id=source_id, language=language)
         else:
             # The identifiers this message introduces: the ones it owns, as opposed to the ids its text
             # merely mentions because another message already owns them. The inbox keeps them apart so a
             # co-named advisory cannot inherit this message's state or severity.
             fresh_ids = [identifier for identifier in ids if identifier not in claimed]
             shown_ids = [identifier for identifier in fresh_ids if not identifier.startswith("src:")]
-            heading, excerpt = headline(item.title, item.summary)
+            heading, excerpt = item_headline(item, language)
             if release is not None:
-                excerpt = PHP_EXCERPT + ", ".join(release.versions)
+                excerpt = messages.text(language, "excerpt.php", versions=", ".join(release.versions))
             elif page is not None and page.lines:
-                excerpt = NODEJS_EXCERPT + ", ".join(page.lines)
+                excerpt = messages.text(language, "excerpt.nodejs", lines=", ".join(page.lines))
             title, body = render(
                 verdict.tag,
                 heading,
@@ -2121,6 +2153,7 @@ def classify_new(
                 feed_host,
                 item.source_title,
                 item.source_url,
+                language=language,
             )
             queued = {
                 "kind": "new",
@@ -2230,6 +2263,7 @@ def reevaluate(
     *,
     thresholds: Thresholds,
     source_thresholds: Mapping[str, Thresholds] | None = None,
+    language: str = DEFAULT_LANGUAGE,
 ) -> None:
     """Re-score due CVEs once a day; queue one escalation per level a CVE newly reaches.
 
@@ -2242,6 +2276,9 @@ def reevaluate(
     (``entry["thresholds"]``) instead of being escalated: otherwise lowering the floor would send the whole
     watch list out at once. Observed exploitation is the exception -- a KEV hit or CISA's active flag that a
     reader was never told about is a miss, whatever the thresholds say.
+
+    ``language`` is the language the escalation messages are written in (``messages``); the text of the first
+    message that an escalation quotes is shown as it was queued.
     """
     watch: dict = state["watch"]
     due = sorted(
@@ -2317,20 +2354,25 @@ def reevaluate(
             for queued in (*state["pending"], *state.get("parked", ()))
         ):
             continue
-        before = "recorded as LOW and not sent" if entry["level"] == "suppressed" else "sent as a warning"
-        line = metrics_line(current.cvss, current.epss, current.percentile, current.ssvc, cve in kev)
-        note = change_note(reason, entry_thresholds)
+        before = messages.text(
+            language, "escalation.before.suppressed" if entry["level"] == "suppressed" else "escalation.before.sent"
+        )
+        line = metrics_line(current.cvss, current.epss, current.percentile, current.ssvc, cve in kev, language=language)
+        note = change_note(reason, entry_thresholds, language=language)
         title, body = render(
             level,
-            f"{cve} now {LEVEL_LABEL[level]}",
+            messages.text(language, "escalation.heading", cve=cve, level=messages.text(language, f"level.{level}")),
             [cve],
             line,
             note,
             entry["link"],
-            f"Previously {before} ({_day(entry['since'])}): {entry['title']}",
+            messages.text(
+                language, "escalation.excerpt", before=before, day=_day(entry["since"]), title=entry["title"]
+            ),
             None,
             feed_host,
-            action=ESCALATION_ACTION,
+            action=messages.text(language, "action.escalation"),
+            language=language,
         )
         # No source_id and no products: an escalation is not a feed item, so routing falls through a
         # source/product rule to tag, ids or the default. Its measured score travels with it so a numeric
@@ -2391,18 +2433,27 @@ def adobe_decision(bulletin: adobe.Bulletin, detail: adobe.Detail | None, exploi
 
 
 def render_adobe(
-    tag: str, apsb: str, head: Sequence[tuple[str, str]], detail: Sequence[tuple[str, str]], decision: bool, link: str
+    tag: str,
+    apsb: str,
+    head: Sequence[tuple[str, str]],
+    detail: Sequence[tuple[str, str]],
+    decision: bool,
+    link: str,
+    *,
+    language: str = DEFAULT_LANGUAGE,
 ) -> tuple[str, str]:
     """(title, body) as Markdown in three blocks: the fact bullets, the bold decision line, then the link bullet.
 
     Like ``render``, the body starts with a newline. ``head`` is (label, value) text the worker wrote. ``detail`` is
     (label, value) page text whose value is already escaped by ``_md``; the values share whatever room the other
     blocks leave (a short value keeps its length), so the link is never the part cut. ``inert`` runs last.
+    ``language`` is the language of the title's level word, the decision line and the link label; ``head`` and
+    ``detail`` arrive already written in it.
     """
-    title = _cap(inert(f"{LEVEL_LABEL[tag].upper()}: Adobe Commerce {apsb}"), 200)
+    title = _cap(inert(messages.level_title(language, tag, f"Adobe Commerce {apsb}")), 200)
     action = [
-        *([f"**{ADOBE_DECISION}**"] if decision else []),
-        *([_fact("Biuletyn", _autolink(link))] if _public_https(link) else []),
+        *([f"**{messages.text(language, 'adobe.decision')}**"] if decision else []),
+        *([_fact(messages.text(language, "label.adobe_link"), _autolink(link))] if _public_https(link) else []),
     ]
     heads = [_fact(label, value) for label, value in head]
     prefixes = sum(len(_fact(label, "")) + 1 for label, _ in detail)
@@ -2417,17 +2468,23 @@ def render_adobe(
     return title, _cap(inert("\n" + "\n\n".join(sections)), MESSAGE_LIMIT - 100 - len(title))
 
 
-def _priority(bulletin: adobe.Bulletin) -> tuple[str, str]:
-    return "Adobe priority", str(bulletin.priority) if bulletin.priority is not None else "unknown"
+def _priority(bulletin: adobe.Bulletin, language: str) -> tuple[str, str]:
+    return (
+        messages.text(language, "adobe.label.priority"),
+        str(bulletin.priority) if bulletin.priority is not None else messages.text(language, "adobe.priority_unknown"),
+    )
 
 
-def _login_answer(detail: adobe.Detail | None) -> str:
+def _login_answer(detail: adobe.Detail | None, language: str) -> str:
     """Whether the critical CVE with the highest score needs a login; on a tie the unauthenticated one decides."""
+    no_details = messages.text(language, "adobe.no_details")
     critical = [cve for cve in detail.cves if cve.severity == "critical"] if detail else []
     if not critical:
-        return "no critical CVEs" if detail and detail.cves else NO_DETAILS
+        return messages.text(language, "adobe.auth.none_critical") if detail and detail.cves else no_details
     worst = max(critical, key=lambda cve: (cve.cvss or 0.0, cve.auth_required is False))
-    return NO_DETAILS if worst.auth_required is None else "yes" if worst.auth_required else "no"
+    if worst.auth_required is None:
+        return no_details
+    return messages.text(language, "adobe.auth.yes" if worst.auth_required else "adobe.auth.no")
 
 
 def _queued(entry: dict, now: int) -> dict:
@@ -2442,24 +2499,34 @@ def _queued(entry: dict, now: int) -> dict:
     return entry
 
 
-def _adobe_new_message(bulletin: adobe.Bulletin, detail: adobe.Detail | None, exploited: str) -> dict:
+def _adobe_new_message(
+    bulletin: adobe.Bulletin, detail: adobe.Detail | None, exploited: str, language: str = DEFAULT_LANGUAGE
+) -> dict:
     decision = adobe_decision(bulletin, detail, exploited)
     scores = [cve.cvss for cve in detail.cves if cve.cvss is not None] if detail else []
+    no_details = messages.text(language, "adobe.no_details")
     head = [
-        ("Adobe bulletin", bulletin.apsb),
-        _priority(bulletin),
-        ("Highest CVSS", f"{max(scores):.1f}" if scores else NO_DETAILS),
-        ("Authentication required", _login_answer(detail)),
-        ("Exploited", exploited),
+        (messages.text(language, "adobe.label.bulletin"), bulletin.apsb),
+        _priority(bulletin, language),
+        (messages.text(language, "adobe.label.cvss"), f"{max(scores):.1f}" if scores else no_details),
+        (messages.text(language, "adobe.label.auth"), _login_answer(detail, language)),
+        # ``exploited`` is a decision token (``yes``, ``no``, ``unknown``); only its display is in the language.
+        (messages.text(language, "adobe.label.exploited"), messages.text(language, f"adobe.exploited.{exploited}")),
     ]
     lines = [
-        ("Affected versions", _versions(detail.affected) if detail and detail.affected else NO_DETAILS),
-        ("Fixed versions", _versions(detail.fixed) if detail and detail.fixed else NO_DETAILS),
+        (
+            messages.text(language, "adobe.label.affected"),
+            _versions(detail.affected) if detail and detail.affected else no_details,
+        ),
+        (
+            messages.text(language, "adobe.label.fixed"),
+            _versions(detail.fixed) if detail and detail.fixed else no_details,
+        ),
     ]
     if detail and detail.hotfix_note:
-        lines.append(("Hotfix", _md(detail.hotfix_note)))
+        lines.append((messages.text(language, "adobe.label.hotfix"), _md(detail.hotfix_note)))
     tag = "critical" if decision else "warning"
-    title, body = render_adobe(tag, bulletin.apsb, head, lines, decision, bulletin.url)
+    title, body = render_adobe(tag, bulletin.apsb, head, lines, decision, bulletin.url, language=language)
     # No source_id and no products: a bulletin is not a feed item, so routing falls through a source/product
     # rule to tag, ids or the default.
     return {
@@ -2475,17 +2542,14 @@ def _adobe_new_message(bulletin: adobe.Bulletin, detail: adobe.Detail | None, ex
     }
 
 
-def _adobe_kev_message(bulletin: adobe.Bulletin, listed: Sequence[str]) -> dict:
-    shown = ", ".join(listed[:MAX_SHOWN_IDS]) + (
-        f" (+{len(listed) - MAX_SHOWN_IDS} more)" if len(listed) > MAX_SHOWN_IDS else ""
-    )
+def _adobe_kev_message(bulletin: adobe.Bulletin, listed: Sequence[str], language: str = DEFAULT_LANGUAGE) -> dict:
     head = [
-        ("Adobe bulletin", bulletin.apsb),
-        _priority(bulletin),
-        ("Exploited", "yes (CISA KEV)"),
-        ("CVEs in KEV", shown),
+        (messages.text(language, "adobe.label.bulletin"), bulletin.apsb),
+        _priority(bulletin, language),
+        (messages.text(language, "adobe.label.exploited"), messages.text(language, "adobe.exploited.kev")),
+        (messages.text(language, "adobe.label.kev"), _shown_ids(listed, language)),
     ]
-    title, body = render_adobe("critical", bulletin.apsb, head, [], True, bulletin.url)
+    title, body = render_adobe("critical", bulletin.apsb, head, [], True, bulletin.url, language=language)
     # Same as a new bulletin: no source_id or products, so tag, ids or the default decide.
     return {
         "kind": "adobe-kev",
@@ -2541,7 +2605,9 @@ def _adobe_list(http: Http, stored: object) -> tuple[adobe.Bulletin, ...] | str:
     return bulletins
 
 
-def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, now: int) -> bool:
+def adobe_pass(
+    state: dict, http: Http, kev: frozenset[str], kev_known: bool, now: int, *, language: str = DEFAULT_LANGUAGE
+) -> bool:
     """Queue the Commerce bulletins nobody has been told about; False after a source fault.
 
     ``state["adobe"]["seen"]`` maps an APSB id to its CVEs, whether it is already reported exploited (``None``
@@ -2555,7 +2621,7 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
     its APSB id to the epoch of the first failure and the page is read again on every pass. A readable page gives
     the one complete message. Once ``ADOBE_DETAIL_RETRY_SECONDS`` have passed, the message goes out once without
     details. A detail fault is not a source fault: the return value stays True. State written before ``retry``
-    existed has none.
+    existed has none. ``language`` is the language the queued messages are written in (``messages``).
     """
     stored = state.get("adobe")
     bulletins = _adobe_list(http, stored)
@@ -2631,7 +2697,7 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
                 record["exploited"] = bool(listed)
             continue
         if listed and not record["exploited"]:
-            state["pending"].append(_queued(_adobe_kev_message(bulletin, listed), now))
+            state["pending"].append(_queued(_adobe_kev_message(bulletin, listed, language), now))
             record["exploited"] = True
             followed += 1
     for bulletin in fresh:
@@ -2653,7 +2719,7 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
         backlog.pop(bulletin.apsb, None)  # delivered: no longer outstanding
         cves = list(dict.fromkeys((*bulletin.cves, *(cve.cve for cve in detail.cves))) if detail else bulletin.cves)
         exploited = adobe_exploited(cves, detail, kev, kev_known)
-        state["pending"].append(_queued(_adobe_new_message(bulletin, detail, exploited), now))
+        state["pending"].append(_queued(_adobe_new_message(bulletin, detail, exploited, language), now))
         seen[bulletin.apsb] = {"cves": cves, "at": now, "exploited": exploited == "yes"}
         queued += 1
     if retry:
@@ -2675,8 +2741,12 @@ def adobe_pass(state: dict, http: Http, kev: frozenset[str], kev_known: bool, no
 
 
 def item_to_state(item: Item) -> dict:
-    """A candidate carried to the next pass; a rotating feed would otherwise drop it unrecorded."""
-    return {
+    """A candidate carried to the next pass; a rotating feed would otherwise drop it unrecorded.
+
+    The keys that name the words the service wrote are stored only when set, so the row of an ordinary item is
+    the row it always was.
+    """
+    row = {
         "guid": item.guid,
         "title": item.title,
         "link": item.link,
@@ -2686,6 +2756,39 @@ def item_to_state(item: Item) -> dict:
         "source_title": item.source_title,
         "source_url": item.source_url,
     }
+    if item.title_key:
+        row["title_key"] = item.title_key
+    if item.summary_key:
+        row["summary_key"] = item.summary_key
+    if item.text_fields:
+        row["text_fields"] = dict(item.text_fields)
+    return row
+
+
+def stored_text_keys(row: Mapping[str, object]) -> dict[str, object]:
+    """The ``Item`` keywords a stored row names its own words with, or none if this version cannot write them.
+
+    A carried row and a webhook inbox entry are JSON that another version or a hand edit may have written. A key
+    the catalogue lacks, or fields that do not fill it, would raise when the message is written, inside a pass,
+    and again on every pass after it. So each stored key is tried once here, in the default language (every
+    language holds the same keys and placeholders), and a row that fails keeps the English words it stored and
+    says so in the log. A row stored before these keys existed names none and is read exactly as it was.
+    """
+    keys = {name: row[name] for name in ("title_key", "summary_key") if row.get(name)}
+    if not keys:
+        return {}
+    stored = row.get("text_fields")
+    fields = tuple((str(name), str(value)) for name, value in stored.items()) if isinstance(stored, dict) else ()
+    try:
+        for key in keys.values():
+            messages.text(DEFAULT_LANGUAGE, key, **dict(fields))
+    except (KeyError, TypeError):
+        LOG.warning(
+            "item %s names words this version cannot write; its stored words are used",
+            _log_id(str(row.get("guid", ""))),
+        )
+        return {}
+    return {**keys, **({"text_fields": fields} if fields else {})}
 
 
 def item_from_state(row: object) -> Item:
@@ -2701,6 +2804,7 @@ def item_from_state(row: object) -> Item:
         tuple(str(value) for value in explicit) if isinstance(explicit, list) else (),
         str(data.get("source_title", "")),
         str(data.get("source_url", "")),
+        **stored_text_keys(data),
     )
 
 
@@ -2719,6 +2823,7 @@ def deliver(
     default: Sequence[str] = (),
     digest: bool = False,
     quiet_hours: delivery.QuietHours | None = None,
+    language: str = DEFAULT_LANGUAGE,
 ) -> bool:
     """Deliver up to DELIVERY_CAP pending messages; False on a failed pass.
 
@@ -2742,6 +2847,9 @@ def deliver(
     and does not count as a failed attempt. Success or failure is then recorded per covered entry -- one
     POST that covered several advisories is one attempt for each of them -- so the parking rule and
     ``state["seen"]`` stay honest.
+
+    ``language`` is the language of a digest's own words (``messages``); a queued message is posted in the
+    language it was rendered in.
     """
     if not notifiers:  # an empty notifier list must never mark a message delivered
         return not state["pending"]
@@ -2768,6 +2876,7 @@ def deliver(
         enabled_ids=enabled_ids,
         digest=digest,
         quiet_hours=quiet_hours,
+        language=language,
     )
 
 
@@ -2866,6 +2975,7 @@ def _deliver_grouped(
     enabled_ids: list[str],
     digest: bool,
     quiet_hours: delivery.QuietHours | None,
+    language: str,
 ) -> bool:
     """Deliver this pass's messages by routing group, batching each group through :func:`delivery.plan`.
 
@@ -2915,8 +3025,10 @@ def _deliver_grouped(
             targets_by_group[key] = targets
         groups[key].append(entry)
     for key, group in groups.items():
-        for batch in delivery.plan(group, now, digest=digest, quiet=quiet_hours):
-            if not _deliver_batch(state, http, now, persist, batch, targets_by_group[key], digest=digest):
+        for batch in delivery.plan(group, now, digest=digest, quiet=quiet_hours, language=language):
+            if not _deliver_batch(
+                state, http, now, persist, batch, targets_by_group[key], digest=digest, language=language
+            ):
                 return False
     return True
 
@@ -2930,6 +3042,7 @@ def _deliver_batch(
     targets: Sequence,
     *,
     digest: bool,
+    language: str,
 ) -> bool:
     """Send one planned batch, destination by destination, and record the outcome per covered entry.
 
@@ -2954,7 +3067,7 @@ def _deliver_batch(
             statuses.append(200)
             continue
         sends = (
-            [(delivery.digest_message([covered[index] for index in need]), need)]
+            [(delivery.digest_message([covered[index] for index in need], language=language), need)]
             if digest
             else [(covered[index], [index]) for index in need]
         )
