@@ -7,11 +7,13 @@ state file, no notifier and no HTTP. The delivery tests below drive ``core.deliv
 from __future__ import annotations
 
 import datetime
+import logging
 
 import pytest
 
 from advisory_radar import core, delivery
 from advisory_radar.config import DEFAULT_THRESHOLDS
+from advisory_radar.notifiers import build_notifier
 
 
 def entry(
@@ -640,3 +642,17 @@ def test_a_legacy_entry_records_its_first_attempt_as_the_claim_clock():
     assert core.deliver(state, [Recorder("ops")], no_http, NOW) is True
     record = state["seen"]["CVE-2026-1"]
     assert state["deliveries"][record["delivery"]]["queued_at"] == NOW - 7200
+
+
+def test_the_log_notifier_writes_the_message_and_delivers_nothing(caplog):
+    """A shadow run logs each message: it calls no channel, and it reports success so the state records it."""
+    notifier = build_notifier({"id": "s", "type": "log"}, {})
+    assert notifier.id == "s"
+
+    def no_http_call(*args):
+        raise AssertionError("the log notifier must not call http")
+
+    message = entry("CRITICAL: shadow run advisory", tag="critical")
+    with caplog.at_level(logging.INFO, logger="advisory_radar.notifiers"):
+        assert notifier.send(message, no_http_call) == 200
+    assert "CRITICAL: shadow run advisory" in caplog.text

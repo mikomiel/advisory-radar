@@ -227,6 +227,10 @@ queue of them cannot push a critical advisory behind it. The window is half-open
 set `TZ` on the container if the service should not run in UTC. Both keys are overlay-writable,
 so the Settings form on `/config` changes them without a restart.
 
+A `log` notifier (`type: log`) needs no url or secret. It writes each message to the application log
+and delivers nothing, but it reports success, so the state records every message as delivered. Use it
+for a shadow run: the instance evaluates what it would send before real channels are configured.
+
 A generic `webhook` notifier may carry a signing secret, referenced from the environment:
 
 ```yaml

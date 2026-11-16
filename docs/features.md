@@ -11,7 +11,8 @@ turns critical, and never re-sends what you already received.
 - Configurable source plugins: RSS/Atom/JSON Feed, FreshRSS (GReader API), changedetection.io (API poll + inbound webhook), generic inbound webhook; vendor enrichment for Debian DSA, php.net ChangeLog, Node.js security blog, Adobe APSB bulletins
 - Enrichment plugins: CVE.org, NVD, FIRST EPSS, CISA KEV, OSV, Debian security tracker
 - Notifier plugins: Discord webhook, Matrix (Hookshot), ntfy, Gotify, Apprise, generic webhook
-  (optionally signed), SMTP; digests per routing group and local quiet hours for non-critical
+  (optionally signed), SMTP, and `log` (writes each message to the application log and delivers
+  nothing, for a shadow run); digests per routing group and local quiet hours for non-critical
   messages
 - Severity decision per CVE with re-evaluation window and one escalation per level; the
   thresholds are configurable on `/config` globally or per source, and `/thresholds` previews

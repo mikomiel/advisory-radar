@@ -1278,6 +1278,23 @@ def test_a_new_webhook_secret_is_entered_and_stored_as_a_reference(tmp_path):
     assert "s3cret-value" not in settings_path(runtime.cfg.state_path).read_text()
 
 
+def test_the_log_notifier_is_added_from_the_form_without_a_url(tmp_path):
+    client, token, runtime = make_client(tmp_path)
+    csrf, fingerprint = config_form(client, token)
+    saved = client.post(
+        "/config/notifiers",
+        data={"csrf": csrf, "fingerprint": fingerprint, "new:id": "shadow", "new:type": "log"},
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303, saved.text
+    overlay = load_settings(settings_path(runtime.cfg.state_path))
+    assert overlay["notifiers"] == [{"id": "shadow", "type": "log"}], "a log channel needs no url or reference"
+    assert [notifier.id for notifier in runtime.notifiers] == ["shadow"]
+    rendered = client.get(saved.headers["location"])
+    assert rendered.status_code == 200, rendered.text
+    assert "shadow" in rendered.text, "the page the browser is sent to lists the new channel"
+
+
 def test_a_literal_webhook_secret_is_refused_by_the_form(tmp_path):
     environment = {"HOOK": "https://hooks.example.net/x"}
     client, token, runtime = make_client(tmp_path, body="sources: []\nnotifiers: []\n", environment=environment)

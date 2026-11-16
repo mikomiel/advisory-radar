@@ -1,4 +1,4 @@
-"""Built-in notifier plugins: Apprise gateway, Discord webhook, generic webhook.
+"""Built-in notifier plugins: Apprise gateway, Discord webhook, generic webhook, log.
 
 A generic ``webhook`` notifier may carry a ``secret``. With one set, every request is signed so a receiver
 can tell a message this instance sent from one an attacker composed against the same URL:
@@ -99,6 +99,17 @@ class DiscordWebhookNotifier:
     def send(self, entry: dict, http: Http) -> int:
         content = f"**{entry['title']}**{entry['body']}"
         return _post_json(http, self.url, {}, {"content": content[:1900]})
+
+
+class LogNotifier:
+    """Writes each message to the application log and delivers nothing, so a shadow run can record deliveries."""
+
+    def __init__(self, notifier_id: str) -> None:
+        self.id = notifier_id
+
+    def send(self, entry: dict, http: Http) -> int:
+        LOG.info("log notifier %s: [%s] %r %r", self.id, entry["tag"], entry["title"], entry["body"])
+        return 200
 
 
 class WebhookNotifier:
@@ -311,6 +322,7 @@ NOTIFIER_BUILDERS = {
         starttls=_bool(cfg.get("use_tls", True), "use_tls"),
         implicit_tls=_bool(cfg.get("implicit_tls", False), "implicit_tls"),
     ),
+    "log": lambda cfg, env: LogNotifier(cfg["id"]),
 }
 
 

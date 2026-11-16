@@ -88,6 +88,8 @@ notifiers:
   #   to: admin@example.com
   #   username: radar@example.com
   #   password: ${SMTP_PASSWORD}
+  # - id: shadow
+  #   type: log            # delivers nothing; writes each message to the log (shadow run)
 
 # Delivery policy. Both keys are editable on /config without a restart.
 # `digest: true` sends one message per routing group instead of one per advisory: the title states
