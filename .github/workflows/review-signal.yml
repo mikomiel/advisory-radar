@@ -27,6 +27,7 @@ permissions: {}
 jobs:
   signal:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: Hand the review event to the default branch
         run: echo "review event relayed to review-gate and automerge"

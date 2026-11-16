@@ -1,7 +1,7 @@
 # Image release: on every v*.*.* tag, build and push to GHCR.
 # release-please creates the tag when a maintainer merges its release pull
 # request -- that merge is the per-release consent; this workflow builds what the
-# tag points at.
+# tag points at, and only when the tag is a release of main (the first step).
 name: release
 
 on:
@@ -19,8 +19,38 @@ jobs:
   image:
     name: image
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Every branch and tag: origin/main must exist for the ancestry check, and the tag list for `latest`
+          # must be complete.
+          fetch-depth: 0
+
+      # Anyone who can push a tag starts this job, and the job holds the credentials that publish and sign the
+      # image. So the tag is checked before anything is built or pushed: its commit must be on main, and the
+      # version in its name must be the version in pyproject.toml, which only the release pull request changes.
+      # A repository ruleset that restricts who may create v* tags is the enforcing control and is an owner
+      # setting (docs/review-and-merge.md); this step is the check that does not depend on it.
+      - name: Verify the release tag
+        run: |
+          set -euo pipefail
+          if ! git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then
+            echo "::error::origin/main is missing from this checkout, so the tag cannot be checked against main"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::${GITHUB_REF_NAME} (${GITHUB_SHA}) is not on main, or the history that proves it is missing"
+            exit 1
+          fi
+          version="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')" || {
+            echo "::error::pyproject.toml carries no [project] version"
+            exit 1
+          }
+          if [[ "${GITHUB_REF_NAME#v}" != "${version}" ]]; then
+            echo "::error::${GITHUB_REF_NAME} does not match version ${version} in pyproject.toml"
+            exit 1
+          fi
 
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1  # v4
 
@@ -34,16 +64,19 @@ jobs:
 
       - name: Image tags
         id: tags
-        # `latest` only for a stable vX.Y.Z tag: a pre-release (v0.2.0-rc1) must not move it under every
-        # existing deployment.
+        # `latest` only for the highest stable vX.Y.Z tag: neither a pre-release (v0.2.0-rc1) nor a rebuild of an
+        # older release may move it under every existing deployment. The order is by version, not by text
+        # (v0.10.0 is above v0.9.0), and `sed -n 1p` replaces `head -n1`, which would close the pipe early and
+        # fail the step under pipefail.
         run: |
           set -euo pipefail
           repo="ghcr.io/${GITHUB_REPOSITORY}"
           tags="${repo}:${GITHUB_REF_NAME}"
-          if [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          highest="$(git tag --list 'v*' --sort=-v:refname | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sed -n 1p)"
+          if [[ "${GITHUB_REF_NAME}" == "${highest}" ]]; then
             tags="${tags}"$'\n'"${repo}:latest"
           else
-            echo "::notice::${GITHUB_REF_NAME} is not a stable vX.Y.Z tag; latest is left untouched"
+            echo "::notice::${GITHUB_REF_NAME} is not the highest stable vX.Y.Z tag (${highest:-none}); latest is left untouched"
           fi
           printf 'list<<TAGS\n%s\nTAGS\n' "$tags" >> "$GITHUB_OUTPUT"
 

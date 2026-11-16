@@ -45,15 +45,40 @@ as a status:
   hours for one.
 - **Dependency updates are exempt from the App review.** A pull
   request opened by Dependabot (`dependabot[bot]`) gets `review: success` with the reason
-  in the description, and only while *every* path the immutable `base...head` comparison
-  names — both sides of a rename — is a dependency manifest (`.github/workflows`,
-  `pyproject.toml`, `uv.lock`, `Dockerfile`, `docker-compose.yml`), and only while the
-  changed-file count that proves that list complete describes the *same* two commits as
+  in the description, and only while four things hold. First, the head is a `dependabot/`
+  branch of this repository, not a fork's: Dependabot pushes the branch of an update to the
+  repository it updates, under that prefix, so a pull request from a fork or from a branch of
+  any other name keeps the review requirement even when its author reads as the bot. Second,
+  *every* path the immutable
+  `base...head` comparison names - both sides of a rename - is a dependency manifest
+  (`.github/workflows`, `pyproject.toml`, `uv.lock`, `Dockerfile`, `docker-compose.yml`), and
+  the changed-file count that proves that list complete describes the *same* two commits as
   the comparison: the count is read separately, so a branch that moved in between is not
-  exempt. It is keyed on an
+  exempt. Third, *every commit* of that comparison is Dependabot's own: authored by the bot,
+  committed by GitHub (`web-flow`) or by the bot, and carrying a signature GitHub reports as
+  verified. The pull request's author is only whoever opened it, and a branch takes more
+  commits afterwards, so a push by a maintainer to a Dependabot branch, or GitHub's *Update
+  branch* button (a merge commit in that person's name), ends the exemption for that head. The
+  comparison lists at most 250 commits and reports their full count beside them, and a list
+  shorter than that count is not exempt. To get a clean head again, comment `@dependabot
+  rebase`: Dependabot rewrites the branch from its own commits. Fourth, a workflow edit is
+  nothing but pins moved: its patch changes only `uses:` lines, each replaced one for one by a
+  `uses:` line for the same action at a full 40-character commit id (with an optional
+  `# vX.Y.Z` comment) and at the same indentation. A changed `run:`, `with:` or `permissions:`
+  line, an extra line, another action, a tag instead of a commit id, an added, removed or
+  renamed workflow file, or a patch the gate did not carry keeps the review requirement. The
+  gate carries a patch for at most 40 changed lines and 16 KiB per file; that bound is
+  transport, not policy. The other manifests are still accepted by path alone, and `ci` is
+  what reads their content. The exemption is keyed on an
   author login GitHub assigns, which a patch cannot claim, and it applies **only where no
   eligible reviewer has said anything decisive**: a stale approval, a dismissed review or a
   comment still leaves it pending, and an approval or a change request is used as-is.
+  **These conditions narrow the exemption; they do not authenticate the bot.** GitHub records
+  a squash merge of a Dependabot pull request as authored by the bot, committed by `web-flow`
+  and verified, whatever content the merged branch held, so a commit like that passes the
+  identity conditions above, and people with write access are trusted for this exemption.
+  What it refuses is a head that is not a `dependabot/` branch of this repository, a commit
+  by anyone else, and an unsigned one.
   `.github/workflows/automerge.yml` still never takes an exempt pull request: it holds
   every candidate to `scripts/review_state.py`'s eligible approval at the exact head, and
   an exempt one has none. **GitHub's own auto-merge is a separate switch**, and while
@@ -82,10 +107,11 @@ as a status:
   the version actually changes. The changed-file count must
   also prove the list complete for the same two commits. A dependency added beside the
   version, an import appended to the version line, a second changed line, a path outside the
-  set, a missing patch (the gate carries one only for a change of at most four lines) or an
-  unreadable list keeps the normal requirement and fails closed. An approval at the exact head
-  is still reported as that approval, a change request still makes the status a `failure`,
-  and `.github/workflows/automerge.yml` still never takes the pull request: it changes
+  set, a missing patch (the gate carries one only for a change of at most 40 lines and 16 KiB
+  per file) or an unreadable list keeps the normal requirement and fails closed. An approval
+  at the exact head is still reported as that approval, a change request still makes the
+  status a `failure`, and `.github/workflows/automerge.yml` still never takes the pull
+  request: it changes
   `pyproject.toml`, a sensitive path, so a person merges it. The shape is recognised in
   [`scripts/review_gate_plan.py`](../scripts/review_gate_plan.py), pinned by
   [`tests/test_review_gate_plan.py`](../tests/test_review_gate_plan.py), and it mirrors
@@ -115,11 +141,23 @@ Two-person review still needs a second human account or a team with another memb
 [`scripts/guard_sensitive_paths.py`](../scripts/guard_sensitive_paths.py) — `.github/`
 (including the workflows and this automation), `Dockerfile`, `docker-compose.yml`,
 `deploy/`, `pyproject.toml`, `uv.lock` (the lock decides what CI installs under
-`uv sync --frozen`), `.python-version`, `.dockerignore`, `.gitleaks.toml`,
+`uv sync --frozen`), `.python-version`, `.dockerignore`, `.gitleaks.toml`, a `.gitleaksignore`
+in any directory (gitleaks drops every finding that one lists, so adding it hides a secret from
+the scan),
 `release-please-config.json` and `.release-please-manifest.json` (the tag format, what a
 release contains, and the version it starts from), `tests/` and
 `scripts/` (the guard and the approval rule are policy too: the workflows execute them from
-the default branch, so they need the same human merge as the workflows themselves) — and
+the default branch, so they need the same human merge as the workflows themselves), and the
+files that configure how the checks run, which would otherwise let a pull request switch the
+checks off without touching `tests/`: `conftest.py` at any depth, the root files `ruff.toml`,
+`.ruff.toml`, `pytest.ini`, `.pytest.ini`, `pytest.toml`, `.pytest.toml` (pytest reads all four
+names, and each one wins over the `[tool.pytest.ini_options]` table of `pyproject.toml`),
+`tox.ini`, `setup.cfg`, `uv.toml`, `.coveragerc`, `noxfile.py`, `hatch.toml`, `hatch_build.py`
+(the build backend merges the first over `[tool.hatch]` and runs the second as a build hook, in
+CI and in the image build) and
+`sitecustomize.py`, and a `ruff.toml`, `.ruff.toml` or `pyproject.toml` below the root (ruff
+applies the closest configuration file to each file, so a nested one silences its own
+subtree) — and
 [`tests/test_guard_sensitive_paths.py`](../tests/test_guard_sensitive_paths.py) pins it. A
 pull request touching one of those paths is never auto-merged: the workflow skips it and a
 human merges it. The guard therefore means "a person merges these", not "a second person
@@ -178,3 +216,85 @@ does not undo the exposure — the credential must be revoked. Prevention is pre
 to the contributor: never commit a secret, and scan locally before pushing. This policy alleges
 no historical leak; it closes the gap between what the job claimed to cover and what a
 one-commit checkout could see.
+
+## Estate identifier guard
+
+`scripts/check_no_estate_identifiers.py` (the `ci` step "No internal identifiers") fails closed. It
+matches every path in the git index and the content of every blob the index names, read with
+`git cat-file --batch`, so a symlink's target and a file that cannot be read on the runner are scanned
+like any other. A blob without a NUL byte is decoded leniently as UTF-8, so a file that is not UTF-8 is
+still matched. A blob that holds a NUL byte is read as text in UTF-16 or UTF-32 instead: every ASCII
+character of such text is written with NUL bytes, and a Windows tool saves a file that way, with or
+without a byte order mark. That blob is read once per encoding and byte order (four readings, each from
+the first byte), and a reading that is wrong for the blob matches nothing. A blob without a NUL byte
+cannot hold an ASCII identifier in a wide encoding. Two inputs are reported clean and are known limits:
+UTF-8 text that holds a stray NUL byte, which is read only as wide text, like the raw ASCII inside image
+data, and UTF-32 text that follows a prefix of one to three bytes, which only some of the readings
+realign. The suffix decides nothing: an `.svg` is text. One
+file is skipped for its content only, `scripts/check_no_estate_identifiers.py`, because its text lists
+the patterns; its path name is still matched. The lock file and `.gitleaks.toml` are read like any other
+file: a lock generated against a private index names that index in every package entry it resolved there.
+A git error, an object that cannot be read, output that does not parse, or
+an empty index ends the run with status 2 and the reason, never with `OK`; status 1 means identifiers
+were found.
+
+The scan reads the index, not the work tree. An edit that is not staged and a file that is not added are
+not scanned, so stage a change before a local run. CI checks out a tree in which everything is tracked,
+so the limit does not apply there.
+
+## Release tags
+
+`release-please` opens the release pull request, merging it creates the `vX.Y.Z` tag, and the tag
+starts `.github/workflows/release.yml`, which builds, pushes and signs the image. Anyone who can push
+a tag starts that job, so it checks the tag before it builds or pushes anything:
+
+- The tag's commit must be an ancestor of `origin/main`. The checkout fetches the whole history for
+  this, and a checkout without `origin/main` fails the job instead of skipping the check.
+- The version in the tag name must equal `[project] version` in `pyproject.toml`, which only the
+  release pull request changes. A pre-release tag such as `v1.2.0-rc1` therefore builds only when
+  `pyproject.toml` carries exactly that version.
+- `latest` moves only when the tag is the highest stable `vX.Y.Z` tag, compared as versions
+  (`v0.10.0` is above `v0.9.0`). Any other tag publishes its own version tag and leaves `latest`
+  where it was. Two tags pushed within one build window can still leave `latest` on the lower one;
+  the next release moves it.
+
+These checks make a wrong tag fail instead of publish. They run inside the job, so they do not stop a
+person with write access from starting it with a tag on a commit of `main`. The build step sets no
+`context`, so the build action reads the tag through its own default Git context rather than from the
+checkout that was verified (not checked against the pinned action version here); a tag moved between
+the check and the build would then not be the commit that was checked. Two repository settings finish
+the control. Neither is visible in the source, and this change neither verifies nor applies either
+one; both are owner actions:
+
+1. **A tag ruleset for `v*`.** In Settings, Rules, Rulesets, create a tag ruleset on `v*` that restricts
+   creation, update and deletion, so that only the identity that owns `RELEASE_PLEASE_TOKEN` can still
+   create such a tag. A ruleset's bypass list takes roles, teams, apps and deploy keys rather than a
+   named user, so pick the entry that covers that identity and nothing wider; these mechanics were not
+   checked here. release-please creates the tag with that token when the release pull request merges,
+   so a ruleset that also blocks that identity stops the release at the tag.
+2. **`RELEASE_PLEASE_TOKEN` in an environment restricted to `main`.** The `release-please` job reads it
+   as `secrets.RELEASE_PLEASE_TOKEN`, a plain secret, so a workflow file on any branch that a writer can
+   push can ask for it. Create a deployment environment whose deployment branches are limited to `main`,
+   move the secret there, and only then add `environment:` to that job in
+   `.github/workflows/release-please.yml`. Adding `environment:` first is wrong: GitHub creates a
+   missing environment on first reference, with no protection, so the job would keep working while
+   protecting nothing. The job carries no `environment:` today, on purpose.
+
+## CI container checks
+
+The `ci` job checks more than the Python code. `docker compose config -q` runs against a scratch copy
+of `docker-compose.yml` with an empty `.env`, so a broken compose file fails the job without starting
+anything. The image is then built and started, and asked for `/healthz`. This job does not start the
+shipped compose file or the Podman quadlet under `deploy/podman/`.
+
+Both ruff steps run with `--no-respect-gitignore`. By default ruff skips what a `.gitignore` or an
+`.ignore` file lists, in any directory and for a tracked file as well, so a new `.gitignore` under
+`src/` that names a module would hide it from the lint and from the format check without touching a
+path that the guard reserves. The flag makes ruff read every file under the root; its default
+excludes still keep `.venv` and `.git` out. A local run without the flag skips those files too, so
+it can pass where CI fails.
+
+Every job carries a `timeout-minutes`, so a hung step cannot hold a runner for the default six hours.
+[`tests/test_ci_hardening.py`](../tests/test_ci_hardening.py) pins that, the ruff flag, the exact
+`hatchling` pin, the `setup-uv` version in the same line as the Dockerfile's builder, and Dependabot's
+coverage of `uv`, `github-actions`, `docker` and `docker-compose`.
