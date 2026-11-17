@@ -54,6 +54,10 @@ SENSITIVE_PATTERNS: tuple[str, ...] = (
     # policy, so a person merges it -- and the generated release pull request always changes the manifest.
     r"^release-please-config\.json$",
     r"^\.release-please-manifest\.json$",
+    # The agent instruction files are the rules a coding agent follows here, so a person merges a change to either.
+    # Only the two files at the repository root are listed; a file of the same name elsewhere stays ordinary.
+    r"^AGENTS\.md$",
+    r"^CLAUDE\.md$",
     r"^tests/",
     # The workflows execute scripts/ on the default branch: this guard, and the approval rule the gate and
     # the merge both apply. Leaving them out of their own guard would let one approved pull request disable
