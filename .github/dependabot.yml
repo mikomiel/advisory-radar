@@ -38,6 +38,13 @@ updates:
       container-images:
         patterns:
           - "*"
+    ignore:
+      # Hold the runtime image below Python 3.15. `pyproject.toml` caps
+      # `requires-python` at <3.15, and the builder stage's uv image tag pins
+      # its own Python, which Dependabot does not bump. Remove this hold in the
+      # change that moves both stages, the bound and the CI matrix together.
+      - dependency-name: "python"
+        versions: [">= 3.15"]
   - package-ecosystem: "docker-compose"
     directory: "/"
     schedule:
