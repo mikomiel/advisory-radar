@@ -3702,6 +3702,10 @@ def create_app(
             "ignored; a partly filled one is saved as written and the validator reports what is wrong. Only "
             "enabled notifiers may be selected. A numeric or KEV predicate matches only what the message "
             "measured: an advisory with no score never satisfies one.</p>"
+            "<p class='muted'>An escalation, the later message about a CVE whose score or exploitation status rose, "
+            "carries no source and no product, so a rule that names either never matches it. Its destination is the "
+            "first rule that matches its tag, ids, score, EPSS or KEV, then the default notifiers, then every "
+            "enabled notifier. <a href='/thresholds?kind=escalation'>Preview where an escalation goes.</a></p>"
         )
 
     def commit_overlay(request: Request, overlay: dict, *, notice: str = ""):
@@ -4944,6 +4948,11 @@ def create_app(
         it has one, and the global block otherwise -- and calls the same ``core.level_of`` and
         ``routing.select`` the pass calls, so the answer cannot drift from the decision it describes. Nothing is
         written and no state is read, so the link can be shared and repeated.
+
+        ``kind=escalation`` previews the later message ``core.reevaluate`` queues for a watched CVE instead. That
+        message is routed with no source and no product, so it is selected with an entry that has neither, and
+        the page lists the rules that name one because they never apply to it. Whether the daily pass sends the
+        escalation at all depends on state this page does not read, and the page says so.
         """
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
@@ -4972,6 +4981,10 @@ def create_app(
         ssvc = (request.query_params.get("ssvc") or "").strip()
         if ssvc not in ("", "active"):
             raise HTTPException(status_code=400, detail="ssvc must be empty or active")
+        kind = (request.query_params.get("kind") or "").strip()
+        if kind not in ("", "escalation"):
+            raise HTTPException(status_code=400, detail="kind must be empty or escalation")
+        escalation = kind == "escalation"
         remote = request.query_params.get("remote") == "1"
         source = (request.query_params.get("source") or "").strip()
         product = (request.query_params.get("product") or "").strip()
@@ -4999,7 +5012,15 @@ def create_app(
             facts = core.CveFacts(cvss, ssvc or None, epss, None, True, remote_unauth=remote)
             level, reason = core.level_of(facts, kev_choice == "yes", kev_choice != "unknown", thresholds=thresholds)
             line = core.metrics_line(cvss, epss, None, ssvc or None, kev_choice == "yes")
-            note = core.reason_note(reason, thresholds)
+            # An escalation says what changed since the first message, not why the CVE is critical.
+            note = core.change_note(reason, thresholds) if escalation else core.reason_note(reason, thresholds)
+            # ``core.reevaluate`` queues an escalation for a CVE that now judges critical, or warning with a measured
+            # score at or above the floor. For any other facts it records the verdict and sends nothing.
+            escalates = level == "critical" or (
+                level == "warning" and cvss is not None and cvss >= thresholds.suppress_below_cvss
+            )
+            # An escalation is about one CVE, the one its watch entry is keyed by, and names no other identifier.
+            escalated = sorted({identifier.upper() for identifier in identifiers if core.CVE_RE.fullmatch(identifier)})
             decisions = {
                 "kev": "the CVE is in the CISA KEV catalog: exploitation observed in the wild.",
                 "ssvc": "CISA records active exploitation (SSVC).",
@@ -5010,6 +5031,17 @@ def create_app(
             }
             if reason in decisions:
                 why = decisions[reason]
+            elif escalation and not escalates:
+                why = (
+                    "no CVE, score or exploitation signal reaches the critical rules, and the score is unknown or "
+                    "below the suppression floor."
+                )
+            elif escalation:
+                why = (
+                    "no CVE, score or exploitation signal reaches the critical rules, but the score is at or above "
+                    "the suppression floor, so a CVE whose first message recorded it as suppressed is escalated as "
+                    "a warning."
+                )
             elif level == "suppressed":
                 why = (
                     "no CVE, score or exploitation signal reaches the critical rules, and the item is below the "
@@ -5033,7 +5065,16 @@ def create_app(
                 )
             tone = {"critical": "critical", "warning": "warning", "suppressed": "ok"}[level]
             label = {"critical": "Critical", "warning": "Warning", "suppressed": "Suppressed"}[level]
-            if level == "suppressed":
+            if escalation and not escalates:
+                tone, label = "ok", "No escalation"
+                destination = "<p class='muted'>No escalation is queued for these facts, so nothing is routed.</p>"
+            elif escalation and len(escalated) != 1:
+                destination = _notice(
+                    "An escalation is about exactly one CVE and names no other identifier: give that CVE's id "
+                    "above to see where it would go.",
+                    "warning",
+                )
+            elif level == "suppressed":
                 # Nothing is sent, so naming a route would describe a message that never exists.
                 destination = "<p class='muted'>No message is sent, so nothing is routed.</p>"
             else:
@@ -5088,8 +5129,19 @@ def create_app(
                 if unpredictable:
                     destination = _notice(" ".join(unpredictable), "warning")
                 else:
-                    selected, where = routing.select(
-                        {
+                    if escalation:
+                        # The entry ``core.reevaluate`` queues: its one CVE with that CVE's measured numbers and KEV
+                        # membership, and no ``source_id`` or ``products``, so a rule naming either cannot match.
+                        [cve] = escalated
+                        message = {
+                            "tag": level,
+                            "ids": [cve],
+                            "scores": {cve: cvss},
+                            "epss": {cve: epss},
+                            "kev": None if kev_choice == "unknown" else kev_choice == "yes",
+                        }
+                    else:
+                        message = {
                             "tag": level,
                             "source_id": source,
                             "products": [product] if product else [],
@@ -5103,7 +5155,9 @@ def create_app(
                             "kev": None
                             if kev_choice == "unknown"
                             else (kev_choice == "yes" if cve_identifiers else False),
-                        },
+                        }
+                    selected, where = routing.select(
+                        message,
                         cfg.routes,
                         cfg.default_notifiers,
                         [str(entry.get("id", "")) for entry in cfg.notifiers],
@@ -5119,7 +5173,41 @@ def create_app(
                             "pass would fail on it rather than drop it.",
                             "warning",
                         )
-            carries = "Recorded with" if level == "suppressed" else "The message would carry"
+                    if escalation:
+                        # Name each rule the missing source and product skip, so a rule the operator wrote is not
+                        # mistaken for one that fires, and the fallback that won when no rule matched.
+                        named: dict[str, list[str]] = {}
+                        for key in ("source", "product"):
+                            for position in rules_matching(key):
+                                named.setdefault(position, []).append(key)
+                        skipped = [f"rule {n} ({' and '.join(named[n])})" for n in sorted(named, key=int)]
+                        explanation = []
+                        if skipped:
+                            explanation.append(
+                                "Skipped, because an escalation carries no source and no product: "
+                                + ", ".join(skipped)
+                                + "."
+                            )
+                        if where == "default":
+                            explanation.append("No rule matches this escalation, so the default notifiers win.")
+                        elif where == "all":
+                            explanation.append(
+                                "No rule matches this escalation and no default is set, so every enabled notifier "
+                                "gets it."
+                                if cfg.routes
+                                else "No routes are configured, so every enabled notifier gets it."
+                            )
+                        if explanation:
+                            destination += f"<p class='muted small'>{esc(' '.join(explanation))}</p>"
+                        destination += (
+                            "<p class='muted small'>Whether the daily pass sends this escalation depends on what its "
+                            "first message told (its level and its score), which a preview does not read. If it is "
+                            "sent, this is where it goes.</p>"
+                        )
+            if escalation:
+                carries = "The escalation would carry" if escalates else "Measured"
+            else:
+                carries = "Recorded with" if level == "suppressed" else "The message would carry"
             result = (
                 "<h2>Result</h2>"
                 f"<p>{_badge(label, tone)} {esc(why)}</p>"
@@ -5141,11 +5229,17 @@ def create_app(
             f"{' checked' if remote else ''}> remote, unauthenticated, no interaction</label>"
             "</div>"
             "<div class='fields'>"
+            f"<label>Message kind<select name='kind'>{choice('', 'New advisory', kind)}"
+            f"{choice('escalation', 'Escalation', kind)}</select></label>"
             f"<label>Source<select name='source'>{source_options}</select></label>"
             f"<label>Product id<input type='text' name='product' value='{esc(product)}'></label>"
             f"<label>Advisory ids<input type='text' name='ids' value='{esc(ids_text)}' "
             "placeholder='CVE-2026-1234 GHSA-abcd-...'></label>"
             "</div>"
+            "<p class='muted small'>An escalation is the later message about one CVE whose score or exploitation "
+            "status rose. It carries no source and no product, so a rule that names either never matches it: "
+            "Source then only picks the thresholds that judge the CVE, Product id is ignored, and Advisory ids "
+            "must give the CVE.</p>"
             "<button class='btn btn-primary' name='preview' value='1'>Preview</button>"
             f" <a class='btn btn-quiet' href='/config'>Change the thresholds</a>"
             "</form>"

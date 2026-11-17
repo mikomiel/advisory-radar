@@ -990,6 +990,132 @@ def test_a_pass_honours_the_quiet_hours_policy(tmp_path):
     assert cfg.store().load()["pending"] == []
 
 
+# --- a delivered message only ever raises the watch it names --------------------------------------------
+#
+# These seed the stored queue and watch, as the tests above do. ``classify_new`` judges only identifiers nobody
+# claims yet, so on a consistent state a fresh feed item does not queue a ``new`` message for a CVE that is
+# already watched. The guard is for the state where one is queued anyway: a pass delivers it as it finds it, and
+# the delivery must not write over the entry that is already there.
+
+
+def _lookups_fail(method, url, headers, payload):
+    """Every request is refused: the KEV catalog is unknown and a re-score measures nothing, so it decides nothing."""
+    return 404, {}, b""
+
+
+def _kev_names(*cves: str):
+    """An http that serves a KEV catalog naming ``cves`` and refuses every other request."""
+    catalog = json.dumps({"catalogVersion": "1", "vulnerabilities": [{"cveID": cve} for cve in cves]}).encode()
+
+    def http(method, url, headers, payload):
+        return (200, {}, catalog) if _is_kev_request(url) else (404, {}, b"")
+
+    return http
+
+
+def _pass_at(cfg: Config, notifier: FakeNotifier, now: int, http) -> int:
+    return pipeline.run_pass(cfg, [], [notifier], http=http, clock=lambda: float(now), sleep=lambda seconds: None)
+
+
+def _queue(cfg: Config, *messages: dict) -> None:
+    """Replace the stored queue, leaving the rest of the state (seen, watch, deliveries) as the last pass wrote it."""
+    stored = cfg.store().load() or core.new_state()
+    stored["pending"] = list(messages)
+    cfg.store().save(stored)
+
+
+def _from_another_feed(cve: str, tag: str = "warning") -> dict:
+    """A second source's message that names ``cve``: its own title, link, source id and score."""
+    return {
+        **queued_message(cve, tag),
+        "source": "Other feed",
+        "source_id": "other",
+        "link": f"https://other.example/{cve}",
+        "scores": {cve: 8.5},
+    }
+
+
+def test_the_first_new_message_a_pass_delivers_creates_the_watch_record(tmp_path):
+    cve = "CVE-2026-9100"
+    cfg = pending_config(tmp_path)
+    _queue(cfg, queued_message(cve, "warning"))
+    assert _pass_at(cfg, FakeNotifier(200), NOW, _lookups_fail) == 0
+    assert cfg.store().load()["watch"][cve] == {
+        "since": NOW,
+        "last_eval": NOW,
+        "level": "warning",
+        "kev_only": False,
+        "title": "Vendor",
+        "link": f"https://vendor.example/{cve}",
+        "thresholds": [9.0, 0.10, 4.0],
+        "judged": "warning",
+        "source_id": "vendor",
+        "cvss": 7.5,
+    }
+
+
+def test_a_second_new_message_at_the_same_level_still_replaces_the_watch_record(tmp_path):
+    """Unchanged: at the level the entry already holds, the later message's record, source and clock stand."""
+    cve = "CVE-2026-9102"
+    cfg = pending_config(tmp_path)
+    notifier = FakeNotifier(200)
+    _queue(cfg, queued_message(cve, "warning"))
+    assert _pass_at(cfg, notifier, NOW, _lookups_fail) == 0
+
+    later = NOW + 2 * core.DAY
+    _queue(cfg, _from_another_feed(cve, "warning"))
+    assert _pass_at(cfg, notifier, later, _lookups_fail) == 0
+
+    assert [message["source_id"] for message in notifier.sent] == ["vendor", "other"], "both were delivered"
+    assert cfg.store().load()["watch"][cve] == {
+        "since": later,
+        "last_eval": later,
+        "level": "warning",
+        "kev_only": False,
+        "title": "Other feed",
+        "link": f"https://other.example/{cve}",
+        "thresholds": [9.0, 0.10, 4.0],
+        "judged": "warning",
+        "source_id": "other",
+        "cvss": 8.5,
+    }
+
+
+def test_a_late_new_warning_does_not_undo_the_critical_escalation_delivered_ahead_of_it(tmp_path):
+    """The queue holds a warning for a watched CVE when a KEV listing makes the next re-score queue a critical.
+
+    The pass delivers the critical escalation first, then the warning that was already waiting. The warning used to
+    write its record over the escalated one: the watch fell back to ``warning`` with a fresh window, and the next
+    daily re-score sent the same critical a second time.
+    """
+    cve = "CVE-2026-9101"
+    cfg = pending_config(tmp_path)
+    notifier = FakeNotifier(200)
+    _queue(cfg, queued_message(cve, "warning"))
+    assert _pass_at(cfg, notifier, NOW, _lookups_fail) == 0
+    assert cfg.store().load()["watch"][cve]["level"] == "warning", "the reader has been told a warning"
+
+    # Two days on the CVE is in the KEV catalog and a second warning that names it is still waiting.
+    day_three = NOW + 2 * core.DAY
+    _queue(cfg, _from_another_feed(cve, "warning"))
+    assert _pass_at(cfg, notifier, day_three, _kev_names(cve)) == 0
+    assert [(message["kind"], message["tag"]) for message in notifier.sent[1:]] == [
+        ("escalation", "critical"),
+        ("new", "warning"),
+    ], "the critical went first and the warning after it"
+    watch = cfg.store().load()["watch"][cve]
+    assert (watch["level"], watch["judged"]) == ("critical", "critical"), "the late warning did not lower the watch"
+    assert watch["since"] == NOW, "and it did not start the watch window again"
+
+    # The reader has the critical, so the next daily re-score owes nothing.
+    assert _pass_at(cfg, notifier, day_three + core.DAY, _kev_names(cve)) == 0
+    assert [(message["kind"], message["tag"]) for message in notifier.sent[1:]] == [
+        ("escalation", "critical"),
+        ("new", "warning"),
+    ], "no second critical"
+    assert cfg.store().load()["pending"] == []
+
+
 # --- the watchlist document the page writes -----------------------------------------------------
 
 

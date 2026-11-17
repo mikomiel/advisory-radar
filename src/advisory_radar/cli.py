@@ -21,7 +21,7 @@ from .catalogue import SOURCE_SPECS
 from .config import Config, ConfigError, forwarded_allow_ips, load_config, secret_values
 from .http import Http, urllib_http
 from .runtime import Runtime, read_config
-from .state import LockBusy, SourceError, serialize_json
+from .state import LockBusy, SourceError
 from .storage import StoreUnavailable, store_for
 
 LOG = logging.getLogger("advisory_radar")
@@ -299,7 +299,7 @@ def _migrate(cfg: Config, target_value: str) -> int:
         return 1
     # Only the stores' reprs are shown: a PostgreSQL locator carries a password, and this line is output an
     # operator may paste into an issue.
-    print(f"migrated the state document ({len(serialize_json(document))} bytes) from {source} to {target}")
+    print(f"migrated the state document from {source} to {target}")
     return 0
 
 
