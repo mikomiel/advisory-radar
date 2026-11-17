@@ -1529,6 +1529,38 @@ def _record_event(state: dict, entry: dict, now: int, outcome: str, delivered_to
     return snapshot_id
 
 
+#: The watch keys that record what the rules in force make of a CVE, with those rules and the source that supplied
+#: them. They are one fact and move together: rules that do not belong to the judgement beside them make the next
+#: re-evaluation read a settings change where there was none, and re-baseline the entry in silence.
+_JUDGEMENT_KEYS = frozenset({"judged", "thresholds", "source_id"})
+
+
+def _watch_after_new_message(existing: object, incoming: dict) -> dict:
+    """The watch record once a delivered ``new`` message names a CVE: the message's, never below what is held.
+
+    A record keeps two levels, each with the facts that belong to it. ``level`` is what the reader was last told,
+    with the message that told it (``since``, ``title``, ``link``, ``cvss``, ``kev_only``) and the re-evaluation
+    clock (``last_eval``). ``judged`` is what the rules in force make of the CVE, with those rules and their
+    source (``thresholds``, ``source_id``). Each side keeps the higher of the held record and the message, and a
+    tie goes to the message, as a message at the held level has always replaced it. A message below what the
+    reader was told therefore changes none of that, the clock included: it must not undo a delivered escalation,
+    and a delivery that tells the reader nothing new must neither stretch the ``REEVAL_WINDOW`` nor postpone the
+    next evaluation. A key stays absent where its side has none: a record without ``cvss`` has a score that counts
+    as known, and a judgement without ``source_id`` is the global rules'.
+
+    The escalation branch of ``_delivered`` makes the same two comparisons in place.
+    """
+    if not isinstance(existing, dict):
+        return incoming
+    told = incoming if _rank(incoming["level"]) >= _rank(existing.get("level")) else existing
+    judged = incoming if _rank(incoming["judged"]) >= _rank(existing.get("judged")) else existing
+    if told is judged:
+        return told
+    merged = {key: value for key, value in told.items() if key not in _JUDGEMENT_KEYS}
+    merged.update({key: value for key, value in judged.items() if key in _JUDGEMENT_KEYS})
+    return merged
+
+
 def _delivered(
     state: dict, entry: dict, now: int, outcome: str = "delivered", delivered_to: Sequence[str] = ()
 ) -> None:
@@ -1590,7 +1622,9 @@ def _delivered(
                 record["source_id"] = source_id
             if "scores" in entry:  # A message queued before the key existed has no score on record: legacy.
                 record["cvss"] = entry["scores"].get(cve)
-            state["watch"][cve] = record
+            # A delivery only ever raises the watch, as an escalation does: a message that names a CVE the entry
+            # already holds higher must not lower it, and must not move its clock either.
+            state["watch"][cve] = _watch_after_new_message(state["watch"].get(cve), record)
     elif kind == "escalation":
         watch = state["watch"].get(entry["cves"][0])
         if watch is not None and outcome == "delivered":
