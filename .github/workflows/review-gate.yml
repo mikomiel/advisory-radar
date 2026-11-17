@@ -5,7 +5,8 @@
 # REVIEW_REQUIRED / BLOCKED). With one human account that rule would deadlock every maintenance PR, so the
 # review is enforced as a *status check* instead: `review` is `success` when the configured reviewer -- or a
 # maintainer -- approved this exact head commit, or when the pull request is an exempt dependency update
-# (Dependabot, manifest-only paths, no review at all). Every other case is `failure` or `pending`.
+# (a `dependabot/` branch of this repository, Dependabot's own signed commits, manifest paths, and in a workflow
+# only a moved action pin; no review at all). Every other case is `failure` or `pending`.
 #
 # What that does and does not guarantee, precisely. A commit status is a stored assertion, not a live query:
 # GitHub never expires one, so nothing revokes it when the facts change.
@@ -70,6 +71,7 @@ env:
 jobs:
   gate:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       # The rules are tested scripts on the default branch; this workflow only supplies the API data.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -91,7 +93,8 @@ jobs:
           set -euo pipefail
           snapshot=$(mktemp)
           plan=$(mktemp)
-          trap 'rm -f "$snapshot" "$plan"' EXIT
+          comparison=$(mktemp)
+          trap 'rm -f "$snapshot" "$plan" "$comparison"' EXIT
           : > "$snapshot"
 
           # Publish only when the verdict changed. GitHub keeps at most 1000 statuses per SHA and context, so a
@@ -112,8 +115,12 @@ jobs:
 
           # Complete enumeration over the REST API: `gh pr list --limit N` truncates silently, and a pull request
           # pushed out of the window would keep an old success that no sweep ever revisits.
-          # The head branch and its repository travel with the snapshot because the generated release pull request
-          # is recognised by them: a fixed branch name in this repository, not a fork's copy of it.
+          # The head branch and its repository travel with the snapshot because both exemptions are recognised by
+          # them: the generated release pull request by a fixed branch name in this repository, a Dependabot update
+          # by a `dependabot/` branch of this repository -- in each case not a fork's copy of it. The base is this
+          # repository by construction (the listing above asks for its pull requests only), so the entry takes it
+          # from REPO rather than from a column: an empty head repository (a deleted fork) is an empty field in
+          # the tab-separated row, and `read` merges adjacent separators, so an empty column cannot sit before another.
           if ! prs=$(gh api --paginate "repos/$REPO/pulls?state=open&base=main&per_page=100" \
               --jq '.[] | [.number, .head.sha, .base.sha, (.draft|tostring), .user.login, .head.ref,
                 (.head.repo.full_name // "")] | @tsv'); then
@@ -165,30 +172,42 @@ jobs:
             else
               echo "::warning::#${pr}: cannot read the changed-file count; not exempt from review"
             fi
-            # Both review exemptions are decided by scripts/review_gate_plan.py from this entry: a Dependabot bump
-            # (author and path) and the generated release pull request (fixed branch, author, paths and the one-line
-            # version diff). The paths and patches come from the immutable two-SHA comparison, never from
-            # /pulls/{n}/files (which follows the branch: a head that moved A -> B -> A could show B's harmless
+            # Both review exemptions are decided by scripts/review_gate_plan.py from this entry: a Dependabot update
+            # (author, head branch and repository, every commit with its signature, paths, and the patch of a
+            # workflow edit) and the generated release pull request (fixed branch, author, paths and the one-line
+            # version diff). The paths, patches and commits come from the immutable two-SHA comparison, never from
+            # /pulls/{n}/files or the branch (which follow it: a head that moved A -> B -> A could show B's harmless
             # files while A is evaluated). Both sides of a rename count. A failed read is not exempt.
             #
-            # A small change carries its patch so the planner can prove the release exemption's *content*; a larger
-            # one does not, and any rule that needs a patch fails closed. The bound is transport, not policy: no
-            # path is named here, so this file cannot become a second copy of the rule.
-            if ! files=$(gh api "repos/$REPO/compare/$base...$head" \
-                --jq '[.files[]? | {filename: .filename, previous_filename: .previous_filename,
-                  additions: (.additions // 0), deletions: (.deletions // 0),
-                  patch: (if ((.additions // 0) + (.deletions // 0)) <= 4 then .patch else null end)}]'); then
-              files='[]'
+            # A small change carries its patch so the planner can prove an exemption's *content*; a larger one does
+            # not, and any rule that needs a patch fails closed. The bound is transport, not policy: no path is
+            # named here, so this file cannot become a second copy of the rule. A commit carries only what the
+            # planner reads -- its author and committer logins and the signature verdict -- and the comparison's own
+            # count of them: it lists at most 250 commits, and a list shorter than its count proves nothing.
+            #
+            # The comparison goes to jq through a file. With patches it can run to megabytes, which one command-line
+            # argument cannot hold (the limit is 128 KB), and a failed hand-off here would stop the status of every
+            # open pull request, not only this one.
+            if ! gh api "repos/$REPO/compare/$base...$head" \
+                --jq '{files: [.files[]? | {filename: .filename, previous_filename: .previous_filename,
+                  status: .status, additions: (.additions // 0), deletions: (.deletions // 0),
+                  patch: (if ((.additions // 0) + (.deletions // 0)) <= 40 and ((.patch // "") | length) <= 16384
+                    then .patch else null end)}],
+                  commits: [.commits[]? | {sha: .sha, author: .author.login, committer: .committer.login,
+                    verified: .commit.verification.verified}],
+                  total_commits: .total_commits}' > "$comparison"; then
+              printf '%s' '{"files":[],"commits":[],"total_commits":null}' > "$comparison"
               echo "::warning::#${pr}: cannot read the comparison; not exempt from review"
             fi
             jq -c -n --argjson number "$pr" --arg head "$head" --arg base "$base" \
               --argjson draft "$draft" --arg author "$author" --argjson changed "$changed" \
               --arg count_head "$count_head" --arg count_base "$count_base" \
-              --arg branch "$branch" --arg head_repo "$headrepo" \
-              --argjson reviews "$reviews" --argjson files "$files" \
+              --arg branch "$branch" --arg head_repo "$headrepo" --arg base_repo "$REPO" \
+              --argjson reviews "$reviews" --slurpfile comparison "$comparison" \
               '{number: $number, head: $head, base: $base, draft: $draft, author: $author, changed: $changed,
                 count_head: $count_head, count_base: $count_base, branch: $branch, head_repo: $head_repo,
-                reviews: $reviews, files: $files}' >> "$snapshot"
+                base_repo: $base_repo, reviews: $reviews, files: $comparison[0].files,
+                commits: $comparison[0].commits, total_commits: $comparison[0].total_commits}' >> "$snapshot"
           done <<<"$prs"
 
           # One status per head commit, worst verdict winning: a status is keyed by (sha, context), so two pull
