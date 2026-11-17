@@ -71,6 +71,9 @@ def run(*paths: str, declared: int | None = None, payload: str | None = None) ->
         # the release files decide the tag a release carries and the version it starts from
         "release-please-config.json",
         ".release-please-manifest.json",
+        # the agent instruction files at the root are the rules a coding agent follows in this repository
+        "AGENTS.md",
+        "CLAUDE.md",
         "tests/test_core.py",
         # the workflows execute scripts/ on the default branch: the guard and the approval rule are policy
         "scripts/guard_sensitive_paths.py",
@@ -125,6 +128,11 @@ def test_these_paths_need_a_human_merge(path: str):
         ".dockerignore.example",
         "docs/release-please-config.json",  # release policy lives at the root, not under docs/
         "release-please-config.json.bak",
+        # the agent instruction files are exact root files too: a copy in a subdirectory or a suffixed name is ordinary
+        "docs/AGENTS.md",
+        "src/CLAUDE.md",
+        "AGENTS.md.bak",
+        "CLAUDE.md.bak",
         "src/advisory_radar/tests_helper.py",
         "docs/tests/notes.md",  # only a top-level tests/ tree is the suite that decides what ci accepts
         # the check-configuration names are whole filenames, not substrings or suffixes
@@ -193,6 +201,8 @@ def test_the_policy_is_the_documented_one():
         GITLEAKS_IGNORE,
         r"^release-please-config\.json$",
         r"^\.release-please-manifest\.json$",
+        r"^AGENTS\.md$",
+        r"^CLAUDE\.md$",
         r"^tests/",
         r"^scripts/",
         CHECK_CONFIGURATION,
