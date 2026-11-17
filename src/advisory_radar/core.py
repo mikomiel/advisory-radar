@@ -3331,11 +3331,18 @@ def _released(entry: dict) -> dict:
     return released
 
 
-def manage_parked(store: Store, release: bool, now: int) -> int:
+def manage_parked(store: Store, release: bool, now: int, *, expected: str | None = None) -> int:
     """The operator's decision on the parked messages; sends nothing and needs no secret.
 
     The caller holds the store's lock, so the read and the write are one transaction. A store that cannot be
     read is logged and reported, never treated as an empty queue: an unreachable database is not a decision.
+
+    The result is an exit status: ``0`` when the decision was applied, ``1`` when it could not be, and ``2`` when
+    ``expected`` names a different queue than the one loaded here, in which case nothing was changed. ``expected``
+    is the digest of the queue a page showed the operator (the SHA-256 of its :func:`parked_token` values in
+    order, 16 hex digits): the web forms pass it, so "release all" and "drop all" act on the messages that were
+    listed and not on whatever was parked by the time the form arrived. The command line passes none and acts on
+    the whole queue, as it always has.
     """
     try:
         state = store.load()
@@ -3347,6 +3354,15 @@ def manage_parked(store: Store, release: bool, now: int) -> int:
         return 1
     _ensure_ownership(state)
     parked = state.setdefault("parked", [])
+    if expected is not None:
+        # Compared against the queue loaded here, which the action below then changes: the check and the write
+        # see one queue. The shape is checked first because ``compare_digest`` raises on non-ASCII input.
+        shown = hashlib.sha256(
+            ",".join(parked_token(entry) for entry in parked if isinstance(entry, dict)).encode("utf-8")
+        ).hexdigest()[:16]
+        if not re.fullmatch(r"[0-9a-f]{16}", expected) or not hmac.compare_digest(shown, expected):
+            LOG.warning("the parked queue is not the one the page offered; it was not changed")
+            return 2
     if release:
         state["pending"] = [*map(_released, parked), *state["pending"]]
     else:

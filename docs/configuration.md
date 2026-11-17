@@ -355,6 +355,13 @@ busy or failed request is not read as the previous successful pass. The result t
 signed token that expires after two minutes and is bound to the signed-in session, so a
 missing, stale or other-session token renders no notice.
 
+**Release all** and **Drop all** on `/parked` act on the queue the page listed. Each form carries a
+digest of the messages shown, and the action compares it, under the state lock, with the queue it is
+about to change. A message parked after the page was rendered makes the two differ: the answer is
+`409` with nothing written, so a new message is never released or dropped unseen. Reload the page
+and decide again. A form without a digest is refused the same way. The `release-parked` and
+`drop-parked` commands carry no digest and act on the whole queue.
+
 `/inbox` is the work list across the whole lifecycle. Its rows are one per identifier, and
 each row keeps every fact the state holds about it — a parked message, a queued one, carried
 work, an earlier delivery, an event — with the most actionable fact shown and the rest listed
@@ -444,6 +451,65 @@ Secrets stay in the environment. The overlay stores a notifier's `url`, `key`,
 `password`, `token` or signing `secret` only as a `${NAME}` or `${NAME_FILE}` reference,
 refuses a literal value, and does not accept `headers` at all. Changing an environment
 variable still needs a restart, because the process reads the environment when it starts.
+
+### Which variables the overlay may reference
+
+`${NAME}` reads any variable of the process, and the overlay is written from a browser session.
+Left open, that session could send the login token, a database password or another channel's
+credential to a URL or a mail host it chose. So the YAML lists the variables the overlay may
+name, and the overlay can name no others:
+
+```yaml
+overlay_references: [DISCORD_WEBHOOK_URL, FEED_TOKEN]   # YAML-only; absent or empty means none
+```
+
+- The key is YAML-only. It is not one of the ten overlay keys, so no form can widen it, and a
+  value that is not a list of upper-case variable names is a configuration error. `X` and
+  `X_FILE` are one family: listing either allows both spellings.
+- Every string of the overlay is checked, not only the credential keys, because a reference in a
+  path, a host list or a route is still a value that a request or an error message can carry. An
+  overlay that names an unlisted variable is refused at startup, on a reload and on a save, and
+  the message lists variable names only, never a value.
+- The one exemption is the YAML's own text in the same place: the same notifier (id and type) and
+  key, or the same source id and key, with the string equal character for character. The forms
+  store whole entries, so switching a YAML-defined notifier off needs no listing. The same string
+  copied anywhere else is the overlay's own use and has to be listed.
+- A source the overlay adds may carry `$` in its `url` only as one whole `${NAME}` reference that
+  is listed. A reference inside a longer URL, such as `https://host/feed?key=${TOKEN}`, is
+  refused even for a listed name: allowing `TOKEN` for a `token` field does not allow it in
+  someone else's query string. Write a literal `$` as `%24`, or define that source in the YAML.
+  The probe and the duplicate check refuse such a source before anything is expanded, resolved
+  or fetched, because a request to `https://${SECRET}.example.net` has already left by the time a
+  save is judged.
+- An `smtp` notifier that the YAML defines with a `password` keeps the YAML's `host`, `port`,
+  `use_tls` and `implicit_tls` whatever the overlay says, and a key the YAML omits stays omitted.
+  One edit therefore cannot send the file's password to another mail host or without TLS. An
+  `smtp` notifier that only the overlay defines names its own server and can reference only
+  listed variables.
+- That protection reads a notifier's `type` as written, so a notifier's `type` is always written
+  out. A `${NAME}` reference in it is a configuration error: a whole reference
+  (`type: ${MAIL_KIND}`), a `_FILE` reference and a reference composed into the name
+  (`type: sm${TAIL}`) alike, on a disabled entry too, because the overlay can enable one. A
+  source's `type` may still be a reference.
+- An OPML import refuses any feed URL that contains `$` (see `sources.md`).
+
+Listing a variable is a decision: a session that holds the UI token can then send its value to an
+address it chooses, as an added source's `token` or an added `smtp` notifier's `password`. List
+only variables you accept being usable that way, and never the login token or an
+`ADVISORY_RADAR_*` variable. The UI token is a full-trust credential in any case (see
+`sources.md`); this closes the path to every variable nobody listed, not the one to the listed ones.
+
+An upgrade needs one step when `settings.json` already references a variable the YAML does not
+list, for example a notifier or a source added on `/config` with `${NAME}`: startup and every
+reload refuse the overlay until the name is listed under `overlay_references` in the YAML, or the
+entry is removed from the overlay. The message names the variables. Deleting `settings.json`
+returns to the YAML, as it always did: restart, or reload on a process that is already running.
+
+A second upgrade step applies to a YAML that writes a `${NAME}` reference in a notifier's `type`.
+Every load of that file refuses it, at startup, on a reload and in a state-only command (`migrate`,
+`release-parked`, `drop-parked`), with `<id>: a notifier type is a name, not a ${NAME} reference;
+write the type itself`. Write the type out (`smtp`, `ntfy` and so on). A variable still supplies the
+values that differ between environments, such as `url` or `host`.
 
 A reload builds the new configuration and its plugins before it swaps them in under the
 state lock. A shared configuration value goes through the same validator the YAML does,

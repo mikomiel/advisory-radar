@@ -251,6 +251,7 @@ def test_a_route_to_an_overlay_added_notifier_does_not_block_state_recovery(tmp_
         "routes:\n"
         "  - match: {tag: critical}\n"
         "    notifiers: [ops]\n"
+        "overlay_references: [OPS_HOOK]\n"  # the overlay-added notifier may name only a variable the YAML lists
         f"state_path: {tmp_path}/state.json\n",
     )
     overlay = {"notifiers": [{"id": "ops", "type": "webhook", "url": "${OPS_HOOK}"}]}

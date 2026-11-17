@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from advisory_radar import core, pipeline
-from advisory_radar.config import load_config
+from advisory_radar.config import ConfigError, load_config
 from advisory_radar.http import RedactFilter
 from advisory_radar.runtime import Runtime
 from advisory_radar.settings import load_settings, load_settings_document, save_settings, settings_path
@@ -24,9 +24,13 @@ from advisory_radar.sources import (
     webhook_item_from_payload,
 )
 from advisory_radar.state import SourceError, load_state_document, save_state, state_lock
-from advisory_radar.web import LoginThrottle, _epoch, _when, create_app, readiness
+from advisory_radar.web import LoginThrottle, _epoch, _parked_digest, _when, create_app, readiness
 
 LOG = logging.getLogger("advisory_radar")
+#: A web auth token, a second one and a webhook secret of the length a start accepts (at least 24).
+TOKEN = "secret-token-0123456789abcdef"
+OTHER_TOKEN = "other-token-0123456789abcdef"
+WEBHOOK_SECRET = "webhook-secret-0123456789abcdef"
 #: Deeper than both the intake's 100-level limit and, on 3.13, the decoder's own limit.
 DEEP_PAYLOAD = b"[" * 10_000 + b"]" * 10_000
 
@@ -42,14 +46,24 @@ def _detach_log_redaction():
 
 def make_app_client(
     tmp_path: Path,
-    token: str = "secret-token",
+    token: str = TOKEN,
     clock: float | None = None,
     environment: dict[str, str] | None = None,
     run_pass=None,
+    references: tuple[str, ...] = (),
+    monotonic=time.monotonic,
 ):
-    """A signed-out client, its token and the runtime the app serves."""
+    """A signed-out client, its token and the runtime the app serves.
+
+    ``references`` is the YAML's ``overlay_references``: the variables a settings form may name. It is empty by
+    default, which is what an installation that never wrote the key has. ``monotonic`` is the clock the
+    unauthenticated probes age their cached read of the state by.
+    """
     cfg_path = tmp_path / "config.yml"
-    cfg_path.write_text(f"sources: []\nnotifiers: []\nstate_path: {tmp_path}/state.json\nweb:\n  port: 8080\n")
+    cfg_path.write_text(
+        f"sources: []\nnotifiers: []\nstate_path: {tmp_path}/state.json\nweb:\n  port: 8080\n"
+        f"overlay_references: {json.dumps(list(references))}\n"
+    )
     env = {"ADVISORY_RADAR_AUTH_TOKEN": token, **(environment or {})}
     runtime = Runtime.build(cfg_path, env, clock=(lambda: clock) if clock else time.time)
     state = core.new_state()
@@ -69,11 +83,13 @@ def make_app_client(
     )
     state.setdefault("runs", []).append({"at": 1792600000, "sent": 1, "parked": 0, "pending": 1, "code": 0})
     save_state(runtime.cfg.state_path, state)
-    app = create_app(runtime, env, clock=(lambda: clock) if clock else time.time, run_pass=run_pass)
+    app = create_app(
+        runtime, env, clock=(lambda: clock) if clock else time.time, run_pass=run_pass, monotonic=monotonic
+    )
     return TestClient(app), token, runtime
 
 
-def make_client(tmp_path: Path, token: str = "secret-token", clock: float | None = None):
+def make_client(tmp_path: Path, token: str = TOKEN, clock: float | None = None):
     client, token, _ = make_app_client(tmp_path, token, clock)
     return client, token
 
@@ -113,7 +129,7 @@ def test_login_and_dashboard(tmp_path):
     assert client.get("/config").status_code == 200
     assert client.get("/api/state").status_code == 200
     # wrong token stays on the login page
-    other, _ = make_client(tmp_path, token="other")
+    other, _ = make_client(tmp_path, token=OTHER_TOKEN)
     bad = other.post("/login", data={"token": "nope"})
     assert "Wrong token" in bad.text
 
@@ -219,7 +235,7 @@ default: [ops]
 PREDICATE_ENV = {"OPS_HOOK": "https://ntfy.example.net/OPS", "PHONE_HOOK": "https://ntfy.example.net/PHONE"}
 
 
-def predicate_client(tmp_path: Path, token: str = "secret-token"):
+def predicate_client(tmp_path: Path, token: str = TOKEN):
     """A signed-out client over a configuration with a source block and a predicate route."""
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text(f"{PREDICATE_CONFIG}state_path: {tmp_path}/state.json\n")
@@ -263,10 +279,44 @@ def test_security_headers_are_sent_with_every_response(tmp_path):
     assert "strict-transport-security" not in health.headers  # opt-in only
 
 
+def test_every_response_is_no_store_and_that_includes_authenticated_json(tmp_path):
+    """The header was set for HTML only, so ``/api/state`` (the whole state document) could be cached (W11)."""
+    client, token = make_client(tmp_path)
+    assert client.get("/api/state").headers["cache-control"] == "no-store", "the refusal is no-store too"
+    signed_in(client, token)
+    state = client.get("/api/state")
+    assert state.status_code == 200 and state.headers["content-type"] == "application/json"
+    assert state.headers["cache-control"] == "no-store"
+    for path in ("/healthz", "/readyz", "/metrics"):
+        assert client.get(path).headers["cache-control"] == "no-store", path
+
+
+def test_the_session_cookie_secure_flag_comes_from_the_injected_environment(tmp_path, monkeypatch):
+    """``create_app`` is given its environment, and the cookie flag read the process one instead (W12).
+
+    The suite opts out of Secure cookies through the process environment (conftest). An app whose own
+    environment does not opt out must still set a Secure cookie, and one whose environment does opt out must
+    not, whichever way the process is set. Sign-in sets the cookie and sign-out clears it, so both are read.
+    """
+    cases = (({}, True), ({"ADVISORY_RADAR_INSECURE_COOKIES": "1"}, False))
+    for index, (process, injected) in enumerate((value, case) for value in ("1", "") for case in cases):
+        monkeypatch.setenv("ADVISORY_RADAR_INSECURE_COOKIES", process)
+        environment, secure = injected
+        folder = tmp_path / f"case{index}"
+        folder.mkdir()
+        client, token, _ = make_app_client(folder, environment=environment)
+        login = client.post("/login", data={"token": token}, follow_redirects=False)
+        csrf = signed_in(client, token)
+        logout = client.post("/logout", data={"csrf": csrf}, follow_redirects=False)
+        for response in (login, logout):
+            flags = [part.strip().lower() for part in response.headers["set-cookie"].split(";")]
+            assert ("secure" in flags) is secure, (process, environment, response.headers["set-cookie"])
+
+
 def test_hsts_is_opt_in(tmp_path):
     cfg_path = tmp_path / "config.yml"
     cfg_path.write_text(f"sources: []\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
-    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t", "ADVISORY_RADAR_PUBLIC_HTTPS": "1"}
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, "ADVISORY_RADAR_PUBLIC_HTTPS": "1"}
     app = create_app(Runtime.build(cfg_path, environment), environment)
     response = TestClient(app).get("/healthz")
     assert response.headers["strict-transport-security"] == "max-age=31536000"
@@ -282,7 +332,10 @@ def test_a_state_changing_post_needs_the_form_token(tmp_path):
     accepted = client.post("/run", data={"csrf": csrf}, follow_redirects=False)
     assert accepted.status_code == 303
     # a non-browser caller may carry the token in a header instead
-    header = client.post("/parked/release", headers={"x-csrf-token": csrf}, follow_redirects=False)
+    empty_queue = _parked_digest([])
+    header = client.post(
+        "/parked/release", headers={"x-csrf-token": csrf}, data={"digest": empty_queue}, follow_redirects=False
+    )
     assert header.status_code == 303
 
 
@@ -374,7 +427,7 @@ def test_a_failed_run_reports_its_result_when_the_state_cannot_be_read(tmp_path)
 def test_a_form_token_from_another_session_is_refused(tmp_path):
     client, token = make_client(tmp_path)
     csrf = signed_in(client, token)
-    other, other_token = make_client(tmp_path, token="another-instance-token")
+    other, other_token = make_client(tmp_path, token=OTHER_TOKEN)
     signed_in(other, other_token)
     # the token is bound to the session cookie, not merely to the auth token
     assert client.post("/run", data={"csrf": csrf}, follow_redirects=False).status_code == 303
@@ -392,6 +445,48 @@ def test_login_is_throttled_after_repeated_failures(tmp_path):
     assert blocked.status_code == 429
     assert int(blocked.headers["retry-after"]) > 0
     assert "advisory_radar_session" not in blocked.cookies
+
+
+def test_the_login_throttle_keys_on_the_client_behind_a_trusted_proxy(tmp_path):
+    """With the proxy trusted, ``X-Forwarded-For`` names the client, so one client's failures lock out no other (W2)."""
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    from advisory_radar.config import forwarded_allow_ips
+
+    client, token = make_client(tmp_path)
+    trusted = forwarded_allow_ips({"ADVISORY_RADAR_FORWARDED_ALLOW_IPS": "192.0.2.10"})
+    behind_proxy = TestClient(ProxyHeadersMiddleware(client.app, trusted_hosts=trusted), client=("192.0.2.10", 50000))
+
+    def attempt(forwarded_for: str, supplied: str):
+        return behind_proxy.post(
+            "/login", data={"token": supplied}, headers={"X-Forwarded-For": forwarded_for}, follow_redirects=False
+        )
+
+    for _ in range(5):
+        assert attempt("203.0.113.5", "wrong").status_code == 200
+    assert attempt("203.0.113.5", token).status_code == 429, "the guessing client is throttled"
+    assert attempt("203.0.113.6", token).status_code == 303, "another client behind the same proxy is not"
+
+
+def test_a_peer_outside_the_trusted_list_cannot_choose_its_own_throttle_key(tmp_path):
+    """``X-Forwarded-For`` from an untrusted peer is ignored, so rotating it does not reset the throttle (W2)."""
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    from advisory_radar.config import forwarded_allow_ips
+
+    client, token = make_client(tmp_path)
+    trusted = forwarded_allow_ips({"ADVISORY_RADAR_FORWARDED_ALLOW_IPS": "192.0.2.10"})
+    direct = TestClient(ProxyHeadersMiddleware(client.app, trusted_hosts=trusted), client=("198.51.100.77", 50000))
+    for index in range(5):
+        response = direct.post(
+            "/login",
+            data={"token": "wrong"},
+            headers={"X-Forwarded-For": f"203.0.113.{index + 10}"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 200
+    blocked = direct.post("/login", data={"token": token}, headers={"X-Forwarded-For": "203.0.113.99"})
+    assert blocked.status_code == 429
 
 
 def test_sign_out_clears_the_session(tmp_path):
@@ -483,7 +578,11 @@ def test_a_refused_post_leaves_the_queue_untouched(tmp_path):
     csrf = signed_in(client, token)
     assert client.post("/parked/release", follow_redirects=False).status_code == 403
     assert len(load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")["parked"]) == 1
-    assert client.post("/parked/release", data={"csrf": csrf}, follow_redirects=False).status_code == 303
+    # The form the page renders names the queue it showed; that is what the action is allowed to act on.
+    digest = re.search(r"name=['\"]digest['\"] value=['\"]([0-9a-f]{16})['\"]", client.get("/parked").text)
+    assert digest, "the bulk form must carry the digest of the queue it lists"
+    released = client.post("/parked/release", data={"csrf": csrf, "digest": digest.group(1)}, follow_redirects=False)
+    assert released.status_code == 303
     assert load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")["parked"] == []
 
 
@@ -679,6 +778,131 @@ def test_a_malformed_collection_does_not_break_the_scrape(tmp_path):
     assert "advisory_radar_pending 0" in metrics.text
 
 
+# --- the unauthenticated probes read the state once per window (W6) ------------------------------
+
+
+class Ticker:
+    """A monotonic clock a test moves by hand."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def count_state_reads(monkeypatch) -> list[int]:
+    """Count every ``JsonStore.load``, whoever asks."""
+    from advisory_radar.storage import JsonStore
+
+    reads: list[int] = []
+    real = JsonStore.load
+
+    def counting(self):
+        reads.append(1)
+        return real(self)
+
+    monkeypatch.setattr(JsonStore, "load", counting)
+    return reads
+
+
+def test_the_probes_share_one_read_of_the_state_inside_the_window(tmp_path, monkeypatch):
+    """Both are unauthenticated and each request used to read and parse the whole state document (W6)."""
+    from advisory_radar.web import PROBE_CACHE_SECONDS
+
+    ticker = Ticker()
+    client, _, _ = make_app_client(tmp_path, clock=1792600060, monotonic=ticker)
+    reads = count_state_reads(monkeypatch)
+    for _ in range(3):
+        assert client.get("/readyz").status_code == 200
+        assert "advisory_radar_ready 1" in client.get("/metrics").text
+    assert len(reads) == 1, "six probes inside one window read the document once"
+    ticker.now += PROBE_CACHE_SECONDS - 0.5
+    client.get("/readyz")
+    assert len(reads) == 1
+    ticker.now += 0.5
+    client.get("/readyz")
+    assert len(reads) == 2, "the window is over, so the next probe reads again"
+
+
+def test_a_probe_sees_a_changed_state_after_the_window_and_not_before(tmp_path):
+    from advisory_radar.web import PROBE_CACHE_SECONDS
+
+    ticker = Ticker()
+    client, _, _ = make_app_client(tmp_path, clock=1792600060, monotonic=ticker)
+    assert client.get("/readyz").status_code == 200
+    (tmp_path / "state.json").write_text("{not json")
+    assert client.get("/readyz").status_code == 200, "the probe may be a few seconds behind"
+    ticker.now += PROBE_CACHE_SECONDS
+    assert client.get("/readyz").status_code == 503
+    assert "advisory_radar_state_readable 0" in client.get("/metrics").text
+
+
+def test_an_unreadable_state_is_not_read_again_for_every_probe(tmp_path, monkeypatch):
+    """A failed read is cached too: a broken store must not be hammered by the probes that report it (W6)."""
+    from advisory_radar.web import PROBE_CACHE_SECONDS
+
+    ticker = Ticker()
+    client, _, _ = make_app_client(tmp_path, monotonic=ticker)
+    (tmp_path / "state.json").write_text("{not json")
+    reads = count_state_reads(monkeypatch)
+    for _ in range(4):
+        assert client.get("/readyz").status_code == 503
+        assert "advisory_radar_state_readable 0" in client.get("/metrics").text
+    assert len(reads) == 1
+    save_state(tmp_path / "state.json", core.new_state())
+    ticker.now += PROBE_CACHE_SECONDS
+    assert client.get("/readyz").text.startswith("not ready: no pass"), "the next window sees the repaired state"
+    assert len(reads) == 2
+
+
+def test_the_authenticated_pages_still_read_the_state_live(tmp_path, monkeypatch):
+    client, token, _ = make_app_client(tmp_path, monotonic=Ticker())
+    signed_in(client, token)
+    client.get("/readyz")  # fills the probe cache
+    reads = count_state_reads(monkeypatch)
+    first = client.get("/api/state").json()
+    state = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    state["seen"]["CVE-2026-9"] = {"at": 1792600000, "outcome": "delivered"}
+    save_state(tmp_path / "state.json", state)
+    second = client.get("/api/state").json()
+    assert "CVE-2026-9" not in first["seen"] and "CVE-2026-9" in second["seen"]
+    assert len(reads) == 2, "a signed-in page is never served from the probe cache"
+
+
+def test_concurrent_probes_wait_for_the_read_in_progress(tmp_path, monkeypatch):
+    """One lock covers the refresh: eight probes arriving together start one read, not eight (W6)."""
+    import threading
+
+    from advisory_radar.storage import JsonStore
+
+    client, _, _ = make_app_client(tmp_path, clock=1792600060, monotonic=Ticker())
+    reads: list[int] = []
+    real = JsonStore.load
+
+    def slow(self):
+        reads.append(1)
+        time.sleep(0.3)  # long enough for every other thread to arrive while this read is running
+        return real(self)
+
+    monkeypatch.setattr(JsonStore, "load", slow)
+    start = threading.Barrier(8)
+    codes: list[int] = []
+
+    def probe():
+        own = TestClient(client.app)
+        start.wait()
+        codes.append(own.get("/readyz").status_code)
+
+    threads = [threading.Thread(target=probe) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert codes == [200] * 8
+    assert len(reads) == 1
+
+
 # --- the settings overlay: /config, its POSTs and /reload -------------------------------------
 
 
@@ -709,7 +933,9 @@ def test_a_deeply_nested_schema_value_is_reported_on_the_configuration_page(tmp_
 
 
 def test_two_saved_notifiers_survive_while_the_application_is_blocked(tmp_path):
-    client, token, runtime = make_app_client(tmp_path, environment={"HOOK": "https://hooks.example.net/x"})
+    client, token, runtime = make_app_client(
+        tmp_path, environment={"HOOK": "https://hooks.example.net/x"}, references=("HOOK",)
+    )
     with state_lock(runtime.cfg.state_path):  # a pass holds the lock, so neither save can be applied
         csrf, fingerprint = config_form(client, token)
         first = client.post(
@@ -760,13 +986,13 @@ def test_a_yaml_notifier_with_headers_can_still_be_edited_from_the_form(tmp_path
         f"state_path: {tmp_path}/state.json\n"
     )
     environment = {
-        "ADVISORY_RADAR_AUTH_TOKEN": "t",
+        "ADVISORY_RADAR_AUTH_TOKEN": TOKEN,
         "HOOK": "https://hooks.example.net/x",
         "TOKEN": "tok",
     }
     runtime = Runtime.build(cfg_path, environment)
     client = TestClient(create_app(runtime, environment))
-    csrf, fingerprint = config_form(client, "t")
+    csrf, fingerprint = config_form(client, TOKEN)
     response = client.post(
         "/config/notifiers",
         data={"csrf": csrf, "fingerprint": fingerprint, "field:hook:url": "${HOOK}"},
@@ -785,13 +1011,137 @@ def test_a_yaml_notifier_with_headers_can_still_be_edited_from_the_form(tmp_path
     )
 
 
+def test_a_new_notifier_cannot_name_a_variable_the_yaml_did_not_list(tmp_path):
+    """The settings form refuses a reference outside ``overlay_references`` and writes nothing (W1)."""
+    secret = "https://hooks.example.net/SECRET-FROM-ENV"
+    client, token, runtime = make_app_client(tmp_path, environment={"HOOK": secret})
+    csrf, fingerprint = config_form(client, token)
+    response = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "new:id": "hook",
+            "new:type": "webhook",
+            "new:reference": "${HOOK}",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 400
+    assert "HOOK" in response.text and "overlay_references" in response.text
+    assert "SECRET-FROM-ENV" not in response.text, "the message names the variable, never what it holds"
+    assert not settings_path(runtime.cfg.state_path).exists(), "a refused save writes nothing"
+    assert runtime.notifiers == []
+
+
+def test_a_listed_variable_is_what_lets_the_form_save_it(tmp_path):
+    client, token, runtime = make_app_client(
+        tmp_path, environment={"HOOK": "https://hooks.example.net/x"}, references=("HOOK",)
+    )
+    csrf, fingerprint = config_form(client, token)
+    response = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "new:id": "hook",
+            "new:type": "webhook",
+            "new:reference": "${HOOK}",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert [notifier.id for notifier in runtime.notifiers] == ["hook"]
+
+
+SMTP_FORM_YAML = (
+    "sources: []\nnotifiers:\n  - id: mail\n    type: smtp\n    host: smtp.example.net\n    port: 587\n"
+    "    from: radar@example.net\n    to: ops@example.net\n    username: radar\n"
+    "    password: ${SMTP_PASSWORD}\n"
+)
+
+
+def test_an_smtp_notifier_that_owns_a_password_cannot_be_pointed_elsewhere_from_the_form(tmp_path):
+    """The YAML's password follows the YAML's host: the form may edit the rest, not where the password goes (W1)."""
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(SMTP_FORM_YAML + f"state_path: {tmp_path}/state.json\n")
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, "SMTP_PASSWORD": "SMTP-PASSWORD-VALUE"}
+    runtime = Runtime.build(cfg_path, environment)
+    client = TestClient(create_app(runtime, environment))
+    csrf, fingerprint = config_form(client, TOKEN)
+    response = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "enabled:mail": "1",
+            "field:mail:host": "attacker.example",
+            "field:mail:port": "25",
+            "field:mail:use_tls": "false",
+            "field:mail:implicit_tls": "false",
+            "field:mail:from": "other@example.net",
+            "field:mail:to": "ops@example.net",
+            "field:mail:username": "radar",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303, "the edit saves: only the destination of the credential is the YAML's"
+    mail = runtime.cfg.notifiers[0]
+    assert (mail["host"], mail["port"]) == ("smtp.example.net", 587)
+    assert "use_tls" not in mail and "implicit_tls" not in mail, "the YAML never set them: the default stays"
+    assert mail["from"] == "other@example.net", "a field that does not receive the password stays editable"
+    assert mail["password"] == "SMTP-PASSWORD-VALUE"
+    assert runtime.notifiers[0].host == "smtp.example.net", "the live notifier is the one built from the pinned values"
+
+
+def test_a_reference_in_a_yaml_notifier_type_cannot_redirect_the_password_from_the_form(tmp_path):
+    """The same edit with ``type: ${MAIL_KIND}`` in the YAML sent the file's password to the form's host (G1).
+
+    A start with that file is refused now, so the case here is the file edited while the process runs: the forms
+    read it on every request, and the running notifier still holds the old configuration. The save is refused and
+    writes nothing, and the live notifier keeps the YAML's host.
+    """
+    cfg_path = tmp_path / "config.yml"
+    state_line = f"state_path: {tmp_path}/state.json\n"
+    cfg_path.write_text(SMTP_FORM_YAML + state_line)
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, "SMTP_PASSWORD": "SMTP-PASSWORD-VALUE", "MAIL_KIND": "smtp"}
+    runtime = Runtime.build(cfg_path, environment)
+    client = TestClient(create_app(runtime, environment))
+    referenced = SMTP_FORM_YAML.replace("type: smtp", "type: ${MAIL_KIND}") + state_line
+    cfg_path.write_text(referenced)
+    csrf, fingerprint = config_form(client, TOKEN)
+    response = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "enabled:mail": "1",
+            "field:mail:host": "attacker.example",
+            "field:mail:port": "25",
+            "field:mail:use_tls": "false",
+            "field:mail:implicit_tls": "false",
+            "field:mail:from": "radar@example.net",
+            "field:mail:to": "ops@example.net",
+            "field:mail:username": "radar",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 400
+    assert "mail: a notifier type is a name" in response.text
+    assert "SMTP-PASSWORD-VALUE" not in response.text
+    assert not settings_path(runtime.cfg.state_path).exists(), "a refused save writes nothing"
+    assert runtime.notifiers[0].host == "smtp.example.net", "the live notifier keeps the YAML's host"
+    with pytest.raises(ConfigError, match="mail: a notifier type is a name"):
+        Runtime.build(cfg_path, environment)
+
+
 def test_a_failing_reference_does_not_echo_the_environment_value(tmp_path, caplog):
     # A *_FILE variable can wrongly hold the credential itself; the expansion error names the variable, and
     # must not print what it held, on the page or in a SIGHUP log.
     from advisory_radar import cli
 
     secret = "https://hooks.example.net/SUPERSECRET-FROM-ENV"
-    client, token, runtime = make_app_client(tmp_path, environment={"HOOK_FILE": secret})
+    client, token, runtime = make_app_client(tmp_path, environment={"HOOK_FILE": secret}, references=("HOOK_FILE",))
     csrf, fingerprint = config_form(client, token)
     response = client.post(
         "/config/notifiers",
@@ -821,8 +1171,35 @@ def test_a_failing_reference_does_not_echo_the_environment_value(tmp_path, caplo
         runtime.detach_redaction()
 
 
+def test_a_reload_whose_secret_file_became_unusable_is_refused_instead_of_a_500(tmp_path):
+    """The file a ``${NAME_FILE}`` reference reads can change after startup, and /reload answered 500 (W8)."""
+    secret_file = tmp_path / "hook"
+    secret_file.write_text("https://ntfy.example.net/TOPIC-SECRET")
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(
+        "sources: []\nnotifiers:\n  - id: hook\n    type: webhook\n    url: ${HOOK_FILE}\n"
+        f"state_path: {tmp_path}/state.json\n"
+    )
+    env = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, "HOOK_FILE": str(secret_file)}
+    runtime = Runtime.build(cfg_path, env)
+    save_state(runtime.cfg.state_path, core.new_state())
+    client = TestClient(create_app(runtime, env))
+    csrf = signed_in(client, TOKEN)
+    try:
+        for damage in (b"\xff\xfe TOPIC-SECRET", b"", b"  \n"):
+            secret_file.write_bytes(damage)
+            response = client.post("/reload", data={"csrf": csrf}, follow_redirects=False)
+            assert response.status_code == 400, damage
+            assert "Reload refused" in response.text and "${HOOK_FILE}" in response.text
+            assert "TOPIC-SECRET" not in response.text
+    finally:
+        runtime.detach_redaction()
+
+
 def test_an_omitted_optional_notifier_field_can_be_set_cleared_and_restored(tmp_path):
-    client, token, runtime = make_app_client(tmp_path, environment={"HOOK": "https://ntfy.example.net/x"})
+    client, token, runtime = make_app_client(
+        tmp_path, environment={"HOOK": "https://ntfy.example.net/x"}, references=("HOOK",)
+    )
     csrf, fingerprint = config_form(client, token)
     added = client.post(
         "/config/notifiers",
@@ -885,7 +1262,9 @@ def test_an_omitted_optional_notifier_field_can_be_set_cleared_and_restored(tmp_
 def test_a_stale_notifier_form_is_refused(tmp_path):
     # Two tabs opened before either save: the second one would rewrite the whole list from rows that do not
     # know about the first save, disabling it and dropping its fields. The revision it carries is the check.
-    client, token, runtime = make_app_client(tmp_path, environment={"HOOK": "https://hooks.example.net/x"})
+    client, token, runtime = make_app_client(
+        tmp_path, environment={"HOOK": "https://hooks.example.net/x"}, references=("HOOK",)
+    )
     csrf, stale_fingerprint = config_form(client, token)
     first = client.post(
         "/config/notifiers",
@@ -920,7 +1299,9 @@ def test_a_stale_notifier_form_is_refused(tmp_path):
 
 
 def test_a_form_from_a_recreated_overlay_is_refused(tmp_path):
-    client, token, runtime = make_app_client(tmp_path, environment={"HOOK": "https://hooks.example.net/x"})
+    client, token, runtime = make_app_client(
+        tmp_path, environment={"HOOK": "https://hooks.example.net/x"}, references=("HOOK",)
+    )
     csrf, fingerprint = config_form(client, token)
     first = client.post(
         "/config/notifiers",
@@ -1143,10 +1524,10 @@ def test_an_unavailable_store_refuses_a_reload_and_explains_a_settings_save(tmp_
         f"sources: []\nnotifiers: []\nstate_path: {tmp_path}/state.json\n"
         "storage: postgresql://radar@db.example/radar\nweb:\n  port: 8080\n"
     )
-    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "secret-token"}
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN}
     runtime = Runtime.build(cfg_path, environment)
     client = TestClient(create_app(runtime, environment))
-    login = client.post("/login", data={"token": "secret-token"}, follow_redirects=False)
+    login = client.post("/login", data={"token": TOKEN}, follow_redirects=False)
     assert login.status_code == 303
     client.cookies.set("advisory_radar_session", login.cookies.get("advisory_radar_session"))
     page = client.get("/config").text
@@ -1185,10 +1566,10 @@ def test_a_source_disabled_on_the_form_is_gone_from_the_next_pass(tmp_path):
         "  - id: two\n    type: rss\n    url: https://feeds.example.com/two.xml\n"
         f"notifiers: []\nstate_path: {tmp_path}/state.json\n"
     )
-    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t"}
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN}
     runtime = Runtime.build(cfg_path, environment)
     client = TestClient(create_app(runtime, environment))
-    csrf, fingerprint = config_form(client, "t")
+    csrf, fingerprint = config_form(client, TOKEN)
     response = client.post(
         "/config/sources",
         data={"csrf": csrf, "fingerprint": fingerprint, "enabled:two": "1", "tag:one": "", "tag:two": "security"},
@@ -1202,7 +1583,9 @@ def test_a_source_disabled_on_the_form_is_gone_from_the_next_pass(tmp_path):
 
 
 def test_a_notifier_added_on_the_form_keeps_a_reference_and_live_value(tmp_path):
-    client, token, runtime = make_app_client(tmp_path, environment={"OPS_HOOK": "https://ntfy.example.com/OPS-TOPIC"})
+    client, token, runtime = make_app_client(
+        tmp_path, environment={"OPS_HOOK": "https://ntfy.example.com/OPS-TOPIC"}, references=("OPS_HOOK",)
+    )
     csrf, fingerprint = config_form(client, token)
     response = client.post(
         "/config/notifiers",
@@ -1233,10 +1616,10 @@ def test_editing_a_notifier_keeps_its_reference_and_never_stores_the_value(tmp_p
         "sources: []\nnotifiers:\n  - id: hook\n    type: discord_webhook\n    url: ${HOOK_URL}\n"
         f"state_path: {tmp_path}/state.json\n"
     )
-    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t", "HOOK_URL": secret}
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, "HOOK_URL": secret}
     runtime = Runtime.build(cfg_path, environment)
     client = TestClient(create_app(runtime, environment))
-    csrf, fingerprint = config_form(client, "t")
+    csrf, fingerprint = config_form(client, TOKEN)
     response = client.post(
         "/config/notifiers",
         data={"csrf": csrf, "fingerprint": fingerprint, "enabled:hook": "1"},
@@ -1259,10 +1642,10 @@ def test_no_secret_value_reaches_the_config_page_or_a_log_line(tmp_path, caplog)
         "notifiers:\n  - id: hook\n    type: discord_webhook\n    url: ${HOOK_URL}\n"
         f"state_path: {tmp_path}/state.json\n"
     )
-    environment = {"ADVISORY_RADAR_AUTH_TOKEN": "t", "HOOK_URL": secret}
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, "HOOK_URL": secret}
     runtime = Runtime.build(cfg_path, environment)
     client = TestClient(create_app(runtime, environment))
-    csrf, fingerprint = config_form(client, "t")
+    csrf, fingerprint = config_form(client, TOKEN)
     page = client.get("/config").text
     assert "SUPERSECRET-WEBHOOK" not in page
     assert "SECRET123" not in page and "SECRET456" not in page and "pw@" not in page
@@ -1480,8 +1863,8 @@ def test_a_legacy_identity_utf8_cannot_encode_still_renders_the_alerts_page(tmp_
 # --- the inbound webhook payload contract (#74, #75) ---------------------------------------------
 
 
-WEBHOOK_ENVIRONMENT = {"ADVISORY_RADAR_AUTH_TOKEN": "secret-token", "ADVISORY_RADAR_WEBHOOK_SECRET": "s3cret"}
-WEBHOOK_HEADERS = {"Authorization": "Bearer s3cret", "Content-Type": "application/json"}
+WEBHOOK_ENVIRONMENT = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, "ADVISORY_RADAR_WEBHOOK_SECRET": WEBHOOK_SECRET}
+WEBHOOK_HEADERS = {"Authorization": f"Bearer {WEBHOOK_SECRET}", "Content-Type": "application/json"}
 
 
 def webhook_client(tmp_path: Path) -> TestClient:
@@ -1505,6 +1888,33 @@ def queued_webhook_item(tmp_path: Path, payload: dict):
     entry = state["webhook_inbox"]["wh"][0]
     item = WebhookSource("wh").fetch(lambda *args: (0, {}, b""), state).items[0]
     return entry, item
+
+
+def test_the_webhook_secret_may_come_from_a_file(tmp_path):
+    """The intake secret had no ``_FILE`` form either, so it sat in the environment of every process (W8b)."""
+    secret_file = tmp_path / "webhook-secret"
+    secret_file.write_text(WEBHOOK_SECRET + "\n")  # the newline an editor adds is not part of the secret
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, "ADVISORY_RADAR_WEBHOOK_SECRET_FILE": str(secret_file)}
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
+    client = TestClient(create_app(Runtime.build(cfg_path, environment), environment), raise_server_exceptions=False)
+    accepted = client.post("/webhooks/wh", json={"title": "Security update"}, headers=WEBHOOK_HEADERS)
+    assert accepted.status_code == 200, accepted.text
+    refused = client.post("/webhooks/wh", json={"title": "Security update"}, headers={"Authorization": "Bearer wrong"})
+    assert refused.status_code == 401
+
+
+def test_a_webhook_secret_set_in_both_forms_is_refused_at_startup(tmp_path):
+    secret_file = tmp_path / "webhook-secret"
+    secret_file.write_text(WEBHOOK_SECRET)
+    environment = {
+        **WEBHOOK_ENVIRONMENT,
+        "ADVISORY_RADAR_WEBHOOK_SECRET_FILE": str(secret_file),
+    }
+    cfg_path = tmp_path / "config.yml"
+    cfg_path.write_text(f"sources:\n  - id: wh\n    type: webhook\nnotifiers: []\nstate_path: {tmp_path}/state.json\n")
+    with pytest.raises(ConfigError, match="ADVISORY_RADAR_WEBHOOK_SECRET and ADVISORY_RADAR_WEBHOOK_SECRET_FILE"):
+        create_app(Runtime.build(cfg_path, environment), environment)
 
 
 def test_a_structured_webhook_id_is_queued_and_becomes_the_item_identity(tmp_path):

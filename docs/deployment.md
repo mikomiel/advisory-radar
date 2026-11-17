@@ -53,6 +53,12 @@ Readiness goes stale when the last pass is older than three poll intervals
 (never fewer than five minutes), so a stopped scheduler surfaces instead of
 answering `ok` forever.
 
+`/readyz` and `/metrics` need no login, so both answer from one read of the state document that
+is reused for five seconds, a failed read included. A loop of requests, or a scrape interval
+shorter than that, costs one read per window instead of one per request, and an answer can be up
+to five seconds behind the state. The window is far shorter than the staleness rule above, so it
+cannot change a verdict. Every page behind the login reads the state live.
+
 `/metrics` is Prometheus text for any compatible scraper:
 
 | Metric | Meaning |
@@ -84,11 +90,20 @@ container needs:
 
 | Env var | Purpose |
 |---|---|
-| `ADVISORY_RADAR_AUTH_TOKEN` | Web UI login token (required for `run`) |
+| `ADVISORY_RADAR_AUTH_TOKEN` | Web UI login token (required for `run`, from this variable or the `_FILE` form). At least 24 characters: `openssl rand -hex 24` makes 48. The session cookie is signed with it |
+| `ADVISORY_RADAR_AUTH_TOKEN_FILE` | Path of a file holding the login token (Docker/Podman secret). Set this or `ADVISORY_RADAR_AUTH_TOKEN`, never both: the process refuses to start. The file is read once at startup, so a rotated secret needs a restart |
+| `ADVISORY_RADAR_WEBHOOK_SECRET` | Bearer secret of the inbound `/webhooks/<id>` endpoint. Ingestion is off without it. Same 24-character minimum |
+| `ADVISORY_RADAR_WEBHOOK_SECRET_FILE` | Path of a file holding that secret. Same rules as `ADVISORY_RADAR_AUTH_TOKEN_FILE` |
+| `ADVISORY_RADAR_FORWARDED_ALLOW_IPS` | Comma-separated addresses or networks of the reverse proxy whose `X-Forwarded-For` is believed, for the login throttle. Default: loopback only. See below |
 | `ADVISORY_RADAR_CONFIG` | Config path (the image sets `/config/config.yml`) |
 | `ADVISORY_RADAR_PUBLIC_HTTPS` | `1` when TLS terminates in front of the container: sends HSTS. Off by default, because a wrong HSTS setting pins a browser to HTTPS |
 | `ADVISORY_RADAR_INSECURE_COOKIES` | `1` only for a plain-HTTP development instance: stops marking the session cookie `Secure` |
 | plus one per referenced secret | e.g. `DISCORD_WEBHOOK_URL`, `APPRISE_PASSWORD`, `FRESHRSS_TOKEN` |
+
+A secret file that is missing, unreadable, not UTF-8 or empty stops startup with an error that
+names the variable and never the path or the content. Surrounding whitespace in the file, such as
+a trailing newline, is dropped. A secret shorter than 24 characters is refused the same way,
+naming the variable and never the value.
 
 Volumes: `/config` (read-only) and `/data` (the state file, `settings.json`, the KEV cache and, with no
 `watchlist:` key, `watchlist.json`). An
@@ -118,6 +133,29 @@ session cookie, a per-session form token on every state-changing POST, and a
 throttle on failed logins (five per five minutes per peer address). Put it behind
 a TLS-terminating reverse proxy; the session cookie is only sent over HTTPS unless
 `ADVISORY_RADAR_INSECURE_COOKIES=1`.
+
+Behind a reverse proxy every connection arrives from the proxy's address, so a throttle keyed on
+the peer would be one counter for every client: five failed logins from anywhere would lock
+everyone out. The server therefore reads the client from `X-Forwarded-For`, but only on a
+connection from an address listed in `ADVISORY_RADAR_FORWARDED_ALLOW_IPS`, a comma-separated list
+of IP addresses and networks:
+
+```bash
+ADVISORY_RADAR_FORWARDED_ALLOW_IPS=192.0.2.10,198.51.100.0/24
+```
+
+- Unset or empty means loopback only (`127.0.0.1` and `::1`), which suits a proxy on the same
+  host. A proxy in another container or on another host must be listed, or the throttle keeps
+  seeing the proxy.
+- `*`, `0.0.0.0/0` and `::/0` are refused at startup, and so is an entry that is not an IP
+  address or a network. Trusting every peer would let any client choose its own throttle key and
+  the address a request is logged under.
+- The server takes the right-most address in `X-Forwarded-For` that is not itself a listed
+  proxy, so the proxy must append the address it saw or replace the header, as the usual
+  reverse proxies do by default. A proxy that passes a client's own `X-Forwarded-For` through
+  untouched lets that client pick its throttle key.
+- uvicorn's own `FORWARDED_ALLOW_IPS` variable is not read: the product always passes this
+  list explicitly.
 
 ### Storage
 
@@ -247,7 +285,8 @@ Two upstreams reward configuration rather than credentials:
   HTML page is followed once through the page's feed autodiscovery link; no validator is stored for that
   hop, because a page's `ETag` says nothing about the feed it advertises.
 - **Per-source pace.** `interval: 30m` on a source entry (the same `<n><s|m|h>` spelling as
-  `poll_interval`) thins only that source's fetching; an absent key follows the global interval. The pass
+  `poll_interval`, and the same `168h` ceiling: a longer value is refused at start and on a reload) thins
+  only that source's fetching; an absent key follows the global interval. The pass
   still re-evaluates, escalates and delivers for every source, and a failed fetch is retried on the next
   pass rather than waiting out the interval. The key is accepted by every kind and is editable on `/config`.
 
