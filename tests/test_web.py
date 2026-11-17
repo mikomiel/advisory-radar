@@ -1094,6 +1094,47 @@ def test_an_smtp_notifier_that_owns_a_password_cannot_be_pointed_elsewhere_from_
     assert runtime.notifiers[0].host == "smtp.example.net", "the live notifier is the one built from the pinned values"
 
 
+def test_a_reference_in_a_yaml_notifier_type_cannot_redirect_the_password_from_the_form(tmp_path):
+    """The same edit with ``type: ${MAIL_KIND}`` in the YAML sent the file's password to the form's host (G1).
+
+    A start with that file is refused now, so the case here is the file edited while the process runs: the forms
+    read it on every request, and the running notifier still holds the old configuration. The save is refused and
+    writes nothing, and the live notifier keeps the YAML's host.
+    """
+    cfg_path = tmp_path / "config.yml"
+    state_line = f"state_path: {tmp_path}/state.json\n"
+    cfg_path.write_text(SMTP_FORM_YAML + state_line)
+    environment = {"ADVISORY_RADAR_AUTH_TOKEN": TOKEN, "SMTP_PASSWORD": "SMTP-PASSWORD-VALUE", "MAIL_KIND": "smtp"}
+    runtime = Runtime.build(cfg_path, environment)
+    client = TestClient(create_app(runtime, environment))
+    referenced = SMTP_FORM_YAML.replace("type: smtp", "type: ${MAIL_KIND}") + state_line
+    cfg_path.write_text(referenced)
+    csrf, fingerprint = config_form(client, TOKEN)
+    response = client.post(
+        "/config/notifiers",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "enabled:mail": "1",
+            "field:mail:host": "attacker.example",
+            "field:mail:port": "25",
+            "field:mail:use_tls": "false",
+            "field:mail:implicit_tls": "false",
+            "field:mail:from": "radar@example.net",
+            "field:mail:to": "ops@example.net",
+            "field:mail:username": "radar",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 400
+    assert "mail: a notifier type is a name" in response.text
+    assert "SMTP-PASSWORD-VALUE" not in response.text
+    assert not settings_path(runtime.cfg.state_path).exists(), "a refused save writes nothing"
+    assert runtime.notifiers[0].host == "smtp.example.net", "the live notifier keeps the YAML's host"
+    with pytest.raises(ConfigError, match="mail: a notifier type is a name"):
+        Runtime.build(cfg_path, environment)
+
+
 def test_a_failing_reference_does_not_echo_the_environment_value(tmp_path, caplog):
     # A *_FILE variable can wrongly hold the credential itself; the expansion error names the variable, and
     # must not print what it held, on the page or in a SIGHUP log.

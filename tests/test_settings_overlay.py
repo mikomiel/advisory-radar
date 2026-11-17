@@ -1199,6 +1199,62 @@ def test_an_smtp_notifier_that_owns_a_password_keeps_its_destination_in_the_yaml
     assert (pinned["use_tls"], pinned["implicit_tls"], pinned["host"]) == (True, False, "smtp.example.net")
 
 
+#: Each way ``_expand`` can turn a notifier ``type`` into ``smtp``: a whole reference, a ``_FILE`` reference and a
+#: reference composed into the name.
+REFERENCE_TYPES = ("${MAIL_KIND}", "${MAIL_KIND_FILE}", "sm${TAIL}")
+
+
+def reference_type_environment(tmp_path) -> dict[str, str]:
+    """An environment in which every spelling in ``REFERENCE_TYPES`` resolves to ``smtp``."""
+    kind_file = tmp_path / "mail-kind"
+    kind_file.write_text("smtp\n")
+    return {"SMTP_PASSWORD": "pw", "MAIL_KIND": "smtp", "MAIL_KIND_FILE": str(kind_file), "TAIL": "tp"}
+
+
+@pytest.mark.parametrize("kind", REFERENCE_TYPES)
+def test_a_reference_in_the_type_cannot_hide_a_yaml_smtp_destination_from_the_pin(tmp_path, kind):
+    """``type: ${MAIL_KIND}`` handed the overlay the host, port and TLS mode that receive the YAML's password (G1).
+
+    The pin looks the destination keys up by the type as written, and ``${MAIL_KIND}`` is not ``smtp``: the lookup
+    found nothing, the form's host, port and ``use_tls: false`` were kept, and the expansion that followed built an
+    smtp notifier that sent the YAML's password to the host the overlay chose. A notifier type is a name now, so
+    the load is refused and the type the pin reads is always the type the builder gets.
+    """
+    owned = {**SMTP_YAML, "type": kind}
+    path = write_config(tmp_path, {"notifiers": [owned]})
+    attacker = {**owned, "host": "attacker.example", "port": 25, "use_tls": False, "implicit_tls": False}
+    with pytest.raises(ConfigError, match=r"mail: a notifier type is a name, not a \$\{NAME\} reference"):
+        load_config(path, reference_type_environment(tmp_path), settings={"notifiers": [attacker]})
+
+
+@pytest.mark.parametrize("enabled", [True, False], ids=["enabled", "disabled"])
+@pytest.mark.parametrize("kind", REFERENCE_TYPES)
+def test_a_notifier_type_must_be_written_out_in_the_yaml(tmp_path, kind, enabled):
+    """The refusal needs no overlay and spares no entry: a disabled notifier is one tick from being built."""
+    path = write_config(tmp_path, {"notifiers": [{**SMTP_YAML, "type": kind, "enabled": enabled}]})
+    with pytest.raises(ConfigError, match=r"mail: a notifier type is a name, not a \$\{NAME\} reference"):
+        load_config(path, reference_type_environment(tmp_path))
+
+
+def test_a_notifier_the_overlay_adds_cannot_use_a_reference_type_either(tmp_path):
+    """Listing the variables gets past ``overlay_references``; the type rule is the wall behind it (G1)."""
+    path = write_config(tmp_path, {"overlay_references": ["MAIL_KIND", "SMTP_PASSWORD"]})
+    added = {**SMTP_YAML, "id": "exfil", "type": "${MAIL_KIND}", "host": "attacker.example"}
+    with pytest.raises(ConfigError, match=r"exfil: a notifier type is a name, not a \$\{NAME\} reference"):
+        load_config(path, reference_type_environment(tmp_path), settings={"notifiers": [added]})
+
+
+def test_a_source_type_may_still_be_a_reference(tmp_path):
+    """The rule is the notifier's alone: a source type is not a switch on where a credential goes.
+
+    The overlay cannot redefine a source the YAML owns, and a source it adds must name a built-in type literally,
+    so a reference in a YAML source's ``type`` leaves nothing for the overlay to redirect.
+    """
+    document = {"sources": [{"id": "feed", "type": "${SOURCE_KIND}", "url": "https://feeds.example.net/x.xml"}]}
+    cfg = load_config(write_config(tmp_path, document), {"SOURCE_KIND": "rss"})
+    assert cfg.sources[0]["type"] == "rss"
+
+
 #: Where each notifier type sends a credential the YAML gave it, read from ``notifiers.NOTIFIER_BUILDERS``.
 NOTIFIER_DESTINATIONS = {
     "apprise": ("url",),

@@ -2925,17 +2925,23 @@ def test_a_claimed_ghsa_does_not_promote_a_new_low_finding():
     assert "critical" not in tags, "a claimed advisory must not promote the new finding"
 
 
-def test_a_plugin_type_error_does_not_echo_the_expanded_value(tmp_path, caplog):
+@pytest.mark.parametrize(
+    "plugins",
+    [
+        "sources:\n  - id: s\n    type: ${PLUGIN_KIND}\n    url: https://feeds.example.com/x.xml\nnotifiers: []\n",
+        # A notifier type is refused before it is expanded; a source type still reaches the builder expanded.
+        "sources: []\nnotifiers:\n  - id: n\n    type: ${PLUGIN_KIND}\n    url: https://hooks.example.com/x\n",
+    ],
+    ids=["source", "notifier"],
+)
+def test_a_plugin_type_error_does_not_echo_the_expanded_value(tmp_path, caplog, plugins):
     import logging
 
     from advisory_radar import cli
 
     path = tmp_path / "c.yml"
-    path.write_text(
-        "sources: []\nnotifiers:\n  - id: n\n    type: ${NOTIFIER_KIND}\n    url: https://hooks.example.com/x\n"
-        "state_path: " + str(tmp_path / "state.json") + "\n"
-    )
-    env = {"NOTIFIER_KIND": "https://hooks.example.com/SUPERSECRET"}
+    path.write_text(plugins + "state_path: " + str(tmp_path / "state.json") + "\n")
+    env = {"PLUGIN_KIND": "https://hooks.example.com/SUPERSECRET"}
     with caplog.at_level(logging.ERROR):
         code = cli.main(["--config", str(path), "once"], env=env)
     assert code == 1, "a bad plugin type is a configuration error, not a traceback"

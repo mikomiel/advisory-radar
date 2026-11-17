@@ -706,6 +706,9 @@ def _pin_credential_destination(entry: dict, owner: dict | None) -> None:
     TLS default cannot be switched off by writing a value the file never set. This overwrites, unlike the
     ``setdefault`` that carries ``headers`` and ``secret``: those are credentials the overlay may not write,
     these are values it may.
+
+    The type is read as written, before expansion. That is sound because ``config_from_document`` refuses a
+    ``${NAME}`` reference in a notifier ``type``: a document that loads has the type here that the builder gets.
     """
     if owner is None or entry.get("type") != owner.get("type") or "password" not in owner:
         return
@@ -927,6 +930,18 @@ def config_from_document(
         extra = set(entry) - (_SOURCE_KEYS if entry in sources else _NOTIFIER_KEYS)
         _require(not extra, f"{entry['id']}: unknown keys {sorted(extra)}")
         _require(isinstance(entry.get("enabled", True), bool), f"{entry['id']}: enabled must be a bool")
+    for entry in notifiers:
+        # A notifier type is a name, never a reference. The type picks the keys that say where a credential is
+        # sent (``CREDENTIAL_DESTINATION_KEYS``) and the overlay merge looks them up before ``_expand`` runs, so
+        # ``type: ${MAIL_KIND}`` is no known type there and ``smtp`` once expanded: ``host``, ``port`` and
+        # ``use_tls`` stay writable from the browser beside the YAML's password. ``search`` rather than
+        # ``fullmatch``, because ``_expand`` substitutes a reference anywhere in a string; every entry, because
+        # the overlay can enable a disabled one. A source type may stay a reference: the overlay cannot
+        # redefine a source the YAML owns, and one it adds names a built-in type literally.
+        _require(
+            _ENV_RE.search(entry["type"]) is None,
+            f"{entry['id']}: a notifier type is a name, not a ${{NAME}} reference; write the type itself",
+        )
     ids = [entry["id"] for entry in (*sources, *notifiers)]
     _require(len(ids) == len(set(ids)), f"duplicate plugin ids: {ids}")
     # Every declared source id, enabled or not: only a source missing from this set was *removed* from the

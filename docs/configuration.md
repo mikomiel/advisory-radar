@@ -451,6 +451,11 @@ overlay_references: [DISCORD_WEBHOOK_URL, FEED_TOKEN]   # YAML-only; absent or e
   One edit therefore cannot send the file's password to another mail host or without TLS. An
   `smtp` notifier that only the overlay defines names its own server and can reference only
   listed variables.
+- That protection reads a notifier's `type` as written, so a notifier's `type` is always written
+  out. A `${NAME}` reference in it is a configuration error: a whole reference
+  (`type: ${MAIL_KIND}`), a `_FILE` reference and a reference composed into the name
+  (`type: sm${TAIL}`) alike, on a disabled entry too, because the overlay can enable one. A
+  source's `type` may still be a reference.
 - An OPML import refuses any feed URL that contains `$` (see `sources.md`).
 
 Listing a variable is a decision: a session that holds the UI token can then send its value to an
@@ -464,6 +469,12 @@ list, for example a notifier or a source added on `/config` with `${NAME}`: star
 reload refuse the overlay until the name is listed under `overlay_references` in the YAML, or the
 entry is removed from the overlay. The message names the variables. Deleting `settings.json`
 returns to the YAML, as it always did: restart, or reload on a process that is already running.
+
+A second upgrade step applies to a YAML that writes a `${NAME}` reference in a notifier's `type`.
+Every load of that file refuses it, at startup, on a reload and in a state-only command (`migrate`,
+`release-parked`, `drop-parked`), with `<id>: a notifier type is a name, not a ${NAME} reference;
+write the type itself`. Write the type out (`smtp`, `ntfy` and so on). A variable still supplies the
+values that differ between environments, such as `url` or `host`.
 
 A reload builds the new configuration and its plugins before it swaps them in under the
 state lock. A shared configuration value goes through the same validator the YAML does,
