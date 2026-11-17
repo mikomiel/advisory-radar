@@ -103,8 +103,8 @@ first start has fifteen minutes to pull the image instead of the default 90 seco
 
 - **Podman 4.5 or newer.** Quadlet starts at 4.4 and gained keys release by release. This unit
   needs 4.5: that release added the health check keys (`HealthCmd=` and the other `Health*`
-  keys) and the UID and GID options of `UserNS=keep-id`. The unit
-  is checked against the Quadlet generator of Podman 5.4.2: use that or newer. A Podman that does
+  keys) and the UID and GID options of `UserNS=keep-id`. CI starts the unit on the Podman 4.9
+  series that Ubuntu 24.04 ships, and its generator was also checked with 5.4.2. A Podman that does
   not know a key skips the whole unit and starts nothing. `/usr/libexec/podman/quadlet -dryrun -user`
   prints the reason (`unsupported key '...'`) or the service it would generate; the path of
   that binary differs between distributions.
