@@ -13,9 +13,11 @@ contribution-friendly; the rules below keep it safe for everyone.
    pull request. Describe the change, the reason and how you tested it. `main` is
    protected: the required checks must be green and the `review` status must
    approve the exact head commit — or the pull request is one of the two shapes
-   that need no review: a Dependabot update that touches only manifests, or the
-   release pull request release-please generates (see [Releases](#releases)). The
-   full policy is in [docs/review-and-merge.md](docs/review-and-merge.md).
+   that need no review: a Dependabot update (a `dependabot/` branch of this
+   repository, the bot's own signed commits, only dependency manifests and the
+   pins of actions a workflow already uses), or the release pull request
+   release-please generates (see [Releases](#releases)). The full policy is in
+   [docs/review-and-merge.md](docs/review-and-merge.md).
 4. Keep PRs small and focused; a reviewer should be able to judge the whole
    diff in one read.
 
@@ -27,7 +29,7 @@ contribution-friendly; the rules below keep it safe for everyone.
 | --- | --- |
 | `ci` | Lint, tests, the image smoke test and the secret scan passed. |
 | `gate` | The trusted default-branch workflow published the gate status. |
-| `review` | An approving review exists at this exact commit, or the update is an exempt Dependabot manifest change. |
+| `review` | An approving review exists at this exact commit, or the pull request is one of the two exempt shapes (a Dependabot update, the generated release pull request). |
 | `dependency-review` | The change does not add a dependency with a known vulnerability. |
 
 If you rename a job, update the required contexts in the same change: renaming a
@@ -83,9 +85,10 @@ and `src/advisory_radar/__init__.py`, the generated `CHANGELOG.md` section, and
   [docs/review-and-merge.md](docs/review-and-merge.md).
 - The merge creates the `vX.Y.Z` tag and the GitHub Release. The tag starts the
   `release` workflow, which pushes `linux/amd64` and `linux/arm64` to
-  `ghcr.io/mikomiel/advisory-radar` under the version tag and, for a stable
-  `vX.Y.Z`, `latest`, with build provenance and an SBOM attestation bound to the
-  pushed digest.
+  `ghcr.io/mikomiel/advisory-radar` under the version tag and, only when the tag
+  is the highest stable `vX.Y.Z` tag, `latest` (a pre-release, or a tag below
+  the highest, leaves `latest` where it was), with build provenance and an SBOM
+  attestation bound to the pushed digest.
 
 ## Code style
 

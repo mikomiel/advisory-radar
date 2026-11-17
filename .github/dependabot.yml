@@ -1,9 +1,9 @@
 version: 2
-# Weekly dependency updates for the image's Python dependencies and for the Actions
-# this repository runs. Both open at most five pull requests, grouped per
-# ecosystem, so the queue stays reviewable; every one of them is a `.github/` or
-# packaging change and therefore waits for a human merge under the automerge
-# policy.
+# Weekly dependency updates for the image's Python dependencies, for the Actions
+# this repository runs, and for the container files: the Dockerfile's base images
+# and the compose file. Each ecosystem opens at most five pull requests, grouped, so
+# the queue stays reviewable; every one of them is a `.github/` or packaging change
+# and therefore waits for a human merge under the automerge policy.
 updates:
   - package-ecosystem: "uv"
     directory: "/"
@@ -25,5 +25,27 @@ updates:
       - "dependencies"
     groups:
       github-actions:
+        patterns:
+          - "*"
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    groups:
+      container-images:
+        patterns:
+          - "*"
+  - package-ecosystem: "docker-compose"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    groups:
+      compose-images:
         patterns:
           - "*"

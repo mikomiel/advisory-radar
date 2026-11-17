@@ -59,6 +59,7 @@ case "$url" in
   *"pulls?state=open"*) cat "$FAKE_PULLS" ;;
   *"/reviews"*) cat "$FAKE_REVIEWS" ;;
   *"/compare/"*)
+    if [ -f "${FAKE_COMPARE_FAIL:-}" ]; then echo "stub: compare failed" >&2; exit 1; fi
     # A raw comparison body is projected with the workflow's own --jq, so a test can cover the transport itself.
     if [ -n "${FAKE_COMPARE_RAW:-}" ] && [ -n "$jqfilter" ]; then jq -c "$jqfilter" "$FAKE_COMPARE"
     else cat "$FAKE_COMPARE"; fi ;;
@@ -91,17 +92,21 @@ def _gate(
     live_fails_for: str = "",
     reviews: str = "[]",
     compare: str = "[]",
+    commits: list[dict] | None = None,
     raw_compare: dict | None = None,
+    compare_fails: bool = False,
     event_head: str = "",
     event_action: str = "",
     event_pr: str = "",
     capture: list[str] | None = None,
 ) -> tuple[int, list[tuple[str, str]]]:
     (tmp_path / "gate.sh").write_text(re.sub(r"\$\{\{[^}]*\}\}", "1", _run_block()))
+    # `compare` is the file list and `commits` the commit list, as the workflow's projection hands them on.
+    projected = {"files": json.loads(compare), "commits": commits or [], "total_commits": len(commits or [])}
     files = {
         "FAKE_PULLS": pulls,
         "FAKE_REVIEWS": reviews,
-        "FAKE_COMPARE": json.dumps(raw_compare) if raw_compare is not None else compare,
+        "FAKE_COMPARE": json.dumps(raw_compare) if raw_compare is not None else json.dumps(projected),
         "FAKE_PREVIOUS": "",
         "FAKE_LIVE": live,
     }
@@ -109,6 +114,8 @@ def _gate(
         (tmp_path / name.lower()).write_text(value)
     if live_fails_for:
         (tmp_path / "fake_live_fail").write_text("")
+    if compare_fails:
+        (tmp_path / "fake_compare_fail").write_text("")
     (tmp_path / "posts").write_text("")
     stub = tmp_path / "gh"
     stub.write_text(STUB)
@@ -116,7 +123,9 @@ def _gate(
     env = {
         **os.environ,
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
-        "REPO": "owner/name",
+        # The gate is the base repository of every pull request it lists, and the planner holds a Dependabot update's
+        # head to it, so the pull request rows below (their head repository is REPOSITORY) must name the same one.
+        "REPO": REPOSITORY,
         "GATE_CONTEXT": "review",
         "REVIEWER_LOGIN": "review-bot[bot]",
         "REVIEWER_TYPE": "Bot",
@@ -127,6 +136,7 @@ def _gate(
         "FAKE_POSTS": str(tmp_path / "posts"),
         "FAKE_LIVE_FAIL": str(tmp_path / "fake_live_fail"),
         "FAKE_LIVE_FAIL_PR": live_fails_for,
+        "FAKE_COMPARE_FAIL": str(tmp_path / "fake_compare_fail"),
         "FAKE_COMPARE_RAW": "1" if raw_compare is not None else "",
         **{name: str(tmp_path / name.lower()) for name in files},
     }
@@ -367,7 +377,7 @@ def test_the_same_row_on_an_ordinary_branch_still_needs_a_review(tmp_path):
 def raw_comparison() -> dict:
     """A `compare` response body, before the workflow's --jq projection.
 
-    The changelog is deliberately large: the projection drops a patch above four changed lines, so a successful
+    The changelog is deliberately large: the projection drops a patch above forty changed lines, so a successful
     release proof from this body also shows the proof does not depend on a patch it does not need.
     """
     return {
@@ -384,9 +394,9 @@ def raw_comparison() -> dict:
                 "filename": "CHANGELOG.md",
                 "previous_filename": None,
                 "status": "modified",
-                "additions": 21,
+                "additions": 61,
                 "deletions": 0,
-                "patch": "@@ -9,3 +9,24 @@\n \n+## [0.2.0](https://example) (2026-11-13)\n",
+                "patch": "@@ -9,3 +9,64 @@\n \n+## [0.2.0](https://example) (2026-11-13)\n",
             },
             {
                 "filename": "pyproject.toml",
@@ -429,3 +439,144 @@ def test_the_real_comparison_projection_feeds_the_release_proof(tmp_path):
     )
     assert code == 0
     assert posted == [(HEAD, "success")]
+
+
+DEPENDABOT_BRANCH = "dependabot/github_actions/actions-all-7e0f"
+DEPENDABOT = "dependabot[bot]"
+
+
+def raw_commit(
+    sha: str = HEAD, author: str = DEPENDABOT, committer: str = "web-flow", verification: dict | None = None
+) -> dict:
+    """One commit of a raw `compare` body: the user objects and the signature verdict nest as the API nests them."""
+    return {
+        "sha": sha,
+        "author": {"login": author, "type": "Bot"},
+        "committer": {"login": committer, "type": "User"},
+        "commit": {
+            "message": "build(deps): bump actions/checkout",
+            "verification": verification
+            or {"verified": True, "reason": "valid", "signature": "-----BEGIN PGP SIGNATURE-----", "payload": "tree"},
+        },
+    }
+
+
+def raw_pin_file(pairs: int, name: str = ".github/workflows/ci.yml") -> dict:
+    """A workflow edit that moves ``pairs`` pins: two changed lines each, as Dependabot writes them."""
+    removed = f"      - uses: actions/checkout@{'a1' * 20}  # v7.0.1"
+    added = f"      - uses: actions/checkout@{'b2' * 20}  # v7.0.2"
+    patch = "@@ -20,5 +20,5 @@\n steps:\n" + f"-{removed}\n" * pairs + f"+{added}\n" * pairs
+    return {
+        "filename": name,
+        "previous_filename": None,
+        "status": "modified",
+        "additions": pairs,
+        "deletions": pairs,
+        "patch": patch,
+    }
+
+
+def _dependabot(
+    tmp_path: Path,
+    body: dict,
+    count: int = 1,
+    author: str = DEPENDABOT,
+    branch: str = DEPENDABOT_BRANCH,
+    repository: str = REPOSITORY,
+) -> list[tuple[str, str]]:
+    code, posted = _gate(
+        tmp_path,
+        pulls=pull_line(41, HEAD, BASE, author=author, branch=branch, repository=repository),
+        live=f"{HEAD}\t{BASE}\t{count}",
+        raw_compare=body,
+    )
+    assert code == 0
+    return posted
+
+
+def test_a_dependabot_pin_update_is_published_as_success_through_the_real_projection(tmp_path):
+    """Six pins are twelve changed lines: past the old four-line bound, so the patch must now travel."""
+    body = {"files": [raw_pin_file(6)], "commits": [raw_commit()], "total_commits": 1}
+    assert _dependabot(tmp_path, body) == [(HEAD, "success")]
+
+
+def test_a_dependabot_update_from_a_fork_or_another_branch_keeps_the_review_requirement(tmp_path):
+    """The row carries the head ref and the head repository, and the planner holds both to Dependabot's shape.
+
+    The same body, commits and author succeed from the bot's own branch of this repository; only the row changes.
+    """
+    body = {"files": [raw_pin_file(2)], "commits": [raw_commit()], "total_commits": 1}
+    assert _dependabot(tmp_path, body) == [(HEAD, "success")]
+    assert _dependabot(tmp_path, body, branch="feat/example") == [(HEAD, "pending")]
+    assert _dependabot(tmp_path, body, repository="someone/advisory-radar") == [(HEAD, "pending")]
+    # A deleted fork has no head repository, so the row ends in an empty field: that must not read as a match.
+    assert _dependabot(tmp_path, body, repository="") == [(HEAD, "pending")]
+
+
+def test_a_commit_that_is_not_dependabots_own_keeps_the_review_requirement_through_the_projection(tmp_path):
+    maintainer = raw_commit(OTHER, author="mikomiel", committer="web-flow")
+    body = {"files": [raw_pin_file(2)], "commits": [maintainer, raw_commit()], "total_commits": 2}
+    assert _dependabot(tmp_path, body) == [(HEAD, "pending")]
+    # the bot's name on a commit a person signed: only the committer shows who that was
+    borrowed = raw_commit(committer="mikomiel")
+    body = {"files": [raw_pin_file(2)], "commits": [borrowed], "total_commits": 1}
+    assert _dependabot(tmp_path, body) == [(HEAD, "pending")]
+
+
+def test_an_unsigned_or_unreported_signature_keeps_the_review_requirement_through_the_projection(tmp_path):
+    for verification in ({"verified": False, "reason": "unsigned"}, {"reason": "valid"}):
+        body = {
+            "files": [raw_pin_file(2)],
+            "commits": [raw_commit(verification=verification)],
+            "total_commits": 1,
+        }
+        assert _dependabot(tmp_path, body) == [(HEAD, "pending")], verification
+    # a commit GitHub could not tie to an account has no author or committer object at all
+    anonymous = {**raw_commit(), "author": None, "committer": None}
+    body = {"files": [raw_pin_file(2)], "commits": [anonymous], "total_commits": 1}
+    assert _dependabot(tmp_path, body) == [(HEAD, "pending")]
+
+
+def test_a_comparison_that_lists_fewer_commits_than_it_counts_is_not_exempt(tmp_path):
+    body = {"files": [raw_pin_file(2)], "commits": [raw_commit()], "total_commits": 3}
+    assert _dependabot(tmp_path, body) == [(HEAD, "pending")]
+
+
+def test_a_patch_beyond_the_transport_bound_is_dropped_and_the_workflow_edit_stays_unproven(tmp_path):
+    """Twenty-five pins are fifty changed lines: above the bound, so no patch travels and the rule fails closed."""
+    body = {"files": [raw_pin_file(25)], "commits": [raw_commit()], "total_commits": 1}
+    assert _dependabot(tmp_path, body) == [(HEAD, "pending")]
+
+
+def test_a_comparison_larger_than_one_argument_still_reaches_the_planner(tmp_path):
+    """The comparison goes to jq through a file: 120 files of forty changed lines carry far more than the
+    128 KB one command-line argument can hold, and the snapshot of every other pull request depends on this run."""
+    files = [raw_pin_file(20, name=f".github/workflows/w{number}.yml") for number in range(120)]
+    body = {"files": files, "commits": [raw_commit()], "total_commits": 1}
+    assert sum(len(item["patch"]) for item in files) > 200_000
+    assert _dependabot(tmp_path, body, count=120, author="mikomiel") == [(HEAD, "pending")]
+
+
+def test_a_patch_beyond_the_size_bound_is_dropped_whatever_its_line_count(tmp_path):
+    """One changed pair, but a context line of twenty thousand characters: the bound is on size as well as lines."""
+    body = {"files": [raw_pin_file(1)], "commits": [raw_commit()], "total_commits": 1}
+    assert _dependabot(tmp_path, body) == [(HEAD, "success")]  # the same edit with a short context line
+    item = raw_pin_file(1)
+    item["patch"] = item["patch"].replace(" steps:\n", f" {'x' * 20_000}\n")
+    body = {"files": [item], "commits": [raw_commit()], "total_commits": 1}
+    assert _dependabot(tmp_path, body) == [(HEAD, "pending")]
+
+
+def test_an_unreadable_comparison_leaves_the_pull_request_without_an_exemption(tmp_path):
+    """The read fails for one pull request: it is not exempt, and the run still publishes every verdict."""
+    output: list[str] = []
+    code, posted = _gate(
+        tmp_path,
+        pulls=pull_line(41, HEAD, BASE, author=DEPENDABOT, branch=DEPENDABOT_BRANCH),
+        live=f"{HEAD}\t{BASE}\t1",
+        compare_fails=True,
+        capture=output,
+    )
+    assert code == 0
+    assert posted == [(HEAD, "pending")]
+    assert "cannot read the comparison; not exempt from review" in output[0]
