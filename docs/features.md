@@ -34,7 +34,9 @@ turns critical, and never re-sends what you already received.
   never the advisory heading
 - Web UI + REST API, in-process scheduler (default every 15 min), atomic state on a volume:
   a JSON file by default, SQLite or PostgreSQL when `storage` says so
-- Per-entry release/drop on the parked queue, next to the bulk actions; `routes`/`default`
-  editable on `/config` with the other settings
+- Per-entry release/drop on the parked queue, next to the bulk actions: each row shows its
+  delivery attempts and the channels that already accepted it and links to its advisory page,
+  and dropping the whole queue asks for confirmation first; `routes`/`default` editable on
+  `/config` with the other settings
 - Docker and Podman deployment (compose file + quadlet/kube YAML), `/healthz` and `/metrics`
 - Secrets via environment / `${NAME_FILE}` references only; redaction filter on logs; fail-closed source errors

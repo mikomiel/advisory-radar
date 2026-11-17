@@ -709,7 +709,8 @@ about it: the state and tag filters select one fact (so a co-named message canno
 critical), the other facts are listed under **Also**, related identifiers are shown rather than
 merged, and the page says remediation is not tracked.
 `/parked` releases or drops one message per row as well as
-the whole queue, and `/runs` filters by exit code and day; the state keeps only the last 200
+the whole queue (dropping the whole queue shows a confirmation page first), and `/runs`
+filters by exit code and day; the state keeps only the last 200
 passes, so the page states that cap instead of paging. The dashboard above the queue counts
 undelivered criticals, quiet-window holds, parked and awaiting-classification work, each count
 linking to the filtered inbox view, and marks a pass that exited 0 with work outstanding as

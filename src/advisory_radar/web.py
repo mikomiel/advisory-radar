@@ -1589,6 +1589,112 @@ def _parked_digest(entries: Iterable[object]) -> str:
 #: What ``core.manage_parked`` returns when the digest a bulk form submitted names a different queue than the one
 #: it loaded; ``0`` is done and ``1`` is a store that could not be read.
 PARKED_QUEUE_CHANGED = 2
+#: How many distinct identifiers of one parked message are tried when looking for the one whose advisory page
+#: shows it; a message that owns none of the first few is listed without a link.
+PARKED_LINK_IDS = 4
+
+
+def _parked_queue(state: Mapping) -> list:
+    """The parked list as stored; a missing or malformed one is an empty queue."""
+    parked = state.get("parked")
+    return parked if isinstance(parked, list) else []
+
+
+def _parked_count(count: int) -> str:
+    """How many parked messages, in the words the parked pages use: ``1 parked message``, ``3 parked messages``."""
+    return f"{count} parked message{'' if count == 1 else 's'}"
+
+
+def _parked_page_id(state: dict, entry: dict) -> str:
+    """The identifier whose advisory page a parked row links to, or empty when none of its identifiers has one.
+
+    ``/advisories/<id>`` shows the message that owns ``<id>`` (``core.owner_of``), and another message that names
+    the same identifier can own it instead: an older one, or a newer escalation about the same CVE. A row
+    therefore prefers an identifier whose page shows this very message. Failing that it takes the first
+    identifier that has a page at all, which is still the evidence about that identifier. The identifiers it
+    introduced (``fresh``) are tried first, then the ones it names (``ids``, which is all a message written
+    before ownership was recorded has).
+    """
+    tried: set[str] = set()
+    elsewhere = ""
+    for key in ("fresh", "ids"):
+        values = entry.get(key)
+        for identifier in values if isinstance(values, list) else ():
+            if not isinstance(identifier, str) or identifier in tried:
+                continue
+            if len(tried) == PARKED_LINK_IDS:
+                return elsewhere
+            tried.add(identifier)
+            owner = core.owner_of(state, identifier)
+            if owner is None:
+                continue
+            if owner[1] is entry:
+                return identifier
+            elsewhere = elsewhere or identifier
+    return elsewhere
+
+
+def _parked_table(state: dict, csrf: str | None = None) -> str:
+    """The parked queue as a table with one row per message, in queue order.
+
+    A row says what the message is (tag, title, identifiers) and what delivery has done with it so far: how many
+    attempts it took and which channels had already accepted it, as the state recorded them. A value the state
+    does not hold, or holds as something that is not a count or a list, is shown as missing and never invented.
+    The title links to the advisory page of the message's identifier (see :func:`_parked_page_id`). With ``csrf``
+    (the form-token input) each row also offers its own Release and Drop; without it the table only lists, as on
+    the drop confirmation.
+    """
+    rows = []
+    for index, entry in enumerate(_parked_queue(state)):
+        if not isinstance(entry, dict):
+            continue
+        identities = entry.get("ids")
+        shown = ""
+        if isinstance(identities, list):
+            shown = ", ".join(value for value in identities if isinstance(value, str))
+        tag = _field(entry.get("tag"))
+        linked = _parked_page_id(state, entry)
+        title = esc(_field(entry.get("title")) or linked)
+        if linked:
+            title = f"<a href='/advisories/{esc(_advisory_token(linked))}'>{title}</a>"
+        attempts = _number(entry.get("attempts"), -1)
+        row = (
+            f"<tr><td>{_badge(tag, tag) if tag else '—'}</td><td>{title}</td>"
+            f"<td class='muted'>{esc(shown[:80])}</td>"
+            f"<td>{attempts if attempts >= 0 else "<span class='muted'>not recorded</span>"}</td>"
+            f"<td>{_identifier_list(entry.get('sent_to'))}</td>"
+        )
+        if csrf is not None:
+            token = esc(core.parked_token(entry))
+            row += (
+                "<td><div class='row-actions'>"
+                f"<form method='post' action='/parked/{index}/release'>{csrf}"
+                f"<input type='hidden' name='token' value='{token}'>"
+                "<button class='btn btn-primary'>Release</button></form>"
+                f"<form method='post' action='/parked/{index}/drop'>{csrf}"
+                f"<input type='hidden' name='token' value='{token}'>"
+                "<button class='btn btn-danger'>Drop</button></form></div></td>"
+            )
+        rows.append(row + "</tr>")
+    headings = ["Tag", "Title", "IDs", "Attempts", "Accepted by", *(["Actions"] if csrf is not None else [])]
+    return (
+        "<div class='scroll'><table class='compact'><tr>"
+        + "".join(f"<th scope='col'>{name}</th>" for name in headings)
+        + "</tr>"
+        + "".join(rows)
+        + "</table></div>"
+    )
+
+
+def _parked_bulk_form(action: str, csrf: str, digest: str, label: str, css: str = "btn") -> str:
+    """One bulk form. It names the queue the page listed (``digest``), which its action refuses to differ from."""
+    return (
+        f'<form method="post" action="{action}">{csrf}'
+        f"<input type='hidden' name='digest' value='{digest}'>"
+        f'<button class="{css}">{esc(label)}</button></form>'
+    )
+
+
 #: A login form is a handful of bytes; an unauthenticated request must not be able to make us buffer more.
 LOGIN_BODY_LIMIT = 8 * 1024
 #: The form field and the header that carry the per-session token; a state-changing POST needs one of them.
@@ -2752,45 +2858,25 @@ def create_app(
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         state = load_state()
-        parked = state.get("parked")
-        parked = parked if isinstance(parked, list) else []
-        csrf = csrf_field(request)
-        rows = []
-        from . import core
-
-        for index, entry in enumerate(parked):
-            if not isinstance(entry, dict):
-                continue
-            token = core.parked_token(entry)
-            identities = entry.get("ids")
-            shown = ""
-            if isinstance(identities, list):
-                shown = ", ".join(value for value in identities if isinstance(value, str))
-            tag = _field(entry.get("tag"))
-            rows.append(
-                f"<tr><td>{_badge(tag, tag) if tag else '—'}</td>"
-                f"<td>{esc(_field(entry.get('title')))}</td><td class='muted'>{esc(shown[:80])}</td>"
-                f"<td><div class='row-actions'>"
-                f"<form method='post' action='/parked/{index}/release'>{csrf}"
-                f"<input type='hidden' name='token' value='{esc(token)}'>"
-                "<button class='btn btn-primary'>Release</button></form>"
-                f"<form method='post' action='/parked/{index}/drop'>{csrf}"
-                f"<input type='hidden' name='token' value='{esc(token)}'>"
-                "<button class='btn btn-danger'>Drop</button></form></div></td></tr>"
-            )
-        digest_field = f"<input type='hidden' name='digest' value='{_parked_digest(parked)}'>"
-        if rows:
+        parked = _parked_queue(state)
+        listed = sum(isinstance(entry, dict) for entry in parked)
+        if listed:
+            csrf = csrf_field(request)
+            digest = _parked_digest(parked)
             body = (
-                "<div class='scroll'><table class='compact'><tr><th scope='col'>Tag</th>"
-                "<th scope='col'>Title</th><th scope='col'>IDs</th><th scope='col'>Actions</th></tr>"
-                + "".join(rows)
-                + "</table></div>"
+                "<p class='muted'>Delivery kept failing for these messages, so they wait here for a decision. "
+                "Release returns a message to the delivery queue, where the next run retries it; a channel that "
+                "already accepted it is not sent it again. Drop discards a message: it is not delivered and nothing "
+                "is remediated.</p>"
+                + _parked_table(state, csrf)
+                + f"<p class='muted'>Release all returns {_parked_count(listed)} to the delivery queue in one step. "
+                "Drop all shows what it would discard first, and discards only after you confirm.</p>"
                 # Both bulk forms name the queue this page listed: the action refuses, and changes nothing, when the
                 # queue is no longer that one (see ``parked_bulk``).
-                f'<div class="bulk"><form method="post" action="/parked/release">{csrf}{digest_field}'
-                '<button class="btn">Release all</button></form>'
-                f'<form method="post" action="/parked/drop">{csrf}{digest_field}'
-                '<button class="btn btn-danger">Drop all</button></form></div>'
+                + '<div class="bulk">'
+                + _parked_bulk_form("/parked/release", csrf, digest, f"Release all ({listed})")
+                + _parked_bulk_form("/parked/drop", csrf, digest, f"Drop all ({listed})", "btn btn-danger")
+                + "</div>"
             )
         else:
             body = _empty("Nothing is parked: no message is waiting for a decision.")
@@ -2841,6 +2927,18 @@ def create_app(
             return RedirectResponse("/login", status_code=303)
         return parked_decision(index, release=False, request=request)
 
+    def queue_changed(request: Request):
+        """The answer when a bulk form names a queue other than the current one: 409, and nothing was written."""
+        return page(
+            "Not changed",
+            "<p>The parked queue is not the one this page listed, so nothing was changed. "
+            "Review the queue again before you decide.</p>"
+            "<p><a href='/parked'>Back to the parked queue</a></p>",
+            active="/parked",
+            actions=sign_out_form(request),
+            status_code=409,
+        )
+
     def parked_bulk(release: bool, request: Request):
         """Release or drop the whole parked queue, but only the queue the form's page listed.
 
@@ -2859,15 +2957,7 @@ def create_app(
                 status = core.manage_parked(store, release=release, now=int(time.time()), expected=expected)
             if status != PARKED_QUEUE_CHANGED:
                 return RedirectResponse("/parked", status_code=303)
-        return page(
-            "Not changed",
-            "<p>The parked queue is not the one this page listed, so nothing was changed. "
-            "Review the queue again before you decide.</p>"
-            "<p><a href='/parked'>Back to the parked queue</a></p>",
-            active="/parked",
-            actions=sign_out_form(request),
-            status_code=409,
-        )
+        return queue_changed(request)
 
     @app.post("/parked/release", dependencies=[Depends(require_csrf)])
     def parked_release(request: Request):
@@ -2877,6 +2967,36 @@ def create_app(
 
     @app.post("/parked/drop", dependencies=[Depends(require_csrf)])
     def parked_drop(request: Request):
+        """Show what "Drop all" would discard, and change nothing: the form on that page confirms the drop.
+
+        The queue is read here, not locked, so this answer is a preview. The digest it checks is handed on to
+        ``/parked/drop/confirm``, which compares it under the state lock, so a queue that moves while the
+        operator reads is refused there.
+        """
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        state = load_state()
+        parked = _parked_queue(state)
+        digest = _parked_digest(parked)
+        if first(form_body(request), "digest") != digest:
+            return queue_changed(request)
+        listed = sum(isinstance(entry, dict) for entry in parked)
+        if not listed:
+            # Nothing is parked, so there is nothing to confirm (the old single-step drop also ended here).
+            return RedirectResponse("/parked", status_code=303)
+        count = _parked_count(listed)
+        effect = "none of them is delivered" if listed != 1 else "it is not delivered"
+        body = (
+            _notice(f"{count} will be discarded; {effect} and nothing is remediated.", "critical")
+            + _parked_table(state)
+            + '<div class="bulk">'
+            + _parked_bulk_form("/parked/drop/confirm", csrf_field(request), digest, f"Drop {count}", "btn btn-danger")
+            + "<a class='btn' href='/parked'>Cancel</a></div>"
+        )
+        return page("Drop parked messages", body, active="/parked", actions=sign_out_form(request))
+
+    @app.post("/parked/drop/confirm", dependencies=[Depends(require_csrf)])
+    def parked_drop_confirm(request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         return parked_bulk(release=False, request=request)
@@ -3582,6 +3702,10 @@ def create_app(
             "ignored; a partly filled one is saved as written and the validator reports what is wrong. Only "
             "enabled notifiers may be selected. A numeric or KEV predicate matches only what the message "
             "measured: an advisory with no score never satisfies one.</p>"
+            "<p class='muted'>An escalation, the later message about a CVE whose score or exploitation status rose, "
+            "carries no source and no product, so a rule that names either never matches it. Its destination is the "
+            "first rule that matches its tag, ids, score, EPSS or KEV, then the default notifiers, then every "
+            "enabled notifier. <a href='/thresholds?kind=escalation'>Preview where an escalation goes.</a></p>"
         )
 
     def commit_overlay(request: Request, overlay: dict, *, notice: str = ""):
@@ -4824,6 +4948,11 @@ def create_app(
         it has one, and the global block otherwise -- and calls the same ``core.level_of`` and
         ``routing.select`` the pass calls, so the answer cannot drift from the decision it describes. Nothing is
         written and no state is read, so the link can be shared and repeated.
+
+        ``kind=escalation`` previews the later message ``core.reevaluate`` queues for a watched CVE instead. That
+        message is routed with no source and no product, so it is selected with an entry that has neither, and
+        the page lists the rules that name one because they never apply to it. Whether the daily pass sends the
+        escalation at all depends on state this page does not read, and the page says so.
         """
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
@@ -4852,6 +4981,10 @@ def create_app(
         ssvc = (request.query_params.get("ssvc") or "").strip()
         if ssvc not in ("", "active"):
             raise HTTPException(status_code=400, detail="ssvc must be empty or active")
+        kind = (request.query_params.get("kind") or "").strip()
+        if kind not in ("", "escalation"):
+            raise HTTPException(status_code=400, detail="kind must be empty or escalation")
+        escalation = kind == "escalation"
         remote = request.query_params.get("remote") == "1"
         source = (request.query_params.get("source") or "").strip()
         product = (request.query_params.get("product") or "").strip()
@@ -4879,7 +5012,15 @@ def create_app(
             facts = core.CveFacts(cvss, ssvc or None, epss, None, True, remote_unauth=remote)
             level, reason = core.level_of(facts, kev_choice == "yes", kev_choice != "unknown", thresholds=thresholds)
             line = core.metrics_line(cvss, epss, None, ssvc or None, kev_choice == "yes")
-            note = core.reason_note(reason, thresholds)
+            # An escalation says what changed since the first message, not why the CVE is critical.
+            note = core.change_note(reason, thresholds) if escalation else core.reason_note(reason, thresholds)
+            # ``core.reevaluate`` queues an escalation for a CVE that now judges critical, or warning with a measured
+            # score at or above the floor. For any other facts it records the verdict and sends nothing.
+            escalates = level == "critical" or (
+                level == "warning" and cvss is not None and cvss >= thresholds.suppress_below_cvss
+            )
+            # An escalation is about one CVE, the one its watch entry is keyed by, and names no other identifier.
+            escalated = sorted({identifier.upper() for identifier in identifiers if core.CVE_RE.fullmatch(identifier)})
             decisions = {
                 "kev": "the CVE is in the CISA KEV catalog: exploitation observed in the wild.",
                 "ssvc": "CISA records active exploitation (SSVC).",
@@ -4890,6 +5031,17 @@ def create_app(
             }
             if reason in decisions:
                 why = decisions[reason]
+            elif escalation and not escalates:
+                why = (
+                    "no CVE, score or exploitation signal reaches the critical rules, and the score is unknown or "
+                    "below the suppression floor."
+                )
+            elif escalation:
+                why = (
+                    "no CVE, score or exploitation signal reaches the critical rules, but the score is at or above "
+                    "the suppression floor, so a CVE whose first message recorded it as suppressed is escalated as "
+                    "a warning."
+                )
             elif level == "suppressed":
                 why = (
                     "no CVE, score or exploitation signal reaches the critical rules, and the item is below the "
@@ -4913,7 +5065,16 @@ def create_app(
                 )
             tone = {"critical": "critical", "warning": "warning", "suppressed": "ok"}[level]
             label = {"critical": "Critical", "warning": "Warning", "suppressed": "Suppressed"}[level]
-            if level == "suppressed":
+            if escalation and not escalates:
+                tone, label = "ok", "No escalation"
+                destination = "<p class='muted'>No escalation is queued for these facts, so nothing is routed.</p>"
+            elif escalation and len(escalated) != 1:
+                destination = _notice(
+                    "An escalation is about exactly one CVE and names no other identifier: give that CVE's id "
+                    "above to see where it would go.",
+                    "warning",
+                )
+            elif level == "suppressed":
                 # Nothing is sent, so naming a route would describe a message that never exists.
                 destination = "<p class='muted'>No message is sent, so nothing is routed.</p>"
             else:
@@ -4968,8 +5129,19 @@ def create_app(
                 if unpredictable:
                     destination = _notice(" ".join(unpredictable), "warning")
                 else:
-                    selected, where = routing.select(
-                        {
+                    if escalation:
+                        # The entry ``core.reevaluate`` queues: its one CVE with that CVE's measured numbers and KEV
+                        # membership, and no ``source_id`` or ``products``, so a rule naming either cannot match.
+                        [cve] = escalated
+                        message = {
+                            "tag": level,
+                            "ids": [cve],
+                            "scores": {cve: cvss},
+                            "epss": {cve: epss},
+                            "kev": None if kev_choice == "unknown" else kev_choice == "yes",
+                        }
+                    else:
+                        message = {
                             "tag": level,
                             "source_id": source,
                             "products": [product] if product else [],
@@ -4983,7 +5155,9 @@ def create_app(
                             "kev": None
                             if kev_choice == "unknown"
                             else (kev_choice == "yes" if cve_identifiers else False),
-                        },
+                        }
+                    selected, where = routing.select(
+                        message,
                         cfg.routes,
                         cfg.default_notifiers,
                         [str(entry.get("id", "")) for entry in cfg.notifiers],
@@ -4999,7 +5173,41 @@ def create_app(
                             "pass would fail on it rather than drop it.",
                             "warning",
                         )
-            carries = "Recorded with" if level == "suppressed" else "The message would carry"
+                    if escalation:
+                        # Name each rule the missing source and product skip, so a rule the operator wrote is not
+                        # mistaken for one that fires, and the fallback that won when no rule matched.
+                        named: dict[str, list[str]] = {}
+                        for key in ("source", "product"):
+                            for position in rules_matching(key):
+                                named.setdefault(position, []).append(key)
+                        skipped = [f"rule {n} ({' and '.join(named[n])})" for n in sorted(named, key=int)]
+                        explanation = []
+                        if skipped:
+                            explanation.append(
+                                "Skipped, because an escalation carries no source and no product: "
+                                + ", ".join(skipped)
+                                + "."
+                            )
+                        if where == "default":
+                            explanation.append("No rule matches this escalation, so the default notifiers win.")
+                        elif where == "all":
+                            explanation.append(
+                                "No rule matches this escalation and no default is set, so every enabled notifier "
+                                "gets it."
+                                if cfg.routes
+                                else "No routes are configured, so every enabled notifier gets it."
+                            )
+                        if explanation:
+                            destination += f"<p class='muted small'>{esc(' '.join(explanation))}</p>"
+                        destination += (
+                            "<p class='muted small'>Whether the daily pass sends this escalation depends on what its "
+                            "first message told (its level and its score), which a preview does not read. If it is "
+                            "sent, this is where it goes.</p>"
+                        )
+            if escalation:
+                carries = "The escalation would carry" if escalates else "Measured"
+            else:
+                carries = "Recorded with" if level == "suppressed" else "The message would carry"
             result = (
                 "<h2>Result</h2>"
                 f"<p>{_badge(label, tone)} {esc(why)}</p>"
@@ -5021,11 +5229,17 @@ def create_app(
             f"{' checked' if remote else ''}> remote, unauthenticated, no interaction</label>"
             "</div>"
             "<div class='fields'>"
+            f"<label>Message kind<select name='kind'>{choice('', 'New advisory', kind)}"
+            f"{choice('escalation', 'Escalation', kind)}</select></label>"
             f"<label>Source<select name='source'>{source_options}</select></label>"
             f"<label>Product id<input type='text' name='product' value='{esc(product)}'></label>"
             f"<label>Advisory ids<input type='text' name='ids' value='{esc(ids_text)}' "
             "placeholder='CVE-2026-1234 GHSA-abcd-...'></label>"
             "</div>"
+            "<p class='muted small'>An escalation is the later message about one CVE whose score or exploitation "
+            "status rose. It carries no source and no product, so a rule that names either never matches it: "
+            "Source then only picks the thresholds that judge the CVE, Product id is ignored, and Advisory ids "
+            "must give the CVE.</p>"
             "<button class='btn btn-primary' name='preview' value='1'>Preview</button>"
             f" <a class='btn btn-quiet' href='/config'>Change the thresholds</a>"
             "</form>"
