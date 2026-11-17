@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import re
 import sqlite3
 import sys
 import threading
@@ -17,7 +18,7 @@ import pytest
 
 from advisory_radar import cli, core
 from advisory_radar.state import load_state_document, save_state
-from advisory_radar.storage import SqliteStore
+from advisory_radar.storage import JsonStore, SqliteStore
 
 
 def make_config(tmp_path: Path, *, storage: str = "") -> Path:
@@ -51,6 +52,35 @@ def test_migrate_copies_the_document_and_names_only_the_stores(tmp_path, capsys)
     # The message names the stores by their redacted reprs, never by the configured value: a PostgreSQL
     # locator carries a password and this line is output an operator may paste into an issue.
     assert "sqlite:///" not in printed
+
+
+@pytest.mark.parametrize("target_kind", ["sqlite", "json"])
+def test_migrate_reports_the_two_stores_and_no_size(target_kind, tmp_path, capsys):
+    """The report names both stores and states no size, whichever form the target writes the document in.
+
+    The line once carried ``len(serialize_json(document))``. A JSON target writes the compact form, which is
+    shorter, so that number was not what the store wrote; the report states no number instead of a wrong one.
+    """
+    document = make_document()
+    json_store, sqlite_store = JsonStore(tmp_path / "state.json"), SqliteStore(tmp_path / "state.db")
+    sqlite_url = f"sqlite:///{tmp_path}/state.db"
+    if target_kind == "sqlite":
+        save_state(tmp_path / "state.json", document)
+        config, to, source, target = make_config(tmp_path), sqlite_url, json_store, sqlite_store
+    else:
+        # The JSON target is the empty ``--to``: the file at ``state_path``, reached from a configured SQL store.
+        sqlite_store.save(document)
+        config, to, source, target = make_config(tmp_path, storage=sqlite_url), "", sqlite_store, json_store
+
+    assert cli.main(["migrate", "--config", str(config), "--to", to], env={}) == 0
+    assert target.load() == document
+
+    printed = capsys.readouterr().out
+    # The reprs hold the temporary path, whose digits and words vary with the test, so they are cut out before
+    # the rest of the line is checked for a count.
+    wording = printed.replace(repr(source), "").replace(repr(target), "")
+    assert not re.search(r"\d|bytes?", wording), f"the report must state no size: {printed!r}"
+    assert printed == f"migrated the state document from {source!r} to {target!r}\n"
 
 
 def test_migrate_refuses_a_target_that_already_holds_a_document(tmp_path, caplog):

@@ -138,6 +138,11 @@ level. When a warning escalation that a channel refused earlier is still queued 
 one is added beside it, a pass delivers the critical first, and the late warning leaves the
 entry at critical, so the next re-evaluation does not send the critical again.
 
+A message that names a CVE the entry already tracks follows the same rule. One below the level
+you were told keeps that level, the message that told it and the watch window as they were, so
+it neither lowers the level nor lengthens the window. One at that level or above updates the
+entry. Neither lowers what the numbers in force make of the CVE.
+
 `/thresholds`, linked from `/config`, previews one advisory: give it a CVSS, an EPSS, its
 KEV and SSVC state, a source, a product and the advisory's identifiers, and it shows the
 level, the reason, the exact metrics line and note the message would carry, and which route

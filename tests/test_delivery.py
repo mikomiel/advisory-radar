@@ -6,6 +6,7 @@ state file, no notifier and no HTTP. The delivery tests below drive ``core.deliv
 
 from __future__ import annotations
 
+import copy
 import datetime
 import logging
 
@@ -1030,6 +1031,200 @@ def test_a_delivered_escalation_does_not_lower_a_judgement_that_was_raised_silen
     assert watch["level"] == "warning", "the reader was told a warning"
     assert watch["judged"] == "critical", "the silent re-baseline is not undone by an older message"
     assert watch["thresholds"] == [7.0, 0.20, 3.0], "and the rules that made it stay with it"
+
+
+# --- the ``new`` branch of ``_delivered``: like an escalation, a delivery only ever raises the watch -------------
+#
+# The follow-up the escalation guard above left open. A delivered ``new`` message wrote its own record over the
+# watch of every CVE it names, so a message below what the entry already held lowered it. The entry now keeps the
+# higher of the two on each side: the level the reader was told (with the message that told it and the clock), and
+# the level the rules in force make of the CVE (with those rules and their source). A tie goes to the message.
+
+THRESHOLDS = [9.0, 0.10, 4.0]
+STRICT = [7.0, 0.20, 3.0]
+
+
+def _watched(cve: str, level: str = "warning", **extra: object) -> dict:
+    """The record a ``new`` message delivered days ago left: both clocks well before ``NOW``."""
+    return {
+        "since": NOW - 3 * core.DAY,
+        "last_eval": NOW - 2 * core.DAY,
+        "level": level,
+        "kev_only": False,
+        "title": "Vendor",
+        "link": f"https://vendor.example/{cve}",
+        "thresholds": THRESHOLDS,
+        "judged": level,
+        "source_id": "vendor",
+        "cvss": 7.5,
+        **extra,
+    }
+
+
+def _from_another_feed(cve: str, level: str = "warning") -> dict:
+    """A ``new`` message that names ``cve`` at ``level``, queued by a second source under stricter rules."""
+    return {
+        **queued(cve, level, source_id="other"),
+        "source": "Other feed",
+        "link": f"https://other.example/{cve}",
+        "thresholds": STRICT,
+        "scores": {cve: 8.5},
+    }
+
+
+def _deliver(state: dict, message: dict, now: int) -> None:
+    core._delivered(state, message, now, outcome="delivered", delivered_to=["ops"])
+
+
+def test_the_first_new_message_creates_the_watch_record():
+    cve = "CVE-2026-9100"
+    state = core.new_state()
+    _deliver(state, queued(cve, "warning"), NOW)
+    assert state["watch"][cve] == {
+        "since": NOW,
+        "last_eval": NOW,
+        "level": "warning",
+        "kev_only": False,
+        "title": "Vendor",
+        "link": f"https://vendor.example/{cve}",
+        "thresholds": THRESHOLDS,
+        "judged": "warning",
+        "source_id": "vendor",
+        "cvss": 7.5,
+    }
+
+
+@pytest.mark.parametrize("late", ["warning", "suppressed"])
+def test_a_late_new_message_never_lowers_a_watch_a_delivered_escalation_raised(late):
+    """A message below a critical the reader already has changes nothing, so the next re-score owes nothing.
+
+    Three days ago the first message told the reader a warning; yesterday a KEV hit raised the CVE and the
+    escalation was delivered; now a second message that names it is delivered late. Its record used to replace the
+    escalated one, which put the watch back at ``warning`` and made the next daily evaluation queue the critical
+    again. The record is as the escalation left it: level, judgement, rules, source and both clocks.
+    """
+    cve = "CVE-2026-9101"
+    state = core.new_state()
+    _deliver(state, queued(cve, "warning"), NOW - 3 * core.DAY)
+    _deliver(state, _escalation(cve, "critical", STRICT), NOW - core.DAY)
+    escalated = copy.deepcopy(state["watch"][cve])
+    assert (escalated["level"], escalated["judged"], escalated["thresholds"]) == ("critical", "critical", STRICT)
+
+    _deliver(state, _from_another_feed(cve, late), NOW)
+
+    assert state["watch"][cve] == escalated, "nothing the escalation recorded was moved by the late message"
+
+
+def test_a_second_new_message_at_the_same_level_replaces_the_record_as_it_always_did():
+    """At the level the entry already holds the message is the later word: its record, rules, source and clock."""
+    cve = "CVE-2026-9102"
+    state = core.new_state()
+    _deliver(state, queued(cve, "warning"), NOW - 3 * core.DAY)
+    _deliver(state, _from_another_feed(cve, "warning"), NOW)
+    assert state["watch"][cve] == {
+        "since": NOW,
+        "last_eval": NOW,
+        "level": "warning",
+        "kev_only": False,
+        "title": "Other feed",
+        "link": f"https://other.example/{cve}",
+        "thresholds": STRICT,
+        "judged": "warning",
+        "source_id": "other",
+        "cvss": 8.5,
+    }
+
+
+def test_a_new_message_above_the_level_the_reader_was_told_replaces_the_record():
+    """A genuine raise is a fresh message at a higher level, so it starts the watch again from itself."""
+    cve = "CVE-2026-9103"
+    state = core.new_state()
+    _deliver(state, queued(cve, "warning"), NOW - 3 * core.DAY)
+    _deliver(state, _from_another_feed(cve, "critical"), NOW)
+    assert state["watch"][cve] == {
+        "since": NOW,
+        "last_eval": NOW,
+        "level": "critical",
+        "kev_only": False,
+        "title": "Other feed",
+        "link": f"https://other.example/{cve}",
+        "thresholds": STRICT,
+        "judged": "critical",
+        "source_id": "other",
+        "cvss": 8.5,
+    }
+
+
+def test_a_late_new_message_does_not_lower_a_judgement_that_was_raised_silently():
+    """``judged`` keeps the higher side with its rules and its source, whatever the message was judged by.
+
+    A settings change re-baselined the CVE to critical without telling anyone. A warning message that names it is
+    then delivered: the reader is told a warning again, so that side is the message's, but the judgement is not
+    undone, and the rules and the source that made it stay with it.
+    """
+    cve = "CVE-2026-9104"
+    state = core.new_state()
+    state["watch"][cve] = _watched(cve, "warning", judged="critical", thresholds=STRICT, source_id="strict")
+    _deliver(state, queued(cve, "warning"), NOW)
+    watch = state["watch"][cve]
+    assert watch["level"] == "warning"
+    assert (watch["judged"], watch["thresholds"], watch["source_id"]) == ("critical", STRICT, "strict"), (
+        "the judgement, its rules and its source are one fact and move together"
+    )
+    assert (watch["since"], watch["last_eval"]) == (NOW, NOW), "the level told is the message's, as at a tie"
+
+
+def test_a_late_new_message_below_the_told_level_leaves_the_message_and_the_clock_alone():
+    """The reader already has a critical: a delivery that tells nothing new may not lengthen or reset the watch.
+
+    The rules were later made stricter, so the CVE is only judged a warning now. The message's judgement ties it,
+    and a tie goes to the message, which brings its own rules and source; everything about what the reader was
+    told stays: the level, the message that told it, the score, and both clocks.
+    """
+    cve = "CVE-2026-9105"
+    state = core.new_state()
+    held = _watched(cve, "critical", judged="warning", thresholds=STRICT, source_id="strict")
+    state["watch"][cve] = copy.deepcopy(held)
+    _deliver(state, queued(cve, "warning"), NOW)
+    assert state["watch"][cve] == {**held, "thresholds": THRESHOLDS, "source_id": "vendor"}
+
+
+def test_a_late_new_message_keeps_the_keys_a_legacy_record_lacks_and_brings_no_source_it_does_not_have():
+    """Whether a key is present means something: a score that is absent counts as known, a source as the global rules.
+
+    The record predates the score, and a message queued before ``source_id`` existed carries none. The level
+    stands, so the record gains no ``cvss``; the message wins the tied judgement, so the old source goes with the
+    rules it belonged to rather than staying beside rules from elsewhere.
+    """
+    cve = "CVE-2026-9106"
+    state = core.new_state()
+    held = _watched(cve, "critical", judged="warning", thresholds=STRICT, source_id="strict")
+    del held["cvss"]
+    state["watch"][cve] = copy.deepcopy(held)
+    legacy = queued(cve, "warning")
+    del legacy["source_id"], legacy["scores"]
+    _deliver(state, legacy, NOW)
+    expected = {key: value for key, value in held.items() if key != "source_id"}
+    assert state["watch"][cve] == {**expected, "thresholds": THRESHOLDS}
+
+
+def test_one_message_raises_the_record_of_one_cve_and_leaves_the_one_the_entry_holds_higher():
+    """The guard is per CVE: a DSA naming dozens of them records each against its own entry."""
+    raised, held = "CVE-2026-9107", "CVE-2026-9108"
+    state = core.new_state()
+    state["watch"][raised] = _watched(raised, "warning")
+    state["watch"][held] = _watched(held, "critical")
+    untouched = copy.deepcopy(state["watch"][held])
+    message = {
+        **_from_another_feed(raised, "critical"),
+        "ids": [raised, held],
+        "cves": [raised, held],
+        "levels": {raised: "critical", held: "warning"},
+        "scores": {raised: 9.8, held: 6.0},
+    }
+    _deliver(state, message, NOW)
+    assert state["watch"][held] == untouched
+    assert (state["watch"][raised]["level"], state["watch"][raised]["since"]) == ("critical", NOW)
 
 
 # --- PR #140 review round 2: what a pass may still send after something failed ----------------------------

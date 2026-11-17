@@ -86,9 +86,14 @@ and `src/advisory_radar/__init__.py`, the generated `CHANGELOG.md` section, and
 - The merge creates the `vX.Y.Z` tag and the GitHub Release. The tag starts the
   `release` workflow, which pushes `linux/amd64` and `linux/arm64` to
   `ghcr.io/mikomiel/advisory-radar` under the version tag and, only when the tag
-  is the highest stable `vX.Y.Z` tag, `latest` (a pre-release, or a tag below
-  the highest, leaves `latest` where it was), with build provenance and an SBOM
-  attestation bound to the pushed digest.
+  is the highest stable `vX.Y.Z` tag that is a release of `main`, `latest`, with
+  build provenance and an SBOM attestation bound to the pushed digest. A tag is
+  a release of `main` when it passes the same two checks as the release itself:
+  its commit is an ancestor of `origin/main`, and the version in its name equals
+  `[project] version` in `pyproject.toml` at that commit. A pre-release, or a
+  tag below the highest release of `main`, leaves `latest` where it was, and a
+  higher tag that fails either check does not hold `latest` back. The full rule
+  is in [docs/review-and-merge.md](docs/review-and-merge.md#release-tags).
 
 ## Code style
 
