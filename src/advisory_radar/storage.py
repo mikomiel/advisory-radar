@@ -105,6 +105,16 @@ class StoreUnavailable(RuntimeError):
     """
 
 
+def _store_unavailable(path: Path, exc: BaseException) -> StoreUnavailable:
+    """A file or database fault that is not contention: this store cannot be used.
+
+    A full disk, a read-only volume or database, and a parent that is not a directory reach the caller the
+    same way a missing driver does, because the pipeline and the CLI already answer ``StoreUnavailable`` with a
+    reported failure instead of a traceback. The JSON file store and SQLite share this one translation.
+    """
+    return StoreUnavailable(f"the state store at {path} is unavailable: {exc}")
+
+
 class Store(Protocol):
     """What the pipeline needs from wherever the document lives: its bytes, and the exclusive lock."""
 
@@ -119,7 +129,10 @@ class JsonStore:
     """Today's behaviour, unchanged: one JSON file, atomic replace, mode 0600, an ``flock`` sidecar.
 
     Every method delegates to ``state.py``. The atomic write and the lock are the two things a second
-    implementation would get subtly wrong, so this store has no persistence code of its own.
+    implementation would get subtly wrong, so this store has no persistence code of its own. What it does add is
+    the translation the SQLite store also makes: a filesystem fault while saving or taking the lock is
+    ``StoreUnavailable``. ``load`` needs none, because ``state.load_state_document`` already reports an
+    unreadable file as ``SourceError``.
     """
 
     def __init__(self, path: Path, *, schema: str = DEFAULT_SCHEMA, owner: str = DEFAULT_OWNER) -> None:
@@ -135,10 +148,20 @@ class JsonStore:
         return load_state_document(self._path, self._schema, self._owner)
 
     def save(self, document: dict) -> None:
-        save_state(self._path, document)
+        try:
+            save_state(self._path, document)
+        except OSError as exc:
+            raise _store_unavailable(self._path, exc) from exc
 
-    def lock(self, *, blocking: bool = True) -> contextlib.AbstractContextManager[None]:
-        return state_lock(self._path, blocking=blocking)
+    @contextlib.contextmanager
+    def lock(self, *, blocking: bool = True) -> Iterator[None]:
+        """Hold the ``flock`` sidecar. Only acquiring it is translated: a body's own fault keeps its own error."""
+        with contextlib.ExitStack() as stack:
+            try:
+                stack.enter_context(state_lock(self._path, blocking=blocking))
+            except OSError as exc:
+                raise _store_unavailable(self._path, exc) from exc
+            yield
 
 
 def _read_document(text: object, *, schema: str, owner: str, location: str) -> dict:
@@ -167,15 +190,6 @@ _SQLITE_UPSERT = """
 INSERT INTO state (id, document) VALUES (1, ?)
 ON CONFLICT (id) DO UPDATE SET document = excluded.document
 """
-
-
-def _sqlite_unavailable(path: Path, exc: BaseException) -> StoreUnavailable:
-    """A SQLite fault that is not contention: this store cannot be used.
-
-    A full disk and a read-only database reach the caller the same way a missing driver does, because the
-    pipeline and the CLI already answer ``StoreUnavailable`` with a reported failure instead of a traceback.
-    """
-    return StoreUnavailable(f"the state store at {path} is unavailable: {exc}")
 
 
 def _sqlite_contention(exc: sqlite3.OperationalError) -> bool:
@@ -256,7 +270,7 @@ class SqliteStore:
         except OSError as exc:
             # A directory that cannot be created or a database this process may open but not chmod is the
             # store being unavailable, not an escaping filesystem error: the probes and the CLI answer this.
-            raise _sqlite_unavailable(self._path, exc) from exc
+            raise _store_unavailable(self._path, exc) from exc
         finally:
             if connection is not None:
                 connection.close()
@@ -279,7 +293,7 @@ class SqliteStore:
             finally:
                 connection.close()
         except (sqlite3.DatabaseError, OSError) as exc:
-            raise _sqlite_unavailable(self._path, exc) from exc
+            raise _store_unavailable(self._path, exc) from exc
 
     @contextlib.contextmanager
     def lock(self, *, blocking: bool = True) -> Iterator[None]:
@@ -298,7 +312,7 @@ class SqliteStore:
             )
         except (sqlite3.DatabaseError, OSError) as exc:
             # A sidecar that cannot even be opened cannot exclude anyone, so it is a store fault, not contention.
-            raise _sqlite_unavailable(self._path, exc) from exc
+            raise _store_unavailable(self._path, exc) from exc
         try:
             os.chmod(self._lock_path, 0o600)
             self._acquire(connection, blocking=blocking)
@@ -310,7 +324,7 @@ class SqliteStore:
             else:
                 connection.execute("COMMIT")
         except (sqlite3.DatabaseError, OSError) as exc:
-            raise _sqlite_unavailable(self._path, exc) from exc
+            raise _store_unavailable(self._path, exc) from exc
         finally:
             # Closing is the backstop: SQLite rolls back on close, so a failing COMMIT cannot leave the lock
             # held by this process.

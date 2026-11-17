@@ -26,10 +26,24 @@ JSON_FEED_VERSION = "jsonfeed.org"
 #: A title derived from an untitled item's content is cut here: a notification title is a headline, not the
 #: first paragraph of the advisory.
 DERIVED_TITLE_CHARS = 200
+#: The largest feed this module reads. ``urllib_http`` stops a body at 64 MiB, but an XML tree costs many times its
+#: source in memory and no publisher's feed comes near this size, so a body above it is refused whatever format it
+#: claims to be.
+MAX_FEED_BYTES = 8 * 1024 * 1024
+#: The deepest element nesting the recursive walks in this module follow. The interpreter's own recursion limit
+#: would end them near a thousand levels with a ``RecursionError`` that no caller expects, and real feed markup and
+#: OPML folders are nested a few levels deep.
+MAX_XML_DEPTH = 100
 
 
 class FeedError(Exception):
     pass
+
+
+def _require_size(body: bytes) -> None:
+    """Refuse a body above ``MAX_FEED_BYTES`` before anything parses it."""
+    if len(body) > MAX_FEED_BYTES:
+        raise FeedError(f"feed is larger than {MAX_FEED_BYTES // (1024 * 1024)} MiB")
 
 
 def _feed_json(body: bytes) -> object | None:
@@ -186,13 +200,21 @@ def _epoch_of(value: object) -> int | None:
 
     RFC 3339 and RFC 822 both occur in the wild across the formats this module reads, so both parsers are
     tried. A value the window rejects is returned as absent rather than as a year-10000 timestamp.
+
+    A date that names no zone (ISO 8601 without an offset, a bare date, RFC 822 without a zone or with ``-0000``)
+    is read as UTC. ``timestamp()`` would otherwise read it in the host's local zone, which says nothing about
+    the publisher's: the same feed would be dated hours differently on two hosts, and an item near the backlog age
+    would be alerted on one and filed as history on the other.
     """
     raw = value.strip() if isinstance(value, str) else ""
     if not raw:
         return None
     for parse in (parsedate_to_datetime, datetime.datetime.fromisoformat):
         try:
-            epoch = int(parse(raw).timestamp())
+            moment = parse(raw)
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=datetime.UTC)
+            epoch = int(moment.timestamp())
         except (TypeError, ValueError, OverflowError):
             continue
         return epoch if _plausible(epoch) else None
@@ -255,7 +277,13 @@ def _derived_title(node: Mapping[str, object]) -> str:
 
 
 def parse_feed(body: bytes) -> FeedExport:
-    """The FreshRSS GReader JSON export."""
+    """The FreshRSS GReader JSON export; a body above ``MAX_FEED_BYTES`` is refused before it is parsed.
+
+    This explicit reader is not behind ``parse_any``, which checks the size for the sniffing path, so the cap is
+    enforced here as well: a FreshRSS instance answers with whatever it likes, and the JSON tree costs many
+    times its source in memory.
+    """
+    _require_size(body)
     return _greader_export(_feed_json(body))
 
 
@@ -433,7 +461,9 @@ def _text_of(node: ET.Element | None) -> str:
         return ""
     parts: list[str] = []
 
-    def walk(element: ET.Element) -> None:
+    def walk(element: ET.Element, depth: int) -> None:
+        if depth > MAX_XML_DEPTH:
+            raise FeedError(f"feed markup is nested too deeply (over {MAX_XML_DEPTH} levels)")
         tag = element.tag.rsplit("}", 1)[-1] if isinstance(element.tag, str) else ""
         block = tag in _XHTML_BLOCKS
         if block:
@@ -441,13 +471,13 @@ def _text_of(node: ET.Element | None) -> str:
         if element.text:
             parts.append(element.text)
         for child in list(element):
-            walk(child)
+            walk(child, depth + 1)
             if child.tail:
                 parts.append(child.tail)
         if block:
             parts.append(" ")
 
-    walk(node)
+    walk(node, 0)
     return clean_text("".join(parts))
 
 
@@ -642,7 +672,9 @@ def parse_opml(body: bytes) -> tuple[tuple[str, str, str], ...]:
         raise FeedError("document is not OPML")
     feeds: list[tuple[str, str, str]] = []
 
-    def walk(element: ET.Element) -> None:
+    def walk(element: ET.Element, depth: int) -> None:
+        if depth > MAX_XML_DEPTH:
+            raise FeedError(f"OPML is nested too deeply (over {MAX_XML_DEPTH} levels)")
         for child in list(element):
             if _local(child.tag) == "outline":
                 xml_url = (child.get("xmlUrl") or "").strip()
@@ -651,9 +683,9 @@ def parse_opml(body: bytes) -> tuple[tuple[str, str, str], ...]:
                     # folder without a feed is skipped, so only a real subscription reaches this branch.
                     title = (child.get("title") or child.get("text") or "").strip()
                     feeds.append((title, xml_url, (child.get("htmlUrl") or "").strip()))
-            walk(child)
+            walk(child, depth + 1)
 
-    walk(root)
+    walk(root, 0)
     return tuple(feeds)
 
 
@@ -733,8 +765,9 @@ def parse_any(body: bytes) -> FeedExport:
     with the GReader rules and a GReader export with the JSON Feed rules, and would read any unrelated JSON
     API's ``{"items": []}`` as a healthy GReader source with no news. The JSON branch therefore needs the
     JSON Feed version or positive GReader evidence. An HTML page is refused here because autodiscovery needs
-    the page URL, which only ``fetch_any`` has.
+    the page URL, which only ``fetch_any`` has. A body above ``MAX_FEED_BYTES`` is refused before it is parsed.
     """
+    _require_size(body)
     head = body.lstrip(b"\xef\xbb\xbf \t\r\n")
     if head[:1] in (b"{", b"["):
         document = _feed_json(body)
@@ -793,6 +826,9 @@ def fetch_any(
         return FeedExport((), False), None
     if status != 200:
         raise RssError(f"feed answered HTTP {status}" if status else "feed is unreachable")
+    # Before the HTML sniff, which parses the whole body as XML: an oversized answer is refused unread, whether
+    # it is a feed or a page that would only have advertised one.
+    _require_size(body)
     if _looks_like_html(body):
         target = discover_feed(body, url)
         if target is None:

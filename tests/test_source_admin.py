@@ -1862,6 +1862,20 @@ def test_opml_import_refuses_a_document_that_does_not_parse(tmp_path):
     assert not (tmp_path / "data" / "settings.json").exists()
 
 
+def test_opml_import_refuses_a_document_nested_too_deeply(tmp_path):
+    """A folder tree deeper than the walk follows is a refused document (400), never a recursion error (500).
+
+    The form body is capped at 64 KiB, which is still room for more levels than the interpreter's recursion limit.
+    """
+    client, _, _ = make_client(tmp_path)
+    deep = '<opml version="2.0"><body>' + "<outline>" * 1500 + "</outline>" * 1500 + "</body></opml>"
+    response = import_opml(client, deep)
+    assert response.status_code == 400
+    assert "could not be read" in response.text
+    assert "nested too deeply" in response.text
+    assert not (tmp_path / "data" / "settings.json").exists()
+
+
 def test_opml_import_checks_every_url_before_writing(tmp_path):
     client, _, _ = make_client(tmp_path)
     response = import_opml(

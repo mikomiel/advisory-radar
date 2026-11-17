@@ -60,18 +60,43 @@ def load_state_document(path: Path, schema: str, owner: str) -> dict | None:
     return expect_schema(document, schema, f"{owner} {path}")
 
 
-def serialize_json(document: dict) -> str:
-    """The exact text ``save_json`` writes, so a caller can size-check a document before replacing a file."""
+def serialize_json(document: dict, *, compact: bool = False) -> str:
+    """The exact text ``save_json`` writes, so a caller can size-check a document before replacing a file.
+
+    Indented by default, because most documents here are ones a person opens to read or fix. ``compact`` is one
+    line without padding, which ``save_state`` asks for: the state document is the one that grows, and every
+    pass writes all of it again.
+    """
+    if compact:
+        return json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
     return json.dumps(document, indent=2, sort_keys=True) + "\n"
 
 
-def save_json(path: Path, document: dict) -> None:
+def _sync_directory(directory: Path) -> None:
+    """Flush a directory's entries, so that a rename inside it survives a power cut. Best effort.
+
+    ``os.replace`` is atomic but not durable on its own: the new name lives in the directory until the directory
+    is flushed, and a power cut right after a save could bring the previous document back although the new
+    file's bytes were synced. A platform or filesystem that cannot open or sync a directory keeps the guarantee it
+    had before; a save whose document is already in place must not fail because of it.
+    """
+    with contextlib.suppress(OSError):
+        descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def save_json(path: Path, document: dict, *, compact: bool = False) -> None:
     """Atomic replace, mode 0600: a crash mid-write leaves the previous document.
 
-    The one implementation behind both documents on the data volume: the state file and the settings
-    overlay must not have two half-correct writers.
+    The new bytes are synced before the rename and the directory after it, so a document a save returned for is
+    the one a restart finds. The one implementation behind both documents on the data volume: the state file and
+    the settings overlay must not have two half-correct writers. ``compact`` is passed through to
+    :func:`serialize_json`.
     """
-    payload = serialize_json(document)
+    payload = serialize_json(document, compact=compact)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.stem}-", dir=path.parent)
     try:
@@ -84,11 +109,16 @@ def save_json(path: Path, document: dict) -> None:
     except BaseException:
         Path(temporary).unlink(missing_ok=True)
         raise
+    _sync_directory(path.parent)
 
 
 def save_state(path: Path, state: dict) -> None:
-    """Atomic replace, mode 0600: a crash mid-write leaves the previous state."""
-    save_json(path, state)
+    """Atomic replace, mode 0600: a crash mid-write leaves the previous state.
+
+    Written compactly: the state is the one document that grows, and every pass writes all of it again. The
+    settings overlay and the watchlist are the files people open, so they keep the indented default.
+    """
+    save_json(path, state, compact=True)
 
 
 class LockBusy(RuntimeError):
