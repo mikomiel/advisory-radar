@@ -4,8 +4,8 @@
 The repository auto-merges an approved pull request whose ``ci`` is green, with
 one exception: **a person merges anything that widens what the automation can
 reach** -- the workflows, the published artifact and its packaging, the release
-configuration, the secret scan configuration, and the test suite that decides
-what ``ci`` accepts.
+configuration, the secret scan configuration, the test suite that decides what
+``ci`` accepts, and the files that configure how that suite and the linter run.
 
 That rule used to live as one ``grep -E`` inside the workflow, where nothing
 could test it and a small regex edit would silently widen auto-merge. It lives
@@ -46,6 +46,9 @@ SENSITIVE_PATTERNS: tuple[str, ...] = (
     r"^\.python-version$",
     r"^\.dockerignore$",
     r"^\.gitleaks\.toml$",
+    # gitleaks drops every finding that a .gitleaksignore lists, so adding one hides a secret from the scan. It is
+    # guarded in any directory: a person has to merge it wherever the scanner might read it from.
+    r"(^|/)\.gitleaksignore$",
     # The release files decide the tag a release carries and the version it starts from: the configuration names
     # the tag format and what a release contains, the manifest the version release-please bumps. That is release
     # policy, so a person merges it -- and the generated release pull request always changes the manifest.
@@ -56,6 +59,20 @@ SENSITIVE_PATTERNS: tuple[str, ...] = (
     # the merge both apply. Leaving them out of their own guard would let one approved pull request disable
     # the guard, and every pull request after it merge without a person.
     r"^scripts/",
+    # Files that decide what the checks run, and that do not live under tests/: a root conftest.py can skip every
+    # test, a ruff.toml can select no rule. The names that tools read once, at the root, are anchored there.
+    # pytest 9 reads four names of its own (pytest.toml, .pytest.toml, pytest.ini, .pytest.ini) and each one wins over
+    # the [tool.pytest.ini_options] table of pyproject.toml, so `addopts = "--co"` in a new one makes pytest pass
+    # without running a test.
+    # The build backend merges hatch.toml over [tool.hatch] and runs hatch_build.py as a build hook: both run during
+    # `uv sync` in CI and during the image build. (`.hatch.toml` is not a name that hatchling reads.)
+    r"^(\.?ruff\.toml|\.?pytest\.(ini|toml)|tox\.ini|setup\.cfg|uv\.toml|\.coveragerc|noxfile\.py"
+    r"|hatch\.toml|hatch_build\.py|sitecustomize\.py)$",
+    # pytest loads a conftest.py from any directory it collects, so this one counts at every depth.
+    r"(^|/)conftest\.py$",
+    # ruff applies the closest configuration file to each file (a pyproject.toml counts only when it has a
+    # [tool.ruff] table), so one below the root silences the subtree it sits in; the root files are listed above.
+    r"/(\.?ruff\.toml|pyproject\.toml)$",
 )
 SENSITIVE = re.compile("|".join(SENSITIVE_PATTERNS))
 

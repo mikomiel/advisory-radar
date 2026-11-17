@@ -69,6 +69,7 @@ jobs:
     outputs:
       merged: ${{ steps.merge.outputs.merged }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       # The guard and approval rules live in tested scripts on the default branch -- the same trust level this
       # workflow already runs at, since it only ever runs from there. No credentials are persisted, so the

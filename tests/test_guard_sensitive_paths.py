@@ -28,6 +28,19 @@ def load_guard():
 
 guard = load_guard()
 
+#: The files that override what the checks run. The first is root-only on purpose (pytest, tox, uv, coverage and the
+#: build backend read one file at the root; pytest 9 reads four names of its own besides pyproject.toml, and any of
+#: them wins over it); a conftest.py counts at any depth; ruff applies the closest configuration file to each file,
+#: so a ruff.toml or a pyproject.toml below the root silences the subtree it sits in.
+CHECK_CONFIGURATION = (
+    r"^(\.?ruff\.toml|\.?pytest\.(ini|toml)|tox\.ini|setup\.cfg|uv\.toml|\.coveragerc|noxfile\.py"
+    r"|hatch\.toml|hatch_build\.py|sitecustomize\.py)$"
+)
+CONFTEST = r"(^|/)conftest\.py$"
+NESTED_RUFF_CONFIGURATION = r"/(\.?ruff\.toml|pyproject\.toml)$"
+#: gitleaks drops every finding that a .gitleaksignore lists, so adding one hides a secret from the scan.
+GITLEAKS_IGNORE = r"(^|/)\.gitleaksignore$"
+
 
 def comparison(*paths: str) -> dict:
     return {"files": [{"filename": path} for path in paths]}
@@ -52,6 +65,9 @@ def run(*paths: str, declared: int | None = None, payload: str | None = None) ->
         ".python-version",
         ".dockerignore",
         ".gitleaks.toml",
+        # the ignore list hides findings from the secret scan, at the scan root and, to stay on the safe side, anywhere
+        ".gitleaksignore",
+        "src/.gitleaksignore",
         # the release files decide the tag a release carries and the version it starts from
         "release-please-config.json",
         ".release-please-manifest.json",
@@ -61,6 +77,34 @@ def run(*paths: str, declared: int | None = None, payload: str | None = None) ->
         "scripts/review_state.py",
         "scripts/review_gate_plan.py",
         "scripts/check_no_estate_identifiers.py",
+        # files that decide what the checks run: a root conftest.py can skip every test, a ruff.toml can select no
+        # rule, and none of them lives under tests/
+        "conftest.py",
+        "ruff.toml",
+        ".ruff.toml",
+        "pytest.ini",
+        # pytest 9 reads these three as well, and each one takes precedence over the [tool.pytest.ini_options] table
+        # of pyproject.toml: `addopts = "--co"` in one of them makes `pytest` pass without running a test
+        ".pytest.ini",
+        "pytest.toml",
+        ".pytest.toml",
+        "tox.ini",
+        "setup.cfg",
+        "uv.toml",
+        ".coveragerc",
+        "noxfile.py",
+        # the build backend merges hatch.toml over [tool.hatch], and runs hatch_build.py as a build hook: both run
+        # (or change what ships) during `uv sync` in CI and during the image build
+        "hatch.toml",
+        "hatch_build.py",
+        "sitecustomize.py",
+        # a conftest.py counts at any depth; ruff applies the closest config file to each file, so a ruff
+        # configuration below the root silences the whole subtree it sits in
+        "src/conftest.py",
+        "src/advisory_radar/conftest.py",
+        "src/advisory_radar/ruff.toml",
+        "src/advisory_radar/.ruff.toml",
+        "src/advisory_radar/pyproject.toml",
     ],
 )
 def test_these_paths_need_a_human_merge(path: str):
@@ -83,6 +127,22 @@ def test_these_paths_need_a_human_merge(path: str):
         "release-please-config.json.bak",
         "src/advisory_radar/tests_helper.py",
         "docs/tests/notes.md",  # only a top-level tests/ tree is the suite that decides what ci accepts
+        # the check-configuration names are whole filenames, not substrings or suffixes
+        "docs/ruff.toml.md",
+        "ruff.toml.bak",
+        "docs/pytest.ini.example",
+        ".pytest.ini.bak",
+        "docs/pytest.toml.md",
+        "noxfile.py.bak",
+        "hatch.toml.bak",
+        "hatch_build.py.bak",
+        "docs/hatch.toml.md",
+        ".gitleaksignore.bak",  # the ignore list is a whole filename, not a prefix or a suffix
+        "docs/not.gitleaksignore",
+        "docs/gitleaksignore.md",
+        "src/advisory_radar/conftest_helpers.py",
+        "src/advisory_radar/my_conftest.py",
+        "src/advisory_radar/pyproject.toml.md",
     ],
 )
 def test_these_paths_may_merge_without_a_person(path: str):
@@ -130,14 +190,50 @@ def test_the_policy_is_the_documented_one():
         r"^\.python-version$",
         r"^\.dockerignore$",
         r"^\.gitleaks\.toml$",
+        GITLEAKS_IGNORE,
         r"^release-please-config\.json$",
         r"^\.release-please-manifest\.json$",
         r"^tests/",
         r"^scripts/",
+        CHECK_CONFIGURATION,
+        CONFTEST,
+        NESTED_RUFF_CONFIGURATION,
     )
-    # The docstring promises the docs page too, so check it: every guarded pattern reads as a literal path once
-    # the anchors and regex escapes are gone, and the paragraph that lists them must name all of them.
+    # The docstring promises the docs page too, so check it. A pattern that reads as one literal path once its anchors
+    # and regex escapes are gone is checked as that name. The four that name several files, or depend on where a file
+    # sits, are listed with what the paragraph must carry: every name as a code span of its own (a bare substring
+    # would let `.pytest.ini` stand in for `pytest.ini`) and, for the rules about place, a phrase that appears once in
+    # the paragraph. Without the phrase, deleting the sentence of a nested rule would still pass on names that the
+    # rest of the paragraph carries.
+    grouped = {
+        CHECK_CONFIGURATION: (
+            [
+                "ruff.toml",
+                ".ruff.toml",
+                "pytest.ini",
+                ".pytest.ini",
+                "pytest.toml",
+                ".pytest.toml",
+                "tox.ini",
+                "setup.cfg",
+                "uv.toml",
+                ".coveragerc",
+                "noxfile.py",
+                "hatch.toml",
+                "hatch_build.py",
+                "sitecustomize.py",
+            ],
+            ["the root files"],
+        ),
+        CONFTEST: (["conftest.py"], ["at any depth"]),
+        NESTED_RUFF_CONFIGURATION: (["ruff.toml", ".ruff.toml", "pyproject.toml"], ["below the root"]),
+        GITLEAKS_IGNORE: ([".gitleaksignore"], ["in any directory"]),
+    }
     docs = (Path(__file__).resolve().parents[1] / "docs" / "review-and-merge.md").read_text()
     paragraph = docs.split("**A person merges anything that widens", 1)[1].split("\n\n", 1)[0]
     for pattern in guard.SENSITIVE_PATTERNS:
-        assert pattern.strip("^$").replace("\\", "") in paragraph, f"{pattern} is guarded but not documented"
+        names, phrases = grouped.get(pattern) or ([pattern.strip("^$").replace("\\", "")], [])
+        for name in names:
+            assert f"`{name}`" in paragraph, f"{pattern} is guarded but `{name}` is not documented"
+        for phrase in phrases:
+            assert paragraph.count(phrase) == 1, f"{pattern} is guarded but the paragraph does not say {phrase!r} once"
