@@ -137,16 +137,46 @@ def test_a_svg_is_scanned_like_any_other_text(repo: Repository):
     assert "docs/diagram.svg:1: private IPv4 range" in done.stderr
 
 
-def test_only_a_blob_with_a_nul_byte_is_treated_as_binary(repo: Repository):
+def test_a_nul_byte_does_not_make_a_blob_binary(repo: Repository):
+    # Every blob is read as text, image data included: it passes while its bytes spell no identifier and fails when
+    # they do. The guard used to skip the UTF-8 reading of any blob with a NUL byte, and image data was the case it
+    # accepted as clean. The identifier here is delimited by NUL bytes, the way text is delimited by spaces.
+    header = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
     identifier = SAMPLES["credential store name"].encode()
-    repo.track("docs/real.png", b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + identifier)
+    repo.track("docs/real.png", header + bytes(range(256)))
     done = repo.run()
-    assert done.returncode == 0, "image data is not text, whatever the pattern finds in its bytes"
-    # the suffix is not what decides: text that is merely named like an image is read
+    assert done.returncode == 0, done.stderr
+    repo.track("docs/real.png", header + b"\x00" + identifier + b"\x00" + bytes(range(256)))
+    done = repo.run()
+    assert done.returncode == 1
+    assert "docs/real.png:" in done.stderr and "credential store name" in done.stderr
+    # the suffix is not what decides either way: text that is merely named like an image is read
     repo.track("docs/fake.png", b"credentials live in " + identifier + b"\n")
     done = repo.run()
     assert done.returncode == 1
     assert "docs/fake.png:1: credential store name" in done.stderr
+
+
+#: Text with one NUL byte in it and the identifier on line 2. A NUL byte is not a line break and not a word character,
+#: so it leaves the line numbers and the ``\b`` boundary of the identifier where they were.
+NUL_LAYOUTS = {
+    "on another line": b"first\x00 line\nreach it at %b today\n",
+    "right before the identifier": b"first line\nreach it at \x00%b today\n",
+    "right after the identifier": b"first line\nreach it at %b\x00 today\n",
+    "at the end of the file": b"first line\nreach it at %b today\n\x00",
+    "beside bytes that are not UTF-8": b"caf\xe9\x00 line\nreach it at %b today\n",
+}
+
+
+@pytest.mark.parametrize("layout", sorted(NUL_LAYOUTS))
+def test_a_stray_nul_byte_does_not_hide_ascii_text(repo: Repository, layout: str):
+    # One NUL byte anywhere used to switch the blob to the UTF-16 and UTF-32 readings only, so the text around it was
+    # never read as the UTF-8 or ASCII that it is, and the file passed with an identifier in it.
+    repo.track("notes.txt", NUL_LAYOUTS[layout] % CONTAINER.encode())
+    done = repo.run()
+    assert done.returncode == 1, "an identifier next to a NUL byte is still an identifier"
+    assert "notes.txt:2: internal container id" in done.stderr
+    assert "\x00" not in done.stderr, "a control character from a file must reach the log escaped"
 
 
 @pytest.mark.parametrize("with_mark", [True, False], ids=["with-mark", "without-mark"])

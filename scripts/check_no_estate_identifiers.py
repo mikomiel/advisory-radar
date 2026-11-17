@@ -15,17 +15,18 @@ pass.
 * Content comes from the blobs (``git cat-file --batch``), not from the work
   tree. A symlink is stored as its target text, so the target is scanned, and
   a file that is unreadable on this machine is scanned like any other.
-* A blob without a NUL byte is decoded as UTF-8 with ``errors="replace"``, so a
-  file that is not UTF-8 is still matched. A blob that holds a NUL byte is read
-  as text in UTF-16 or UTF-32 instead, because every ASCII character of such
-  text is written with NUL bytes (a Windows tool saves a file that way, with or
-  without a byte order mark): once per encoding and byte order, from the first
-  byte. A blob without a NUL byte cannot hold an ASCII identifier in a wide
-  encoding, so no wide text slips between the two rules. Two inputs are
-  reported clean and are known limits: UTF-8 text that holds a stray NUL byte,
-  which is read only as wide text, like the raw ASCII inside image data, and
-  UTF-32 text that follows a prefix of one to three bytes, which only some of
-  the readings realign. The suffix decides nothing: an ``.svg`` is text, and a
+* Every blob is decoded as UTF-8 with ``errors="replace"``, so a file that is
+  not UTF-8 is still matched, and so are ASCII text next to a stray NUL byte
+  and the raw ASCII inside image data: a NUL byte does not make a blob binary.
+  A blob that holds a NUL byte is read as text in UTF-16 and UTF-32 as well,
+  because every ASCII character of such text is written with NUL bytes (a
+  Windows tool saves a file that way, with or without a byte order mark): once
+  per encoding and byte order, from the first byte. A blob without a NUL byte
+  cannot hold an ASCII identifier in a wide encoding, so no wide text slips
+  between the readings. Two inputs are reported clean and are known limits: an
+  identifier that a NUL byte splits, which no reading joins again, and UTF-32
+  text that follows a prefix of one to three bytes, which only some of the
+  readings realign. The suffix decides nothing: an ``.svg`` is text, and a
   text file named ``.png`` is read.
 * Path names are matched too.
 * The content of one file is not read: this script, which lists what it looks
@@ -71,7 +72,8 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 SKIP_FILES = {"scripts/check_no_estate_identifiers.py"}
 
 #: The encodings in which every ASCII character is written with NUL bytes, so that a text file in one of them is a
-#: blob that holds NUL bytes. Each is applied from the first byte whether or not a byte order mark is there.
+#: blob that holds NUL bytes. Each is applied from the first byte whether or not a byte order mark is there, and
+#: only to a blob that holds a NUL byte, beside its UTF-8 reading.
 WIDE_CODECS = ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
 
 #: A submodule entry is a commit of another repository: it has no blob here, so only its path name is matched.
@@ -159,15 +161,18 @@ def read_blobs(entries: list[Entry]) -> list[tuple[Entry, bytes | None]]:
 
 
 def readings(content: bytes) -> list[str]:
-    """The texts that a blob may hold: UTF-8 for a blob without a NUL byte, else one text per wide encoding.
+    """The texts that a blob may hold: UTF-8 always, and one text per wide encoding when it holds a NUL byte.
 
     No encoding is chosen: a reading that is wrong for the blob is noise and matches none of the patterns (they
-    need ASCII characters in a row), so no heuristic can pick the wrong one. Binary data is read the same way and
-    yields no match either.
+    need ASCII characters in a row), so no heuristic can pick the wrong one. The UTF-8 reading is never dropped,
+    because a NUL byte turns no ASCII text into anything else: a stray one, or the zeros inside binary data, must
+    not hide an identifier that stands next to it. Binary data is read the same way and yields a match only when
+    its bytes spell an identifier.
     """
-    if b"\0" not in content:
-        return [content.decode("utf-8", errors="replace")]
-    return [content.decode(codec, errors="replace") for codec in WIDE_CODECS]
+    texts = [content.decode("utf-8", errors="replace")]
+    if b"\0" in content:
+        texts += [content.decode(codec, errors="replace") for codec in WIDE_CODECS]
+    return texts
 
 
 def scan(blobs: list[tuple[Entry, bytes | None]]) -> list[str]:

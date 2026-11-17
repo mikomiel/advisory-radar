@@ -222,21 +222,21 @@ one-commit checkout could see.
 `scripts/check_no_estate_identifiers.py` (the `ci` step "No internal identifiers") fails closed. It
 matches every path in the git index and the content of every blob the index names, read with
 `git cat-file --batch`, so a symlink's target and a file that cannot be read on the runner are scanned
-like any other. A blob without a NUL byte is decoded leniently as UTF-8, so a file that is not UTF-8 is
-still matched. A blob that holds a NUL byte is read as text in UTF-16 or UTF-32 instead: every ASCII
+like any other. Every blob is decoded leniently as UTF-8, so a file that is not UTF-8 is still matched,
+and so are ASCII text next to a stray NUL byte and the raw ASCII inside image data: a NUL byte does not
+make a blob binary. A blob that holds a NUL byte is also read as text in UTF-16 and UTF-32: every ASCII
 character of such text is written with NUL bytes, and a Windows tool saves a file that way, with or
-without a byte order mark. That blob is read once per encoding and byte order (four readings, each from
-the first byte), and a reading that is wrong for the blob matches nothing. A blob without a NUL byte
-cannot hold an ASCII identifier in a wide encoding. Two inputs are reported clean and are known limits:
-UTF-8 text that holds a stray NUL byte, which is read only as wide text, like the raw ASCII inside image
-data, and UTF-32 text that follows a prefix of one to three bytes, which only some of the readings
-realign. The suffix decides nothing: an `.svg` is text. One
-file is skipped for its content only, `scripts/check_no_estate_identifiers.py`, because its text lists
-the patterns; its path name is still matched. The lock file and `.gitleaks.toml` are read like any other
-file: a lock generated against a private index names that index in every package entry it resolved there.
-A git error, an object that cannot be read, output that does not parse, or
-an empty index ends the run with status 2 and the reason, never with `OK`; status 1 means identifiers
-were found.
+without a byte order mark. Those are four more readings, one per encoding and byte order, each from the
+first byte, and a reading that is wrong for the blob matches nothing. A blob without a NUL byte cannot
+hold an ASCII identifier in a wide encoding. Two inputs are reported clean and are known limits: an
+identifier that a NUL byte splits, which no reading joins again, and UTF-32 text that follows a prefix
+of one to three bytes, which only some of the readings realign. The suffix decides nothing: an `.svg`
+is text, and image data is read like text, so a binary file fails only when its bytes spell an
+identifier. One file is skipped for its content only, `scripts/check_no_estate_identifiers.py`, because
+its text lists the patterns; its path name is still matched. The lock file and `.gitleaks.toml` are read
+like any other file: a lock generated against a private index names that index in every package entry it
+resolved there. A git error, an object that cannot be read, output that does not parse, or an empty index
+ends the run with status 2 and the reason, never with `OK`; status 1 means identifiers were found.
 
 The scan reads the index, not the work tree. An edit that is not staged and a file that is not added are
 not scanned, so stage a change before a local run. CI checks out a tree in which everything is tracked,
@@ -253,16 +253,22 @@ a tag starts that job, so it checks the tag before it builds or pushes anything:
 - The version in the tag name must equal `[project] version` in `pyproject.toml`, which only the
   release pull request changes. A pre-release tag such as `v1.2.0-rc1` therefore builds only when
   `pyproject.toml` carries exactly that version.
-- `latest` moves only when the tag is the highest stable `vX.Y.Z` tag, compared as versions
-  (`v0.10.0` is above `v0.9.0`). Any other tag publishes its own version tag and leaves `latest`
-  where it was. Two tags pushed within one build window can still leave `latest` on the lower one;
-  the next release moves it.
+- `latest` moves only when the tag is the highest stable `vX.Y.Z` tag that is a release of `main`,
+  compared as versions (`v0.10.0` is above `v0.9.0`). A stable tag is a release of `main` when it passes
+  the two checks above, read at its own commit: that commit is an ancestor of `origin/main`, and the tag
+  name equals `[project] version` in `pyproject.toml` there. A stray higher tag that fails one of them (a
+  `v999.0.0` on a side commit, on a commit that carries another version, or on no commit at all) does not
+  hold `latest` back from the real releases below it. Any other tag publishes its own version tag and
+  leaves `latest` where it was. Two tags pushed within one build window can still leave `latest` on the
+  lower one; the next release moves it.
 
 These checks make a wrong tag fail instead of publish. They run inside the job, so they do not stop a
-person with write access from starting it with a tag on a commit of `main`. The build step sets no
-`context`, so the build action reads the tag through its own default Git context rather than from the
-checkout that was verified (not checked against the pinned action version here); a tag moved between
-the check and the build would then not be the commit that was checked. Two repository settings finish
+person with write access from starting it with a tag on a commit of `main`. The build step sets
+`context: .`, so it builds the checkout that the checks read, not what the build action's own default Git
+context would read again at build time; a tag moved after the checkout cannot change what is built. Which
+commit the checkout holds is up to `actions/checkout`, and nothing in the job compares it with
+`GITHUB_SHA`, which the ancestry check names. Neither this point nor the build action's handling of a
+path context was checked against the pinned actions here. Two repository settings finish
 the control. Neither is visible in the source, and this change neither verifies nor applies either
 one; both are owner actions:
 

@@ -64,19 +64,41 @@ jobs:
 
       - name: Image tags
         id: tags
-        # `latest` only for the highest stable vX.Y.Z tag: neither a pre-release (v0.2.0-rc1) nor a rebuild of an
-        # older release may move it under every existing deployment. The order is by version, not by text
-        # (v0.10.0 is above v0.9.0), and `sed -n 1p` replaces `head -n1`, which would close the pipe early and
-        # fail the step under pipefail.
+        # `latest` only for the highest stable vX.Y.Z tag that is a release of main: neither a pre-release
+        # (v0.2.0-rc1) nor a rebuild of an older release may move it under every existing deployment, and a stray
+        # higher tag that the step above would refuse (a v999.0.0 on a side commit) may not hold it back for good.
+        # The order is by version, not by text (v0.10.0 is above v0.9.0). The loop reads a list that is already
+        # complete, so that it runs in this shell and its `break` closes no pipe: a pipe into it would lose
+        # `highest` in a subshell, and could fail the step under pipefail when the producer is closed early.
         run: |
           set -euo pipefail
           repo="ghcr.io/${GITHUB_REPOSITORY}"
           tags="${repo}:${GITHUB_REF_NAME}"
-          highest="$(git tag --list 'v*' --sort=-v:refname | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sed -n 1p)"
+          # The checks of the step above, for a tag other than the one that started this run: its commit is on main
+          # and its name is the version in pyproject.toml at that commit. Whatever fails means "not a release", never
+          # an abort. `set -e` does not apply inside a function that an `if` calls, so each command returns on its own.
+          release_of_main() {
+            local sha version
+            sha="$(git rev-parse --verify --quiet "refs/tags/$1^{commit}")" || return 1
+            git merge-base --is-ancestor "${sha}" origin/main || return 1
+            version="$(git show "${sha}:pyproject.toml" 2>/dev/null | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])' 2>/dev/null)" || return 1
+            [[ "${1#v}" == "${version}" ]]
+          }
+          stable="$(git tag --list 'v*' --sort=-v:refname | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; })"
+          highest=""
+          while IFS= read -r candidate; do
+            [[ -n "${candidate}" ]] || continue
+            # This run's own tag passed the step above. A higher one has to pass the same checks to rank.
+            if [[ "${candidate}" == "${GITHUB_REF_NAME}" ]] || release_of_main "${candidate}"; then
+              highest="${candidate}"
+              break
+            fi
+            echo "${candidate} is not a release of main, so it does not compete for latest"
+          done <<< "${stable}"
           if [[ "${GITHUB_REF_NAME}" == "${highest}" ]]; then
             tags="${tags}"$'\n'"${repo}:latest"
           else
-            echo "::notice::${GITHUB_REF_NAME} is not the highest stable vX.Y.Z tag (${highest:-none}); latest is left untouched"
+            echo "::notice::${GITHUB_REF_NAME} is not the highest stable vX.Y.Z tag that is a release of main (${highest:-none}); latest is left untouched"
           fi
           printf 'list<<TAGS\n%s\nTAGS\n' "$tags" >> "$GITHUB_OUTPUT"
 
@@ -84,6 +106,9 @@ jobs:
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7
         with:
+          # The checkout that the first step verified, not the build action's own default Git context, which reads
+          # the repository again when it builds.
+          context: .
           push: true
           # BuildKit's own provenance and SBOM attestations, in the image manifest. The GitHub attestation
           # below is the independent record: it is signed by this run's identity and can be verified later

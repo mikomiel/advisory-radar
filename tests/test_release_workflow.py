@@ -76,10 +76,20 @@ class Checkout:
         assert done.returncode == 0, done.stderr
         return done.stdout.strip()
 
-    def commit(self, version: str, *, on_main: bool = True) -> str:
-        """A commit whose ``pyproject.toml`` carries ``version``; ``main`` (and ``origin/main``) move to it."""
+    def commit(self, version: str | None, *, on_main: bool = True, project: str | None = None) -> str:
+        """A commit whose ``pyproject.toml`` carries ``version``; ``main`` (and ``origin/main``) move to it.
+
+        ``version=None`` leaves the commit without a ``pyproject.toml``, and ``project`` is the text of that file when
+        it should be something else than a well-formed ``[project]`` table.
+        """
         self.counter += 1
-        (self.root / "pyproject.toml").write_text(f'[project]\nname = "radar"\nversion = "{version}"\n')
+        pyproject = self.root / "pyproject.toml"
+        if project is not None:
+            pyproject.write_text(project)
+        elif version is None:
+            pyproject.unlink(missing_ok=True)
+        else:
+            pyproject.write_text(f'[project]\nname = "radar"\nversion = "{version}"\n')
         (self.root / "change.txt").write_text(f"{self.counter}\n")
         self.git("add", "--all")
         self.git("commit", "-q", "-m", f"change {self.counter}")
@@ -89,13 +99,19 @@ class Checkout:
         return sha
 
     def side_commit(self, version: str) -> str:
-        """A commit that is not an ancestor of ``origin/main``, as on a branch that never merged."""
+        """A commit that is not an ancestor of ``origin/main``, as on a branch that never merged.
+
+        The head goes back to ``main`` afterwards, so that the next commit continues ``main`` and does not adopt
+        this one.
+        """
         main = self.git("rev-parse", "refs/remotes/origin/main")
         self.git("checkout", "-q", "--detach", main)
-        return self.commit(version, on_main=False)
+        sha = self.commit(version, on_main=False)
+        self.git("checkout", "-q", "--detach", main)
+        return sha
 
-    def tag(self, name: str, sha: str) -> None:
-        self.git("tag", name, sha)
+    def tag(self, name: str, sha: str, *, annotated: bool = False) -> None:
+        self.git("tag", *(["--annotate", "--message", "release"] if annotated else []), name, sha)
 
     def release(self, tag: str) -> Outcome:
         """Run the job's shell for a push of ``tag``, as the runner would, and report what it would publish."""
@@ -198,6 +214,61 @@ def test_a_pre_release_does_not_hide_the_newest_stable_tag(checkout: Checkout):
     assert checkout.release("v1.0.0").tags == [f"{IMAGE}:v1.0.0", f"{IMAGE}:latest"]
 
 
+#: Above every release these tests cut: a rule that lets this tag rank holds ``latest`` back for good.
+STRAY = "v999.0.0"
+
+#: A commit for the stray tag, each with one thing wrong that the first step of the job refuses to release.
+STRAY_COMMITS = {
+    "a commit that never reached main": lambda checkout: checkout.side_commit("999.0.0"),
+    "a version that is not the tag's": lambda checkout: checkout.commit("1.0.1"),
+    "no pyproject.toml": lambda checkout: checkout.commit(None),
+    "a pyproject.toml that is not TOML": lambda checkout: checkout.commit(None, project="[project\n"),
+}
+
+
+@pytest.mark.parametrize("make_stray", STRAY_COMMITS.values(), ids=STRAY_COMMITS.keys())
+def test_a_higher_tag_that_the_job_would_refuse_does_not_hold_latest_back(checkout: Checkout, make_stray):
+    # `latest` goes to the highest stable tag that is a release of main. A tag that fails the checks of the first step
+    # is not one, whoever pushed it: letting it rank would keep `latest` on the old image until someone deletes it.
+    checkout.tag("v1.0.0", checkout.commit("1.0.0"))
+    checkout.tag(STRAY, make_stray(checkout))
+    assert checkout.release(STRAY).refused, "the stray tag has to be one that the job refuses to release itself"
+    outcome = checkout.release("v1.0.0")
+    assert not outcome.refused, outcome.log
+    assert outcome.tags == [f"{IMAGE}:v1.0.0", f"{IMAGE}:latest"]
+
+
+def test_a_higher_tag_that_names_no_commit_does_not_hold_latest_back(checkout: Checkout):
+    # A tag may point at a tree or a blob. It has no commit to check, so it cannot be a release, and it must not
+    # abort the job either.
+    checkout.tag("v1.0.0", checkout.commit("1.0.0"))
+    checkout.tag(STRAY, checkout.git("rev-parse", "HEAD^{tree}"))
+    outcome = checkout.release("v1.0.0")
+    assert not outcome.refused, outcome.log
+    assert outcome.tags == [f"{IMAGE}:v1.0.0", f"{IMAGE}:latest"]
+
+
+def test_a_stray_tag_does_not_keep_a_later_release_from_taking_latest(checkout: Checkout):
+    checkout.tag("v1.0.0", checkout.commit("1.0.0"))
+    checkout.tag(STRAY, checkout.side_commit("999.0.0"))
+    checkout.tag("v1.1.0", checkout.commit("1.1.0"))
+    assert checkout.release("v1.1.0").tags == [f"{IMAGE}:v1.1.0", f"{IMAGE}:latest"]
+    # and the stray tag is no reason to hand `latest` back to the older release
+    assert checkout.release("v1.0.0").tags == [f"{IMAGE}:v1.0.0"]
+
+
+@pytest.mark.parametrize("annotated", [False, True], ids=["lightweight", "annotated"])
+def test_a_higher_tag_that_is_a_release_still_holds_latest_back(checkout: Checkout, annotated: bool):
+    # The other half of the rule, next to a stray tag that ranks above both: a higher tag that passes the checks is
+    # what the older release has to yield to, whether the tag is an object of its own or a bare reference.
+    checkout.tag("v1.0.0", checkout.commit("1.0.0"))
+    checkout.tag(STRAY, checkout.side_commit("999.0.0"))
+    checkout.tag("v1.1.0", checkout.commit("1.1.0"), annotated=annotated)
+    outcome = checkout.release("v1.0.0")
+    assert not outcome.refused, outcome.log
+    assert outcome.tags == [f"{IMAGE}:v1.0.0"], "v1.1.0 is a release of main and is above this tag"
+
+
 def test_the_tag_is_checked_before_anything_is_built_or_pushed():
     steps = release_steps()
     assert str(steps[0]["uses"]).startswith("actions/checkout@")
@@ -208,6 +279,16 @@ def test_the_tag_is_checked_before_anything_is_built_or_pushed():
     # nothing that holds a credential or builds may run first
     credentialed = [i for i, step in enumerate(steps) if str(step.get("uses", "")).startswith("docker/")]
     assert credentialed and min(credentialed) > 1
+
+
+def test_the_image_is_built_from_the_checkout_that_was_verified():
+    steps = release_steps()
+    build = next(step for step in steps if str(step.get("uses", "")).startswith(BUILD))
+    # Without a `context` the build action reads the repository again through its own default Git context, and what it
+    # builds is no longer the working tree that the first step verified.
+    assert build["with"].get("context") == ".", "the build must name the verified checkout as its context"
+    # `.` is that working tree only while the checkout leaves the event's commit at the workspace root
+    assert not {"ref", "path", "repository"} & set(steps[0].get("with", {}))
 
 
 def test_no_expression_is_interpolated_into_a_script():
