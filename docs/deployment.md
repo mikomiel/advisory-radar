@@ -55,19 +55,32 @@ Mount a directory (`./data:/data`) instead of the named volume when you want to 
 or back up the state with ordinary tools, or when you are upgrading from the earlier compose
 file: it mounted `./data` and ran the container as 1000:1000 unless you set
 `ADVISORY_RADAR_UID` and `ADVISORY_RADAR_GID`, so your state is in that directory and the new
-named volume starts empty. The directory has to be writable for whoever runs the container.
-Either give it to the image's user:
+named volume starts empty. The directory and every file in it have to belong to whoever runs
+the container: the service writes its state, settings and lock files with mode 0600, so a file
+that another UID owns cannot be read.
+
+For a new, empty directory, give it to the image's user:
 
 ```bash
 sudo install -d -m 0750 -o 10001 -g 10001 data
 ```
 
-or run the container as your own account: put your ids in `.env`, and uncomment the `user:`
-line in the compose file.
+When you upgrade and `data` already holds state, the simplest path is to keep running as the
+account that wrote it: put your ids in `.env` and uncomment the `user:` line in the compose
+file.
 
 ```bash
-mkdir -p data
 printf 'ADVISORY_RADAR_UID=%s\nADVISORY_RADAR_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
+```
+
+To move existing state to the image's user instead, stop the service, back the directory up,
+and change the owner of the directory and everything in it:
+
+```bash
+docker compose down
+tar -czf advisory-radar-data-backup.tgz data
+sudo chown -R 10001:10001 data
+sudo chmod 0750 data
 ```
 
 ## Podman (quadlet, rootless)
