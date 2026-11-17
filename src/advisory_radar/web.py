@@ -1589,6 +1589,112 @@ def _parked_digest(entries: Iterable[object]) -> str:
 #: What ``core.manage_parked`` returns when the digest a bulk form submitted names a different queue than the one
 #: it loaded; ``0`` is done and ``1`` is a store that could not be read.
 PARKED_QUEUE_CHANGED = 2
+#: How many distinct identifiers of one parked message are tried when looking for the one whose advisory page
+#: shows it; a message that owns none of the first few is listed without a link.
+PARKED_LINK_IDS = 4
+
+
+def _parked_queue(state: Mapping) -> list:
+    """The parked list as stored; a missing or malformed one is an empty queue."""
+    parked = state.get("parked")
+    return parked if isinstance(parked, list) else []
+
+
+def _parked_count(count: int) -> str:
+    """How many parked messages, in the words the parked pages use: ``1 parked message``, ``3 parked messages``."""
+    return f"{count} parked message{'' if count == 1 else 's'}"
+
+
+def _parked_page_id(state: dict, entry: dict) -> str:
+    """The identifier whose advisory page a parked row links to, or empty when none of its identifiers has one.
+
+    ``/advisories/<id>`` shows the message that owns ``<id>`` (``core.owner_of``), and another message that names
+    the same identifier can own it instead: an older one, or a newer escalation about the same CVE. A row
+    therefore prefers an identifier whose page shows this very message. Failing that it takes the first
+    identifier that has a page at all, which is still the evidence about that identifier. The identifiers it
+    introduced (``fresh``) are tried first, then the ones it names (``ids``, which is all a message written
+    before ownership was recorded has).
+    """
+    tried: set[str] = set()
+    elsewhere = ""
+    for key in ("fresh", "ids"):
+        values = entry.get(key)
+        for identifier in values if isinstance(values, list) else ():
+            if not isinstance(identifier, str) or identifier in tried:
+                continue
+            if len(tried) == PARKED_LINK_IDS:
+                return elsewhere
+            tried.add(identifier)
+            owner = core.owner_of(state, identifier)
+            if owner is None:
+                continue
+            if owner[1] is entry:
+                return identifier
+            elsewhere = elsewhere or identifier
+    return elsewhere
+
+
+def _parked_table(state: dict, csrf: str | None = None) -> str:
+    """The parked queue as a table with one row per message, in queue order.
+
+    A row says what the message is (tag, title, identifiers) and what delivery has done with it so far: how many
+    attempts it took and which channels had already accepted it, as the state recorded them. A value the state
+    does not hold, or holds as something that is not a count or a list, is shown as missing and never invented.
+    The title links to the advisory page of the message's identifier (see :func:`_parked_page_id`). With ``csrf``
+    (the form-token input) each row also offers its own Release and Drop; without it the table only lists, as on
+    the drop confirmation.
+    """
+    rows = []
+    for index, entry in enumerate(_parked_queue(state)):
+        if not isinstance(entry, dict):
+            continue
+        identities = entry.get("ids")
+        shown = ""
+        if isinstance(identities, list):
+            shown = ", ".join(value for value in identities if isinstance(value, str))
+        tag = _field(entry.get("tag"))
+        linked = _parked_page_id(state, entry)
+        title = esc(_field(entry.get("title")) or linked)
+        if linked:
+            title = f"<a href='/advisories/{esc(_advisory_token(linked))}'>{title}</a>"
+        attempts = _number(entry.get("attempts"), -1)
+        row = (
+            f"<tr><td>{_badge(tag, tag) if tag else '—'}</td><td>{title}</td>"
+            f"<td class='muted'>{esc(shown[:80])}</td>"
+            f"<td>{attempts if attempts >= 0 else "<span class='muted'>not recorded</span>"}</td>"
+            f"<td>{_identifier_list(entry.get('sent_to'))}</td>"
+        )
+        if csrf is not None:
+            token = esc(core.parked_token(entry))
+            row += (
+                "<td><div class='row-actions'>"
+                f"<form method='post' action='/parked/{index}/release'>{csrf}"
+                f"<input type='hidden' name='token' value='{token}'>"
+                "<button class='btn btn-primary'>Release</button></form>"
+                f"<form method='post' action='/parked/{index}/drop'>{csrf}"
+                f"<input type='hidden' name='token' value='{token}'>"
+                "<button class='btn btn-danger'>Drop</button></form></div></td>"
+            )
+        rows.append(row + "</tr>")
+    headings = ["Tag", "Title", "IDs", "Attempts", "Accepted by", *(["Actions"] if csrf is not None else [])]
+    return (
+        "<div class='scroll'><table class='compact'><tr>"
+        + "".join(f"<th scope='col'>{name}</th>" for name in headings)
+        + "</tr>"
+        + "".join(rows)
+        + "</table></div>"
+    )
+
+
+def _parked_bulk_form(action: str, csrf: str, digest: str, label: str, css: str = "btn") -> str:
+    """One bulk form. It names the queue the page listed (``digest``), which its action refuses to differ from."""
+    return (
+        f'<form method="post" action="{action}">{csrf}'
+        f"<input type='hidden' name='digest' value='{digest}'>"
+        f'<button class="{css}">{esc(label)}</button></form>'
+    )
+
+
 #: A login form is a handful of bytes; an unauthenticated request must not be able to make us buffer more.
 LOGIN_BODY_LIMIT = 8 * 1024
 #: The form field and the header that carry the per-session token; a state-changing POST needs one of them.
@@ -2752,45 +2858,25 @@ def create_app(
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         state = load_state()
-        parked = state.get("parked")
-        parked = parked if isinstance(parked, list) else []
-        csrf = csrf_field(request)
-        rows = []
-        from . import core
-
-        for index, entry in enumerate(parked):
-            if not isinstance(entry, dict):
-                continue
-            token = core.parked_token(entry)
-            identities = entry.get("ids")
-            shown = ""
-            if isinstance(identities, list):
-                shown = ", ".join(value for value in identities if isinstance(value, str))
-            tag = _field(entry.get("tag"))
-            rows.append(
-                f"<tr><td>{_badge(tag, tag) if tag else '—'}</td>"
-                f"<td>{esc(_field(entry.get('title')))}</td><td class='muted'>{esc(shown[:80])}</td>"
-                f"<td><div class='row-actions'>"
-                f"<form method='post' action='/parked/{index}/release'>{csrf}"
-                f"<input type='hidden' name='token' value='{esc(token)}'>"
-                "<button class='btn btn-primary'>Release</button></form>"
-                f"<form method='post' action='/parked/{index}/drop'>{csrf}"
-                f"<input type='hidden' name='token' value='{esc(token)}'>"
-                "<button class='btn btn-danger'>Drop</button></form></div></td></tr>"
-            )
-        digest_field = f"<input type='hidden' name='digest' value='{_parked_digest(parked)}'>"
-        if rows:
+        parked = _parked_queue(state)
+        listed = sum(isinstance(entry, dict) for entry in parked)
+        if listed:
+            csrf = csrf_field(request)
+            digest = _parked_digest(parked)
             body = (
-                "<div class='scroll'><table class='compact'><tr><th scope='col'>Tag</th>"
-                "<th scope='col'>Title</th><th scope='col'>IDs</th><th scope='col'>Actions</th></tr>"
-                + "".join(rows)
-                + "</table></div>"
+                "<p class='muted'>Delivery kept failing for these messages, so they wait here for a decision. "
+                "Release returns a message to the delivery queue, where the next run retries it; a channel that "
+                "already accepted it is not sent it again. Drop discards a message: it is not delivered and nothing "
+                "is remediated.</p>"
+                + _parked_table(state, csrf)
+                + f"<p class='muted'>Release all returns {_parked_count(listed)} to the delivery queue in one step. "
+                "Drop all shows what it would discard first, and discards only after you confirm.</p>"
                 # Both bulk forms name the queue this page listed: the action refuses, and changes nothing, when the
                 # queue is no longer that one (see ``parked_bulk``).
-                f'<div class="bulk"><form method="post" action="/parked/release">{csrf}{digest_field}'
-                '<button class="btn">Release all</button></form>'
-                f'<form method="post" action="/parked/drop">{csrf}{digest_field}'
-                '<button class="btn btn-danger">Drop all</button></form></div>'
+                + '<div class="bulk">'
+                + _parked_bulk_form("/parked/release", csrf, digest, f"Release all ({listed})")
+                + _parked_bulk_form("/parked/drop", csrf, digest, f"Drop all ({listed})", "btn btn-danger")
+                + "</div>"
             )
         else:
             body = _empty("Nothing is parked: no message is waiting for a decision.")
@@ -2841,6 +2927,18 @@ def create_app(
             return RedirectResponse("/login", status_code=303)
         return parked_decision(index, release=False, request=request)
 
+    def queue_changed(request: Request):
+        """The answer when a bulk form names a queue other than the current one: 409, and nothing was written."""
+        return page(
+            "Not changed",
+            "<p>The parked queue is not the one this page listed, so nothing was changed. "
+            "Review the queue again before you decide.</p>"
+            "<p><a href='/parked'>Back to the parked queue</a></p>",
+            active="/parked",
+            actions=sign_out_form(request),
+            status_code=409,
+        )
+
     def parked_bulk(release: bool, request: Request):
         """Release or drop the whole parked queue, but only the queue the form's page listed.
 
@@ -2859,15 +2957,7 @@ def create_app(
                 status = core.manage_parked(store, release=release, now=int(time.time()), expected=expected)
             if status != PARKED_QUEUE_CHANGED:
                 return RedirectResponse("/parked", status_code=303)
-        return page(
-            "Not changed",
-            "<p>The parked queue is not the one this page listed, so nothing was changed. "
-            "Review the queue again before you decide.</p>"
-            "<p><a href='/parked'>Back to the parked queue</a></p>",
-            active="/parked",
-            actions=sign_out_form(request),
-            status_code=409,
-        )
+        return queue_changed(request)
 
     @app.post("/parked/release", dependencies=[Depends(require_csrf)])
     def parked_release(request: Request):
@@ -2877,6 +2967,36 @@ def create_app(
 
     @app.post("/parked/drop", dependencies=[Depends(require_csrf)])
     def parked_drop(request: Request):
+        """Show what "Drop all" would discard, and change nothing: the form on that page confirms the drop.
+
+        The queue is read here, not locked, so this answer is a preview. The digest it checks is handed on to
+        ``/parked/drop/confirm``, which compares it under the state lock, so a queue that moves while the
+        operator reads is refused there.
+        """
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        state = load_state()
+        parked = _parked_queue(state)
+        digest = _parked_digest(parked)
+        if first(form_body(request), "digest") != digest:
+            return queue_changed(request)
+        listed = sum(isinstance(entry, dict) for entry in parked)
+        if not listed:
+            # Nothing is parked, so there is nothing to confirm (the old single-step drop also ended here).
+            return RedirectResponse("/parked", status_code=303)
+        count = _parked_count(listed)
+        effect = "none of them is delivered" if listed != 1 else "it is not delivered"
+        body = (
+            _notice(f"{count} will be discarded; {effect} and nothing is remediated.", "critical")
+            + _parked_table(state)
+            + '<div class="bulk">'
+            + _parked_bulk_form("/parked/drop/confirm", csrf_field(request), digest, f"Drop {count}", "btn btn-danger")
+            + "<a class='btn' href='/parked'>Cancel</a></div>"
+        )
+        return page("Drop parked messages", body, active="/parked", actions=sign_out_form(request))
+
+    @app.post("/parked/drop/confirm", dependencies=[Depends(require_csrf)])
+    def parked_drop_confirm(request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         return parked_bulk(release=False, request=request)

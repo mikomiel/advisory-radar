@@ -380,12 +380,31 @@ busy or failed request is not read as the previous successful pass. The result t
 signed token that expires after two minutes and is bound to the signed-in session, so a
 missing, stale or other-session token renders no notice.
 
-**Release all** and **Drop all** on `/parked` act on the queue the page listed. Each form carries a
-digest of the messages shown, and the action compares it, under the state lock, with the queue it is
-about to change. A message parked after the page was rendered makes the two differ: the answer is
-`409` with nothing written, so a new message is never released or dropped unseen. Reload the page
-and decide again. A form without a digest is refused the same way. The `release-parked` and
-`drop-parked` commands carry no digest and act on the whole queue.
+`/parked` lists each parked message with its tag, title and identifiers, the number of delivery
+attempts, and the channels that had already accepted it, as the state recorded them: a value the
+state does not hold is shown as not recorded, never invented. The title links to the advisory page
+of one of the message's identifiers, preferring one whose page shows that message. When another
+message owns every identifier it names (a newer escalation about the same CVE, say), the page shows
+that message instead, and a message that names no identifier has no page to link to. **Release**
+returns a message to the delivery queue, where the next run retries it with a fresh attempt count,
+and a channel that already accepted it is not sent it again. **Drop** discards a message: it is not
+delivered and nothing is remediated.
+
+**Release all** and **Drop all** act on the queue the page listed, and their buttons state how many
+messages that is. **Release all** is one step. **Drop all** is two: it shows a confirmation page that
+names the count and the effect ("N parked messages will be discarded; none of them is delivered and
+nothing is remediated"), lists every message it would discard, and offers **Drop N parked
+messages** or **Cancel**. The page needs no JavaScript, and Cancel is a plain link back to
+`/parked` that changes nothing. Each bulk form carries a digest of the messages shown, and the
+action compares it, under the state lock, with the queue it is about to change. A message parked
+after the page was rendered makes the two differ: the answer is `409` with nothing written, so a
+new message is never released or dropped unseen. Both steps of a drop check this, so a queue that
+changes while the confirmation page is open is refused when you confirm. Reload the page and decide
+again. A form without a digest is refused the same way. The drop itself is
+`POST /parked/drop/confirm`; `POST /parked/drop` only shows the confirmation page and changes
+nothing, so a script that dropped the queue through it posts the same `digest` and form token to
+`/parked/drop/confirm` instead. The `release-parked` and `drop-parked` commands carry no digest and
+act on the whole queue.
 
 `/inbox` is the work list across the whole lifecycle. Its rows are one per identifier, and
 each row keeps every fact the state holds about it — a parked message, a queued one, carried

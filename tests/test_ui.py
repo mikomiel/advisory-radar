@@ -1629,7 +1629,12 @@ def test_the_bulk_parked_actions_still_release_and_drop(tmp_path):
     state["parked"] = [parked_entry("CVE-2026-3")]
     save_state(runtime_state_path(tmp_path), state)
     digest = bulk_digests(client)["/parked/drop"]
-    assert client.post("/parked/drop", data={"csrf": csrf, "digest": digest}, follow_redirects=False).status_code == 303
+    # Dropping the queue takes two requests: the bulk form only shows what it would discard, and the confirm
+    # button on that page drops it.
+    assert client.post("/parked/drop", data={"csrf": csrf, "digest": digest}, follow_redirects=False).status_code == 200
+    assert len(load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")["parked"]) == 1
+    confirmed = client.post("/parked/drop/confirm", data={"csrf": csrf, "digest": digest}, follow_redirects=False)
+    assert confirmed.status_code == 303
     stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
     assert stored["parked"] == [] and stored["seen"]["CVE-2026-3"]["outcome"] == "dropped"
 
@@ -1667,10 +1672,16 @@ def test_a_bulk_parked_action_refuses_a_queue_that_changed_since_its_page(tmp_pa
     refused = client.post(f"/parked/{action}", data={"csrf": csrf, "digest": digest}, follow_redirects=False)
     assert refused.status_code == 409
     assert "nothing was changed" in refused.text
+    assert "will be discarded" not in refused.text, "a stale form gets no confirmation to confirm"
     assert (tmp_path / "state.json").read_bytes() == before, "a refused bulk action writes nothing"
     # The operator reloads, sees all three, and decides again.
     fresh = bulk_digests(client)[f"/parked/{action}"]
     assert fresh != digest
+    if action == "drop":
+        # The form only shows what a drop would discard; the confirm button on that page performs it.
+        shown = client.post("/parked/drop", data={"csrf": csrf, "digest": fresh}, follow_redirects=False)
+        assert shown.status_code == 200
+        action = "drop/confirm"
     accepted = client.post(f"/parked/{action}", data={"csrf": csrf, "digest": fresh}, follow_redirects=False)
     assert accepted.status_code == 303
     stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
@@ -1678,7 +1689,7 @@ def test_a_bulk_parked_action_refuses_a_queue_that_changed_since_its_page(tmp_pa
 
 
 @pytest.mark.parametrize("digest", [None, "", "not-a-digest", "0" * 16, "G" * 16, "é" * 16])
-@pytest.mark.parametrize("action", ["release", "drop"])
+@pytest.mark.parametrize("action", ["release", "drop", "drop/confirm"])
 def test_a_bulk_parked_post_without_a_matching_digest_is_refused(tmp_path, action, digest):
     """A form that names no queue cannot be defaulted to "whatever is queued now" (W4)."""
     state = core.new_state()
@@ -1712,6 +1723,299 @@ def test_core_bulk_parked_refuses_a_queue_other_than_the_one_expected(tmp_path):
     save_state(tmp_path / "state.json", state)
     assert core.manage_parked(store, release=False, now=NOW) == 0
     assert load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")["parked"] == []
+
+
+# --- the bulk drop is confirmed on its own page, and every parked row explains itself -----------
+
+
+def visible_text(page: str) -> str:
+    """What a reader sees of a rendered page: no stylesheet, no tags, entities decoded, whitespace collapsed."""
+    body = re.sub(r"<style>.*?</style>", " ", page, flags=re.S)
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", body))).strip()
+
+
+def parked_rows(page: str) -> list[tuple[dict[str, str], str]]:
+    """Each row of the parked table as ({column heading: text}, its html), read the way a person reads it."""
+    headings = [visible_text(heading) for heading in re.findall(r"<th\b[^>]*>(.*?)</th>", page, re.S)]
+    rows = []
+    for raw in re.findall(r"<tr>(.*?)</tr>", page, re.S):
+        cells = [visible_text(cell) for cell in re.findall(r"<td\b[^>]*>(.*?)</td>", raw, re.S)]
+        if cells:
+            rows.append((dict(zip(headings, cells, strict=True)), raw))
+    return rows
+
+
+def drop_confirmation(client: TestClient, csrf: str):
+    """Submit the bulk "Drop all" form as the parked page renders it; the answer is the confirmation page."""
+    digest = bulk_digests(client)["/parked/drop"]
+    return client.post("/parked/drop", data={"csrf": csrf, "digest": digest}, follow_redirects=False)
+
+
+def confirm_form(page: str) -> dict[str, str]:
+    """The fields of the form the confirmation page posts to /parked/drop/confirm, as a browser would send them."""
+    form = re.search(r'<form method="post" action="/parked/drop/confirm">(.*?)</form>', page, re.S)
+    assert form, "the confirmation page has no form that posts to /parked/drop/confirm"
+    return dict(re.findall(r"name=['\"]([a-z]+)['\"] value=['\"]([^'\"]*)['\"]", form.group(1)))
+
+
+def two_parked(tmp_path: Path):
+    """A signed-in client over two parked messages, and its form token."""
+    state = core.new_state()
+    state["parked"] = [parked_entry("CVE-2026-1"), parked_entry("CVE-2026-2", "warning")]
+    client, token, _ = make_client(tmp_path, state=state)
+    return client, sign_in(client, token)
+
+
+def test_the_bulk_drop_form_lists_what_it_would_discard_and_changes_nothing(tmp_path):
+    client, csrf = two_parked(tmp_path)
+    before = (tmp_path / "state.json").read_bytes()
+    shown = drop_confirmation(client, csrf)
+    _assert_shell(shown, active="/parked", status=200)
+    assert (tmp_path / "state.json").read_bytes() == before, "the bulk form asks; it discards nothing"
+    text = visible_text(shown.text)
+    assert "2 parked messages will be discarded; none of them is delivered and nothing is remediated" in text
+    assert [cells["Title"] for cells, _ in parked_rows(shown.text)] == [
+        "CRITICAL: CVE-2026-1 in libxml2",
+        "WARNING: CVE-2026-2 in libxml2",
+    ], "every message the drop would discard is listed, in queue order"
+    assert "Drop 2 parked messages" in text, "the button that discards says how many it discards"
+
+
+def test_a_single_parked_message_is_named_in_the_singular(tmp_path):
+    state = core.new_state()
+    state["parked"] = [parked_entry("CVE-2026-1")]
+    client, token, _ = make_client(tmp_path, state=state)
+    text = visible_text(drop_confirmation(client, sign_in(client, token)).text)
+    assert "1 parked message will be discarded; it is not delivered and nothing is remediated" in text
+    assert "1 parked messages" not in text and "Drop 1 parked message" in text
+
+
+def test_the_confirm_form_names_the_queue_it_listed_and_carries_the_form_token(tmp_path):
+    client, csrf = two_parked(tmp_path)
+    digest = bulk_digests(client)["/parked/drop"]
+    assert confirm_form(drop_confirmation(client, csrf).text) == {"csrf": csrf, "digest": digest}
+
+
+def test_confirming_the_drop_discards_the_listed_messages_and_releases_none(tmp_path):
+    client, csrf = two_parked(tmp_path)
+    fields = confirm_form(drop_confirmation(client, csrf).text)
+    confirmed = client.post("/parked/drop/confirm", data=fields, follow_redirects=False)
+    assert confirmed.status_code == 303 and confirmed.headers["location"] == "/parked"
+    stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    assert stored["parked"] == [] and stored["pending"] == []
+    assert [stored["seen"][cve]["outcome"] for cve in ("CVE-2026-1", "CVE-2026-2")] == ["dropped", "dropped"]
+    assert "Nothing is parked" in client.get("/parked").text
+
+
+@pytest.mark.parametrize("change", ["added", "removed", "replaced"])
+def test_a_queue_that_changed_after_the_confirmation_page_is_refused_on_confirm(tmp_path, change):
+    """The confirm button acts on the queue its page listed: a message parked, released or swapped since is a 409."""
+    first, second = parked_entry("CVE-2026-1"), parked_entry("CVE-2026-2", "warning")
+    state = core.new_state()
+    state["parked"] = [first, second]
+    client, token, _ = make_client(tmp_path, state=state)
+    csrf = sign_in(client, token)
+    fields = confirm_form(drop_confirmation(client, csrf).text)
+    state["parked"] = {
+        "added": [first, second, parked_entry("CVE-2026-3", "warning")],
+        "removed": [first],
+        "replaced": [first, parked_entry("CVE-2026-9", "warning")],  # the same count, another message
+    }[change]
+    save_state(runtime_state_path(tmp_path), state)
+    before = (tmp_path / "state.json").read_bytes()
+    refused = client.post("/parked/drop/confirm", data=fields, follow_redirects=False)
+    assert refused.status_code == 409
+    assert "nothing was changed" in refused.text and "will be discarded" not in refused.text
+    assert (tmp_path / "state.json").read_bytes() == before, "a refused confirmation writes nothing"
+
+
+def test_cancelling_the_drop_leaves_every_message_parked(tmp_path):
+    client, csrf = two_parked(tmp_path)
+    before = (tmp_path / "state.json").read_bytes()
+    shown = drop_confirmation(client, csrf)
+    cancel = re.search(r"<a\b[^>]*\bhref='(/parked)'[^>]*>\s*Cancel\s*</a>", shown.text)
+    assert cancel, "the confirmation page offers a way back that is a plain link, not a form"
+    back = client.get(cancel.group(1))
+    assert back.status_code == 200 and len(parked_rows(back.text)) == 2
+    assert (tmp_path / "state.json").read_bytes() == before, "cancelling discards nothing"
+
+
+def test_an_empty_queue_has_no_drop_to_confirm(tmp_path):
+    """Only a script can post the bulk drop with nothing parked: there is no count to confirm, so it goes back."""
+    client, token, _ = make_client(tmp_path)
+    csrf = sign_in(client, token)
+    sent = client.post("/parked/drop", data={"csrf": csrf, "digest": _parked_digest([])}, follow_redirects=False)
+    assert sent.status_code == 303 and sent.headers["location"] == "/parked"
+
+
+@pytest.mark.parametrize("path", ["/parked/drop", "/parked/drop/confirm"])
+def test_a_get_request_cannot_drop_the_queue(tmp_path, path):
+    client, _ = two_parked(tmp_path)
+    before = (tmp_path / "state.json").read_bytes()
+    assert client.get(path, follow_redirects=False).status_code == 405
+    assert (tmp_path / "state.json").read_bytes() == before
+
+
+def test_the_confirmation_page_needs_no_javascript(tmp_path):
+    client, csrf = two_parked(tmp_path)
+    shown = drop_confirmation(client, csrf)
+    # The shared contract: no script element, no inline handler or style, and the CSP that forbids scripts outright.
+    _assert_shell(shown, active="/parked", status=200)
+    assert not re.search(r"\son[a-z]+\s*=", shown.text), "no event-handler attribute"
+    assert "javascript:" not in shown.text.lower()
+    # Both choices work as plain HTML: a submit button in a POST form, and a link.
+    form = re.search(r'<form method="post" action="/parked/drop/confirm">(.*?)</form>', shown.text, re.S)
+    assert form and "<button" in form.group(1) and "type='button'" not in form.group(1)
+
+
+def test_both_drop_steps_need_a_session_and_the_form_token(tmp_path):
+    client, csrf = two_parked(tmp_path)
+    digest = bulk_digests(client)["/parked/drop"]
+    before = (tmp_path / "state.json").read_bytes()
+    for path in ("/parked/drop", "/parked/drop/confirm"):
+        for data in ({"digest": digest}, {"csrf": "0" * 64, "digest": digest}):
+            assert client.post(path, data=data, follow_redirects=False).status_code == 403, (path, data)
+    assert (tmp_path / "state.json").read_bytes() == before
+    # A caller with no session is sent to sign in, and nothing is dropped.
+    client.cookies.clear()
+    signed_out = client.post("/parked/drop/confirm", data={"csrf": csrf, "digest": digest}, follow_redirects=False)
+    assert signed_out.status_code == 303 and signed_out.headers["location"] == "/login"
+    assert (tmp_path / "state.json").read_bytes() == before
+
+
+def test_each_parked_row_links_to_the_advisory_page_that_shows_that_message(tmp_path):
+    """``/advisories/<id>`` shows the message that owns ``<id>``, so the link names an identifier the row owns."""
+    first = parked_entry("CVE-2026-1", title="FIRST-MESSAGE", queued_at=NOW - 2000)
+    second = parked_entry("CVE-2026-1", title="SECOND-MESSAGE", ids=["CVE-2026-1", "CVE-2026-2"], queued_at=NOW - 1000)
+    state = core.new_state()
+    state["parked"] = [first, second]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    rows = {cells["Title"]: raw for cells, raw in parked_rows(client.get("/parked").text)}
+    # The earlier claim owns CVE-2026-1, so the second message links through the identifier only it owns.
+    for title, owned in (("FIRST-MESSAGE", "CVE-2026-1"), ("SECOND-MESSAGE", "CVE-2026-2")):
+        assert re.findall(r"href='(/advisories/[^']*)'", rows[title]) == [f"/advisories/{advisory_token(owned)}"]
+        opened = client.get(f"/advisories/{advisory_token(owned)}")
+        assert opened.status_code == 200 and title in opened.text, "the link opens the message it sits on"
+
+
+def test_a_row_links_through_the_identifier_it_introduced_however_many_it_names(tmp_path):
+    """The writer records ``fresh`` on every message; a message that names many identifiers owns only some."""
+    named = [f"CVE-2026-{number}" for number in range(10, 16)]
+    earlier = parked_entry("CVE-2026-10", title="EARLIER-MESSAGE", queued_at=NOW - 2000, ids=named[:5], fresh=named[:5])
+    # Six identifiers, five of them already introduced by the earlier message: the one it owns is the last.
+    later = parked_entry("CVE-2026-10", title="LATER-MESSAGE", queued_at=NOW - 1000, ids=named, fresh=named[5:])
+    state = core.new_state()
+    state["parked"] = [earlier, later]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    rows = {cells["Title"]: raw for cells, raw in parked_rows(client.get("/parked").text)}
+    for title, owned in (("EARLIER-MESSAGE", named[0]), ("LATER-MESSAGE", named[5])):
+        assert re.findall(r"href='(/advisories/[^']*)'", rows[title]) == [f"/advisories/{advisory_token(owned)}"]
+        opened = client.get(f"/advisories/{advisory_token(owned)}")
+        assert opened.status_code == 200 and title in opened.text, "the link opens the message it sits on"
+
+
+def test_a_parked_row_that_owns_none_of_its_identifiers_still_links_to_their_advisory_page(tmp_path):
+    """The page of an identifier is a row's evidence even when another message owns it: it shows that message."""
+    owner = parked_entry("CVE-2026-1", title="OWNER-MESSAGE", queued_at=NOW - 2000, fresh=["CVE-2026-1"])
+    mention = parked_entry("CVE-2026-1", title="MENTION-MESSAGE", queued_at=NOW - 1000, fresh=[])
+    state = core.new_state()
+    state["parked"] = [owner, mention]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    rows = {cells["Title"]: raw for cells, raw in parked_rows(client.get("/parked").text)}
+    page = f"/advisories/{advisory_token('CVE-2026-1')}"
+    for title in ("OWNER-MESSAGE", "MENTION-MESSAGE"):
+        assert re.findall(r"href='(/advisories/[^']*)'", rows[title]) == [page], title
+    opened = client.get(page)
+    assert opened.status_code == 200 and "OWNER-MESSAGE" in opened.text, "the page shows the message that owns it"
+
+
+def test_a_parked_row_keeps_its_link_when_a_newer_escalation_takes_the_advisory_page(tmp_path):
+    """``/advisories/<id>`` opens the newest parked message that names <id>, so an escalation can take it over."""
+    older = parked_entry(
+        "CVE-2026-1", "warning", title="OLDER-MESSAGE", queued_at=NOW - 2000, parked_at=NOW - 1500, fresh=["CVE-2026-1"]
+    )
+    newer = parked_entry(
+        "CVE-2026-1",
+        kind="escalation",
+        title="ESCALATION-MESSAGE",
+        queued_at=NOW - 500,
+        parked_at=NOW - 100,
+        fresh=["CVE-2026-1"],
+    )
+    state = core.new_state()
+    state["parked"] = [older, newer]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    rows = {cells["Title"]: raw for cells, raw in parked_rows(client.get("/parked").text)}
+    page = f"/advisories/{advisory_token('CVE-2026-1')}"
+    for title in ("OLDER-MESSAGE", "ESCALATION-MESSAGE"):
+        assert re.findall(r"href='(/advisories/[^']*)'", rows[title]) == [page], title
+    opened = client.get(page)
+    assert opened.status_code == 200 and "ESCALATION-MESSAGE" in opened.text
+
+
+def test_a_parked_message_that_names_no_identifier_is_listed_without_a_link(tmp_path):
+    """There is no advisory page to send the reader to, and the row is still there to release or drop."""
+    state = core.new_state()
+    state["parked"] = [parked_entry("CVE-2026-1", title="NAMELESS-MESSAGE", ids=[], fresh=[])]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get("/parked")
+    assert page.status_code == 200
+    ((cells, raw),) = parked_rows(page.text)
+    assert cells["Title"] == "NAMELESS-MESSAGE" and "/advisories/" not in raw
+    assert "action='/parked/0/release'" in raw and "action='/parked/0/drop'" in raw
+
+
+def test_a_parked_row_shows_its_attempts_and_the_channels_that_already_accepted_it(tmp_path):
+    state = core.new_state()
+    state["parked"] = [
+        parked_entry("CVE-2026-1", title="ACCEPTED-BY-TWO", attempts=4, sent_to=["ops", "phone"]),
+        parked_entry("CVE-2026-2", title="ACCEPTED-BY-NONE", attempts=7, sent_to=[]),
+    ]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    rows = {cells["Title"]: cells for cells, _ in parked_rows(client.get("/parked").text)}
+    assert rows["ACCEPTED-BY-TWO"]["Attempts"] == "4" and rows["ACCEPTED-BY-TWO"]["Accepted by"] == "ops, phone"
+    assert rows["ACCEPTED-BY-NONE"]["Attempts"] == "7" and rows["ACCEPTED-BY-NONE"]["Accepted by"] == "(none recorded)"
+
+
+def test_a_parked_row_says_so_when_the_state_holds_no_attempts_or_channels(tmp_path):
+    """Nothing is invented for an older or hand-edited record: a missing or malformed value is not a count."""
+    state = core.new_state()
+    state["parked"] = [
+        {"tag": "warning", "title": "BARE-MESSAGE", "ids": ["CVE-2026-1"]},
+        parked_entry("CVE-2026-2", title="ODD-MESSAGE", attempts="3", sent_to={"ops": True}),
+        parked_entry("CVE-2026-3", title="FLAG-MESSAGE", attempts=True, sent_to="ops"),
+    ]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get("/parked")
+    assert page.status_code == 200
+    for cells, _ in parked_rows(page.text):
+        assert cells["Attempts"] == "not recorded" and cells["Accepted by"] == "(none recorded)", cells["Title"]
+
+
+def test_the_bulk_buttons_state_their_count_and_the_help_states_the_effect(tmp_path):
+    state = core.new_state()
+    state["parked"] = [parked_entry(f"CVE-2026-{number}") for number in range(1, 4)]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    page = client.get("/parked").text
+    release = re.search(r'<form method="post" action="/parked/release">.*?<button[^>]*>(.*?)</button>', page, re.S)
+    drop = re.search(r'<form method="post" action="/parked/drop">.*?<button[^>]*>(.*?)</button>', page, re.S)
+    assert release and visible_text(release.group(1)) == "Release all (3)"
+    assert drop and visible_text(drop.group(1)) == "Drop all (3)"
+    text = visible_text(page)
+    # What each action does is written down, for one row and for the whole queue.
+    assert "Release returns a message to the delivery queue, where the next run retries it" in text
+    assert "a channel that already accepted it is not sent it again" in text
+    assert "Drop discards a message: it is not delivered and nothing is remediated" in text
+    assert "Release all returns 3 parked messages to the delivery queue in one step" in text
+    assert "Drop all shows what it would discard first, and discards only after you confirm" in text
 
 
 def runtime_state_path(tmp_path: Path) -> Path:
