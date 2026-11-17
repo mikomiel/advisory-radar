@@ -7,7 +7,9 @@ CI starts both paths end to end with [`e2e.yml`](../.github/workflows/e2e.yml): 
 the Compose commands below, the other installs the unmodified Podman unit for a rootless user on
 the Podman that the runner provides (its log prints the version). Each job builds the image from
 the change under test, then checks that the container runs that image as UID 10001, answers
-`/healthz`, can write `/data` and keeps its state across a restart.
+`/healthz`, can write `/data` and keeps its state across a restart. Each also waits for the
+container's own scheduled health check to report `healthy`, before and after the restart, and
+never runs the probe by hand to get there ([Health checks](#health-checks)).
 
 Pick one:
 
@@ -241,6 +243,11 @@ mkdir -m 0700 secrets
 printf '%s' "$(openssl rand -hex 24)" | install -m 0444 /dev/stdin secrets/advisory_radar_token
 ```
 
+A checkout of this repository lists `secrets/` in `.gitignore` and `.dockerignore`, so the file
+is neither staged by `git add .` nor uploaded to a remote builder as part of the build context.
+If you keep the compose file in another repository or directory, add `secrets/` to that
+project's `.gitignore`, and to its `.dockerignore` if you build an image there.
+
 Then remove `ADVISORY_RADAR_AUTH_TOKEN` from `.env` and uncomment the three marked pieces in
 `docker-compose.yml`: `ADVISORY_RADAR_AUTH_TOKEN_FILE: /run/secrets/advisory_radar_token`
 under `environment:`, `secrets: [advisory_radar_token]` under the service, and the top-level
@@ -266,15 +273,21 @@ Podman creates it.
 ## Health checks
 
 The image, the compose file and the quadlet all run one probe, `advisory-radar healthcheck`.
-It reads `web.port` from the configuration (`ADVISORY_RADAR_CONFIG`, which the image sets to
-`/config/config.yml`), asks `http://127.0.0.1:<port>/healthz` and exits 0 on a `200`. On
-anything else (a refused connection, no answer within 3 seconds, another status, a
-configuration it cannot read) it exits 1 and prints the reason, which the container runtime
-keeps as the health log (`State.Health` in `docker inspect` and `podman inspect`).
+It reads one number from the YAML file (`ADVISORY_RADAR_CONFIG`, which the image sets to
+`/config/config.yml`): `web.port`, which is 8080 when the file does not set it. It asks
+`http://127.0.0.1:<port>/healthz` and exits 0 on a `200`. On anything else (a refused
+connection, no answer within 3 seconds, another status, a file it cannot read, a `web.port`
+that is not a number from 1 to 65535) it exits 1 and prints the reason on one line, which the
+container runtime keeps as the health log (`State.Health` in `docker inspect` and
+`podman inspect`).
 
-The probe sends no credential, reads no secret and ignores proxy variables, and it only
-ever talks to the loopback address of its own container. Because it reads no secret, a
-`${VARIABLE}` that only a notifier needs cannot turn a running service unhealthy.
+The probe sends no credential and ignores proxy variables, and it only ever talks to the
+loopback address of its own container. It reads nothing but that file: it expands no
+`${VARIABLE}`, opens no `${VARIABLE_FILE}` secret, does not merge the settings saved in the
+web UI (they cannot change `web.port`, which is bound when the process starts) and validates
+no other setting. The service checks its own configuration when it starts, so a
+`${VARIABLE}` that only a notifier needs, or a value that the UI has replaced, cannot turn a
+running service unhealthy.
 
 It is a liveness check: it passes while the process answers HTTP. `/readyz` is the check for
 whether passes keep finishing (see [Monitoring](#monitoring-beszel-and-friends)). Run it by
@@ -284,6 +297,14 @@ hand:
 docker compose exec advisory-radar advisory-radar healthcheck
 podman exec advisory-radar advisory-radar healthcheck   # or: podman healthcheck run advisory-radar
 ```
+
+On Podman the scheduled check is a systemd timer that Podman creates for the container.
+`podman healthcheck run` runs the probe once and records its result in the same status and
+log, so a `healthy` status right after it does not show that the timer works. Without a
+manual run, `podman inspect --format '{{.State.Health.Status}}' advisory-radar` turns
+`healthy` by itself once the first scheduled check has passed, and the log
+(`podman inspect --format '{{json .State.Health.Log}}' advisory-radar`) gains an entry every
+interval (30 s) after that.
 
 If you start the image with another configuration path, set `ADVISORY_RADAR_CONFIG` to it
 instead of passing `--config` on the command line: the probe reads the variable, so a flag

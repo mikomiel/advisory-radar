@@ -25,6 +25,7 @@ DOCKERFILE = ROOT / "Dockerfile"
 COMPOSE = ROOT / "docker-compose.yml"
 QUADLET = ROOT / "deploy" / "podman" / "advisory-radar.container"
 DOCKERIGNORE = ROOT / ".dockerignore"
+GITIGNORE = ROOT / ".gitignore"
 README = ROOT / "README.md"
 DEPLOYMENT = ROOT / "docs" / "deployment.md"
 
@@ -251,16 +252,55 @@ def test_every_healthcheck_calls_a_subcommand_the_cli_parses(name):
 # --- .dockerignore ----------------------------------------------------------------------------------------------
 
 
-def dockerignore_patterns() -> list[str]:
-    lines = DOCKERIGNORE.read_text(encoding="utf-8").splitlines()
+def ignore_patterns(path: Path) -> list[str]:
+    lines = path.read_text(encoding="utf-8").splitlines()
     return [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
+
+
+def dockerignore_patterns() -> list[str]:
+    return ignore_patterns(DOCKERIGNORE)
+
+
+def gitignore_patterns() -> list[str]:
+    return ignore_patterns(GITIGNORE)
 
 
 def test_dockerignore_keeps_local_state_and_secrets_out_of_the_build_context():
     patterns = {pattern.rstrip("/") for pattern in dockerignore_patterns()}
     # ``**/__pycache__``, not the bare name: a bare name only matches at the root of the context.
-    for required in (".git", ".venv", "**/__pycache__", ".pytest_cache", "data", "config", ".env"):
+    for required in (".git", ".venv", "**/__pycache__", ".pytest_cache", "data", "config", ".env", "secrets"):
         assert required in patterns, f".dockerignore does not exclude {required}"
+
+
+def test_gitignore_keeps_local_state_and_secrets_out_of_commits():
+    """What the quickstart and the secrets section of the guide create beside the compose file is never staged."""
+    patterns = {pattern.rstrip("/") for pattern in gitignore_patterns()}
+    for required in ("config", "data", ".env", "secrets"):
+        assert required in patterns, f".gitignore does not ignore {required}"
+
+
+def documented_secret_files() -> set[str]:
+    """Each ``secrets/...`` file that the guide or the compose file tells an operator to create, as a relative path.
+
+    A leading ``./`` is dropped, and ``/run/secrets/...`` -- the path inside the container -- is not one of them.
+    """
+    text = DEPLOYMENT.read_text(encoding="utf-8") + COMPOSE.read_text(encoding="utf-8")
+    return set(re.findall(r"(?<![\w/.-])(?:\./)?(secrets/[\w.-]+)", text))
+
+
+def is_ignored(path: str, patterns: list[str]) -> bool:
+    """Whether a relative path at the top of the tree falls under one of these patterns (names and globs only)."""
+    stripped = [pattern.rstrip("/") for pattern in patterns]
+    return any(fnmatch.fnmatch(path, pattern) or path.startswith(pattern + "/") for pattern in stripped)
+
+
+def test_the_secret_files_the_guide_creates_are_ignored_by_the_build_and_by_git():
+    """``secrets/advisory_radar_token`` sits where the build context starts and where ``git add .`` looks."""
+    documented = documented_secret_files()
+    assert documented, "the guide and the compose file name no secret file; this test has nothing left to cover"
+    for path in sorted(documented):
+        assert is_ignored(path, dockerignore_patterns()), f".dockerignore does not exclude {path}: a build uploads it"
+        assert is_ignored(path, gitignore_patterns()), f".gitignore does not ignore {path}: `git add .` stages it"
 
 
 def test_dockerignore_excludes_nothing_the_build_copies():

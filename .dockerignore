@@ -13,10 +13,12 @@
 .ruff_cache
 .mypy_cache
 
-# Local state, configuration and secrets (the quickstart creates all three beside the Dockerfile)
+# Local state, configuration and secrets (the quickstart creates the first three beside the Dockerfile, and
+# docs/deployment.md#keeping-secrets-out-of-env the last one)
 data
 config
 .env
 .env.*
+secrets
 *.db
 *.db-journal

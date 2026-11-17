@@ -4,7 +4,9 @@
 # tell a user to run, so a compose file or a Podman unit that no longer starts the image would still pass it.
 # Each job here builds the image from the checkout, never from a registry (the image under test is the one this
 # change produced), then starts it exactly as the guide says and checks what a user depends on: the running image,
-# the user it runs as, /healthz, a writable /data and state that survives a restart.
+# the user it runs as, /healthz, the container's own scheduled health check, a writable /data and state that
+# survives a restart. No step runs the health probe by hand to get a result: that would set the status itself and
+# pass a unit whose scheduled checks never run (only the failure diagnostics do, last).
 #
 #   compose         the README quickstart, in an empty scratch directory
 #   podman-quadlet  the shipped unit, installed unmodified into a rootless user's systemd
@@ -233,7 +235,12 @@ jobs:
           systemctl --user daemon-reload
           systemctl --user start advisory-radar
 
-      - name: Wait until the container is healthy
+      - name: Wait until the scheduled health check reports healthy
+        # The status has to come from the unit's own schedule. `podman healthcheck run` sets it too, so no step here
+        # runs the probe by hand: that would pass a unit whose scheduled checks never run. Podman schedules the first
+        # check about one interval (30 s) after the start, so two minutes is a wide margin, and a second entry in the
+        # health log shows that the schedule goes on. The wait is defined again after the restart, because a step is a
+        # shell of its own; tests/test_e2e_workflow.py keeps the two definitions the same.
         run: |
           set -euo pipefail
           fail() { echo "::error::$*"; exit 1; }
@@ -244,21 +251,30 @@ jobs:
             sleep 2
           done
           curl -fsS --max-time 5 "$url" > /dev/null || fail "$url does not answer two minutes after the start"
-          # The health status needs a probe result, and Podman schedules the first one a full interval (30 s) after
-          # the start. The manual probe runs only once the web UI is known to answer, so it cannot fail and count
-          # against the unit's three retries.
-          status=unknown
-          for attempt in $(seq 1 24); do
+          wait_for_scheduled_health() {
+            local status=unknown end last
+            for _ in $(seq 1 24); do
+              status=$(podman inspect --format '{{.State.Health.Status}}' advisory-radar)
+              echo "health status: $status"
+              if [ "$status" = healthy ]; then break; fi
+              sleep 5
+            done
+            [ "$status" = healthy ] || fail "no scheduled check reported healthy in two minutes (status '$status')"
+            # One entry proves one run. The log keeps only its last few entries, so they are not counted: the end
+            # time of the newest one has to change.
+            last=$(podman inspect --format '{{json .State.Health.Log}}' advisory-radar | jq -r '.[-1].End // empty')
+            [ -n "$last" ] || fail "the container is healthy but its health log is empty"
+            end=$last
+            for _ in $(seq 1 18); do
+              sleep 5
+              end=$(podman inspect --format '{{json .State.Health.Log}}' advisory-radar | jq -r '.[-1].End // empty')
+              if [ "$end" != "$last" ]; then break; fi
+            done
+            [ "$end" != "$last" ] || fail "the health check did not run again within 90 seconds of its first result"
             status=$(podman inspect --format '{{.State.Health.Status}}' advisory-radar)
-            echo "health status: $status"
-            if [ "$status" = healthy ]; then break; fi
-            if [ "$attempt" -eq 12 ]; then
-              echo "no result after a minute: the health timer may not run on this host, so run the probe once by hand"
-              if podman healthcheck run advisory-radar; then echo "the probe passed"; fi
-            fi
-            sleep 5
-          done
-          [ "$status" = healthy ] || fail "the container is '$status' two minutes after the web UI answered"
+            [ "$status" = healthy ] || fail "after a second scheduled run the container is '$status', not 'healthy'"
+          }
+          wait_for_scheduled_health
 
       - name: Running container is the built image, as UID 10001 mapped onto the runner user
         run: |
@@ -309,6 +325,39 @@ jobs:
           in_container=$(podman exec advisory-radar cat /data/e2e-probe)
           [ "$in_container" = persisted ] || fail "the file in the new container reads '$in_container'"
 
+      - name: The health schedule resumes after the restart
+        # A new container starts its health status over, so this waits for the new container's own scheduled checks
+        # exactly as the wait after the first start does. No step may run the probe by hand: that would pass a unit
+        # whose scheduled checks do not run after a restart. The function is the one that wait defines, copied, because
+        # a step is a shell of its own.
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          wait_for_scheduled_health() {
+            local status=unknown end last
+            for _ in $(seq 1 24); do
+              status=$(podman inspect --format '{{.State.Health.Status}}' advisory-radar)
+              echo "health status: $status"
+              if [ "$status" = healthy ]; then break; fi
+              sleep 5
+            done
+            [ "$status" = healthy ] || fail "no scheduled check reported healthy in two minutes (status '$status')"
+            # One entry proves one run. The log keeps only its last few entries, so they are not counted: the end
+            # time of the newest one has to change.
+            last=$(podman inspect --format '{{json .State.Health.Log}}' advisory-radar | jq -r '.[-1].End // empty')
+            [ -n "$last" ] || fail "the container is healthy but its health log is empty"
+            end=$last
+            for _ in $(seq 1 18); do
+              sleep 5
+              end=$(podman inspect --format '{{json .State.Health.Log}}' advisory-radar | jq -r '.[-1].End // empty')
+              if [ "$end" != "$last" ]; then break; fi
+            done
+            [ "$end" != "$last" ] || fail "the health check did not run again within 90 seconds of its first result"
+            status=$(podman inspect --format '{{.State.Health.Status}}' advisory-radar)
+            [ "$status" = healthy ] || fail "after a second scheduled run the container is '$status', not 'healthy'"
+          }
+          wait_for_scheduled_health
+
       - name: Service, generated unit and container diagnostics
         if: failure()
         run: |
@@ -322,9 +371,15 @@ jobs:
           show podman ps --all
           show podman logs advisory-radar
           show podman inspect --format '{{json .State.Health}}' advisory-radar
+          # Podman runs a scheduled health check from a transient timer of the user manager. A schedule that never
+          # runs shows here as a container with no timer.
+          show systemctl --user list-timers --all --no-pager
           show podman info
           # The usual reasons a rootless Podman cannot start a container on a runner: no user namespace, no sub-ids
           # for this user, or a missing helper that the Podman package only recommends.
           show sysctl kernel.apparmor_restrict_unprivileged_userns
           show grep "^$(id -un):" /etc/subuid /etc/subgid
           show dpkg --list uidmap slirp4netns passt dbus-user-session
+          # Last, because a manual run sets the health status and adds to the health log that the lines above print.
+          # It tells a probe that fails (its output is shown) from a schedule that does not run (the probe passes).
+          show podman healthcheck run advisory-radar
