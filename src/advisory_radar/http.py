@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import functools
 import http.client
+import io
 import ipaddress
 import json
 import logging
@@ -17,19 +19,23 @@ USER_AGENT = "advisory-radar (+https://github.com/mikomiel/advisory-radar)"
 #: One Discord message holds 2000 characters; titles and bodies are capped below it.
 MESSAGE_LIMIT = 2000
 
-#: ``http(method, url, headers, body) -> (status, headers, body)``; status 0 is any network error.
+#: ``http(method, url, headers, body) -> (status, headers, body)``; status 0 is any network error. A GET reads a
+#: document, so a body that cannot be received in full is an error: a truncated document is not the document. Any
+#: other method is read for its status alone, so an answer whose status line arrived keeps that status when its
+#: body is lost: reporting 0 for it would make the caller send the same request again.
 Http = Callable[[str, str, Mapping[str, str], bytes | None], tuple[int, dict[str, str], bytes]]
 
 #: urllib buffers at most this many bytes plus one, so no response exhausts memory.
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
-#: The longest one socket operation (connect, send, a single read) may wait.
+#: The longest one socket operation (connect, send, a single receive) may wait.
 HTTP_TIMEOUT = 30
-#: How long a response body may take to arrive, counted from just before the connection attempt. The timeout above
+#: How long a response may take to arrive, counted from just before the connection attempt. The timeout above
 #: bounds one operation, so a peer that sends a byte every few seconds never trips it and could hold a pass, and
-#: the state lock around it, for as long as it likes. The deadline is enforced only between body reads, never
-#: during the connect or the wait for the headers: a request already waiting inside one read can end up to
-#: ``HTTP_TIMEOUT`` later than this, and a peer that dribbles its headers is held back only by ``HTTP_TIMEOUT`` on
-#: each wait and ended at the first body read after the deadline.
+#: the state lock around it, for as long as it likes. Every receive is therefore capped at the time that is left
+#: (``_DeadlineReader``), whichever part of the response it belongs to: the status line, a header, a chunk-size
+#: line, a trailer or the body. The connection attempt (TCP connect and TLS handshake) and the send are not
+#: receives of the answer and keep ``HTTP_TIMEOUT`` alone; a connect that spends the whole budget ends the request
+#: at its first receive.
 HTTP_DEADLINE = 120
 #: One read of a body. Small enough that the deadline is checked often, large enough not to cost many calls.
 _READ_CHUNK = 64 * 1024
@@ -118,8 +124,86 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class _Request(urllib.request.Request):
+    """A request that carries the monotonic time by which its whole response has to have arrived."""
+
+    def __init__(self, *args, deadline: float, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.deadline = deadline
+
+
+class _DeadlineReader(io.RawIOBase):
+    """The raw side of a response's socket file: no single receive waits past the request's deadline.
+
+    ``HTTPResponse`` reads the status line, the headers, every chunk-size line and the trailer with ``readline``,
+    which keeps receiving until it has a whole line. A peer that sends one byte inside every socket timeout stays
+    in one such call for as long as it likes, and no check between two ``read1`` calls ever runs. The receive is
+    the one place all of those reads share, so the limit is applied there: the socket's timeout is set to
+    ``HTTP_TIMEOUT`` or to the time that is left, whichever is shorter, and a receive that finds none left fails.
+    """
+
+    def __init__(self, raw: io.RawIOBase, sock: socket.socket, deadline: float) -> None:
+        super().__init__()
+        self._raw, self._sock, self._deadline = raw, sock, deadline
+
+    def readable(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        return self._raw.fileno()
+
+    def readinto(self, buffer) -> int | None:
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("the response did not finish before the deadline")
+        self._sock.settimeout(min(HTTP_TIMEOUT, remaining))
+        return self._raw.readinto(buffer)
+
+    def close(self) -> None:
+        try:
+            self._raw.close()
+        finally:
+            super().close()
+
+
+class _DeadlineResponse(http.client.HTTPResponse):
+    """An ``HTTPResponse`` whose socket file receives under the request's deadline."""
+
+    def __init__(self, sock, *args, deadline: float, **kwargs) -> None:
+        super().__init__(sock, *args, **kwargs)
+        # The base class has just opened the socket's file and read nothing from it. ``detach`` hands back its raw
+        # stream without closing it, so the socket keeps the reference that holds it open as long as the response.
+        self.fp = io.BufferedReader(_DeadlineReader(self.fp.detach(), sock, deadline))
+
+
+class _BoundedConnection:
+    """Mixin for ``HTTPConnection`` and ``HTTPSConnection``: the response it reads is built under the deadline."""
+
+    def __init__(self, *args, deadline: float, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.response_class = functools.partial(_DeadlineResponse, deadline=deadline)
+
+
+class _Connection(_BoundedConnection, http.client.HTTPConnection):
+    pass
+
+
+class _SecureConnection(_BoundedConnection, http.client.HTTPSConnection):
+    pass
+
+
+class _HTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):  # noqa: D102 - urllib hook
+        return self.do_open(_Connection, req, deadline=req.deadline)
+
+
+class _HTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):  # noqa: D102 - urllib hook
+        return self.do_open(_SecureConnection, req, context=self._context, deadline=req.deadline)
+
+
 #: Built once: the opener owns no per-call state, and building it per request would leak connections.
-_OPENER = urllib.request.build_opener(_NoRedirects)
+_OPENER = urllib.request.build_opener(_NoRedirects, _HTTPHandler, _HTTPSHandler)
 
 
 def _read_within(response, limit: int, deadline: float) -> bytes:
@@ -155,17 +239,28 @@ def urllib_http(
         # ``urllib`` opens its other handlers too -- ``file://`` would read a local file as a feed. Every source
         # and notifier this program talks to is HTTP(S), so any other scheme is a refused request, not a fetch.
         return 0, {}, b""
-    # Taken before the connection is opened, so the time spent connecting and waiting for the headers counts
-    # against it, although nothing checks it until the body is being read.
+    # Taken before the connection is opened, so the time spent connecting counts against it; every receive after
+    # that is capped at what is left of it (``_DeadlineReader``).
     deadline = time.monotonic() + HTTP_DEADLINE
     try:
         # Built inside the guard: a malformed URL raises a ValueError whose text carries the URL, and a URL
         # can carry a token.
-        request = urllib.request.Request(url, data=body, headers={"User-Agent": USER_AGENT, **headers}, method=method)
+        request = _Request(
+            url, data=body, headers={"User-Agent": USER_AGENT, **headers}, method=method, deadline=deadline
+        )
         with _OPENER.open(request, timeout=HTTP_TIMEOUT) as response:
-            # A body that outlasts the deadline is a network error like any other (``TimeoutError`` is an
-            # ``OSError``): no partial body is returned, because a truncated document is not the document.
-            return response.status, dict(response.headers), _read_within(response, MAX_RESPONSE_BYTES + 1, deadline)
+            status, response_headers = response.status, dict(response.headers)
+            try:
+                payload = _read_within(response, MAX_RESPONSE_BYTES + 1, deadline)
+            except (OSError, http.client.HTTPException):
+                # A body that outlasts the deadline, or ends in a reset, is a network error like any other
+                # (``TimeoutError`` is an ``OSError``) for a GET: no partial body is returned, because a truncated
+                # document is not the document. Any other method is read for its status alone, and the receiver
+                # has answered: dropping its 200 would make the caller send the same message again.
+                if method.upper() == "GET":
+                    raise
+                payload = b""
+            return status, response_headers, payload
     except urllib.error.HTTPError as exc:
         try:
             payload = _read_within(exc, MAX_RESPONSE_BYTES + 1, deadline)

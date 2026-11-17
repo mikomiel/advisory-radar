@@ -277,7 +277,13 @@ def _derived_title(node: Mapping[str, object]) -> str:
 
 
 def parse_feed(body: bytes) -> FeedExport:
-    """The FreshRSS GReader JSON export."""
+    """The FreshRSS GReader JSON export; a body above ``MAX_FEED_BYTES`` is refused before it is parsed.
+
+    This explicit reader is not behind ``parse_any``, which checks the size for the sniffing path, so the cap is
+    enforced here as well: a FreshRSS instance answers with whatever it likes, and the JSON tree costs many
+    times its source in memory.
+    """
+    _require_size(body)
     return _greader_export(_feed_json(body))
 
 

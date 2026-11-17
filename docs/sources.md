@@ -36,13 +36,14 @@ another host is configured directly. The second keeps the existing guard rail ag
 router page or the metadata service, because the page — not the operator — chose that URL.
 
 A feed is read whole, so what a publisher can make this reader spend is bounded. A body above
-8 MiB is refused unread, a feed or a page alike and whatever format it claims (the HTTP layer
-itself stops any response at 64 MiB). Markup nested more than 100 levels deep inside an entry,
-and an OPML folder tree that deep, is refused as an unreadable document instead of followed. A
-document refused for either reason fails that source's pass and is reported on `/sources`, like
-any other feed this reader cannot read. A date that names no zone (an ISO 8601 date without an
-offset, a bare date, an RFC 822 date without a zone or with `-0000`) is read as UTC, never in
-the host's local zone, so the same feed is dated the same way on every host.
+8 MiB is refused unread, a feed or a page alike and whatever format it claims, a FreshRSS
+export included (the HTTP layer itself stops any response at 64 MiB). Markup nested more than
+100 levels deep inside an entry, and an OPML folder tree that deep, is refused as an
+unreadable document instead of followed. A document refused for either reason fails that
+source's pass and is reported on `/sources`, like any other feed this reader cannot read. A
+date that names no zone (an ISO 8601 date without an offset, a bare date, an RFC 822 date
+without a zone or with `-0000`) is read as UTC, never in the host's local zone, so the same
+feed is dated the same way on every host.
 
 Every source may carry `interval: 30m` (the same `<n><s|m|h>` spelling as
 `poll_interval`) to be fetched at its own pace; without one it follows the global
@@ -53,17 +54,24 @@ transient error cannot become an outage. `interval` is accepted by every kind in
 addition to the keys in the table.
 
 Every HTTP request the program makes, a source fetch as much as a lookup or a notification sent
-over HTTP, ends when one network operation (connect, send, one read) waits 30 seconds, and when
-the whole request has taken 120 seconds. The second limit is the one that matters for a server
-that answers a few bytes at a time: the first never trips for it, and the pass, with the state
-lock it holds, would wait as long as the server liked. A request ended this way is an
-unreachable source for that pass, like any other network error. The 120 seconds are counted
-from the start of the connection attempt, but they are checked only between the reads of the
-response body. A request already waiting inside one read can end up to 30 seconds after them,
-and the deadline does not interrupt the connection attempt or the wait for the response
-headers: a server that sends its headers a few bytes at a time is held back only by the
-30-second limit on each wait, and its request is ended at the first body read after the 120
-seconds. Email through SMTP is not an HTTP request and has the 30-second limit alone.
+over HTTP, ends when one network operation (connect, TLS handshake, send, one receive) waits 30
+seconds, and when the server's answer is still not complete 120 seconds after the connection
+attempt began. The second limit is the one that matters for a server that answers a few bytes
+at a time: the first never trips for it, and the pass, with the state lock it holds, would wait
+as long as the server liked. A request ended this way is an unreachable source for that pass,
+like any other network error. Every wait for the server's answer is cut at what is left of the
+120 seconds: the status line, each header, the size line and the trailer of a chunked body, and
+the body itself. A server that sends any of those a few bytes at a time is therefore ended at
+120 seconds, and so is one that says nothing. The connection attempt (the TCP connect and the
+TLS handshake) and the sending of the request are not waits for the answer: they have the
+30-second limit alone, and a connection attempt that has used up the whole budget ends the
+request at its first wait for the answer.
+
+A document is read whole or not at all: a source or a lookup whose body cannot be received in
+full is unreachable for that pass. A notification is judged by its status alone, so a receiver
+that has answered and then stalls or resets while sending its body keeps its status: reporting
+it as unreachable would make the same message go out again. Email through SMTP is not an HTTP
+request and has the 30-second limit alone.
 
 A pasted OPML 2.0 subscription list is imported with **Add feeds from OPML** in the same
 section: every `<outline>` with an `xmlUrl` becomes an `rss` source, folders are

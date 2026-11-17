@@ -8,6 +8,7 @@ import time
 import pytest
 
 from advisory_radar import feeds
+from advisory_radar.sources import FreshRssSource
 
 GREADER = b"""{
   "items": [
@@ -565,6 +566,38 @@ def test_fetch_any_refuses_an_oversized_feed_behind_the_autodiscovery_hop(monkey
 
     with pytest.raises(feeds.FeedError, match="larger than 8 MiB"):
         feeds.fetch_any(http, PAGE_URL)
+
+
+def test_the_freshrss_reader_refuses_an_export_over_the_size_cap():
+    """The explicit GReader reader is not behind ``parse_any``, so the cap has to be enforced in it as well."""
+    with pytest.raises(feeds.FeedError, match="larger than 8 MiB"):
+        feeds.parse_feed(_padded(GREADER, FEED_CAP + 1))
+
+
+def test_the_freshrss_reader_reads_an_export_of_exactly_the_size_cap():
+    assert feeds.parse_feed(_padded(GREADER, FEED_CAP)).items
+
+
+def test_a_freshrss_source_refuses_an_oversized_answer_before_parsing_it(monkeypatch):
+    """What a pass runs for a ``freshrss`` source is ``fetch_feed``, which must not parse a body past the cap."""
+    parsed = []
+    original = feeds._feed_json
+    monkeypatch.setattr(feeds, "_feed_json", lambda body: parsed.append(len(body)) or original(body))
+
+    def http(method, url, headers, body):
+        return 200, {}, _padded(GREADER, FEED_CAP + 1)
+
+    with pytest.raises(feeds.FeedError, match="larger than 8 MiB"):
+        FreshRssSource("fresh", "https://rss.example.net", "token").fetch(http, {})
+    assert parsed == [], "the oversized body was refused unread"
+
+
+def test_a_freshrss_source_reads_an_answer_of_exactly_the_size_cap():
+    def http(method, url, headers, body):
+        return 200, {}, _padded(GREADER, FEED_CAP)
+
+    window = FreshRssSource("fresh", "https://rss.example.net", "token").fetch(http, {})
+    assert [item.guid for item in window.items] == ["1"]
 
 
 def test_markup_nested_too_deeply_is_a_feed_error_not_a_recursion_error():

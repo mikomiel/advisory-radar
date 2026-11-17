@@ -7,8 +7,12 @@ per-source enrichment clocks, secret collection and the persisted run record.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
+import socketserver
+import threading
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -3452,8 +3456,9 @@ def test_a_body_that_dribbles_past_the_deadline_is_a_network_error(monkeypatch):
 
 
 def test_the_deadline_counts_the_time_spent_before_the_first_byte(monkeypatch):
-    """The clock starts before the connection, so a slow connect or header wait spends the same budget. Nothing
-    interrupts that wait (only HTTP_TIMEOUT bounds each step of it): the request ends at the first body read."""
+    """The clock starts before the connection, so a slow connect or header wait spends the same budget, and a
+    request that reaches its first body read with nothing left ends there. This one has no socket: a wait for the
+    headers is itself cut at the deadline by the real transport, which the loopback tests below cover."""
 
     def opened(request, timeout):
         clock.now += transport.HTTP_DEADLINE + 1  # connecting and waiting for the headers took that long
@@ -3484,3 +3489,164 @@ def test_a_body_inside_the_deadline_is_returned_whole_and_bounded_by_the_limit(m
     assert status == 200 and payload == b"x" * 11, "callers rely on receiving MAX_RESPONSE_BYTES + 1 bytes"
     monkeypatch.setattr(transport, "MAX_RESPONSE_BYTES", 1000)
     assert transport.urllib_http("GET", "https://feeds.example.com/small", {}, None)[2] == b"x" * 100
+
+
+# ---------------------------------------------------------------------------
+# PR #140 review round: what the transport keeps of an answer it could not finish, and where it stops waiting
+
+
+class _LosesItsBody(_Dribble):
+    """A response whose status line arrived and whose body ends in a connection reset."""
+
+    def read1(self, size: int = -1) -> bytes:
+        raise ConnectionResetError("reset by peer")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        lambda clock: _Dribble(clock, seconds_per_byte=10.0),
+        lambda clock: _LosesItsBody(clock, seconds_per_byte=0.0),
+    ],
+    ids=["dribbled-past-the-deadline", "reset"],
+)
+def test_a_post_keeps_the_status_its_receiver_answered_when_the_body_is_lost(monkeypatch, body):
+    """A notifier POST is judged by its status alone, and a 200 is the receiver's answer whatever follows it.
+
+    Reporting status 0 for it says "not delivered", so the message is posted again and the receiver gets it twice.
+    A GET that reads a document is the opposite: a truncated document is not the document, so it stays an error.
+    """
+    clock, transport = _http_with(monkeypatch, lambda request, timeout: body(clock))
+    assert transport.urllib_http("POST", "https://hooks.example.com/x", {}, b"{}") == (200, {}, b"")
+    assert transport.urllib_http("GET", "https://feeds.example.com/x", {}, None) == (0, {}, b"")
+
+
+def test_a_webhook_that_answered_200_is_not_told_apart_from_one_that_finished(monkeypatch):
+    from advisory_radar.notifiers import WebhookNotifier
+
+    clock, transport = _http_with(monkeypatch, lambda request, timeout: _Dribble(clock, seconds_per_byte=10.0))
+    entry = {"title": "t", "body": "b", "tag": "warning", "kind": "new", "ids": ["CVE-2026-1"]}
+    assert WebhookNotifier("hook", "https://hooks.example.com/x").send(entry, transport.urllib_http) == 200
+
+
+_HTTP_200 = b"HTTP/1.1 200 OK\r\nConnection: close\r\n"
+_CHUNKED = _HTTP_200 + b"Transfer-Encoding: chunked\r\n\r\n"
+#: Places inside one response where a peer can stall, as ``(sent before the stall, sent after it)``. The stall is a
+#: run of single bytes in a chunk extension, a trailer or a header: reading the body in pieces never covers them.
+_STALLS = {
+    "chunk-size-extension": (_CHUNKED + b"5;e=", b"\r\nhello\r\n0\r\n\r\n"),
+    "last-chunk-extension": (_CHUNKED + b"5\r\nhello\r\n0;e=", b"\r\n\r\n"),
+    "trailer": (_CHUNKED + b"5\r\nhello\r\n0\r\nX-T: ", b"\r\n\r\n"),
+    "header": (_HTTP_200 + b"Content-Length: 5\r\nX-Slow: ", b"\r\n\r\nhello"),
+}
+
+
+def _dribble(count: int, interval: float) -> list:
+    """``count`` single bytes, each followed by a pause of ``interval`` seconds."""
+    return [part for _ in range(count) for part in (b"x", interval)]
+
+
+@contextlib.contextmanager
+def _scripted_server(monkeypatch, *script):
+    """A loopback server that answers every request by playing ``script``: bytes are sent, numbers are pauses.
+
+    Yields the URL and an event that is set when a send failed because the client had gone away, which is how a
+    test sees that the client stopped reading while the server still had bytes to send.
+    """
+    gone = threading.Event()
+
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self):
+            received = b""
+            while b"\r\n\r\n" not in received:  # the request head, and with it a small body
+                chunk = self.request.recv(4096)
+                if not chunk:
+                    return
+                received += chunk
+            try:
+                for part in script:
+                    if isinstance(part, bytes):
+                        self.request.sendall(part)
+                    else:
+                        time.sleep(part)
+            except OSError:
+                gone.set()
+
+    class Server(socketserver.ThreadingTCPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    # An environment proxy must not stand between the test and the loopback server it starts.
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    server = Server(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/", gone
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _short_limits(monkeypatch, deadline: float = 0.4):
+    """The transport with a short deadline and a socket timeout no test pause comes near.
+
+    A test that expects the request to fail may use the 0.4 s default: a slow machine only makes it fail sooner.
+    A test that expects an answer to arrive passes a deadline its loopback exchange cannot plausibly miss.
+    """
+    from advisory_radar import http as transport
+
+    monkeypatch.setattr(transport, "HTTP_DEADLINE", deadline)
+    monkeypatch.setattr(transport, "HTTP_TIMEOUT", 5)
+    return transport
+
+
+@pytest.mark.parametrize("stall", _STALLS)
+def test_a_peer_that_dribbles_framing_bytes_is_cut_off_at_the_deadline(monkeypatch, stall):
+    """``read1`` returns after one read of the body, but it can sit inside a chunk-size line, a trailer or a header
+    for as long as bytes keep arriving inside the socket timeout; the deadline has to stop that too."""
+    transport = _short_limits(monkeypatch)
+    before, after = _STALLS[stall]
+    with _scripted_server(monkeypatch, before, *_dribble(100, 0.05), after) as (url, gone):
+        assert transport.urllib_http("GET", url, {}, None) == (0, {}, b"")
+        assert gone.wait(3), "the client gave up while the server was still sending: the deadline stopped it"
+
+
+@pytest.mark.parametrize("stall", _STALLS)
+def test_framing_that_arrives_in_time_is_read_whole(monkeypatch, stall):
+    """The control for the test above: the same responses, without the stall, are read exactly as before."""
+    transport = _short_limits(monkeypatch, deadline=10)
+    before, after = _STALLS[stall]
+    with _scripted_server(monkeypatch, before, *_dribble(3, 0.0), after) as (url, _):
+        status, headers, payload = transport.urllib_http("GET", url, {}, None)
+    assert (status, payload) == (200, b"hello")
+    assert ("X-Slow" in headers) == (stall == "header")
+
+
+def test_a_read_that_waits_for_the_server_ends_at_the_deadline_not_at_the_socket_timeout(monkeypatch):
+    """Nothing is in flight here, so one receive is waiting for the peer: it must not outlast the deadline."""
+    transport = _short_limits(monkeypatch)
+    with _scripted_server(monkeypatch, _HTTP_200 + b"Content-Length: 5\r\n\r\n", 3.0, b"hello") as (url, _):
+        started = time.monotonic()
+        result = transport.urllib_http("GET", url, {}, None)
+        elapsed = time.monotonic() - started
+    assert result == (0, {}, b"")
+    assert elapsed < 2.5, "the receive was cut at the 0.4 s deadline; the socket timeout (5 s) never applied"
+
+
+def test_a_webhook_that_answers_200_and_then_stalls_its_body_is_still_a_200(monkeypatch):
+    """The same loss as above, over a real connection: the receiver answered, so the answer is its status.
+
+    The 200 has to arrive inside the deadline for this to be the case, so the deadline is a second here, not the
+    0.4 s of the tests that expect a failure; the stall that follows the 200 lasts five.
+    """
+    transport = _short_limits(monkeypatch, deadline=1.0)
+    with _scripted_server(monkeypatch, _HTTP_200 + b"Content-Length: 100000\r\n\r\n", *_dribble(100, 0.05)) as (
+        url,
+        gone,
+    ):
+        status, _, payload = transport.urllib_http("POST", url, {"Content-Type": "application/json"}, b"{}")
+        assert gone.wait(3), "the client stopped waiting at the deadline"
+        assert (status, payload) == (200, b""), "a receiver that answered 200 was not asked twice"
+        assert transport.urllib_http("GET", url, {}, None) == (0, {}, b""), "a document read is still incomplete"

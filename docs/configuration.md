@@ -126,7 +126,10 @@ still escalates — that is evidence, not a rule.
 
 An escalation counts as told only when a channel accepted it. If the message is dropped
 instead, the entry keeps the level you were last told, so the next daily re-evaluation queues
-the escalation again for as long as the CVE is watched.
+the escalation again for as long as the CVE is watched. A delivery only ever raises that
+level. When a warning escalation that a channel refused earlier is still queued and a critical
+one is added beside it, a pass delivers the critical first, and the late warning leaves the
+entry at critical, so the next re-evaluation does not send the critical again.
 
 `/thresholds`, linked from `/config`, previews one advisory: give it a CVSS, an EPSS, its
 KEV and SSVC state, a source, a product and the advisory's identifiers, and it shows the
@@ -238,9 +241,12 @@ for a shadow run: the instance evaluates what it would send before real channels
 A pass delivers a bounded number of queued advisories. When more are queued than that, it takes
 the critical ones first and fills the rest of its window in queue order, so a long queue of
 warnings cannot hold a critical advisory behind the limit, and a warning that a channel refuses
-cannot stop the pass before a critical one has been tried. A digest is built from the same
-window. The stored queue keeps its order, and a queue with no critical advisory is delivered
-exactly as before.
+cannot stop the pass before a critical one has been tried. That holds across routes too: every
+critical advisory is tried before any warning, whichever channels they are routed to, so a
+warning that one channel refuses cannot keep a critical advisory for another channel from
+being tried. A digest is built from the same window, and one that covers a critical advisory
+counts as a critical message. The stored queue keeps its order, and a queue with no critical
+advisory is delivered exactly as before.
 
 A generic `webhook` notifier may carry a signing secret, referenced from the environment:
 

@@ -1597,9 +1597,18 @@ def _delivered(
             # Like a new message, a dropped escalation was never sent: the watch must keep the level the reader
             # was last told. Advancing it would make the next re-score treat the escalation as old news and never
             # owe it again; left alone, the next daily re-score queues it again while the CVE is still watched.
-            watch["level"] = entry["tag"]
-            watch["judged"] = entry["tag"]
-            watch["thresholds"] = Thresholds.from_snapshot(entry.get("thresholds")).snapshot()
+            #
+            # A delivery only ever raises the watch. A warning escalation that failed once can still be queued
+            # when a critical one is added beside it, and a pass delivers the critical first: writing the warning
+            # over it afterwards would put the watch back below what the reader has been told, and the next daily
+            # re-score would queue the critical again. The same holds for ``judged``, which a silent re-baseline
+            # may have raised past the message, and the rules travel with the judgement they produced.
+            tag = entry["tag"]
+            if _rank(tag) >= _rank(watch.get("level")):
+                watch["level"] = tag
+            if _rank(tag) >= _rank(watch.get("judged")):
+                watch["judged"] = tag
+                watch["thresholds"] = Thresholds.from_snapshot(entry.get("thresholds")).snapshot()
         # The escalation is a later notification about an advisory already recorded: the seen record keeps
         # what was first sent, and this event explains the higher level.
         _record_event(state, entry, now, outcome, delivered_to)
@@ -2879,9 +2888,11 @@ def deliver(
     cannot take the slot a critical advisory needs; they stay pending and are looked at again on a later pass.
     Each group is planned once (:func:`delivery.plan`): a digest becomes one POST per destination covering the
     entries that still need it, and an entry held by quiet hours is absent from every batch, stays pending
-    and does not count as a failed attempt. Success or failure is then recorded per covered entry -- one
-    POST that covered several advisories is one attempt for each of them -- so the parking rule and
-    ``state["seen"]`` stay honest.
+    and does not count as a failed attempt. The batches of every group are posted in the order of the window,
+    not group by group, so each critical advisory is tried before any warning whichever channels they are
+    routed to (a digest that covers a critical advisory is posted with the critical ones). Success or failure
+    is then recorded per covered entry -- one POST that covered several advisories is one attempt for each of
+    them -- so the parking rule and ``state["seen"]`` stay honest.
 
     ``language`` is the language of a digest's own words (``messages``); a queued message is posted in the
     language it was rendered in.
@@ -3051,6 +3062,11 @@ def _deliver_grouped(
     two rules that name the same notifiers in another order share one digest, and the entries keep the order
     of the window. A selection that names no built notifier therefore fails the pass before any of this pass's
     messages is posted, and every message stays pending.
+
+    The batches of all groups are then posted in the order of the window, a digest at the place of its first
+    entry. With digests off that is the order the single-message loop uses, so every critical advisory is tried
+    before any warning whichever channels they are routed to: a warning that one channel refuses stops the pass,
+    and it must not be the reason a critical advisory routed to another channel is never tried.
     """
     window = []
     for entry in _critical_first(state["pending"]):
@@ -3088,12 +3104,19 @@ def _deliver_grouped(
             groups[key] = []
             targets_by_group[key] = targets
         groups[key].append(entry)
-    for key, group in groups.items():
-        for batch in delivery.plan(group, now, digest=digest, quiet=quiet_hours, language=language):
-            if not _deliver_batch(
-                state, http, now, persist, batch, targets_by_group[key], digest=digest, language=language
-            ):
-                return False
+    # Planned for every group first, then posted in the order of the window, not group by group: a group walked to
+    # the end before the next one starts would post its warnings ahead of another group's critical advisory, and a
+    # warning its channel refuses would end the pass before that critical was tried.
+    position = {id(entry): index for index, entry in enumerate(window)}
+    scheduled = [
+        (batch, targets_by_group[key])
+        for key, group in groups.items()
+        for batch in delivery.plan(group, now, digest=digest, quiet=quiet_hours, language=language)
+    ]
+    scheduled.sort(key=lambda step: position[id(step[0].entries[0])])
+    for batch, targets in scheduled:
+        if not _deliver_batch(state, http, now, persist, batch, targets, digest=digest, language=language):
+            return False
     return True
 
 

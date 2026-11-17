@@ -890,3 +890,143 @@ def test_a_critical_behind_a_full_window_goes_first_in_a_digest():
     assert len(ops.sent) == 1 and ops.sent[0]["ids"][0] == "CVE-2026-9000"
     assert len(ops.sent[0]["ids"]) == core.DELIVERY_CAP, "the cap still bounds what one pass covers"
     assert len(state["pending"]) == 1
+
+
+# --- PR #140 review round -------------------------------------------------------------------------------
+
+
+class _Ordered(Recorder):
+    """A channel that writes every id it is handed to one shared list, so the order across channels is visible."""
+
+    def __init__(self, notifier_id: str, log: list[str], refuses_warnings: bool = False) -> None:
+        super().__init__(notifier_id)
+        self.log = log
+        self.refuses_warnings = refuses_warnings
+
+    def send(self, entry: dict, http) -> int:
+        self.log.append(entry["ids"][0])
+        super().send(entry, http)
+        return 400 if self.refuses_warnings and entry["tag"] == "warning" else 200
+
+
+def test_a_refused_warning_for_one_route_does_not_hold_back_a_critical_for_another():
+    """Grouped delivery (quiet hours configured, even when closed) must try every critical before any warning.
+
+    The window is critical-first, but the entries are then grouped by routing, and the groups used to be posted one
+    after another: the warning that shares a route with the first critical was posted before the second critical,
+    and its refusal ended the pass before that critical was tried at all.
+    """
+    state = core.new_state()
+    state["pending"] = [
+        queued("CVE-2026-1", "critical", source_id="one"),
+        queued("CVE-2026-2", "critical", source_id="two"),
+        queued("CVE-2026-3", "warning", source_id="one"),
+    ]
+    routes = [
+        {"match": {"source": "one"}, "notifiers": ["ops"]},
+        {"match": {"source": "two"}, "notifiers": ["phone"]},
+    ]
+    log: list[str] = []
+    ops, phone = _Ordered("ops", log, refuses_warnings=True), _Ordered("phone", log)
+    window = delivery.parse_quiet_hours("22:00-07:00")
+    assert core.deliver(state, [ops, phone], no_http, local_at(12), routes=routes, quiet_hours=window) is False
+    assert log == ["CVE-2026-1", "CVE-2026-2", "CVE-2026-3"], "both critical advisories were tried before the warning"
+    assert state["seen"]["CVE-2026-2"]["outcome"] == "delivered", "the critical for the other route was delivered"
+    assert [entry["ids"][0] for entry in state["pending"]] == ["CVE-2026-3"]
+    assert state["pending"][0]["attempts"] == 1, "only the refused warning is charged an attempt"
+
+
+def test_grouped_delivery_posts_in_the_order_of_the_window_across_routes():
+    """With digests off the grouped path is the single-message loop with routing: critical first, queue order after."""
+    state = core.new_state()
+    state["pending"] = [
+        queued("CVE-2026-1", "warning", source_id="one"),
+        queued("CVE-2026-2", "critical", source_id="two"),
+        queued("CVE-2026-3", "warning", source_id="two"),
+        queued("CVE-2026-4", "critical", source_id="one"),
+    ]
+    routes = [
+        {"match": {"source": "one"}, "notifiers": ["ops"]},
+        {"match": {"source": "two"}, "notifiers": ["phone"]},
+    ]
+    log: list[str] = []
+    ops, phone = _Ordered("ops", log), _Ordered("phone", log)
+    window = delivery.parse_quiet_hours("22:00-07:00")
+    assert core.deliver(state, [ops, phone], no_http, local_at(12), routes=routes, quiet_hours=window) is True
+    assert log == ["CVE-2026-2", "CVE-2026-4", "CVE-2026-1", "CVE-2026-3"]
+    assert state["pending"] == []
+
+
+def _watch_below_the_bar(cve: str, level: str = "suppressed") -> dict:
+    """A CVE first scored below the bar: the reader was told nothing, so only the watch record knows it."""
+    return {
+        "since": local_at(12) - 3 * core.DAY,
+        "last_eval": local_at(12) - 2 * core.DAY,
+        "level": level,
+        "judged": level,
+        "title": "vendored widget",
+        "link": "https://vendor.example/9000",
+        "cvss": 2.0,
+    }
+
+
+class _MeasuredAt5:
+    """Complete CVE facts at CVSS 5.0: a warning, never critical unless something else (KEV) says so."""
+
+    def cves(self, cves, **ignored):
+        return {identifier: core.CveFacts(5.0, None, None, None, True) for identifier in cves}
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{}, {"digest": True}, {"quiet_hours": delivery.parse_quiet_hours("22:00-07:00")}],
+    ids=["each", "digest", "quiet-hours-closed"],
+)
+def test_a_late_warning_escalation_never_lowers_what_a_critical_one_already_told_the_reader(options):
+    """A warning escalation that failed once stays queued; a KEV hit then queues a critical one beside it.
+
+    Both are delivered in one pass, critical first. The warning must not write its level over the critical one:
+    that would put the watch back at ``warning`` and make the next daily evaluation queue the critical again.
+    """
+    cve = "CVE-2026-9000"
+    noon = local_at(12)
+    state = core.new_state()
+    state["watch"][cve] = _watch_below_the_bar(cve)
+    ops = Recorder(status=500)
+
+    # Day one: the score reaches the warning bar and the channel refuses the escalation.
+    core.reevaluate(state, _MeasuredAt5(), frozenset(), True, noon, "", thresholds=DEFAULT_THRESHOLDS)
+    assert [entry["tag"] for entry in state["pending"]] == ["warning"]
+    assert core.deliver(state, [ops], no_http, noon, **options) is False
+    assert [entry["tag"] for entry in state["pending"]] == ["warning"], "the refused warning stays queued"
+    assert state["watch"][cve]["level"] == "suppressed", "nothing was told yet"
+
+    # Day two: the CVE is added to KEV, so a critical escalation is queued beside the pending warning.
+    kev = frozenset({cve})
+    core.reevaluate(state, _MeasuredAt5(), kev, True, noon + core.DAY, "", thresholds=DEFAULT_THRESHOLDS)
+    assert sorted(entry["tag"] for entry in state["pending"]) == ["critical", "warning"]
+    ops.status = 200  # the channel is back
+    assert core.deliver(state, [ops], no_http, noon + core.DAY, **options) is True
+    assert state["pending"] == []
+
+    watch = state["watch"][cve]
+    assert (watch["level"], watch["judged"]) == ("critical", "critical"), "the warning did not lower the watch"
+    assert sorted(event["tag"] for _, event in core.delivery_events(state, cve)) == ["critical", "warning"], (
+        "both messages were delivered, so both are on record"
+    )
+
+    # Day three: the reader was told critical, so there is nothing to escalate.
+    core.reevaluate(state, _MeasuredAt5(), kev, True, noon + 2 * core.DAY, "", thresholds=DEFAULT_THRESHOLDS)
+    assert state["pending"] == [], "a critical the reader already has is not queued again"
+
+
+def test_a_delivered_escalation_does_not_lower_a_judgement_that_was_raised_silently():
+    """``judged`` is what the numbers in force say: a settings change may have raised it past the queued message."""
+    cve = "CVE-2026-9001"
+    state = core.new_state()
+    state["watch"][cve] = {**_watch_below_the_bar(cve), "judged": "critical", "thresholds": [7.0, 0.20, 3.0]}
+    core._delivered(state, _escalation(cve, "warning"), NOW, outcome="delivered", delivered_to=["ops"])
+    watch = state["watch"][cve]
+    assert watch["level"] == "warning", "the reader was told a warning"
+    assert watch["judged"] == "critical", "the silent re-baseline is not undone by an older message"
+    assert watch["thresholds"] == [7.0, 0.20, 3.0], "and the rules that made it stay with it"
