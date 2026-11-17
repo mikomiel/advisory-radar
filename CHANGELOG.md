@@ -11,6 +11,23 @@ release decision: the `vX.Y.Z` tag it creates is what builds and publishes
 section by hand -- [CONTRIBUTING.md](CONTRIBUTING.md#releases) owns the release
 boundary.
 
+## [0.5.0](https://github.com/mikomiel/advisory-radar/compare/v0.4.0...v0.5.0) (2026-11-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **web:** POST /parked/drop now renders a confirmation page; the drop happens on POST /parked/drop/confirm with the same snapshot digest.
+
+### Added
+
+* **web:** confirm bulk parked drops and show attempts per row ([#151](https://github.com/mikomiel/advisory-radar/issues/151)) ([a8911ef](https://github.com/mikomiel/advisory-radar/commit/a8911ef0b48bd8f758991acc0b2724ba64dff50d))
+* **web:** preview where an escalation is routed ([#152](https://github.com/mikomiel/advisory-radar/issues/152)) ([97bf83b](https://github.com/mikomiel/advisory-radar/commit/97bf83b4d1c40faffcf372b5f5e69f139169dadb)), closes [#89](https://github.com/mikomiel/advisory-radar/issues/89)
+
+
+### Fixed
+
+* **pipeline:** keep the higher watch level on a late new message ([#148](https://github.com/mikomiel/advisory-radar/issues/148)) ([99bef9c](https://github.com/mikomiel/advisory-radar/commit/99bef9cf8d9fc60bd723969ef2b0314a710200a4))
+
 ## [0.4.0](https://github.com/mikomiel/advisory-radar/compare/v0.3.1...v0.4.0) (2026-11-17)
 
 
