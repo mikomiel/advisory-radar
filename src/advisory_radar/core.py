@@ -2868,31 +2868,46 @@ def deliver(
 
     The window is the queue taken critical-first (:func:`_critical_first`): a stable sort, so each class keeps
     its queue order and a queue without a critical message is offered exactly as before. A critical advisory
-    therefore never waits behind a window's worth of warnings, and a warning a channel refuses cannot stop the
-    pass before it.
+    therefore never waits behind a window's worth of warnings.
+
+    The guarantee a failure may not break: a refused payload that carries no critical advisory never prevents a
+    payload that carries a critical advisory from being tried in the same pass. A payload is what one POST
+    carries: a queued message, or the digest of the advisories one destination still lacks. The rule that keeps
+    it is the same on every path: a failure never ends the pass. Once anything has failed (a refused or
+    unreachable channel, a selection that names no built notifier, an entry the full parked list cannot take),
+    the pass goes on, but it posts only payloads that carry a critical advisory (:func:`_is_critical`). A payload
+    that carries none waits for a later pass: it is not posted, it is not an attempt, and its entries stay
+    exactly as they were found. An advisory a destination acknowledged is never sent to it again (``sent_to``),
+    so going on cannot duplicate a post. The state of the pass is read when a message or a batch starts, never
+    between its destinations: the channels behind a refusing one still get the same message.
 
     ``routes`` and ``default`` narrow the channels per message (see :func:`routing.select`); both empty keeps
-    the pre-routing behaviour of every enabled notifier. A failed message stays pending and stops the pass, so
-    nothing behind it in the window is tried. Its MAX_DELIVERY_ATTEMPTS-th failed attempt, or a first attempt
-    older than PARK_AFTER, parks it instead (see ``_park``) and the pass goes on with the next message, unless
-    the parked list is full: then it stays pending and stops the pass. A message that already failed
+    the pre-routing behaviour of every enabled notifier. A failed message stays pending. Its
+    MAX_DELIVERY_ATTEMPTS-th failed attempt, or a first attempt older than PARK_AFTER, parks it instead (see
+    ``_park``). Parking is not a failure: the pass goes on with the next message, warnings included, unless the
+    parked list is full. Then the message stays pending and the pass has failed. A message that already failed
     MAX_DELIVERY_ATTEMPTS times is never posted again, so a full parked list cannot turn into a duplicate post
     on every pass. A selection that names no built notifier is a configuration fault: it logs an error, fails
-    the pass and leaves the message queued, never marked delivered.
+    the pass and leaves the message queued, never marked delivered and never charged an attempt.
+
+    A failed pass tries every critical advisory of its window, where it used to stop at the first failed message.
+    During an outage the criticals of the window are therefore charged an attempt on every pass and reach the
+    parking limit together, while warnings that no critical payload carries wait untouched. A channel that is down
+    gets one request per critical message or digest, and a later critical can reach a channel before an earlier
+    one that it refused.
 
     With ``digest`` and ``quiet_hours`` both unset this is the message-by-message loop it has always been,
-    kept whole in :func:`_deliver_each` so turning the features off changes no request, no state field and no
-    log line. When either is set, the routing decision is made per entry and the entries are grouped by the
-    set of notifiers it selects, because a digest may only cover advisories that reach the same channels.
-    Entries quiet hours hold are skipped while the delivery window is filled, so a queue of held warnings
-    cannot take the slot a critical advisory needs; they stay pending and are looked at again on a later pass.
-    Each group is planned once (:func:`delivery.plan`): a digest becomes one POST per destination covering the
-    entries that still need it, and an entry held by quiet hours is absent from every batch, stays pending
-    and does not count as a failed attempt. The batches of every group are posted in the order of the window,
-    not group by group, so each critical advisory is tried before any warning whichever channels they are
-    routed to (a digest that covers a critical advisory is posted with the critical ones). Success or failure
-    is then recorded per covered entry -- one POST that covered several advisories is one attempt for each of
-    them -- so the parking rule and ``state["seen"]`` stay honest.
+    kept whole in :func:`_deliver_each`: while nothing fails, turning the features off changes no request, no
+    state field and no log line. When either is set, the routing decision is made per entry and the entries are
+    grouped by the set of notifiers it selects, because a digest may only cover advisories that reach the same
+    channels. Entries quiet hours hold are skipped while the delivery window is filled, so a queue of held
+    warnings cannot take the slot a critical advisory needs; they stay pending and are looked at again on a
+    later pass. Each group is planned once (:func:`delivery.plan`): a digest becomes one POST per destination
+    covering the entries that still need it, and an entry held by quiet hours is absent from every batch, stays
+    pending and does not count as a failed attempt. The batches of every group are posted in the order of the
+    window, not group by group, with a digest at the place of its first entry. Success or failure is then
+    recorded per covered entry (one POST that covered several advisories is one attempt for each of them) so the
+    parking rule and ``state["seen"]`` stay honest.
 
     ``language`` is the language of a digest's own words (``messages``); a queued message is posted in the
     language it was rendered in.
@@ -2926,16 +2941,25 @@ def deliver(
     )
 
 
+def _is_critical(message: Mapping) -> bool:
+    """Whether a queue entry, or the digest built from entries, carries a critical advisory.
+
+    The predicate is the one ``delivery.is_held`` and ``delivery.digest_message`` read: a message tagged
+    ``critical`` is the one kind quiet hours never hold, and a digest is critical when any entry it covers is. The
+    window order and the rule for what a failed pass may still post both use it (see :func:`deliver`). A missing
+    or damaged tag is not evidence of a critical advisory, so it is not critical.
+    """
+    return message.get("tag") == "critical"
+
+
 def _critical_first(entries: Sequence[dict]) -> list[dict]:
     """The queue in the order a pass offers it to its delivery window: critical messages first.
 
     A stable sort, so each class keeps its queue order and a queue without a critical message is offered exactly
-    as before. Without it, a window's worth of warnings queued ahead of a critical advisory takes every slot, and a
-    warning that a channel refuses at the head stops the pass before the critical advisory is tried at all. The
-    stored queue is not reordered: this is only the window. The predicate is the one ``delivery.is_held`` uses,
-    because a message tagged ``critical`` is the one kind quiet hours never hold.
+    as before. Without it, a window's worth of warnings queued ahead of a critical advisory takes every slot, and
+    the critical advisory waits a pass. The stored queue is not reordered: this is only the window.
     """
-    return sorted(entries, key=lambda entry: entry.get("tag") != "critical")
+    return sorted(entries, key=lambda entry: not _is_critical(entry))
 
 
 def _worst_failure(statuses: Sequence[int]) -> int:
@@ -2964,13 +2988,18 @@ def _deliver_each(
     """The pre-digest delivery loop, kept whole: one message at a time, each with its own routing and attempts.
 
     The window is the first DELIVERY_CAP entries of the queue taken critical-first (:func:`_critical_first`).
+    The loop never ends at a failed message: it records the failure and goes on, and from the next message
+    only a critical one is tried (the rule of :func:`deliver`). A warning it skips is left as found.
     """
+    failed = False
     for entry in _critical_first(state["pending"])[:DELIVERY_CAP]:
+        if failed and not _is_critical(entry):
+            continue  # not tried after a failure: no attempt, no first-attempt time, nothing written to it
         entry.setdefault("first_attempt_at", now)
         if entry.get("attempts", 0) >= MAX_DELIVERY_ATTEMPTS:  # only a full parked list leaves one here
-            if _park(state, entry, entry.get("last_status", 0), now):
-                continue
-            return False
+            if not _park(state, entry, entry.get("last_status", 0), now):
+                failed = True
+            continue
         already = set(entry.get("sent_to") or ())
         selected, label = routing.select(entry, routes, default, enabled_ids)
         targets = [notifier for notifier in notifiers if notifier.id in set(selected)]
@@ -2984,7 +3013,8 @@ def _deliver_each(
                 label,
                 ",".join(selected) or "none",
             )
-            return False
+            failed = True
+            continue
         statuses = []
         for notifier in targets:
             if notifier.id in already:  # a retry only re-sends to the channels that have not had it
@@ -3021,9 +3051,9 @@ def _deliver_each(
         entry["attempts"] = entry.get("attempts", 0) + 1
         entry["last_status"] = status
         if entry["attempts"] >= MAX_DELIVERY_ATTEMPTS or now - entry["first_attempt_at"] > PARK_AFTER:
-            if _park(state, entry, status, now):
-                continue
-            return False
+            if not _park(state, entry, status, now):
+                failed = True
+            continue
         LOG.error(
             "delivery of %s refused or unreachable (HTTP %s, attempt %d of %d); %d message(s) stay pending",
             _audit_ids(entry),
@@ -3032,8 +3062,8 @@ def _deliver_each(
             MAX_DELIVERY_ATTEMPTS,
             len(state["pending"]),
         )
-        return False
-    return True
+        failed = True
+    return not failed
 
 
 def _deliver_grouped(
@@ -3060,14 +3090,19 @@ def _deliver_grouped(
     The walk is done before the first POST so a group is complete when it is planned: a later advisory that
     routes to the same channels belongs in the same digest. Groups are keyed by the set of destination ids, so
     two rules that name the same notifiers in another order share one digest, and the entries keep the order
-    of the window. A selection that names no built notifier therefore fails the pass before any of this pass's
-    messages is posted, and every message stays pending.
+    of the window. A selection that names no built notifier fails the pass and leaves that message pending and
+    untouched; the other messages are still planned.
 
     The batches of all groups are then posted in the order of the window, a digest at the place of its first
-    entry. With digests off that is the order the single-message loop uses, so every critical advisory is tried
-    before any warning whichever channels they are routed to: a warning that one channel refuses stops the pass,
-    and it must not be the reason a critical advisory routed to another channel is never tried.
+    entry. With digests off that is the order the single-message loop uses. With digests on it is only an
+    approximation: a batch is placed by its first entry, but a destination is sent what it still lacks, so a
+    batch that is first because of a critical advisory can owe one destination a digest of warnings alone,
+    ahead of another group's critical. The order is therefore not what keeps the guarantee of :func:`deliver`;
+    the failure rule does. The pass never ends at a failed batch, and a batch that starts after a failure posts
+    only the payloads that carry a critical advisory (:func:`_deliver_batch`), so a refused warning-only digest
+    cannot keep another group's critical from being tried.
     """
+    failed = False
     window = []
     for entry in _critical_first(state["pending"]):
         if len(window) >= DELIVERY_CAP:
@@ -3080,7 +3115,7 @@ def _deliver_grouped(
         if entry.get("attempts", 0) >= MAX_DELIVERY_ATTEMPTS:  # only a full parked list leaves one here
             entry.setdefault("first_attempt_at", now)
             if not _park(state, entry, entry.get("last_status", 0), now):
-                return False
+                failed = True  # it stays pending and is never posted again; it holds nothing else back
             continue
         candidates.append(entry)
     groups: dict[frozenset[str], list[dict]] = {}
@@ -3098,15 +3133,15 @@ def _deliver_grouped(
                 label,
                 ",".join(selected) or "none",
             )
-            return False
+            failed = True
+            continue
         key = frozenset(selected)
         if key not in groups:
             groups[key] = []
             targets_by_group[key] = targets
         groups[key].append(entry)
     # Planned for every group first, then posted in the order of the window, not group by group: a group walked to
-    # the end before the next one starts would post its warnings ahead of another group's critical advisory, and a
-    # warning its channel refuses would end the pass before that critical was tried.
+    # the end before the next one starts would post its warnings ahead of another group's critical advisory.
     position = {id(entry): index for index, entry in enumerate(window)}
     scheduled = [
         (batch, targets_by_group[key])
@@ -3115,9 +3150,12 @@ def _deliver_grouped(
     ]
     scheduled.sort(key=lambda step: position[id(step[0].entries[0])])
     for batch, targets in scheduled:
-        if not _deliver_batch(state, http, now, persist, batch, targets, digest=digest, language=language):
-            return False
-    return True
+        # ``failed`` is read as the batch starts: a batch posts to every destination under the state it began in.
+        if not _deliver_batch(
+            state, http, now, persist, batch, targets, digest=digest, language=language, critical_only=failed
+        ):
+            failed = True
+    return not failed
 
 
 def _deliver_batch(
@@ -3130,21 +3168,31 @@ def _deliver_batch(
     *,
     digest: bool,
     language: str,
+    critical_only: bool,
 ) -> bool:
     """Send one planned batch, destination by destination, and record the outcome per covered entry.
 
     Each destination receives only the entries that still need it: ``sent_to`` is kept across passes, so a
     digest rebuilt after a partial acknowledgement must not carry an advisory that destination already
     accepted. With digesting on, a destination gets one digest of its own subset; with it off, each of those
-    entries is posted as it was rendered. An entry whose destinations have all accepted is delivered even
-    when another entry in the batch failed, an entry with a refused destination takes one attempt for the
-    pass, and a batch whose entries all park lets the pass continue, exactly as a single parked message does.
-    Every refused entry is charged its attempt before any parking is attempted, so a full parked queue cannot
-    leave a later covered entry with no attempt or status recorded.
+    entries is posted as it was rendered.
+
+    ``critical_only`` says the pass had already failed when this batch started (the rule of :func:`deliver`).
+    The payload each destination would receive is judged, not the batch or its first entry: a destination whose
+    payload carries no critical advisory is skipped, so a batch that is critical for one destination can still
+    owe another a digest of warnings alone, and that digest waits for a later pass. A skipped payload is not an
+    attempt. An entry that no refused payload covered keeps its attempts, last status and first-attempt time
+    as they were found. The flag is read once for the whole batch, never between its destinations, so one
+    destination's refusal does not keep the same entries from the destinations behind it.
+
+    An entry whose destinations have all accepted is delivered even when another entry in the batch failed, an
+    entry with a refused destination takes one attempt for the pass, and a batch whose entries all park lets the
+    pass continue, exactly as a single parked message does. Every refused entry is charged its attempt before
+    any parking is attempted, so a full parked queue cannot leave a later covered entry with no attempt or
+    status recorded. The result is False when an entry was refused and stays pending, or could not be parked.
+    A skipped payload does not make it False: the pass has failed already.
     """
     covered = list(batch.entries)
-    for entry in covered:
-        entry.setdefault("first_attempt_at", now)
     statuses: list[int] = []
     failure_status: list[int | None] = [None] * len(covered)
     for notifier in targets:
@@ -3159,6 +3207,10 @@ def _deliver_batch(
             else [(covered[index], [index]) for index in need]
         )
         for payload, indices in sends:
+            if critical_only and not _is_critical(payload):
+                continue  # not tried after a failure: the entries it covers are left as found
+            for index in indices:
+                covered[index].setdefault("first_attempt_at", now)
             try:
                 status = notifier.send(payload, http)
             except Exception as exc:  # a broken notifier is a failed attempt, never a crash or a duplicate
@@ -3183,7 +3235,9 @@ def _deliver_batch(
         if all(notifier.id in set(entry.get("sent_to") or ()) for notifier in targets)
     }
     if delivered:
-        status_text = "/".join(str(status) for status in statuses)
+        # No status at all when every payload of the batch was skipped: an entry acknowledged in an earlier pass
+        # is completed without a request.
+        status_text = "/".join(str(status) for status in statuses) or "-"
         for index in sorted(delivered):
             entry = covered[index]
             accepted = sorted(entry.get("sent_to") or ())
@@ -3198,21 +3252,19 @@ def _deliver_batch(
                 status_text,
                 " ".join(entry["title"].split()),
             )
-    # Account for every covered entry before any parking is attempted. A full parked queue must not leave a
-    # later covered entry with no attempt recorded: the failed POST covered it just as much as the first one.
-    for index, entry in enumerate(covered):
-        if index in delivered:
-            continue
-        status = failure_status[index]
-        if status is None:  # a pending entry always has a destination that refused or failed it
-            status = _worst_failure(statuses)
+    # Account for every refused entry before any parking is attempted. A full parked queue must not leave a
+    # later covered entry with no attempt recorded: the failed POST covered it just as much as the first one. An
+    # entry that is neither delivered nor refused had every payload that would have carried it skipped, or was
+    # accepted by some destinations and skipped by the rest: no destination refused it, so it takes no attempt.
+    refused = [index for index in range(len(covered)) if index not in delivered and failure_status[index] is not None]
+    for index in refused:
+        entry = covered[index]
         entry["attempts"] = entry.get("attempts", 0) + 1
-        entry["last_status"] = status
+        entry["last_status"] = failure_status[index]
     blocked = False
     remaining = []
-    for index, entry in enumerate(covered):
-        if index in delivered:
-            continue
+    for index in refused:
+        entry = covered[index]
         status = entry["last_status"]
         if entry["attempts"] >= MAX_DELIVERY_ATTEMPTS or now - entry["first_attempt_at"] > PARK_AFTER:
             if not _park(state, entry, status, now):

@@ -240,13 +240,31 @@ for a shadow run: the instance evaluates what it would send before real channels
 
 A pass delivers a bounded number of queued advisories. When more are queued than that, it takes
 the critical ones first and fills the rest of its window in queue order, so a long queue of
-warnings cannot hold a critical advisory behind the limit, and a warning that a channel refuses
-cannot stop the pass before a critical one has been tried. That holds across routes too: every
-critical advisory is tried before any warning, whichever channels they are routed to, so a
-warning that one channel refuses cannot keep a critical advisory for another channel from
-being tried. A digest is built from the same window, and one that covers a critical advisory
-counts as a critical message. The stored queue keeps its order, and a queue with no critical
-advisory is delivered exactly as before.
+warnings cannot hold a critical advisory behind the limit. A digest is built from the same
+window, and one that covers a critical advisory counts as a critical message. The stored queue
+keeps its order, and a queue with no critical advisory is delivered exactly as before.
+
+One guarantee holds on every path (one message at a time, quiet hours, digests, routes): a
+payload that a channel refuses and that carries no critical advisory never keeps a payload that
+does carry one from being tried in the same pass. A payload is what one request carries: a
+message, or the digest of the advisories one destination has not yet accepted. The rule behind
+the guarantee is that a failure does not end the pass. After the first failure (a refusal, an
+unreachable channel, a route that names no enabled notifier, or a message that cannot be parked
+because the parked list is full) the pass goes on, but it sends only payloads that carry a
+critical advisory. A payload with none waits for the next pass: it is not sent, and it does not
+count as an attempt for the messages it would have carried. A message, or a group's batch, that
+has already started still goes to all of its channels. A destination that already accepted
+an advisory is never sent it again. This matters most for digests. A destination that has accepted
+the critical advisory of a group is owed only that group's warnings, so its digest carries no
+critical advisory, and if it refuses that digest the critical advisories of the other groups are
+still sent. The pass still reports the failure.
+
+A failed pass therefore tries every critical advisory of its window, where it used to stop at
+the first failed message. During an outage each critical advisory of the window takes one
+attempt per pass, and a channel that is down receives one request for every critical message or
+digest, so the critical advisories reach the parking limit together. Warnings that no critical
+payload carries wait untouched. After a failure, a later critical advisory can reach a channel
+before an earlier one that the channel refused.
 
 A generic `webhook` notifier may carry a signing secret, referenced from the environment:
 

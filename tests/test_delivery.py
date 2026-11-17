@@ -1030,3 +1030,184 @@ def test_a_delivered_escalation_does_not_lower_a_judgement_that_was_raised_silen
     assert watch["level"] == "warning", "the reader was told a warning"
     assert watch["judged"] == "critical", "the silent re-baseline is not undone by an older message"
     assert watch["thresholds"] == [7.0, 0.20, 3.0], "and the rules that made it stay with it"
+
+
+# --- PR #140 review round 2: what a pass may still send after something failed ----------------------------
+#
+# The guarantee: a refused payload that carries no critical advisory never prevents a payload that carries a
+# critical advisory from being tried in the same pass. The rule that keeps it: after a failure the pass goes on,
+# but only with payloads that carry a critical advisory. A warning-only payload waits for a later pass, and it
+# is not an attempt.
+
+_EVERY_PATH = pytest.mark.parametrize(
+    "options",
+    [{}, {"quiet_hours": delivery.parse_quiet_hours("22:00-07:00")}, {"digest": True}],
+    ids=["each", "quiet-hours-closed", "digest"],
+)
+
+_THREE_ROUTES = [
+    {"match": {"source": "one"}, "notifiers": ["ops"]},
+    {"match": {"source": "two"}, "notifiers": ["pager"]},
+    {"match": {"source": "three"}, "notifiers": ["mail"]},
+]
+
+_UNTRIED_KEYS = {"attempts", "first_attempt_at", "last_status", "sent_to"}
+
+
+def test_a_refused_warning_only_digest_does_not_keep_another_groups_critical_from_being_tried():
+    """A nominally critical group can owe one destination a digest of warnings alone.
+
+    C1 and W1 route to ops and phone, C2 to pager, and ops accepted C1 in an earlier pass. The C1/W1 group is
+    first in the window, but ops is now owed only W1: a warning-only digest, which it refuses. That refusal used
+    to end the pass before pager was offered C2.
+    """
+    state = core.new_state()
+    c1 = queued("CVE-2026-1", "critical", source_id="one")
+    c1.update({"sent_to": ["ops"], "attempts": 1, "first_attempt_at": NOW - 60, "last_status": 503})
+    c2 = queued("CVE-2026-2", "critical", source_id="two")
+    w1 = queued("CVE-2026-3", "warning", source_id="one")
+    state["pending"] = [c1, c2, w1]
+    routes = [
+        {"match": {"source": "one"}, "notifiers": ["ops", "phone"]},
+        {"match": {"source": "two"}, "notifiers": ["pager"]},
+    ]
+    ops, phone, pager = _RefusesWarnings("ops"), Recorder("phone"), Recorder("pager")
+
+    assert core.deliver(state, [ops, phone, pager], no_http, NOW, routes=routes, digest=True) is False
+
+    assert [message["ids"] for message in pager.sent] == [["CVE-2026-2"]], "the critical for the other group was tried"
+    assert [message["ids"] for message in ops.sent] == [["CVE-2026-3"]], "ops is sent only what it lacks, and once"
+    assert [message["tag"] for message in ops.sent] == ["warning"]
+    assert [message["ids"] for message in phone.sent] == [["CVE-2026-1", "CVE-2026-3"]]
+    for cve, accepted in (("CVE-2026-1", ["ops", "phone"]), ("CVE-2026-2", ["pager"])):
+        record = state["seen"][cve]
+        assert record["outcome"] == "delivered"
+        assert state["deliveries"][record["delivery"]]["delivered_to"] == accepted
+    (left,) = state["pending"]
+    assert left["ids"] == ["CVE-2026-3"]
+    assert left["sent_to"] == ["phone"], "the channel that accepted the warning is kept, ops still owes it"
+    assert (left["attempts"], left["last_status"]) == (1, 400), "only the refusal is charged"
+
+
+@_EVERY_PATH
+def test_a_refused_critical_does_not_keep_a_critical_for_another_channel_from_being_tried(options):
+    """After a failure the pass goes on with critical advisories, in every delivery mode.
+
+    The window is critical-first and one payload is one entry, so a refused *warning* cannot precede a critical in
+    the single-message loop. What changes there is a refused critical: it used to end the pass, and the critical
+    for another channel behind it was never tried. The warning behind both is not posted, and it is not charged.
+    """
+    state = core.new_state()
+    state["pending"] = [
+        queued("CVE-2026-1", "critical", source_id="one"),
+        queued("CVE-2026-2", "critical", source_id="two"),
+        queued("CVE-2026-3", "warning", source_id="three"),
+    ]
+    ops, pager, mail = Recorder("ops", status=500), Recorder("pager"), Recorder("mail")
+
+    assert core.deliver(state, [ops, pager, mail], no_http, local_at(12), routes=_THREE_ROUTES, **options) is False
+
+    assert [message["ids"] for message in ops.sent] == [["CVE-2026-1"]]
+    assert [message["ids"] for message in pager.sent] == [["CVE-2026-2"]], "the critical behind the refused one went"
+    assert mail.sent == [], "a warning is not tried once the pass has failed"
+    assert state["seen"]["CVE-2026-2"]["outcome"] == "delivered"
+    refused, untried = state["pending"]
+    assert (refused["ids"][0], refused["attempts"], refused["last_status"]) == ("CVE-2026-1", 1, 500)
+    assert untried["ids"][0] == "CVE-2026-3"
+    assert not _UNTRIED_KEYS & set(untried), "a warning that was not tried is not an attempt"
+
+
+@_EVERY_PATH
+def test_the_cap_still_bounds_a_pass_that_goes_on_after_a_failure(options):
+    """Going on after a failure never widens the window: criticals beyond the cap wait for the next pass."""
+    state = core.new_state()
+    state["pending"] = [queued("CVE-2026-1", "critical", source_id="one")] + [
+        queued(f"CVE-2026-{number}", "critical", source_id="two") for number in range(2, core.DELIVERY_CAP + 4)
+    ]
+    ops, pager = Recorder("ops", status=500), Recorder("pager")
+
+    assert core.deliver(state, [ops, pager], no_http, local_at(12), routes=_THREE_ROUTES, **options) is False
+
+    posted = {identifier for message in pager.sent for identifier in message["ids"]}
+    assert posted == {f"CVE-2026-{number}" for number in range(2, core.DELIVERY_CAP + 1)}
+    beyond = [entry for entry in state["pending"] if entry["ids"][0] not in {"CVE-2026-1"}]
+    assert [entry["ids"][0] for entry in beyond] == [
+        f"CVE-2026-{number}" for number in range(core.DELIVERY_CAP + 1, core.DELIVERY_CAP + 4)
+    ]
+    assert not any(_UNTRIED_KEYS & set(entry) for entry in beyond), "the entries beyond the cap were not touched"
+
+
+def test_a_warning_only_payload_is_skipped_after_a_failure_and_costs_its_entries_nothing(caplog):
+    """The skip judges the payload that would be posted, not the batch it belongs to.
+
+    The first group fails. The second group is nominally critical, but pager already accepted its critical, so
+    pager is owed a digest of the warning alone: skipped, with the warning left exactly as it was found and no
+    refusal logged for it. The critical, acknowledged everywhere, is completed without a post, and its log line
+    says no status was seen in this pass instead of printing an empty one.
+    """
+    state = core.new_state()
+    refused = queued("CVE-2026-1", "critical", source_id="one")
+    acknowledged = queued("CVE-2026-2", "critical", source_id="two")
+    acknowledged["sent_to"] = ["pager"]
+    waiting = queued("CVE-2026-3", "warning", source_id="two")
+    state["pending"] = [refused, acknowledged, waiting]
+    ops, pager = Recorder("ops", status=500), Recorder("pager")
+
+    with caplog.at_level(logging.INFO, logger="advisory_radar"):
+        assert core.deliver(state, [ops, pager], no_http, NOW, routes=_THREE_ROUTES, digest=True) is False
+
+    assert pager.sent == [], "the digest of the warning alone was skipped"
+    assert state["seen"]["CVE-2026-2"]["outcome"] == "delivered", "the acknowledged critical is completed"
+    assert [entry["ids"][0] for entry in state["pending"]] == ["CVE-2026-1", "CVE-2026-3"]
+    assert not _UNTRIED_KEYS & set(waiting), "a skipped payload is not an attempt"
+    messages = [record.getMessage() for record in caplog.records]
+    refusals = [message for message in messages if "refused or unreachable" in message]
+    assert len(refusals) == 1 and "CVE-2026-1" in refusals[0] and "CVE-2026-3" not in refusals[0]
+    (completed,) = [message for message in messages if message.startswith("delivered ")]
+    assert "CVE-2026-2" in completed and "(HTTP -)" in completed, "no request was made for it in this pass"
+
+
+@_EVERY_PATH
+def test_a_warning_stuck_behind_a_full_parked_list_does_not_keep_a_critical_from_being_posted(options):
+    """An entry that already failed every attempt is never posted again; with the parked list full it stays queued.
+
+    That is a fault of the warning, not of the critical beside it. The single-message loop reaches the warning
+    after the critical, and the grouped path used to meet it before the first post and end the pass.
+    """
+    state = core.new_state()
+    stuck = queued("CVE-2026-1")
+    stuck.update({"attempts": core.MAX_DELIVERY_ATTEMPTS, "first_attempt_at": NOW - 60, "last_status": 500})
+    state["pending"] = [stuck, queued("CVE-2026-2", "critical")]
+    state["parked"] = [
+        {"title": f"parked {number}", "ids": [f"CVE-2026-{number}"]} for number in range(100, 100 + core.MAX_PARKED)
+    ]
+    ops = Recorder()
+
+    assert core.deliver(state, [ops], no_http, local_at(12), **options) is False
+
+    assert [message["ids"] for message in ops.sent] == [["CVE-2026-2"]], "the critical went, the stuck warning not"
+    assert state["seen"]["CVE-2026-2"]["outcome"] == "delivered"
+    assert state["pending"] == [stuck] and stuck["attempts"] == core.MAX_DELIVERY_ATTEMPTS
+    assert len(state["parked"]) == core.MAX_PARKED
+
+
+@_EVERY_PATH
+def test_a_message_routed_to_no_enabled_notifier_does_not_keep_a_critical_from_being_posted(options):
+    """A routing fault leaves that message queued and fails the pass. It is not a refusal of the critical beside it."""
+    state = core.new_state()
+    state["pending"] = [
+        queued("CVE-2026-1", "warning", source_id="nowhere"),
+        queued("CVE-2026-2", "critical", source_id="two"),
+    ]
+    routes = [
+        {"match": {"source": "nowhere"}, "notifiers": ["gone"]},
+        {"match": {"source": "two"}, "notifiers": ["pager"]},
+    ]
+    pager = Recorder("pager")
+
+    assert core.deliver(state, [pager], no_http, local_at(12), routes=routes, **options) is False
+
+    assert [message["ids"] for message in pager.sent] == [["CVE-2026-2"]]
+    (left,) = state["pending"]
+    assert left["ids"] == ["CVE-2026-1"]
+    assert not {"attempts", "last_status", "sent_to"} & set(left), "a routing fault is not an attempt"
