@@ -145,7 +145,8 @@ Two-person review still needs a second human account or a team with another memb
 in any directory (gitleaks drops every finding that one lists, so adding it hides a secret from
 the scan),
 `release-please-config.json` and `.release-please-manifest.json` (the tag format, what a
-release contains, and the version it starts from), `tests/` and
+release contains, and the version it starts from), `AGENTS.md` and `CLAUDE.md` at the
+repository root (the rules a coding agent follows in this repository), `tests/` and
 `scripts/` (the guard and the approval rule are policy too: the workflows execute them from
 the default branch, so they need the same human merge as the workflows themselves), and the
 files that configure how the checks run, which would otherwise let a pull request switch the
