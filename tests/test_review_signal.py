@@ -40,7 +40,11 @@ def test_the_relay_is_a_no_op_that_may_run_from_a_head():
     assert loaded.get("permissions") == {}
     assert "env" not in loaded, "a top-level environment could carry a secret into the no-op"
     for job_name, job in loaded["jobs"].items():
-        assert set(job) == {"runs-on", "steps"}, f"{job_name} may declare only runs-on and steps, not {sorted(job)}"
+        # `timeout-minutes` is the one key allowed beside the two: it can only cut a run short, and every job in
+        # this repository carries one (tests/test_ci_hardening.py). It cannot widen what the no-op reaches.
+        assert {"runs-on", "steps"} <= set(job) <= {"runs-on", "steps", "timeout-minutes"}, (
+            f"{job_name} may declare only runs-on, steps and a timeout, not {sorted(job)}"
+        )
         for step in job["steps"]:
             assert set(step) == {"name", "run"}, f"a relay step may only run a command, not {sorted(step)}"
             assert "${{" not in step["run"], "an expression could read the pull request"

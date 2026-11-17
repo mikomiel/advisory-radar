@@ -57,16 +57,22 @@ def load_kev(http: Http, cache_path: Path, *, save: bool) -> tuple[frozenset[str
     if isinstance(vulnerabilities, list) and _catalog_is_usable(vulnerabilities):
         cves = sorted({row["cveID"].upper() for row in vulnerabilities})
         if save:
-            save_state(
-                cache_path,
-                {
-                    "schema": KEV_CACHE_SCHEMA,
-                    "etag": header(response_headers, "ETag"),
-                    "last_modified": header(response_headers, "Last-Modified"),
-                    "catalog_version": document.get("catalogVersion") if isinstance(document, dict) else None,
-                    "cves": cves,
-                },
-            )
+            try:
+                save_state(
+                    cache_path,
+                    {
+                        "schema": KEV_CACHE_SCHEMA,
+                        "etag": header(response_headers, "ETag"),
+                        "last_modified": header(response_headers, "Last-Modified"),
+                        "catalog_version": document.get("catalogVersion") if isinstance(document, dict) else None,
+                        "cves": cves,
+                    },
+                )
+            except OSError as exc:
+                # The cache only saves a later download and backs a failed fetch. Losing the write must not
+                # lose the catalog that was just validated: the fresh set is returned and the next pass fetches
+                # again, exactly as it does when no cache exists.
+                LOG.warning("kev: the cache at %s could not be written (%s); using the fresh catalog", cache_path, exc)
         return frozenset(cves), True
     if cached:
         # The cached CVEs still promote (a hit is a hit), but an unvalidated catalog may simply be missing a

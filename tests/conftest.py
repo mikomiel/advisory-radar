@@ -16,6 +16,25 @@ def _insecure_cookies_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def real_directory_sync() -> None:
+    """Ask for the real directory sync after a save; see ``_skip_the_directory_sync``."""
+
+
+@pytest.fixture(autouse=True)
+def _skip_the_directory_sync(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
+    """Leave out the directory sync a save ends with.
+
+    It is a second ``fsync`` per save, which on a slow disk doubles the time of every test that saves a document
+    and which none of them can observe. The tests that pin the sync itself request ``real_directory_sync``.
+    """
+    if "real_directory_sync" in request.fixturenames:
+        return
+    from advisory_radar import state
+
+    monkeypatch.setattr(state, "_sync_directory", lambda directory: None)
+
+
+@pytest.fixture
 def read_only_sqlite(monkeypatch: pytest.MonkeyPatch):
     """Make one SQLite document database read-only at the engine, and leave every other file alone.
 

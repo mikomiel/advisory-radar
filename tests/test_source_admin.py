@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -22,7 +23,7 @@ from advisory_radar import core, pipeline
 from advisory_radar.config import ConfigError, Thresholds, load_config, load_document
 from advisory_radar.http import _host_of, private_destination, resolve_host, urllib_http
 from advisory_radar.runtime import Runtime
-from advisory_radar.settings import save_settings, settings_path, validate_settings
+from advisory_radar.settings import SETTINGS_LOCK, save_settings, settings_path, validate_settings
 from advisory_radar.state import save_state, state_lock
 from advisory_radar.web import create_app
 
@@ -38,7 +39,7 @@ RSS = b"""<?xml version="1.0"?><rss version="2.0"><channel><title>Vendor</title>
 CSRF_RE = re.compile(r'name="csrf" value="([0-9a-f]{64})"')
 FINGERPRINT_RE = re.compile(r"name='fingerprint' value='([0-9a-f]{64})'")
 REVISION_RE = re.compile(r"name='revision' value='(\d+)'")
-TOKEN = "secret"
+TOKEN = "secret-token-0123456789abcdef"
 
 
 def fake_http(method: str, url: str, headers, body) -> tuple[int, dict[str, str], bytes]:
@@ -118,6 +119,30 @@ def new_source(client: TestClient, **fields: str):
         data={"csrf": csrf, "fingerprint": fingerprint, "enabled:vendor": "1", **fields},
         follow_redirects=False,
     )
+
+
+def recording_client(tmp_path: Path, *, environment: dict[str, str], listed: tuple[str, ...] = ()):
+    """A client whose transport and resolver record every call, and whose YAML lists ``listed`` as referenceable.
+
+    A reference in the overlay is only valid for a variable the YAML lists under ``overlay_references``; the
+    default here lists none, which is what a deployment that never wrote the key has.
+    """
+    fetched: list[str] = []
+    resolved: list[str] = []
+
+    def transport(method, url, headers, body):
+        fetched.append(url)
+        return 200, {}, RSS
+
+    def resolver(host: str) -> tuple[str, ...]:
+        resolved.append(host)
+        return (PUBLIC_ADDRESS,)
+
+    extra = f"overlay_references: {json.dumps(list(listed))}\n" if listed else ""
+    client, runtime, path = make_client(
+        tmp_path, environment=environment, transport=transport, resolve=resolver, extra=extra
+    )
+    return client, runtime, fetched, resolved
 
 
 # --- the overlay: adding, editing and removing one source ----------------------------------------
@@ -208,7 +233,9 @@ def test_a_literal_secret_is_refused_for_an_added_source(tmp_path):
 
 
 def test_a_reference_is_accepted_and_stored_as_written(tmp_path):
-    client, _, _ = make_client(tmp_path, environment={"FRESHRSS_TOKEN": "s3cret"})
+    client, _, _ = make_client(
+        tmp_path, environment={"FRESHRSS_TOKEN": "s3cret"}, extra="overlay_references: [FRESHRSS_TOKEN]\n"
+    )
     response = new_source(
         client,
         **{"new:type": "freshrss", "new:url": "https://rss.example.net", "new:token": "${FRESHRSS_TOKEN}"},
@@ -360,7 +387,7 @@ def test_the_add_source_form_carries_the_revision_it_was_probed_from(tmp_path):
 
 
 def test_the_probe_names_an_unset_reference_and_never_its_value(tmp_path):
-    client, _, _ = make_client(tmp_path)
+    client, _, _ = make_client(tmp_path, extra="overlay_references: [FRESHRSS_TOKEN_NOT_SET]\n")
     csrf, fingerprint = signed_in(client)
     response = client.post(
         "/config/sources/probe",
@@ -580,7 +607,11 @@ def test_a_probe_reports_a_url_that_is_not_http(tmp_path):
 
 
 def test_a_whole_url_reference_is_probed_after_expansion(tmp_path):
-    client, _, _ = make_client(tmp_path, environment={"FEED_URL": "https://feeds.example.net/feed.xml"})
+    client, _, _ = make_client(
+        tmp_path,
+        environment={"FEED_URL": "https://feeds.example.net/feed.xml"},
+        extra="overlay_references: [FEED_URL]\n",
+    )
     csrf, fingerprint = signed_in(client)
     response = client.post(
         "/config/sources/probe",
@@ -693,18 +724,32 @@ def test_a_public_address_is_allowed():
 
 
 def test_a_reference_cannot_smuggle_a_private_destination_past_the_check(tmp_path):
+    """A whole reference is expanded before the destination is judged; one embedded in a url is refused (W1)."""
+
     def resolver(host: str) -> tuple[str, ...]:
         return ("127.0.0.1",) if host == "127.0.0.1" else (PUBLIC_ADDRESS,)
 
-    client, _, _ = make_client(tmp_path, environment={"INTERNAL_HOST": "127.0.0.1"}, resolve=resolver)
-    response = new_source(client, **{"new:type": "rss", "new:url": "http://${INTERNAL_HOST}/feed.xml"})
-    assert response.status_code == 400
-    assert "private network" in response.text
+    client, _, _ = make_client(
+        tmp_path,
+        environment={"INTERNAL_URL": "http://127.0.0.1/feed.xml", "INTERNAL_HOST": "127.0.0.1"},
+        resolve=resolver,
+        extra="overlay_references: [INTERNAL_URL, INTERNAL_HOST]\n",
+    )
+    whole = new_source(client, **{"new:type": "rss", "new:url": "${INTERNAL_URL}"})
+    assert whole.status_code == 400
+    assert "private network" in whole.text
+    embedded = new_source(client, **{"new:type": "rss", "new:url": "http://${INTERNAL_HOST}/feed.xml"})
+    assert embedded.status_code == 400
+    assert "whole" in embedded.text, "a reference inside a url never reaches the destination check"
     assert not (tmp_path / "data" / "settings.json").exists()
 
 
 def test_a_whole_url_reference_can_be_saved(tmp_path):
-    client, runtime, _ = make_client(tmp_path, environment={"FEED_URL": "https://feeds.example.net/feed.xml"})
+    client, runtime, _ = make_client(
+        tmp_path,
+        environment={"FEED_URL": "https://feeds.example.net/feed.xml"},
+        extra="overlay_references: [FEED_URL]\n",
+    )
     response = new_source(client, **{"new:type": "rss", "new:url": "${FEED_URL}"})
     assert response.status_code == 303
     assert overlay(tmp_path)["sources_added"][0]["url"] == "${FEED_URL}"
@@ -966,6 +1011,35 @@ def test_the_sources_page_redacts_a_stored_error_at_render_time(tmp_path):
     page = client.get("/sources").text
     assert "s3cret-token" not in page
     assert "boom" in page
+
+
+def test_the_sources_page_escapes_a_stored_error_once(tmp_path):
+    """``_short`` already escapes after its cut, so a second ``esc`` showed ``&amp;`` literally (W10)."""
+    client, runtime, _ = make_client(tmp_path)
+    state = core.new_state()
+    state["source_health"] = {
+        "vendor": {"at": 1, "ok": False, "ok_at": 0, "items": 0, "error": "HTTP 502 for a&b <retry>"}
+    }
+    save_state(runtime.cfg.state_path, state)
+    signed_in(client)
+    page = client.get("/sources").text
+    assert "HTTP 502 for a&amp;b &lt;retry&gt;" in page
+    assert "&amp;amp;" not in page and "&amp;lt;" not in page
+
+
+def test_a_probe_escapes_an_item_title_once(tmp_path):
+    """The same single escape for the first few titles a probe shows (W10)."""
+    feed = RSS.replace(b"CVE-2026-1111 fixed in libfoo", b"CVE-2026-1111 in libfoo &amp; libbar")
+
+    def http(method, url, headers, body):
+        return 200, {}, feed
+
+    client, _, _ = make_client(tmp_path, transport=http)
+    csrf, fingerprint = signed_in(client)
+    response = client.post("/config/sources/probe", data={"csrf": csrf, "fingerprint": fingerprint, "id": "vendor"})
+    assert response.status_code == 200
+    assert "CVE-2026-1111 in libfoo &amp; libbar" in response.text
+    assert "&amp;amp;" not in response.text
 
 
 def test_a_bare_config_app_redacts_a_row_origin(tmp_path):
@@ -1773,6 +1847,109 @@ def test_an_added_source_can_carry_an_interval(tmp_path):
 # --- importing an OPML subscription list ---------------------------------------------------------
 
 
+# --- W1: a reference in the overlay reads any variable of the process -------------------------------------
+#
+# The overlay is written by a signed-in browser session, and ``${NAME}`` expands to any variable of the process,
+# the auth token included. Every route below used to carry one out to a host the session chose.
+
+LEAK = "hunter2-the-auth-token"
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["https://x.example/c?k=${LEAK}", "https://${LEAK}.example.net/feed", "${LEAK}", "https://x.example/a$b"],
+)
+def test_an_unsaved_probe_with_a_reference_never_fetches_or_resolves(tmp_path, url):
+    client, _, fetched, resolved = recording_client(tmp_path, environment={"LEAK": LEAK})
+    csrf, fingerprint = signed_in(client)
+    resolved.clear()  # rendering the page may resolve nothing, but the claim is about the probe itself
+    response = client.post(
+        "/config/sources/probe",
+        data={"csrf": csrf, "fingerprint": fingerprint, "new:type": "rss", "new:url": url},
+    )
+    assert response.status_code == 400
+    assert "overlay_references" in response.text
+    assert fetched == [] and resolved == [], "the reference is refused before it is expanded, fetched or resolved"
+    assert LEAK not in response.text
+
+
+def test_a_listed_variable_cannot_be_spliced_into_a_url_by_a_probe_or_a_save(tmp_path):
+    """Allowing a variable for a credential field is not allowing it in a URL the browser chose."""
+    url = "https://x.example/c?k=${LEAK}"
+    client, _, fetched, resolved = recording_client(tmp_path, environment={"LEAK": LEAK}, listed=("LEAK",))
+    csrf, fingerprint = signed_in(client)
+    resolved.clear()
+    probed = client.post(
+        "/config/sources/probe",
+        data={"csrf": csrf, "fingerprint": fingerprint, "new:type": "rss", "new:url": url},
+    )
+    assert probed.status_code == 400 and "whole" in probed.text
+    saved = new_source(client, **{"new:type": "rss", "new:url": url})
+    assert saved.status_code == 400 and "whole" in saved.text
+    assert fetched == [] and resolved == []
+    assert LEAK not in probed.text + saved.text
+    assert not (tmp_path / "data" / "settings.json").exists()
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"new:type": "rss", "new:url": "https://x.example/c?k=${LEAK}"},
+        {"new:type": "rss", "new:url": "${LEAK}"},
+        {"new:type": "freshrss", "new:url": "https://rss.example.net", "new:token": "${LEAK}"},
+    ],
+    ids=["embedded in a url", "a whole url", "a credential field"],
+)
+def test_a_source_saved_with_an_unlisted_reference_is_refused_and_writes_nothing(tmp_path, fields):
+    client, _, fetched, resolved = recording_client(tmp_path, environment={"LEAK": LEAK})
+    signed_in(client)
+    resolved.clear()
+    response = new_source(client, **fields)
+    assert response.status_code == 400
+    assert "overlay_references" in response.text
+    assert "LEAK" in response.text or "whole" in response.text
+    assert LEAK not in response.text
+    assert fetched == [] and resolved == []
+    assert not (tmp_path / "data" / "settings.json").exists()
+
+
+def test_an_edit_cannot_put_a_reference_into_an_added_source(tmp_path):
+    client, _, fetched, resolved = recording_client(tmp_path, environment={"LEAK": LEAK})
+    assert new_source(client, **{"new:type": "rss", "new:url": "https://nodejs.org/feed/a.xml"}).status_code == 303
+    csrf, fingerprint = signed_in(client)
+    resolved.clear()
+    response = client.post(
+        "/config/sources",
+        data={
+            "csrf": csrf,
+            "fingerprint": fingerprint,
+            "enabled:vendor": "1",
+            "enabled:nodejs-org": "1",
+            "added_url:nodejs-org": "https://x.example/c?k=${LEAK}",
+        },
+    )
+    assert response.status_code == 400
+    assert "overlay_references" in response.text and LEAK not in response.text
+    assert resolved == [] and fetched == []
+    assert overlay(tmp_path)["sources_added"][0]["url"] == "https://nodejs.org/feed/a.xml"
+
+
+def test_a_listed_whole_reference_still_probes_saves_and_runs(tmp_path):
+    url = "https://feeds.example.net/listed.xml"
+    client, runtime, fetched, _ = recording_client(tmp_path, environment={"FEED_URL": url}, listed=("FEED_URL",))
+    csrf, fingerprint = signed_in(client)
+    probed = client.post(
+        "/config/sources/probe",
+        data={"csrf": csrf, "fingerprint": fingerprint, "new:type": "rss", "new:url": "${FEED_URL}"},
+    )
+    assert probed.status_code == 200 and "Answered with 2 entries." in probed.text
+    assert fetched == [url]
+    assert new_source(client, **{"new:type": "rss", "new:url": "${FEED_URL}"}).status_code == 303
+    assert overlay(tmp_path)["sources_added"][0]["url"] == "${FEED_URL}"
+    runtime.reload(blocking=True)
+    assert url in [source.url for source in runtime.sources]
+
+
 def opml(*urls: str) -> str:
     """An OPML 2.0 document with one folder holding one outline per URL."""
     outlines = "".join(f'<outline text="{urlsplit(url).hostname or "feed"}" xmlUrl="{url}"/>' for url in urls)
@@ -1862,6 +2039,20 @@ def test_opml_import_refuses_a_document_that_does_not_parse(tmp_path):
     assert not (tmp_path / "data" / "settings.json").exists()
 
 
+def test_opml_import_refuses_a_document_nested_too_deeply(tmp_path):
+    """A folder tree deeper than the walk follows is a refused document (400), never a recursion error (500).
+
+    The form body is capped at 64 KiB, which is still room for more levels than the interpreter's recursion limit.
+    """
+    client, _, _ = make_client(tmp_path)
+    deep = '<opml version="2.0"><body>' + "<outline>" * 1500 + "</outline>" * 1500 + "</body></opml>"
+    response = import_opml(client, deep)
+    assert response.status_code == 400
+    assert "could not be read" in response.text
+    assert "nested too deeply" in response.text
+    assert not (tmp_path / "data" / "settings.json").exists()
+
+
 def test_opml_import_checks_every_url_before_writing(tmp_path):
     client, _, _ = make_client(tmp_path)
     response = import_opml(
@@ -1881,31 +2072,106 @@ def test_opml_import_refuses_a_private_destination(tmp_path):
     assert not (tmp_path / "data" / "settings.json").exists()
 
 
-def test_opml_import_expands_an_imported_reference_when_skipping_a_configured_feed(tmp_path):
+@pytest.mark.parametrize(
+    "url",
+    [
+        "${FEED_URL}",
+        "https://x.example/c?k=${FEED_URL}",
+        "https://${FEED_URL}.example.net/feed.xml",
+        "https://x.example/a$b",
+    ],
+    ids=["a whole reference", "embedded in a query", "in a host label", "a literal dollar"],
+)
+def test_opml_import_refuses_a_feed_that_carries_a_reference(tmp_path, url):
+    """An OPML document is someone else's text; a reference in it would read a secret out of the environment (W1).
+
+    Refused even for a variable the YAML lists: the list is for references the operator types, not for what a
+    pasted document names. The message points at the feed by position and never repeats its url.
+    """
+    client, _, fetched, resolved = recording_client(tmp_path, environment={"FEED_URL": LEAK}, listed=("FEED_URL",))
+    signed_in(client)
+    resolved.clear()
+    response = import_opml(client, opml("https://a.example.net/feed.xml", url))
+    assert response.status_code == 400
+    assert "Feed 2" in response.text and "nothing was added" in response.text.lower()
+    assert LEAK not in response.text and "FEED_URL" not in response.text and "x.example" not in response.text
+    assert fetched == [] and resolved == [], "the document is judged before any host is resolved"
+    assert not (tmp_path / "data" / "settings.json").exists(), "one refused feed refuses the whole batch"
+
+
+def test_opml_import_refuses_a_reference_even_for_a_feed_that_is_already_configured(tmp_path):
     client, _, _ = make_client(
         tmp_path,
         sources=[{"id": "vendor", "type": "rss", "url": "https://feeds.example.net/security.xml"}],
         environment={"FEED_URL": "https://feeds.example.net/security.xml"},
     )
     response = import_opml(client, opml("${FEED_URL}"))
-    assert response.status_code == 200
-    assert "added 0, skipped 1" in response.text
-    assert not (tmp_path / "data" / "settings.json").exists(), "an already-configured feed writes nothing"
+    assert response.status_code == 400
+    assert not (tmp_path / "data" / "settings.json").exists()
 
 
-def test_opml_import_treats_a_reference_and_its_literal_as_one_subscription(tmp_path):
-    client, _, _ = make_client(tmp_path, environment={"FEED_URL": "https://a.example.net/feed.xml"})
-    response = import_opml(client, opml("https://a.example.net/feed.xml", "${FEED_URL}"))
-    assert response.status_code == 200
-    assert "added 1, skipped 1" in response.text
-    assert [entry["url"] for entry in overlay(tmp_path)["sources_added"]] == ["https://a.example.net/feed.xml"]
+def test_opml_import_takes_at_most_one_hundred_feeds_and_resolves_none_above_that(tmp_path):
+    client, _, fetched, resolved = recording_client(tmp_path, environment={})
+    signed_in(client)
+    resolved.clear()
+    too_many = opml(*(f"https://h{number}.example.net/feed.xml" for number in range(101)))
+    response = import_opml(client, too_many)
+    assert response.status_code == 400
+    assert "101" in response.text and "at most 100" in response.text
+    assert resolved == [], "the cap is judged before any host is resolved"
+    assert not (tmp_path / "data" / "settings.json").exists()
+    exactly = import_opml(client, opml(*(f"https://h{number}.example.net/feed.xml" for number in range(100))))
+    assert exactly.status_code == 200 and "added 100, skipped 0" in exactly.text
+    assert len(resolved) == 100
 
 
-def test_opml_import_stores_an_imported_reference_as_written(tmp_path):
-    client, runtime, _ = make_client(tmp_path, environment={"FEED_URL": "https://b.example.net/feed.xml"})
-    response = import_opml(client, opml("${FEED_URL}"))
-    assert response.status_code == 200
-    assert "added 1, skipped 0" in response.text
-    assert overlay(tmp_path)["sources_added"][0]["url"] == "${FEED_URL}"
-    runtime.reload(blocking=True)
-    assert "https://b.example.net/feed.xml" in [source.url for source in runtime.sources]
+def test_opml_import_resolves_every_host_outside_the_settings_lock(tmp_path):
+    """DNS answers at the resolver's pace; under the lock it would hold every other settings save behind it (W9).
+
+    The lock is re-entrant, so the probe is a second thread: it can only take the lock when the import's own
+    thread is not holding it.
+    """
+    held: list[bool] = []
+
+    def resolver(host: str) -> tuple[str, ...]:
+        outcome: list[bool] = []
+
+        def probe() -> None:
+            free = SETTINGS_LOCK.acquire(blocking=False)
+            outcome.append(free)
+            if free:
+                SETTINGS_LOCK.release()
+
+        thread = threading.Thread(target=probe)
+        thread.start()
+        thread.join()
+        held.append(not outcome[0])
+        return (PUBLIC_ADDRESS,)
+
+    client, _, _ = make_client(tmp_path, resolve=resolver)
+    signed_in(client)
+    held.clear()
+    response = import_opml(client, opml("https://a.example.net/feed.xml", "https://b.example.net/feed.xml"))
+    assert response.status_code == 200 and "added 2, skipped 0" in response.text
+    assert held == [False, False], "each host was resolved while the settings lock was free"
+
+
+def test_opml_import_resolves_each_distinct_feed_url_at_most_once(tmp_path):
+    """The cost the docs state: at most one lookup per distinct feed URL, however often the document repeats it (W9).
+
+    The check is made per URL and not per host, so two feeds on one host are two lookups.
+    """
+    client, _, _, resolved = recording_client(tmp_path, environment={})
+    signed_in(client)
+    resolved.clear()
+    response = import_opml(
+        client,
+        opml(
+            "https://a.example.net/one.xml",
+            "https://a.example.net/one.xml",
+            "https://a.example.net/two.xml",
+            "https://b.example.net/feed.xml",
+        ),
+    )
+    assert response.status_code == 200 and "added 3, skipped 1" in response.text
+    assert resolved == ["a.example.net", "a.example.net", "b.example.net"], "the repeated URL is not looked up again"

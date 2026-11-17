@@ -131,6 +131,13 @@ what you were actually told
 apart from what the numbers now say, so a KEV hit or a CISA active flag that arrives later
 still escalates — that is evidence, not a rule.
 
+An escalation counts as told only when a channel accepted it. If the message is dropped
+instead, the entry keeps the level you were last told, so the next daily re-evaluation queues
+the escalation again for as long as the CVE is watched. A delivery only ever raises that
+level. When a warning escalation that a channel refused earlier is still queued and a critical
+one is added beside it, a pass delivers the critical first, and the late warning leaves the
+entry at critical, so the next re-evaluation does not send the critical again.
+
 `/thresholds`, linked from `/config`, previews one advisory: give it a CVSS, an EPSS, its
 KEV and SSVC state, a source, a product and the advisory's identifiers, and it shows the
 level, the reason, the exact metrics line and note the message would carry, and which route
@@ -238,6 +245,34 @@ A `log` notifier (`type: log`) needs no url or secret. It writes each message to
 and delivers nothing, but it reports success, so the state records every message as delivered. Use it
 for a shadow run: the instance evaluates what it would send before real channels are configured.
 
+A pass delivers a bounded number of queued advisories. When more are queued than that, it takes
+the critical ones first and fills the rest of its window in queue order, so a long queue of
+warnings cannot hold a critical advisory behind the limit. A digest is built from the same
+window, and one that covers a critical advisory counts as a critical message. The stored queue
+keeps its order, and a queue with no critical advisory is delivered exactly as before.
+
+One guarantee holds on every path (one message at a time, quiet hours, digests, routes): a
+payload that a channel refuses and that carries no critical advisory never keeps a payload that
+does carry one from being tried in the same pass. A payload is what one request carries: a
+message, or the digest of the advisories one destination has not yet accepted. The rule behind
+the guarantee is that a failure does not end the pass. After the first failure (a refusal, an
+unreachable channel, a route that names no enabled notifier, or a message that cannot be parked
+because the parked list is full) the pass goes on, but it sends only payloads that carry a
+critical advisory. A payload with none waits for the next pass: it is not sent, and it does not
+count as an attempt for the messages it would have carried. A message, or a group's batch, that
+has already started still goes to all of its channels. A destination that already accepted
+an advisory is never sent it again. This matters most for digests. A destination that has accepted
+the critical advisory of a group is owed only that group's warnings, so its digest carries no
+critical advisory, and if it refuses that digest the critical advisories of the other groups are
+still sent. The pass still reports the failure.
+
+A failed pass therefore tries every critical advisory of its window, where it used to stop at
+the first failed message. During an outage each critical advisory of the window takes one
+attempt per pass, and a channel that is down receives one request for every critical message or
+digest, so the critical advisories reach the parking limit together. Warnings that no critical
+payload carries wait untouched. After a failure, a later critical advisory can reach a channel
+before an earlier one that the channel refused.
+
 A generic `webhook` notifier may carry a signing secret, referenced from the environment:
 
 ```yaml
@@ -326,6 +361,13 @@ last-pass line: finished, failed, already running, or not available in this proc
 busy or failed request is not read as the previous successful pass. The result travels in a
 signed token that expires after two minutes and is bound to the signed-in session, so a
 missing, stale or other-session token renders no notice.
+
+**Release all** and **Drop all** on `/parked` act on the queue the page listed. Each form carries a
+digest of the messages shown, and the action compares it, under the state lock, with the queue it is
+about to change. A message parked after the page was rendered makes the two differ: the answer is
+`409` with nothing written, so a new message is never released or dropped unseen. Reload the page
+and decide again. A form without a digest is refused the same way. The `release-parked` and
+`drop-parked` commands carry no digest and act on the whole queue.
 
 `/inbox` is the work list across the whole lifecycle. Its rows are one per identifier, and
 each row keeps every fact the state holds about it — a parked message, a queued one, carried
@@ -417,6 +459,65 @@ Secrets stay in the environment. The overlay stores a notifier's `url`, `key`,
 refuses a literal value, and does not accept `headers` at all. Changing an environment
 variable still needs a restart, because the process reads the environment when it starts.
 
+### Which variables the overlay may reference
+
+`${NAME}` reads any variable of the process, and the overlay is written from a browser session.
+Left open, that session could send the login token, a database password or another channel's
+credential to a URL or a mail host it chose. So the YAML lists the variables the overlay may
+name, and the overlay can name no others:
+
+```yaml
+overlay_references: [DISCORD_WEBHOOK_URL, FEED_TOKEN]   # YAML-only; absent or empty means none
+```
+
+- The key is YAML-only. It is not one of the ten overlay keys, so no form can widen it, and a
+  value that is not a list of upper-case variable names is a configuration error. `X` and
+  `X_FILE` are one family: listing either allows both spellings.
+- Every string of the overlay is checked, not only the credential keys, because a reference in a
+  path, a host list or a route is still a value that a request or an error message can carry. An
+  overlay that names an unlisted variable is refused at startup, on a reload and on a save, and
+  the message lists variable names only, never a value.
+- The one exemption is the YAML's own text in the same place: the same notifier (id and type) and
+  key, or the same source id and key, with the string equal character for character. The forms
+  store whole entries, so switching a YAML-defined notifier off needs no listing. The same string
+  copied anywhere else is the overlay's own use and has to be listed.
+- A source the overlay adds may carry `$` in its `url` only as one whole `${NAME}` reference that
+  is listed. A reference inside a longer URL, such as `https://host/feed?key=${TOKEN}`, is
+  refused even for a listed name: allowing `TOKEN` for a `token` field does not allow it in
+  someone else's query string. Write a literal `$` as `%24`, or define that source in the YAML.
+  The probe and the duplicate check refuse such a source before anything is expanded, resolved
+  or fetched, because a request to `https://${SECRET}.example.net` has already left by the time a
+  save is judged.
+- An `smtp` notifier that the YAML defines with a `password` keeps the YAML's `host`, `port`,
+  `use_tls` and `implicit_tls` whatever the overlay says, and a key the YAML omits stays omitted.
+  One edit therefore cannot send the file's password to another mail host or without TLS. An
+  `smtp` notifier that only the overlay defines names its own server and can reference only
+  listed variables.
+- That protection reads a notifier's `type` as written, so a notifier's `type` is always written
+  out. A `${NAME}` reference in it is a configuration error: a whole reference
+  (`type: ${MAIL_KIND}`), a `_FILE` reference and a reference composed into the name
+  (`type: sm${TAIL}`) alike, on a disabled entry too, because the overlay can enable one. A
+  source's `type` may still be a reference.
+- An OPML import refuses any feed URL that contains `$` (see `sources.md`).
+
+Listing a variable is a decision: a session that holds the UI token can then send its value to an
+address it chooses, as an added source's `token` or an added `smtp` notifier's `password`. List
+only variables you accept being usable that way, and never the login token or an
+`ADVISORY_RADAR_*` variable. The UI token is a full-trust credential in any case (see
+`sources.md`); this closes the path to every variable nobody listed, not the one to the listed ones.
+
+An upgrade needs one step when `settings.json` already references a variable the YAML does not
+list, for example a notifier or a source added on `/config` with `${NAME}`: startup and every
+reload refuse the overlay until the name is listed under `overlay_references` in the YAML, or the
+entry is removed from the overlay. The message names the variables. Deleting `settings.json`
+returns to the YAML, as it always did: restart, or reload on a process that is already running.
+
+A second upgrade step applies to a YAML that writes a `${NAME}` reference in a notifier's `type`.
+Every load of that file refuses it, at startup, on a reload and in a state-only command (`migrate`,
+`release-parked`, `drop-parked`), with `<id>: a notifier type is a name, not a ${NAME} reference;
+write the type itself`. Write the type out (`smtp`, `ntfy` and so on). A variable still supplies the
+values that differ between environments, such as `url` or `host`.
+
 A reload builds the new configuration and its plugins before it swaps them in under the
 state lock. A shared configuration value goes through the same validator the YAML does,
 and the overlay adds its own restrictions (a notifier's secret must be a reference, a
@@ -450,6 +551,27 @@ document read through the configured store into another one, and prints both sto
 the URL, which can carry a password. It refuses a target that already holds a document, so a
 wrong `--to` cannot overwrite a live state, and it leaves the source in place: set `storage:`
 to the new store and restart once the copy looks right.
+
+## First sight, backlog and outages
+
+A source is bootstrapped the first time it answers, once per source: an item published within
+the last day is queued as news, and everything older is recorded as `backlog` and never alerted,
+so installing the program or adding a feed does not replay its history. An item with no date is
+unknown rather than old, so it is queued. A source that was down on the first pass is
+bootstrapped when it first answers.
+
+After that, an item the state has never seen is news unless it is already old: one first seen
+more than 7 days after its publication date is recorded as `backlog` too, and never alerted.
+
+An outage changes that rule. A source that could not be read for longer than 7 days returns,
+once it recovers, the advisories published while it was down, and age alone would file every
+one of them as history. So the pass compares the item with the source's last successful read:
+an item is `backlog` only when it is older than 7 days **and** was published more than one day
+before that read. Anything newer was not in a window an earlier pass read, so it is alerted
+however old it now is. The day covers a publisher that dates an entry slightly before the pass
+that first listed it. A source that has never been read successfully, or that was removed or
+disabled and later brought back (its health record is dropped while it does not run), keeps the
+plain 7-day rule, and an item carried over from an earlier pass is never history.
 
 ## Gap detection
 

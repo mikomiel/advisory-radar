@@ -7,14 +7,29 @@ per-source enrichment clocks, secret collection and the persisted run record.
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import errno
 import json
+import re
+import socketserver
+import threading
+import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
+import yaml
 
 from advisory_radar import core, pipeline
-from advisory_radar.config import DEFAULT_THRESHOLDS, collect_secrets, load_config
+from advisory_radar.config import (
+    DEFAULT_THRESHOLDS,
+    MIN_SECRET_LENGTH,
+    ConfigError,
+    collect_secrets,
+    env_secret,
+    load_config,
+)
 from advisory_radar.notifiers import AppriseNotifier, DiscordWebhookNotifier, build_notifier
 from advisory_radar.sources import RssSource
 from advisory_radar.state import LockBusy, state_lock
@@ -99,6 +114,181 @@ def test_web_ui_refuses_an_empty_auth_token(tmp_path):
         create_app(config(tmp_path), {})
 
 
+#: A token and a webhook secret of the length ``openssl rand -hex 24`` makes half of: the shortest accepted.
+MINIMUM_SECRET = "k" * 24
+
+
+@pytest.mark.parametrize("token", ["Zq", "Zq7-ci-tok", "Zq" + "x" * 21], ids=["2", "10", "23"])
+def test_web_ui_refuses_a_short_auth_token(tmp_path, token):
+    """A one-character token was accepted, and the session cookie is signed with it (W7)."""
+    from advisory_radar.web import create_app
+
+    with pytest.raises(ConfigError) as raised:
+        create_app(config(tmp_path), {"ADVISORY_RADAR_AUTH_TOKEN": token})
+    message = str(raised.value)
+    assert "ADVISORY_RADAR_AUTH_TOKEN" in message and "at least 24" in message
+    assert "openssl rand -hex 24" in message, "the refusal says how to make a token that is accepted"
+    assert token not in message, "a refused secret is never echoed"
+
+
+def test_web_ui_accepts_an_auth_token_of_exactly_the_minimum_length(tmp_path):
+    from advisory_radar.web import create_app
+
+    create_app(config(tmp_path), {"ADVISORY_RADAR_AUTH_TOKEN": MINIMUM_SECRET})
+
+
+CI_WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+SMOKE_STEP = "Container image builds and starts"
+
+
+def smoke_test_token(run: str) -> str:
+    """The login token the image smoke test would hand the container, as the container would read it.
+
+    Two shapes are recognised: a literal, and ``"$(openssl rand -hex N)"``, which is N bytes written as 2N hex
+    characters. Anything else cannot be judged from the text, so it is refused here instead of being assumed
+    long enough.
+    """
+    generated = re.search(r'-e ADVISORY_RADAR_AUTH_TOKEN="\$\(openssl rand -hex (\d+)\)"', run)
+    if generated:
+        return "f" * (2 * int(generated[1]))
+    literal = re.search(r"-e ADVISORY_RADAR_AUTH_TOKEN=([\w.~+-]+)(?=\s)", run)
+    assert literal, 'the smoke test must pass the token as a literal or as "$(openssl rand -hex N)"'
+    return literal[1]
+
+
+def test_the_ci_image_smoke_test_starts_the_container_with_a_token_run_accepts():
+    """``run`` refuses a short token, so a smoke test that still passes one never gets /healthz answered (W7).
+
+    The token is judged by the same ``env_secret`` call that ``create_app`` makes, so tightening the minimum again
+    fails here before it fails the required ``ci`` check on a pull request.
+    """
+    steps = [
+        step
+        for step in yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]["ci"]["steps"]
+        if step.get("name") == SMOKE_STEP
+    ]
+    assert len(steps) == 1, "the ci job must have exactly one image smoke-test step"
+    env = {"ADVISORY_RADAR_AUTH_TOKEN": smoke_test_token(steps[0]["run"])}
+    try:
+        env_secret(env, "ADVISORY_RADAR_AUTH_TOKEN", minimum=MIN_SECRET_LENGTH)
+    except ConfigError as exc:
+        pytest.fail(f"the container would exit 1 and /healthz would never answer: {exc}")
+
+
+def test_web_ui_refuses_a_short_webhook_secret_but_not_an_absent_one(tmp_path):
+    """A set webhook secret is held to the token's rule; an unset one still just disables the intake (W7)."""
+    from advisory_radar.web import create_app
+
+    base = {"ADVISORY_RADAR_AUTH_TOKEN": MINIMUM_SECRET}
+    with pytest.raises(ConfigError) as raised:
+        create_app(config(tmp_path), {**base, "ADVISORY_RADAR_WEBHOOK_SECRET": "Zq-short"})
+    assert "ADVISORY_RADAR_WEBHOOK_SECRET" in str(raised.value) and "Zq-short" not in str(raised.value)
+    assert "openssl rand -hex 24" in str(raised.value)
+    create_app(config(tmp_path), base)
+    create_app(config(tmp_path), {**base, "ADVISORY_RADAR_WEBHOOK_SECRET": ""})
+    create_app(config(tmp_path), {**base, "ADVISORY_RADAR_WEBHOOK_SECRET": "w" * 24})
+
+
+def sign_in_status(client, token: str) -> int:
+    return client.post("/login", data={"token": token}, follow_redirects=False).status_code
+
+
+def test_the_auth_token_may_come_from_a_file(tmp_path):
+    """There was no ``_FILE`` form: the token had to sit in the environment, where a process listing shows it (W8b)."""
+    from fastapi.testclient import TestClient
+
+    from advisory_radar.web import create_app
+
+    token_file = tmp_path / "token"
+    token_file.write_text("f" * 24 + "\n")  # an editor or `echo` leaves a newline; it is not part of the secret
+    client = TestClient(create_app(config(tmp_path), {"ADVISORY_RADAR_AUTH_TOKEN_FILE": str(token_file)}))
+    assert sign_in_status(client, "f" * 24) == 303
+    assert sign_in_status(client, "g" * 24) == 200, "a wrong token is shown the sign-in form again"
+
+
+def test_the_auth_token_is_read_once_at_startup(tmp_path):
+    """The login compare re-read the variable on every request, so it could drift from the cookie key (W8b)."""
+    from fastapi.testclient import TestClient
+
+    from advisory_radar.web import create_app
+
+    token_file = tmp_path / "token"
+    token_file.write_text("o" * 24)
+    client = TestClient(create_app(config(tmp_path), {"ADVISORY_RADAR_AUTH_TOKEN_FILE": str(token_file)}))
+    token_file.write_text("n" * 24)  # a rotation takes a restart, like every other startup-bound value
+    assert sign_in_status(client, "n" * 24) == 200
+    assert sign_in_status(client, "o" * 24) == 303
+
+
+def test_the_auth_token_and_its_file_together_are_refused(tmp_path):
+    from advisory_radar.web import create_app
+
+    token_file = tmp_path / "token"
+    token_file.write_text("b" * 24)
+    env = {"ADVISORY_RADAR_AUTH_TOKEN": "Zq" + "a" * 22, "ADVISORY_RADAR_AUTH_TOKEN_FILE": str(token_file)}
+    with pytest.raises(ConfigError) as raised:
+        create_app(config(tmp_path), env)
+    message = str(raised.value)
+    assert "ADVISORY_RADAR_AUTH_TOKEN" in message and "ADVISORY_RADAR_AUTH_TOKEN_FILE" in message
+    assert "both" in message
+    assert "Zq" + "a" * 22 not in message and "b" * 24 not in message and str(token_file) not in message
+
+
+@pytest.mark.parametrize(
+    ("contents", "reason"),
+    [
+        (b"", "the file is empty"),
+        (b" \r\n", "the file is empty"),
+        (b"\xff\xfe" + b"x" * 30, "the file is not UTF-8 text"),
+        (None, "no readable file"),
+    ],
+    ids=["empty", "blank", "not-utf8", "absent"],
+)
+def test_an_unusable_auth_token_file_is_refused_naming_the_variable_only(tmp_path, contents, reason):
+    """Every failed read is a ``ConfigError`` that names ``ADVISORY_RADAR_AUTH_TOKEN_FILE`` and nothing else (W8b)."""
+    from advisory_radar.web import create_app
+
+    token_file = tmp_path / "token"
+    if contents is not None:
+        token_file.write_bytes(contents)
+    with pytest.raises(ConfigError) as raised:
+        create_app(config(tmp_path), {"ADVISORY_RADAR_AUTH_TOKEN_FILE": str(token_file)})
+    assert str(raised.value) == f"ADVISORY_RADAR_AUTH_TOKEN_FILE: {reason}"
+
+
+@pytest.mark.parametrize("name", ["ADVISORY_RADAR_AUTH_TOKEN", "ADVISORY_RADAR_WEBHOOK_SECRET"])
+def test_a_short_secret_in_a_file_is_refused_naming_the_file_variable(tmp_path, name):
+    from advisory_radar.web import create_app
+
+    short = tmp_path / "short"
+    short.write_text("Zq-short\n")
+    # The other secret is valid, so the refusal can only be about this one.
+    other = {} if name == "ADVISORY_RADAR_AUTH_TOKEN" else {"ADVISORY_RADAR_AUTH_TOKEN": MINIMUM_SECRET}
+    with pytest.raises(ConfigError) as raised:
+        create_app(config(tmp_path), {**other, f"{name}_FILE": str(short)})
+    assert str(raised.value).startswith(f"{name}_FILE:")
+    assert "Zq-short" not in str(raised.value)
+
+
+def test_run_exits_with_a_config_error_instead_of_a_traceback_on_a_short_token(tmp_path, monkeypatch, caplog):
+    """The refusal is a startup error like any other: logged as ``config: ...``, exit code 1, no server (W7)."""
+    import logging
+
+    from advisory_radar import cli
+
+    cfg_path = tmp_path / "c.yml"
+    cfg_path.write_text(f"sources: []\nnotifiers: []\nstate_path: {tmp_path / 'state.json'}\n")
+
+    def serve(*args, **kwargs):
+        raise AssertionError("a refused token must not start the server")
+
+    monkeypatch.setattr("uvicorn.run", serve)
+    with caplog.at_level(logging.ERROR, logger=cli.LOG.name):
+        code = cli.main(["--config", str(cfg_path), "run"], env={"ADVISORY_RADAR_AUTH_TOKEN": "Zq-short"})
+    assert code == 1
+    assert "config: ADVISORY_RADAR_AUTH_TOKEN" in caplog.text and "Zq-short" not in caplog.text
+
+
 def test_pass_skips_when_another_pass_holds_the_lock(tmp_path):
     cfg = config(tmp_path)
     notifier = Notifier()
@@ -117,8 +307,11 @@ def test_pass_skips_when_another_pass_holds_the_lock(tmp_path):
     assert not notifier.sent
 
 
-def test_a_blocking_pass_still_reports_one_when_the_lock_times_out(tmp_path, monkeypatch):
-    """The CLI and scheduler keep their ``1 = failed`` contract; only the non-blocking web path has a skip code."""
+def test_a_blocking_pass_still_reports_one_when_the_store_refuses_the_lock(tmp_path, monkeypatch):
+    """The CLI and scheduler keep their ``1 = failed`` contract; only the non-blocking web path has a skip code.
+
+    No store times a blocking acquisition out, so this is a store that refuses the lock outright.
+    """
     cfg = config(tmp_path)
 
     class BusyStore:
@@ -448,6 +641,112 @@ def test_file_backed_secret_values_are_redacted(tmp_path):
     assert "SUPERSECRET" not in record.getMessage()
 
 
+def file_reference_config(tmp_path):
+    """A configuration whose one notifier reads its url from ``${HOOK_FILE}``."""
+    cfg_path = tmp_path / "c.yml"
+    cfg_path.write_text(
+        "sources: []\nnotifiers:\n  - id: d\n    type: discord_webhook\n    url: ${HOOK_FILE}\n"
+        f"state_path: {tmp_path / 'state.json'}\n"
+    )
+    return cfg_path
+
+
+def test_an_undecodable_secret_file_is_a_config_error_that_names_the_reference_only(tmp_path):
+    """A secret file holding bytes that are not UTF-8 raised a bare ``UnicodeDecodeError`` (W8).
+
+    That exception's text quotes the offending byte, so it would also have put part of the secret in the log.
+    """
+    secret_file = tmp_path / "hook"
+    secret_file.write_bytes(b"https://hooks.example.com/\xff\xfeSUPERSECRET")
+    with pytest.raises(ConfigError) as raised:
+        load_config(file_reference_config(tmp_path), {"HOOK_FILE": str(secret_file)})
+    assert "${HOOK_FILE}" in str(raised.value) and "UTF-8" in str(raised.value)
+    assert "SUPERSECRET" not in str(raised.value) and "xff" not in str(raised.value).lower()
+    assert str(secret_file) not in str(raised.value), "the path may itself be the secret, so it is never printed"
+
+
+def test_an_unreadable_secret_file_is_a_config_error_that_names_the_reference_only(tmp_path, monkeypatch):
+    """``PermissionError`` escaped as an ``OSError`` that quotes the path (W8).
+
+    The suite runs as root, which ignores file modes, so the read is made to fail the way an unreadable file does.
+    """
+    secret_file = tmp_path / "hook"
+    secret_file.write_text("https://hooks.example.com/SUPERSECRET")
+    real = Path.read_text
+
+    def denied(self, *args, **kwargs):
+        if self == secret_file:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", denied)
+    with pytest.raises(ConfigError) as raised:
+        load_config(file_reference_config(tmp_path), {"HOOK_FILE": str(secret_file)})
+    assert str(raised.value).startswith("${HOOK_FILE}: no readable file")
+    assert str(secret_file) not in str(raised.value) and "SUPERSECRET" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("code", "reason"),
+    [(errno.ENAMETOOLONG, "File name too long"), (errno.EACCES, "Permission denied")],
+    ids=["name-too-long", "permission-denied"],
+)
+def test_a_secret_file_whose_stat_fails_is_a_config_error_that_names_the_reference_only(
+    tmp_path, monkeypatch, code, reason
+):
+    """Python 3.13's ``Path.is_file`` re-raises an ``OSError`` that quotes the path; 3.14 returns ``False`` (W8).
+
+    The image runs 3.13, where the check sat outside the ``try`` and a long or unsearchable path ended the start
+    with a traceback that prints the path. The stat is made to fail the way 3.13 does, so the test holds on both.
+    """
+    secret_file = tmp_path / "hook"
+    secret_file.write_text("https://hooks.example.com/SUPERSECRET")
+    real = Path.is_file
+
+    def failing(self, *args, **kwargs):
+        if self == secret_file:
+            raise OSError(code, reason, str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "is_file", failing)
+    with pytest.raises(ConfigError) as raised:
+        load_config(file_reference_config(tmp_path), {"HOOK_FILE": str(secret_file)})
+    assert str(raised.value) == "${HOOK_FILE}: no readable file"
+    assert str(secret_file) not in str(raised.value) and "SUPERSECRET" not in str(raised.value)
+
+
+@pytest.mark.parametrize("contents", ["", "\n", "  \r\n\t "])
+def test_an_empty_secret_file_is_refused_instead_of_loading_an_empty_secret(tmp_path, contents):
+    """An empty file resolved to ``''`` and the notifier came up with no credential at all (W8)."""
+    secret_file = tmp_path / "hook"
+    secret_file.write_text(contents)
+    with pytest.raises(ConfigError) as raised:
+        load_config(file_reference_config(tmp_path), {"HOOK_FILE": str(secret_file)})
+    assert "${HOOK_FILE}: the file is empty" in str(raised.value)
+
+
+def test_a_missing_secret_file_names_the_reference_as_written(tmp_path):
+    """``${X_FILE}`` is read through the variable ``X_FILE``; the message used to name ``${X_FILE_FILE}`` (W8)."""
+    with pytest.raises(ConfigError) as raised:
+        load_config(file_reference_config(tmp_path), {"HOOK_FILE": str(tmp_path / "absent")})
+    assert str(raised.value) == "${HOOK_FILE}: no readable file"
+    with pytest.raises(ConfigError) as unset:
+        load_config(file_reference_config(tmp_path), {})
+    assert str(unset.value) == "${HOOK_FILE}: no readable file"
+
+
+def test_a_state_only_command_tolerates_any_unusable_secret_file(tmp_path):
+    """``lenient`` leaves the reference alone for every way a file can fail, as it already did for a missing one."""
+    cfg_path = file_reference_config(tmp_path)
+    bad = tmp_path / "bad"
+    bad.write_bytes(b"\xff\xfe")
+    empty = tmp_path / "empty"
+    empty.write_text("")
+    for path in (bad, empty, tmp_path / "absent"):
+        cfg = load_config(cfg_path, {"HOOK_FILE": str(path)}, lenient=True)
+        assert cfg.notifiers[0]["url"] == "${HOOK_FILE}", path.name
+
+
 def test_a_malformed_kev_catalog_is_not_trusted(tmp_path):
     from advisory_radar.kev import KEV_CACHE_SCHEMA, load_kev
     from advisory_radar.state import save_state
@@ -646,7 +945,7 @@ def test_stopping_the_server_does_not_run_another_pass(tmp_path, monkeypatch):
     )
     calls: list[int] = []
 
-    def fake_run(app, host=None, port=None, log_level=None):
+    def fake_run(app, host=None, port=None, log_level=None, **kwargs):
         for _ in range(200):  # let the scheduler take its first pass, then stop like a SIGTERM would
             if calls:
                 return None
@@ -655,10 +954,68 @@ def test_stopping_the_server_does_not_run_another_pass(tmp_path, monkeypatch):
 
     monkeypatch.setattr("uvicorn.run", fake_run)
     monkeypatch.setattr(cli.pipeline, "run_pass", lambda *a, **k: calls.append(1) or 0)
-    monkeypatch.setenv("ADVISORY_RADAR_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("ADVISORY_RADAR_AUTH_TOKEN", MINIMUM_SECRET)
     code = cli.main(["--config", str(cfg_path), "run"])
     assert code == 0
     assert len(calls) == 1, "shutdown must not start an extra pass"
+
+
+FORWARDED = "ADVISORY_RADAR_FORWARDED_ALLOW_IPS"
+
+
+def run_with_stub_server(tmp_path, monkeypatch, env: dict[str, str]):
+    """Run ``advisory-radar run`` against a stub server; return the exit code and the keywords it was started with."""
+    from advisory_radar import cli
+
+    cfg_path = tmp_path / "c.yml"
+    cfg_path.write_text(f"sources: []\nnotifiers: []\nstate_path: {tmp_path / 'state.json'}\n")
+    started: dict = {}
+
+    def stub_run(app, **kwargs):
+        started.update(kwargs)
+
+    monkeypatch.setattr("uvicorn.run", stub_run)
+    monkeypatch.setattr(cli.pipeline, "run_pass", lambda *args, **kwargs: 0)
+    code = cli.main(["--config", str(cfg_path), "run"], env={"ADVISORY_RADAR_AUTH_TOKEN": MINIMUM_SECRET, **env})
+    return code, started
+
+
+def test_run_starts_the_server_with_an_explicit_loopback_default(tmp_path, monkeypatch):
+    """Without a value uvicorn reads its own ``FORWARDED_ALLOW_IPS``, which this project does not document (W2)."""
+    monkeypatch.setenv("FORWARDED_ALLOW_IPS", "*")
+    code, started = run_with_stub_server(tmp_path, monkeypatch, {})
+    assert code == 0
+    assert started["forwarded_allow_ips"] == ["127.0.0.1", "::1"], "an explicit value, so uvicorn's variable is unused"
+
+
+def test_run_trusts_the_proxies_the_documented_variable_names(tmp_path, monkeypatch):
+    """Behind a reverse proxy every login came from the proxy's address, so one throttle served every client (W2)."""
+    code, started = run_with_stub_server(tmp_path, monkeypatch, {FORWARDED: "192.0.2.10, 198.51.100.0/24,"})
+    assert code == 0
+    assert started["forwarded_allow_ips"] == ["192.0.2.10", "198.51.100.0/24"]
+    code, started = run_with_stub_server(tmp_path, monkeypatch, {FORWARDED: "2001:db8::1"})
+    assert started["forwarded_allow_ips"] == ["2001:db8::1"]
+    code, started = run_with_stub_server(tmp_path, monkeypatch, {FORWARDED: " "})
+    assert started["forwarded_allow_ips"] == ["127.0.0.1", "::1"], "a blank value is an unset one"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["*", "0.0.0.0/0", "::/0", "192.0.2.10,*", "proxy.example.net", "192.0.2.999", "192.0.2.0/33", "192.0.2.10/24"],
+)
+def test_run_refuses_a_forwarded_list_that_trusts_everyone_or_that_uvicorn_would_drop(
+    tmp_path, monkeypatch, caplog, value
+):
+    """uvicorn turns a malformed entry into a literal that never matches, so a typo would trust no proxy (W2)."""
+    import logging
+
+    from advisory_radar import cli
+
+    with caplog.at_level(logging.ERROR, logger=cli.LOG.name):
+        code, started = run_with_stub_server(tmp_path, monkeypatch, {FORWARDED: value})
+    assert code == 1
+    assert started == {}, "the server must not start with a trust list that was refused"
+    assert f"config: {FORWARDED}:" in caplog.text
 
 
 def test_a_kev_hit_escalates_even_when_the_scored_lookups_fail():
@@ -2259,8 +2616,10 @@ def test_the_config_page_does_not_print_a_source_token(tmp_path):
         "notifiers: []\nstate_path: " + str(tmp_path / "state.json") + "\n"
     )
     cfg = load_config(path, {})
-    client = TestClient(create_app(cfg, {"ADVISORY_RADAR_AUTH_TOKEN": "t"}))
-    client.post("/login", data={"token": "t"}, follow_redirects=False)
+    # The cookie flag follows the environment the app is given (W12), so a plain-HTTP client opts out in it.
+    env = {"ADVISORY_RADAR_AUTH_TOKEN": MINIMUM_SECRET, "ADVISORY_RADAR_INSECURE_COOKIES": "1"}
+    client = TestClient(create_app(cfg, env))
+    client.post("/login", data={"token": MINIMUM_SECRET}, follow_redirects=False)
     body = client.get("/config").text
     assert "SECRET123" not in body and "SECRET456" not in body and "pw@" not in body
     assert "feeds.example.com" in body
@@ -2574,17 +2933,23 @@ def test_a_claimed_ghsa_does_not_promote_a_new_low_finding():
     assert "critical" not in tags, "a claimed advisory must not promote the new finding"
 
 
-def test_a_plugin_type_error_does_not_echo_the_expanded_value(tmp_path, caplog):
+@pytest.mark.parametrize(
+    "plugins",
+    [
+        "sources:\n  - id: s\n    type: ${PLUGIN_KIND}\n    url: https://feeds.example.com/x.xml\nnotifiers: []\n",
+        # A notifier type is refused before it is expanded; a source type still reaches the builder expanded.
+        "sources: []\nnotifiers:\n  - id: n\n    type: ${PLUGIN_KIND}\n    url: https://hooks.example.com/x\n",
+    ],
+    ids=["source", "notifier"],
+)
+def test_a_plugin_type_error_does_not_echo_the_expanded_value(tmp_path, caplog, plugins):
     import logging
 
     from advisory_radar import cli
 
     path = tmp_path / "c.yml"
-    path.write_text(
-        "sources: []\nnotifiers:\n  - id: n\n    type: ${NOTIFIER_KIND}\n    url: https://hooks.example.com/x\n"
-        "state_path: " + str(tmp_path / "state.json") + "\n"
-    )
-    env = {"NOTIFIER_KIND": "https://hooks.example.com/SUPERSECRET"}
+    path.write_text(plugins + "state_path: " + str(tmp_path / "state.json") + "\n")
+    env = {"PLUGIN_KIND": "https://hooks.example.com/SUPERSECRET"}
     with caplog.at_level(logging.ERROR):
         code = cli.main(["--config", str(path), "once"], env=env)
     assert code == 1, "a bad plugin type is a configuration error, not a traceback"
@@ -3163,3 +3528,482 @@ def test_settlement_is_idempotent_across_a_serialisation():
     reloaded = json.loads(once)
     core._ensure_ownership(reloaded)
     assert json.dumps(reloaded, sort_keys=True) == once
+
+
+# ---------------------------------------------------------------------------
+# Pipeline robustness and delivery correctness review
+
+
+def _health(ok_at: int, *, ok: bool = False) -> dict:
+    """One ``source_health`` record the way ``pipeline._record_health`` writes it."""
+    return {"at": ok_at, "ok": ok, "ok_at": ok_at, "items": 0, "error": "" if ok else "OSError: down"}
+
+
+def _seeded_state(source_health: dict | None = None) -> dict:
+    state = core.new_state()
+    state["seeded"] = {"s1": True}
+    if source_health is not None:
+        state["source_health"] = source_health
+    return state
+
+
+def test_an_advisory_published_during_an_outage_is_news_not_backlog(tmp_path):
+    """A source down for longer than BACKLOG_AGE returns what it missed; age alone must not call that history."""
+    cfg = config(tmp_path)
+    cfg.store().save(_seeded_state({"s1": _health(NOW - 10 * core.DAY)}))
+    missed = core.Item(
+        "missed", "vendor advisory missed", "https://vendor.example.com/m", "notes", NOW - 9 * core.DAY, ()
+    )
+    notifier = Notifier()
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [missed])],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert [entry["title"] for entry in notifier.sent] == ["WARNING: vendor advisory missed"]
+    seen = cfg.store().load()["seen"]
+    assert seen["src:s1:missed"]["outcome"] == "delivered", (
+        "an item the outage hid is reported, not recorded as history"
+    )
+
+
+def test_history_older_than_the_last_success_is_still_backlog_after_an_outage(tmp_path):
+    cfg = config(tmp_path)
+    cfg.store().save(_seeded_state({"s1": _health(NOW - 10 * core.DAY)}))
+    old = core.Item("old", "vendor advisory old", "https://vendor.example.com/o", "notes", NOW - 30 * core.DAY, ())
+    notifier = Notifier()
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [old])],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert notifier.sent == []
+    assert cfg.store().load()["seen"]["src:s1:old"]["outcome"] == "backlog"
+
+
+def test_a_source_that_never_answered_keeps_the_age_rule(tmp_path):
+    """No recorded success (a re-enabled source has its health dropped) means age alone decides, as before."""
+    cfg = config(tmp_path)
+    cfg.store().save(_seeded_state())
+    nine_days = core.Item(
+        "nine", "vendor advisory nine", "https://vendor.example.com/n", "notes", NOW - 9 * core.DAY, ()
+    )
+    notifier = Notifier()
+    pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [nine_days])],
+        [notifier],
+        http=http_for({}),
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert notifier.sent == []
+    assert cfg.store().load()["seen"]["src:s1:nine"]["outcome"] == "backlog"
+
+
+class _NoLookups(core.Intel):
+    def __init__(self) -> None:
+        super().__init__(None, {}, lambda: float(NOW), lambda s: None)
+
+
+def _classify(state: dict, published: int, **extra) -> core.Item:
+    entry = core.Item("g1", "vendor advisory", "https://vendor.example.com/a", "notes", published, ())
+    core.classify_new(
+        state,
+        [entry],
+        _NoLookups(),
+        frozenset(),
+        True,
+        NOW,
+        "vendor.example.com",
+        core.Policy(("curl",), (), ()),
+        thresholds=DEFAULT_THRESHOLDS,
+        **extra,
+    )
+    return entry
+
+
+def test_the_outage_slack_decides_the_boundary_of_history():
+    """History is older than BACKLOG_AGE and published before the last success minus one day of slack."""
+    last_ok = NOW - 10 * core.DAY
+    edge = last_ok - core.BACKLOG_OUTAGE_SLACK
+    news, history = core.new_state(), core.new_state()
+    _classify(news, edge, last_ok=last_ok)
+    _classify(history, edge - 1, last_ok=last_ok)
+    assert len(news["pending"]) == 1, "published exactly at the edge is news"
+    assert history["pending"] == [] and history["seen"]["src:g1"]["outcome"] == "backlog"
+
+
+def test_the_age_rule_alone_applies_without_a_last_success():
+    state = core.new_state()
+    _classify(state, NOW - 8 * core.DAY, last_ok=0)
+    assert state["pending"] == [] and state["seen"]["src:g1"]["outcome"] == "backlog"
+
+
+def test_a_last_success_in_the_future_cannot_turn_history_into_news():
+    """A clock that stepped backwards must not make every old item look like one an outage hid."""
+    state = core.new_state()
+    _classify(state, NOW - 30 * core.DAY, last_ok=NOW + 365 * core.DAY)
+    assert state["pending"] == [] and state["seen"]["src:g1"]["outcome"] == "backlog"
+
+
+def test_the_tail_left_by_a_full_queue_gets_the_same_outage_decision():
+    """The tail past the delivery room is decided by the same rule, so the carry holds only news."""
+    last_ok = NOW - 10 * core.DAY
+    state = core.new_state()
+    # Undated items sort first and fill the room, so the two dated items below are the tail.
+    undated = [core.Item(f"u{n}", f"undated {n}", "https://vendor.example.com/u", "n", None, ()) for n in range(6)]
+    missed = core.Item("missed", "missed", "https://vendor.example.com/m", "n", NOW - 9 * core.DAY, ())
+    old = core.Item("old", "old", "https://vendor.example.com/o", "n", NOW - 30 * core.DAY, ())
+    left = core.classify_new(
+        state,
+        [*undated, missed, old],
+        _NoLookups(),
+        frozenset(),
+        True,
+        NOW,
+        "vendor.example.com",
+        core.Policy(("curl",), (), ()),
+        thresholds=DEFAULT_THRESHOLDS,
+        last_ok=last_ok,
+    )
+    assert {entry.guid for entry in left} == {"u5", "missed"}, "news the room could not take is carried"
+    assert state["seen"]["src:old"]["outcome"] == "backlog", "history in the tail is still recorded, never carried"
+
+
+def _kev_http(*cves: str):
+    body = json.dumps({"catalogVersion": "1", "vulnerabilities": [{"cveID": cve} for cve in cves]}).encode()
+
+    def http(method, url, headers, payload):
+        return 200, {"ETag": "e1"}, body
+
+    return http
+
+
+def test_a_failed_kev_cache_write_still_returns_the_fresh_catalog(tmp_path, caplog):
+    """The cache is an optimisation: a write fault must not discard the catalog that was just fetched."""
+    from advisory_radar.kev import load_kev
+
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a file where the cache directory should be")
+    with caplog.at_level("WARNING", logger="advisory_radar"):
+        cves, known = load_kev(_kev_http("CVE-2026-1111"), blocker / "kev.json", save=True)
+    assert cves == frozenset({"CVE-2026-1111"}) and known is True
+    assert "could not be written" in caplog.text and str(blocker) in caplog.text
+
+
+def test_the_kev_cache_is_written_on_one_line_and_read_back(tmp_path):
+    """The cache is saved like the state document, so it is not padded, and the next fetch still reads it."""
+    from advisory_radar.kev import load_kev
+
+    cache = tmp_path / "kev.json"
+    load_kev(_kev_http("CVE-2026-1111", "CVE-2026-2222"), cache, save=True)
+    assert "\n" not in cache.read_text(encoding="utf-8")[:-1], "one line"
+
+    def not_modified(method, url, headers, payload):
+        assert headers["If-None-Match"] == "e1", "the validator stored in the compact cache is sent back"
+        return 304, {}, b""
+
+    cves, known = load_kev(not_modified, cache, save=False)
+    assert cves == frozenset({"CVE-2026-1111", "CVE-2026-2222"}) and known is True
+
+
+def test_a_pass_survives_an_unwritable_kev_cache(tmp_path):
+    cfg = config(tmp_path)
+    (tmp_path / "kev.json").mkdir()  # the cache cannot be replaced by a file, so the write fails
+    notifier = Notifier()
+
+    def http(method, url, headers, payload):
+        if urlsplit(url).hostname == "www.cisa.gov":
+            return _kev_http("CVE-2026-4242")(method, url, headers, payload)
+        return http_for({})(method, url, headers, payload)
+
+    code = pipeline.run_pass(
+        cfg,
+        [WindowSource("s1", [item("g1", "vendor note")])],
+        [notifier],
+        http=http,
+        clock=lambda: float(NOW),
+        sleep=lambda s: None,
+    )
+    assert code == 0, "an unwritable cache is a warning, never a failed pass"
+    assert len(notifier.sent) == 1
+
+
+class _Clock:
+    """A monotonic clock a test moves by hand, installed as the ``time`` the HTTP transport reads."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class _Dribble:
+    """A response body a peer sends one byte at a time, each read costing simulated seconds, with no socket.
+
+    ``read`` behaves as ``http.client`` does: it keeps reading until it has the requested bytes or the peer
+    closes, however many reads (and however much time) that takes. ``read1`` returns after one read.
+    """
+
+    status = 200
+    headers: dict = {}
+
+    def __init__(self, clock: _Clock, seconds_per_byte: float, size: int = 2000) -> None:
+        self.clock = clock
+        self.seconds_per_byte = seconds_per_byte
+        self.left = size
+        self.reads = 0
+
+    def read1(self, size: int = -1) -> bytes:
+        if self.left <= 0:
+            return b""
+        self.reads += 1
+        self.clock.now += self.seconds_per_byte
+        self.left -= 1
+        return b"x"
+
+    def read(self, size: int = -1) -> bytes:
+        body = b""
+        while (size < 0 or len(body) < size) and (chunk := self.read1(1)):
+            body += chunk
+        return body
+
+    def close(self) -> None:  # ``HTTPError`` closes the body it wraps when it is collected
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+
+def _http_with(monkeypatch, opened):
+    """``urllib_http`` over a fake opener and a hand-moved clock; returns the clock."""
+    import types
+
+    from advisory_radar import http as transport
+
+    clock = _Clock()
+    monkeypatch.setattr(transport, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+    monkeypatch.setattr(transport._OPENER, "open", opened)
+    return clock, transport
+
+
+def test_a_body_that_dribbles_past_the_deadline_is_a_network_error(monkeypatch):
+    """HTTP_TIMEOUT bounds one socket operation; a peer sending a byte every few seconds must still be cut off."""
+    body: _Dribble | None = None
+
+    def opened(request, timeout):
+        nonlocal body
+        body = _Dribble(clock, seconds_per_byte=10.0)
+        return body
+
+    clock, transport = _http_with(monkeypatch, opened)
+    assert transport.urllib_http("GET", "https://feeds.example.com/slow", {}, None) == (0, {}, b"")
+    assert body is not None and body.reads <= transport.HTTP_DEADLINE // 10 + 1, "it stopped reading at the deadline"
+
+
+def test_the_deadline_counts_the_time_spent_before_the_first_byte(monkeypatch):
+    """The clock starts before the connection, so a slow connect or header wait spends the same budget, and a
+    request that reaches its first body read with nothing left ends there. This one has no socket: a wait for the
+    headers is itself cut at the deadline by the real transport, which the loopback tests below cover."""
+
+    def opened(request, timeout):
+        clock.now += transport.HTTP_DEADLINE + 1  # connecting and waiting for the headers took that long
+        return _Dribble(clock, seconds_per_byte=0.0, size=10)
+
+    clock, transport = _http_with(monkeypatch, opened)
+    assert transport.urllib_http("GET", "https://feeds.example.com/late", {}, None) == (0, {}, b"")
+
+
+def test_a_refusal_that_dribbles_its_body_keeps_its_status(monkeypatch):
+    import urllib.error
+
+    def opened(request, timeout):
+        raise urllib.error.HTTPError(
+            request.full_url, 503, "busy", {"Retry-After": "30"}, _Dribble(clock, seconds_per_byte=10.0)
+        )
+
+    clock, transport = _http_with(monkeypatch, opened)
+    status, headers, payload = transport.urllib_http("GET", "https://feeds.example.com/busy", {}, None)
+    assert status == 503 and headers == {"Retry-After": "30"}, "the refusal is the answer; only its body was lost"
+    assert payload == b""
+
+
+def test_a_body_inside_the_deadline_is_returned_whole_and_bounded_by_the_limit(monkeypatch):
+    clock, transport = _http_with(monkeypatch, lambda request, timeout: _Dribble(clock, 0.01, size=100))
+    monkeypatch.setattr(transport, "MAX_RESPONSE_BYTES", 10)
+    status, _, payload = transport.urllib_http("GET", "https://feeds.example.com/big", {}, None)
+    assert status == 200 and payload == b"x" * 11, "callers rely on receiving MAX_RESPONSE_BYTES + 1 bytes"
+    monkeypatch.setattr(transport, "MAX_RESPONSE_BYTES", 1000)
+    assert transport.urllib_http("GET", "https://feeds.example.com/small", {}, None)[2] == b"x" * 100
+
+
+# ---------------------------------------------------------------------------
+# PR #140 review round: what the transport keeps of an answer it could not finish, and where it stops waiting
+
+
+class _LosesItsBody(_Dribble):
+    """A response whose status line arrived and whose body ends in a connection reset."""
+
+    def read1(self, size: int = -1) -> bytes:
+        raise ConnectionResetError("reset by peer")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        lambda clock: _Dribble(clock, seconds_per_byte=10.0),
+        lambda clock: _LosesItsBody(clock, seconds_per_byte=0.0),
+    ],
+    ids=["dribbled-past-the-deadline", "reset"],
+)
+def test_a_post_keeps_the_status_its_receiver_answered_when_the_body_is_lost(monkeypatch, body):
+    """A notifier POST is judged by its status alone, and a 200 is the receiver's answer whatever follows it.
+
+    Reporting status 0 for it says "not delivered", so the message is posted again and the receiver gets it twice.
+    A GET that reads a document is the opposite: a truncated document is not the document, so it stays an error.
+    """
+    clock, transport = _http_with(monkeypatch, lambda request, timeout: body(clock))
+    assert transport.urllib_http("POST", "https://hooks.example.com/x", {}, b"{}") == (200, {}, b"")
+    assert transport.urllib_http("GET", "https://feeds.example.com/x", {}, None) == (0, {}, b"")
+
+
+def test_a_webhook_that_answered_200_is_not_told_apart_from_one_that_finished(monkeypatch):
+    from advisory_radar.notifiers import WebhookNotifier
+
+    clock, transport = _http_with(monkeypatch, lambda request, timeout: _Dribble(clock, seconds_per_byte=10.0))
+    entry = {"title": "t", "body": "b", "tag": "warning", "kind": "new", "ids": ["CVE-2026-1"]}
+    assert WebhookNotifier("hook", "https://hooks.example.com/x").send(entry, transport.urllib_http) == 200
+
+
+_HTTP_200 = b"HTTP/1.1 200 OK\r\nConnection: close\r\n"
+_CHUNKED = _HTTP_200 + b"Transfer-Encoding: chunked\r\n\r\n"
+#: Places inside one response where a peer can stall, as ``(sent before the stall, sent after it)``. The stall is a
+#: run of single bytes in a chunk extension, a trailer or a header: reading the body in pieces never covers them.
+_STALLS = {
+    "chunk-size-extension": (_CHUNKED + b"5;e=", b"\r\nhello\r\n0\r\n\r\n"),
+    "last-chunk-extension": (_CHUNKED + b"5\r\nhello\r\n0;e=", b"\r\n\r\n"),
+    "trailer": (_CHUNKED + b"5\r\nhello\r\n0\r\nX-T: ", b"\r\n\r\n"),
+    "header": (_HTTP_200 + b"Content-Length: 5\r\nX-Slow: ", b"\r\n\r\nhello"),
+}
+
+
+def _dribble(count: int, interval: float) -> list:
+    """``count`` single bytes, each followed by a pause of ``interval`` seconds."""
+    return [part for _ in range(count) for part in (b"x", interval)]
+
+
+@contextlib.contextmanager
+def _scripted_server(monkeypatch, *script):
+    """A loopback server that answers every request by playing ``script``: bytes are sent, numbers are pauses.
+
+    Yields the URL and an event that is set when a send failed because the client had gone away, which is how a
+    test sees that the client stopped reading while the server still had bytes to send.
+    """
+    gone = threading.Event()
+
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self):
+            received = b""
+            while b"\r\n\r\n" not in received:  # the request head, and with it a small body
+                chunk = self.request.recv(4096)
+                if not chunk:
+                    return
+                received += chunk
+            try:
+                for part in script:
+                    if isinstance(part, bytes):
+                        self.request.sendall(part)
+                    else:
+                        time.sleep(part)
+            except OSError:
+                gone.set()
+
+    class Server(socketserver.ThreadingTCPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    # An environment proxy must not stand between the test and the loopback server it starts.
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    server = Server(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/", gone
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _short_limits(monkeypatch, deadline: float = 0.4):
+    """The transport with a short deadline and a socket timeout no test pause comes near.
+
+    A test that expects the request to fail may use the 0.4 s default: a slow machine only makes it fail sooner.
+    A test that expects an answer to arrive passes a deadline its loopback exchange cannot plausibly miss.
+    """
+    from advisory_radar import http as transport
+
+    monkeypatch.setattr(transport, "HTTP_DEADLINE", deadline)
+    monkeypatch.setattr(transport, "HTTP_TIMEOUT", 5)
+    return transport
+
+
+@pytest.mark.parametrize("stall", _STALLS)
+def test_a_peer_that_dribbles_framing_bytes_is_cut_off_at_the_deadline(monkeypatch, stall):
+    """``read1`` returns after one read of the body, but it can sit inside a chunk-size line, a trailer or a header
+    for as long as bytes keep arriving inside the socket timeout; the deadline has to stop that too."""
+    transport = _short_limits(monkeypatch)
+    before, after = _STALLS[stall]
+    with _scripted_server(monkeypatch, before, *_dribble(100, 0.05), after) as (url, gone):
+        assert transport.urllib_http("GET", url, {}, None) == (0, {}, b"")
+        assert gone.wait(3), "the client gave up while the server was still sending: the deadline stopped it"
+
+
+@pytest.mark.parametrize("stall", _STALLS)
+def test_framing_that_arrives_in_time_is_read_whole(monkeypatch, stall):
+    """The control for the test above: the same responses, without the stall, are read exactly as before."""
+    transport = _short_limits(monkeypatch, deadline=10)
+    before, after = _STALLS[stall]
+    with _scripted_server(monkeypatch, before, *_dribble(3, 0.0), after) as (url, _):
+        status, headers, payload = transport.urllib_http("GET", url, {}, None)
+    assert (status, payload) == (200, b"hello")
+    assert ("X-Slow" in headers) == (stall == "header")
+
+
+def test_a_read_that_waits_for_the_server_ends_at_the_deadline_not_at_the_socket_timeout(monkeypatch):
+    """Nothing is in flight here, so one receive is waiting for the peer: it must not outlast the deadline."""
+    transport = _short_limits(monkeypatch)
+    with _scripted_server(monkeypatch, _HTTP_200 + b"Content-Length: 5\r\n\r\n", 3.0, b"hello") as (url, _):
+        started = time.monotonic()
+        result = transport.urllib_http("GET", url, {}, None)
+        elapsed = time.monotonic() - started
+    assert result == (0, {}, b"")
+    assert elapsed < 2.5, "the receive was cut at the 0.4 s deadline; the socket timeout (5 s) never applied"
+
+
+def test_a_webhook_that_answers_200_and_then_stalls_its_body_is_still_a_200(monkeypatch):
+    """The same loss as above, over a real connection: the receiver answered, so the answer is its status.
+
+    The 200 has to arrive inside the deadline for this to be the case, so the deadline is a second here, not the
+    0.4 s of the tests that expect a failure; the stall that follows the 200 lasts five.
+    """
+    transport = _short_limits(monkeypatch, deadline=1.0)
+    with _scripted_server(monkeypatch, _HTTP_200 + b"Content-Length: 100000\r\n\r\n", *_dribble(100, 0.05)) as (
+        url,
+        gone,
+    ):
+        status, _, payload = transport.urllib_http("POST", url, {"Content-Type": "application/json"}, b"{}")
+        assert gone.wait(3), "the client stopped waiting at the deadline"
+        assert (status, payload) == (200, b""), "a receiver that answered 200 was not asked twice"
+        assert transport.urllib_http("GET", url, {}, None) == (0, {}, b""), "a document read is still incomplete"

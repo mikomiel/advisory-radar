@@ -35,13 +35,44 @@ cannot redirect the reader to a host an attacker picked, and a feed genuinely se
 another host is configured directly. The second keeps the existing guard rail against a
 router page or the metadata service, because the page — not the operator — chose that URL.
 
+A feed is read whole, so what a publisher can make this reader spend is bounded. A body above
+8 MiB is refused unread, a feed or a page alike and whatever format it claims, a FreshRSS
+export included (the HTTP layer itself stops any response at 64 MiB). Markup nested more than
+100 levels deep inside an entry, and an OPML folder tree that deep, is refused as an
+unreadable document instead of followed. A document refused for either reason fails that
+source's pass and is reported on `/sources`, like any other feed this reader cannot read. A
+date that names no zone (an ISO 8601 date without an offset, a bare date, an RFC 822 date
+without a zone or with `-0000`) is read as UTC, never in the host's local zone, so the same
+feed is dated the same way on every host.
+
 Every source may carry `interval: 30m` (the same `<n><s|m|h>` spelling as
-`poll_interval`) to be fetched at its own pace; without one it follows the global
+`poll_interval`, and at most `168h`, seven days, for both, so a typo cannot park the scheduler)
+to be fetched at its own pace; without one it follows the global
 interval. The interval throttles the fetch only: re-evaluation, escalation and delivery
 still run for every source on every pass, so a slow feed never delays an alert. A fetch
 that fails is retried on the next pass instead of waiting out the interval, so one
 transient error cannot become an outage. `interval` is accepted by every kind in
 addition to the keys in the table.
+
+Every HTTP request the program makes, a source fetch as much as a lookup or a notification sent
+over HTTP, ends when one network operation (connect, TLS handshake, send, one receive) waits 30
+seconds, and when the server's answer is still not complete 120 seconds after the connection
+attempt began. The second limit is the one that matters for a server that answers a few bytes
+at a time: the first never trips for it, and the pass, with the state lock it holds, would wait
+as long as the server liked. A request ended this way is an unreachable source for that pass,
+like any other network error. Every wait for the server's answer is cut at what is left of the
+120 seconds: the status line, each header, the size line and the trailer of a chunked body, and
+the body itself. A server that sends any of those a few bytes at a time is therefore ended at
+120 seconds, and so is one that says nothing. The connection attempt (the TCP connect and the
+TLS handshake) and the sending of the request are not waits for the answer: they have the
+30-second limit alone, and a connection attempt that has used up the whole budget ends the
+request at its first wait for the answer.
+
+A document is read whole or not at all: a source or a lookup whose body cannot be received in
+full is unreachable for that pass. A notification is judged by its status alone, so a receiver
+that has answered and then stalls or resets while sending its body keeps its status: reporting
+it as unreachable would make the same message go out again. Email through SMTP is not an HTTP
+request and has the 30-second limit alone.
 
 A pasted OPML 2.0 subscription list is imported with **Add feeds from OPML** in the same
 section: every `<outline>` with an `xmlUrl` becomes an `rss` source, folders are
@@ -49,9 +80,16 @@ descended into, and a feed already configured or repeated in the document is ski
 counted. Each URL is checked exactly as a single add is, and a document that cannot be
 read, holds no feed, or names one unusable address is refused without writing anything.
 The outline title is not stored: the existing URL-host id derivation and the watch tag
-keep the meanings they already have.
+keep the meanings they already have. A document is someone else's text, so it is judged first:
+one import takes at most 100 feeds (split a larger list and import the parts), and a feed URL
+that contains `$` refuses the whole document, because an imported `${NAME}` would read a secret out
+of the environment on the strength of a pasted file. A literal `$` is written `%24`. Each
+distinct feed URL is resolved at most once, before the settings lock is taken, so a slow lookup
+does not stall other saves.
 
-A source added on that page may not point into a private network: the form refuses
+A source added on that page may carry `$` in its `url` only as one whole `${NAME}` reference
+that the YAML lists under `overlay_references`; any other `$` is refused (write it as `%24`), as
+`configuration.md` explains. It may not point into a private network either: the form refuses
 an address that resolves to loopback or to an internal range, unless the YAML sets
 `allow_private_sources: true`. A configured YAML source is never subject to the
 check, so a FreshRSS or changedetection.io instance on the LAN stays a supported
@@ -132,4 +170,13 @@ non-string (400). A JSON object with no `title` is 422. `guid` is kept verbatim
 and escaped when rendered, so a legacy sender that supplies a lone surrogate
 there keeps working. The bearer secret, the 64 KiB body bound and the inbox
 limit are unchanged.
+
+Two answers say nothing about the payload: they mean "not queued, try again". While a pass
+holds the state lock (it holds it for its whole transaction, so for as long as the pass runs)
+the endpoint answers `503` with `{"error": "busy, retry"}` and `Retry-After: 30`, and when the
+inbox is full it answers `429` with `Retry-After: 60` until a pass has processed some entries.
+Neither response queues anything and this side keeps no copy, so the retry belongs to the
+sender: a sender that treats a `503` or a `429` as final loses that advisory. Retry after the
+`Retry-After` interval. A `400`, `401`, `404`, `413` or `422` will not succeed when the same
+request is sent again.
 

@@ -18,7 +18,7 @@ import yaml
 
 from . import core, messages, pipeline
 from .catalogue import SOURCE_SPECS
-from .config import Config, ConfigError, load_config, secret_values
+from .config import Config, ConfigError, forwarded_allow_ips, load_config, secret_values
 from .http import Http, urllib_http
 from .runtime import Runtime, read_config
 from .state import LockBusy, SourceError, serialize_json
@@ -337,7 +337,11 @@ def _wait_for_next_pass(runtime: Runtime, stopping: threading.Event) -> None:
     seen without waiting for the interval to expire.
     """
     while not stopping.is_set():
-        if runtime.wake.wait(runtime.cfg.poll_interval_seconds):
+        # ``Event.wait`` raises ``OverflowError`` past ``TIMEOUT_MAX``, and this call sits outside the
+        # scheduler's ``try``: the thread would end while the web process stayed up and ``/readyz`` stayed
+        # green. A configuration cannot name such a pace (see ``MAX_INTERVAL_SECONDS``), but a ``Config``
+        # built in code can, so the wait is clamped here as well.
+        if runtime.wake.wait(min(runtime.cfg.poll_interval_seconds, threading.TIMEOUT_MAX)):
             runtime.wake.clear()
             continue
         return
@@ -443,7 +447,15 @@ def main(
                     cfg, sources, notifiers, http=http, clock=clock, sleep=sleep, lock_blocking=lock_blocking
                 )
 
-            app = create_app(runtime, environment, run_pass=one_pass)
+            try:
+                app = create_app(runtime, environment, run_pass=one_pass)
+                forwarded = forwarded_allow_ips(environment)
+            except ConfigError as exc:
+                # A missing, short or unreadable auth token or webhook secret, or a proxy list that trusts every
+                # client, is a startup error like a bad configuration file: one line, exit 1, and no scheduler or
+                # server was started.
+                LOG.error("config: %s", exc)
+                return 1
             stopping = threading.Event()
             thread = threading.Thread(
                 target=run_scheduler,
@@ -457,7 +469,13 @@ def main(
 
             LOG.info("web UI on http://%s:%d", runtime.cfg.web_host, runtime.cfg.web_port)
             try:
-                uvicorn.run(app, host=runtime.cfg.web_host, port=runtime.cfg.web_port, log_level="warning")
+                uvicorn.run(
+                    app,
+                    host=runtime.cfg.web_host,
+                    port=runtime.cfg.web_port,
+                    log_level="warning",
+                    forwarded_allow_ips=forwarded,
+                )
             finally:
                 # Shutdown is not a reason to fetch and notify again: stop the schedule and leave. The wake
                 # event ends the wait between passes so the thread is not joined while asleep.

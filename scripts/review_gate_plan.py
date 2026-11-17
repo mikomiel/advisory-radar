@@ -8,17 +8,22 @@ changes-requested one green, so this script aggregates conservatively: the worst
 requests sharing a head wins, and the description names them all.
 
 Input: a JSON array of ``{number, head, base, draft, author, changed, count_head, count_base, branch,
-head_repo, reviews, files}`` on stdin -- one entry per open pull request, with the reviews exactly as the API
-returned them, ``changed`` the pull request's own changed-file count, ``files`` the entries of the immutable
-``compare`` (``filename`` and ``previous_filename``), and ``branch``/``head_repo`` the head ref and its
-repository as the list endpoint reported them. Flattening renames is this script's job, so that it is tested.
+head_repo, base_repo, reviews, files, commits, total_commits}`` on stdin -- one entry per open pull request, with the
+reviews exactly as the API returned them, ``changed`` the pull request's own changed-file count, ``files`` the
+entries of the immutable ``compare`` (``filename``, ``previous_filename``, ``status``, ``additions``,
+``deletions`` and, for a small change, ``patch``), ``commits`` its commits (``sha``, the ``author`` and
+``committer`` logins and the signature's ``verified`` verdict) with ``total_commits`` the count the comparison
+reports, ``branch``/``head_repo`` the head ref and its repository as the list endpoint reported them, and
+``base_repo`` the repository the gate runs in, which is the base of every pull request it lists.
+Flattening renames is this script's job, so that it is tested.
 
 Two entries may be published as ``success`` without an independent approval, and only by their exact shape: a
-Dependabot update that touches nothing but dependency manifests, and the release pull request release-please
-generates from merged commits -- recognised by its branch, author, the five files it manages *and* a patch that is
-only the version bump those files carry. Neither can be auto-merged: the merge workflow still asks
-:mod:`review_state` for an eligible approval at the exact head, and both always change a path
-``guard_sensitive_paths.py`` reserves for a person.
+Dependabot update -- on a ``dependabot/`` branch of this repository, not a fork's, every commit the bot's own and
+signed by GitHub, touching nothing but dependency manifests and, in a workflow, nothing but the pin of an action it
+already uses -- and the release pull request release-please generates from merged commits, recognised by its
+branch, author, the five files it manages *and* a patch that is only the version bump those files carry. Neither
+can be auto-merged: the merge workflow still asks :mod:`review_state` for an eligible approval at the exact head,
+and both always change a path ``guard_sensitive_paths.py`` reserves for a person.
 
 Output: one line per head, ``head<TAB>state<TAB>description``, where state is a GitHub status state. The
 caller publishes these; it decides nothing.
@@ -43,18 +48,43 @@ import review_state  # noqa: E402
 #: Higher blocks more: a shared head is only green when every pull request on it is green.
 SEVERITY = {"success": 1, "pending": 2, "failure": 3}
 MAX_DESCRIPTION = 140
-#: Authors whose pull requests do not need an App review, and only while every changed path stays inside
-#: DEPENDENCY_PATHS. Dependabot's updates are mechanical and `ci` (the image build included) still has to pass.
-#: The login is GitHub's, not the pull request's, so a patch cannot claim it. A pull request the exemption
-#: covers is still not taken by automerge.yml: the merge asks ``review_state.py`` for an eligible approval at
-#: the exact head, and an exempt pull request has none. GitHub's own auto-merge switch is separate: while
-#: `allow_auto_merge` is on, a write-access user can have GitHub merge an exempt bump once its checks are green.
+#: Authors whose pull requests do not need an App review, and only while the head is a Dependabot branch of this
+#: repository, every commit is their own and every changed path stays inside DEPENDENCY_FILES and
+#: DEPENDENCY_DIRECTORIES. Dependabot's updates are mechanical and `ci` (the image build included) still has to
+#: pass. The login is GitHub's, not the pull request's, so a patch cannot claim it -- but it is only whoever
+#: *opened* the pull request, which is why the branch and the commits are read too.
+#: A pull request the exemption covers is still not taken by automerge.yml: the merge asks ``review_state.py``
+#: for an eligible approval at the exact head, and an exempt pull request has none. GitHub's own auto-merge
+#: switch is separate: while `allow_auto_merge` is on, a write-access user can have GitHub merge an exempt bump
+#: once its checks are green.
 EXEMPT_AUTHORS = frozenset({"app/dependabot", "dependabot[bot]"})
+#: Dependabot pushes the branch of an update to the repository it updates, and names it under this prefix.
+DEPENDABOT_BRANCH_PREFIX = "dependabot/"
+#: Who may be recorded as the committer of an exempt author's commit besides that author: GitHub itself, whose
+#: key signs what Dependabot writes through the API. This narrows the exemption; it does not authenticate the bot.
+#: An author is only an email address, so a commit carries the bot's name without the bot having written it. A
+#: squash merge of a Dependabot pull request is recorded by GitHub as authored by that bot, committed by
+#: ``web-flow`` and verified, whatever content the merged branch held: such a commit satisfies every identity
+#: condition here, and a person with write access can bring one about. The exemption therefore trusts the people
+#: with write access, and what it refuses is a commit by somebody else, an unsigned one, and a head that is not
+#: a Dependabot branch of this repository.
+SIGNING_COMMITTERS = frozenset({"web-flow"})
 #: Paths a dependency update may touch for the exemption to apply, checked rather than assumed. Files match
 #: exactly -- ``Dockerfile/evil.py`` is somebody deleting the manifest and adding a directory of source, not a
-#: dependency update -- and only the workflow tree matches as a prefix.
+#: dependency update -- and only the workflow tree matches as a prefix. A manifest is accepted by its path; a
+#: workflow can run code, so its patch must also be nothing but pins moved (see ``_only_pin_changes``).
 DEPENDENCY_FILES = frozenset({"pyproject.toml", "uv.lock", "Dockerfile", "docker-compose.yml"})
 DEPENDENCY_DIRECTORIES = (".github/workflows/",)
+#: The one workflow line a Dependabot update writes: ``uses:`` an action at a full commit id, an optional
+#: ``# vX.Y.Z`` comment of printable ASCII, and nothing else -- no tab, no carriage return, no second key. The
+#: captured ``lead`` is the indentation and list marker, which must not move.
+PINNED_USES = re.compile(
+    r"(?P<lead>[ ]*(?:-[ ]+)?)uses:[ ]+(?P<action>[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)@(?P<sha>[0-9a-f]{40})"
+    r"(?:[ ]+#[ -~]*)?"
+)
+#: The only lines of a patch that are not content: a hunk header and git's missing-newline marker.
+HUNK_HEADER = re.compile(r"@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@.*")
+NO_NEWLINE_MARKER = "\\ No newline at end of file"
 #: The generated release pull request, recognised by its exact shape: release-please names the branch after the
 #: package, opens it with the token owner's account, and only ever changes the release-managed files. Every fact
 #: together, because any one alone is too broad -- a fixed branch name would let a maintainer reuse it, an author
@@ -141,15 +171,155 @@ def _complete(entry: dict) -> bool:
     return len(files) >= declared
 
 
-def exempt(entry: dict, author: str, exempt_authors: frozenset[str]) -> bool:
-    """Whether the dependency exemption covers this entry: an exempt author, a complete, manifest-only path list.
+def _count(value: object) -> bool:
+    """Whether a count is an integer; a boolean is not one, although Python says so."""
+    return isinstance(value, int) and not isinstance(value, bool)
 
-    Fail-closed in four places: an unreadable list is not exempt, a list shorter than the pull request's own
-    changed-file count is not exempt (``compare`` caps its list at 300, so a source file could hide past the
-    cap), a count that does not describe the same commit pair as the comparison is not exempt, and an empty
-    list is not exempt.
+
+def _commits_are_the_authors_own(entry: dict, exempt_authors: frozenset[str]) -> bool:
+    """Whether every commit of the comparison is an exempt author's own, signed by GitHub, and none is missing.
+
+    The pull request's author is whoever opened it, and a branch takes more commits afterwards: a maintainer who
+    pushes to a Dependabot branch leaves that author unchanged. So each commit is read: authored by an exempt
+    author, committed by GitHub or by that author, and carrying a signature GitHub reports as verified. The
+    verdict must be the boolean ``true`` -- a missing or unreadable one is not a pass. ``compare`` lists at most
+    250 commits and reports the full count beside them, so a list shorter than that count could hide a later
+    commit by somebody else and proves nothing; the head must be among them, or the list describes another commit.
+    These facts narrow the exemption; they do not authenticate the bot (see ``SIGNING_COMMITTERS``).
     """
-    return author in exempt_authors and _complete(entry) and _dependency_only(_changed_names(entry))
+    head = entry.get("head")
+    commits = entry.get("commits")
+    total = entry.get("total_commits")
+    if not isinstance(head, str) or not head or not isinstance(commits, list):
+        return False
+    if not _count(total) or len(commits) < total:
+        return False
+    signers = SIGNING_COMMITTERS | exempt_authors
+    shas: set[str] = set()
+    for item in commits:
+        if not isinstance(item, dict):
+            return False
+        sha, author, committer = item.get("sha"), item.get("author"), item.get("committer")
+        if not isinstance(sha, str) or not sha:
+            return False
+        # Type first: a value that is not a name must be refused, not looked up (a list is not hashable).
+        if not isinstance(author, str) or author not in exempt_authors:
+            return False
+        if not isinstance(committer, str) or committer not in signers:
+            return False
+        if item.get("verified") is not True:
+            return False
+        shas.add(sha)
+    return head in shas
+
+
+def _change_blocks(patch: str) -> list[tuple[list[str], list[str]]] | None:
+    """A patch as its blocks of changed lines, each ``(removed, added)``, or None when a line is not one git writes.
+
+    Split on LF alone, as ``_bumped_version`` does: ``str.splitlines`` also breaks on a carriage return or U+2028,
+    and a YAML parser may read those as a newline, so a changed line could then look like the pin plus a fragment
+    this loop never saw. A block is what lies between context lines, removals first, as git writes it. Any other
+    line -- text outside a hunk, a removal after an addition -- is not understood and fails the whole patch.
+    """
+    blocks: list[tuple[list[str], list[str]]] = []
+    removed: list[str] = []
+    added: list[str] = []
+    for line in patch.split("\n"):
+        if line.startswith("-") and not added:
+            removed.append(line[1:])
+        elif line.startswith("+"):
+            added.append(line[1:])
+        elif line == "" or line.startswith(" ") or line == NO_NEWLINE_MARKER or HUNK_HEADER.fullmatch(line):
+            # Context, a header or the end of the patch: the block that was open is complete.
+            if removed or added:
+                blocks.append((removed, added))
+                removed, added = [], []
+        else:
+            return None
+    if removed or added:
+        blocks.append((removed, added))
+    return blocks
+
+
+def _pins_moved(removed: list[str], added: list[str]) -> bool:
+    """Whether each removed line is replaced, in place, by a pin of the same action at the same indentation."""
+    if not removed or len(removed) != len(added):
+        return False
+    for old, new in zip(removed, added, strict=True):
+        before, after = PINNED_USES.fullmatch(old), PINNED_USES.fullmatch(new)
+        if before is None or after is None:
+            return False
+        if before["lead"] != after["lead"] or before["action"] != after["action"]:
+            return False
+    return True
+
+
+def _only_pin_changes(item: dict) -> bool:
+    """Whether a workflow file's diff only moves the pin of an action the workflow already uses.
+
+    The path says a workflow changed; the patch says what it can do now. A Dependabot update replaces ``uses:``
+    lines one for one and writes nothing else, so every changed line must be such a line, paired with the line it
+    replaces, and the counts the comparison reports must agree with the patch: a patch the compare cut short, an
+    addition it hid, a file that was added, removed or renamed, or no patch at all is not proof and fails closed.
+    """
+    if item.get("status") != "modified" or item.get("previous_filename"):
+        return False
+    patch, additions, deletions = item.get("patch"), item.get("additions"), item.get("deletions")
+    if not isinstance(patch, str) or not _count(additions) or not _count(deletions):
+        return False
+    blocks = _change_blocks(patch)
+    if not blocks:
+        return False
+    if sum(len(removed) for removed, _ in blocks) != deletions or sum(len(added) for _, added in blocks) != additions:
+        return False
+    return all(_pins_moved(removed, added) for removed, added in blocks)
+
+
+def _workflow_edits_are_pins(entry: dict) -> bool:
+    """Whether every file that touches the workflow tree, under either name, only moves pins."""
+    files = entry.get("files")
+    for item in files if isinstance(files, list) else []:
+        if not isinstance(item, dict):
+            return False
+        names = (item.get("filename"), item.get("previous_filename"))
+        in_tree = any(isinstance(name, str) and name.startswith(d) for name in names for d in DEPENDENCY_DIRECTORIES)
+        if in_tree and not _only_pin_changes(item):
+            return False
+    return True
+
+
+def _from_dependabots_branch(entry: dict) -> bool:
+    """Whether the head is a ``dependabot/`` branch of this repository, not a fork's.
+
+    Dependabot pushes the branch of an update to the repository it updates, so a pull request from a fork, or from a
+    branch of another name, is not the bot's even when its author reads as the bot. ``base_repo`` is the repository
+    the gate runs in. A missing or unreadable fact is not a match, and neither are two empty names: a deleted fork
+    reports no head repository, and an unknown base must not equal it.
+    """
+    branch, head_repo, base_repo = entry.get("branch"), entry.get("head_repo"), entry.get("base_repo")
+    if not isinstance(branch, str) or not branch.startswith(DEPENDABOT_BRANCH_PREFIX):
+        return False
+    return isinstance(head_repo, str) and bool(head_repo) and head_repo == base_repo
+
+
+def exempt(entry: dict, author: str, exempt_authors: frozenset[str]) -> bool:
+    """Whether the dependency exemption covers this entry: the author's own signed commits, manifests and pins only.
+
+    Fail-closed in every place a fact is unproven: a head that is not a ``dependabot/`` branch of this repository
+    is not exempt, an unreadable list is not exempt, a list shorter than the pull request's own changed-file count
+    is not exempt (``compare`` caps its list at 300, so a source file could hide past the cap), a count that does
+    not describe the same commit pair as the comparison is not exempt, an empty list is not exempt, a commit that
+    is not the exempt author's own and signed by GitHub is not exempt (nor is a commit list that may be
+    incomplete), and a workflow edit that is more than a moved pin is not exempt.
+    """
+    return (
+        author in exempt_authors
+        and _from_dependabots_branch(entry)
+        and _complete(entry)
+        and _dependency_only(_changed_names(entry))
+        and _commits_are_the_authors_own(entry, exempt_authors)
+        and _workflow_edits_are_pins(entry)
+    )
 
 
 def release_candidate(entry: dict) -> bool:
@@ -319,7 +489,10 @@ def main(argv: list[str] | None = None, stdin=None) -> int:
     parser.add_argument(
         "--exempt-authors",
         default=",".join(sorted(EXEMPT_AUTHORS)),
-        help="comma-separated authors whose pull requests need no App review; empty disables the exemption",
+        help=(
+            "comma-separated authors whose pull requests need no App review, when the head is also a dependabot/ "
+            "branch of this repository; empty disables the exemption"
+        ),
     )
     arguments = parser.parse_args(argv)
     associations = frozenset(

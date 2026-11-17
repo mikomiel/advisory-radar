@@ -22,7 +22,7 @@ from advisory_radar.runtime import Runtime
 from advisory_radar.sources import RssSource
 from advisory_radar.web import create_app
 
-TOKEN = "secret"
+TOKEN = "secret-token-0123456789abcdef"
 CSRF_RE = re.compile(r'name="csrf" value="([0-9a-f]{64})"')
 FINGERPRINT_RE = re.compile(r"name='fingerprint' value='([0-9a-f]*)'")
 FEED_URL = "https://feeds.example.net/security.xml"

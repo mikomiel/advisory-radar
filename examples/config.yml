@@ -2,7 +2,7 @@
 # Copy to config/config.yml on your volume and edit. Secrets are referenced
 # via ${ENV_VAR} and never stored in this file.
 
-# How often sources are polled (ISO 8601 duration-ish; default 15m).
+# How often sources are polled (<n><s|m|h>, at most 168h; default 15m).
 poll_interval: 15m
 
 # Where the auxiliary files are kept inside the container: the settings overlay,
@@ -50,7 +50,14 @@ sources:
   #   api_key: ${CHANGEDETECTION_API_KEY}
   #   tag: security          # optional: only watches with this tag
   # - id: inbox
-  #   type: webhook          # receives POST /webhooks/inbox (set ADVISORY_RADAR_WEBHOOK_SECRET)
+  #   type: webhook          # receives POST /webhooks/inbox (set ADVISORY_RADAR_WEBHOOK_SECRET or
+  #                          # ADVISORY_RADAR_WEBHOOK_SECRET_FILE; at least 24 characters)
+
+# The environment variables the /config overlay may reference as ${NAME} or ${NAME_FILE}.
+# With no list the overlay can reference none: a browser session must not be able to send
+# any variable of the process (the login token, a database password) to an address it chooses.
+# YAML-only. List only variables you accept being usable from the UI, never the login token.
+# overlay_references: [DISCORD_WEBHOOK_URL, FEED_TOKEN]
 
 # Scope alerts to what you run. With no key the document is `watchlist.json`
 # beside `state_path`, on the writable volume, and /watchlist edits it; with
@@ -125,4 +132,5 @@ notifiers:
 web:
   host: 0.0.0.0
   port: 8080
-  # The session auth token is env-only: ADVISORY_RADAR_AUTH_TOKEN.
+  # The session auth token is env-only: ADVISORY_RADAR_AUTH_TOKEN, or the file named by
+  # ADVISORY_RADAR_AUTH_TOKEN_FILE (at least 24 characters: openssl rand -hex 24).

@@ -18,8 +18,8 @@ import html
 import json
 import logging
 import math
-import os
 import re
+import threading
 import time
 import urllib.parse
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -35,10 +35,12 @@ from . import __version__, core, delivery, feeds, pipeline, watchlist
 from .catalogue import SOURCE_SPECS
 from .config import (
     DEFAULT_THRESHOLDS,
+    MIN_SECRET_LENGTH,
     THRESHOLD_KEYS,
     Config,
     ConfigError,
     config_from_document,
+    env_secret,
     expand_entry,
     load_document,
     secret_values,
@@ -50,6 +52,7 @@ from .settings import (
     SECRET_KEYS,
     SETTINGS_LOCK,
     StaleSettings,
+    added_source_reference_error,
     is_reference,
     load_settings_document,
     save_settings,
@@ -546,7 +549,9 @@ def _cursor_decode(value: str) -> tuple[int, str]:
     try:
         at, identifier = json.loads(raw)
         return int(at), str(identifier)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError, RecursionError):
+        # ``1e999`` parses to an infinity ``int()`` cannot take, and a deeply nested list exhausts the
+        # parser's stack; neither is a ``ValueError``, and neither is a position this page ever rendered.
         raise malformed from None
 
 
@@ -1568,6 +1573,22 @@ def readiness(cfg: Config, state: dict, now: int) -> tuple[bool, str]:
     return True, "ready"
 
 
+def _parked_digest(entries: Iterable[object]) -> str:
+    """A digest of the parked messages a page lists, in queue order: what its "release all" and "drop all" submit.
+
+    ``core.manage_parked`` computes the same value from the queue it loads under the state lock, and refuses when
+    the two differ, so a bulk action acts on the messages the operator saw and not on whatever was parked by the
+    time the form arrived. It is built from the per-row :func:`core.parked_token` values the page already carries,
+    so it moves with a message's time, identifiers, title and link, with an added or removed message, and with
+    the order.
+    """
+    tokens = ",".join(core.parked_token(entry) for entry in entries if isinstance(entry, dict))
+    return hashlib.sha256(tokens.encode("utf-8")).hexdigest()[:16]
+
+
+#: What ``core.manage_parked`` returns when the digest a bulk form submitted names a different queue than the one
+#: it loaded; ``0`` is done and ``1`` is a store that could not be read.
+PARKED_QUEUE_CHANGED = 2
 #: A login form is a handful of bytes; an unauthenticated request must not be able to make us buffer more.
 LOGIN_BODY_LIMIT = 8 * 1024
 #: The form field and the header that carry the per-session token; a state-changing POST needs one of them.
@@ -1576,6 +1597,10 @@ CSRF_HEADER = "x-csrf-token"
 #: A settings form carries one row per configured plugin; still a bounded read, and the CSRF dependency
 #: hands the body to the handler that edits it.
 FORM_BODY_LIMIT = 64 * 1024
+#: Feeds one OPML import may add. Every feed's host is resolved to judge its destination before anything is
+#: written, and the document is pasted by a browser session: a bound keeps one request from becoming thousands of
+#: lookups, and a larger list is imported in parts.
+OPML_FEED_LIMIT = 100
 #: Notifier keys the /config form edits. None of them carries a credential: a secret-bearing key is
 #: written only as an environment reference, and ``headers`` is not writable at all.
 NOTIFIER_FORM_KEYS = ("topic", "priority", "host", "port", "from", "to", "username", "use_tls", "implicit_tls")
@@ -1616,6 +1641,10 @@ LOGIN_MAX_FAILURES = 5
 #: Peers the throttle remembers. Bounded because a rotating-address attacker must not turn it into unbounded
 #: memory; see LoginThrottle for why the oldest peer is evicted rather than a new peer refused.
 LOGIN_MAX_PEERS = 1024
+#: How long /readyz and /metrics reuse one read of the state document. Both are unauthenticated and each request
+#: used to read and parse the whole document; readiness is judged in minutes (``READY_MIN_AGE_SECONDS``), so a view a
+#: few seconds old cannot change an answer, and a scrape interval shorter than this costs nothing.
+PROBE_CACHE_SECONDS = 5.0
 
 
 class LoginThrottle:
@@ -2057,6 +2086,7 @@ def create_app(
     clock: Callable[[], float] = time.time,
     http: Http = urllib_http,
     resolve: Callable[[str], Iterable[str]] = resolve_host,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> FastAPI:
     """The web UI over one live configuration.
 
@@ -2071,24 +2101,32 @@ def create_app(
         # types into it still has to resolve against the same environment the configuration did.
         runtime = Runtime.from_config(runtime, environment=dict(env))
     app = FastAPI(title="advisory-radar", docs_url=None, redoc_url=None)
-    auth = Auth(env.get("ADVISORY_RADAR_AUTH_TOKEN", ""))
+    # Both process secrets are resolved here, once: a ``_FILE`` form is read at startup, and the login compare and
+    # the webhook intake close over these values instead of re-reading the environment on every request. A
+    # rotation therefore takes a restart, as it already did for the cookie the token signs.
+    token = env_secret(env, "ADVISORY_RADAR_AUTH_TOKEN", minimum=MIN_SECRET_LENGTH)
+    if not token:
+        # The session cookie is signed with this token; an empty key is a public key, so anyone could
+        # mint a cookie for a protected endpoint.
+        raise ConfigError(
+            "ADVISORY_RADAR_AUTH_TOKEN must be set to serve the web UI "
+            "(or ADVISORY_RADAR_AUTH_TOKEN_FILE, naming a file that holds it)"
+        )
+    webhook_secret = env_secret(env, "ADVISORY_RADAR_WEBHOOK_SECRET", minimum=MIN_SECRET_LENGTH)
+    auth = Auth(token)
 
     def webhook_source_ids() -> set[str]:
         """Webhooks are open to a configured webhook source id only, read from the live runtime."""
         return {source.id for source in runtime.sources if getattr(source, "kind", "") == "webhook"}
-
-    token = env.get("ADVISORY_RADAR_AUTH_TOKEN", "")
-    if not token:
-        # The session cookie is signed with this token; an empty key is a public key, so anyone could
-        # mint a cookie for a protected endpoint.
-        raise ValueError("ADVISORY_RADAR_AUTH_TOKEN must be set to serve the web UI")
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
         """Headers on every response, including /healthz and /metrics.
 
         ``default-src 'none'`` is honest today: the pages ship no script and load nothing external. An
-        authenticated page lists advisories and run history, so it must not sit in a shared proxy's cache.
+        authenticated response lists advisories and run history, as JSON (``/api/state``) as much as HTML, so
+        none may sit in a shared proxy's cache. ``no-store`` is therefore the default for every response, and a
+        new endpoint cannot forget it; a route that sets its own ``Cache-Control`` keeps it.
         """
         response = await call_next(request)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -2097,8 +2135,7 @@ def create_app(
         response.headers.setdefault("Content-Security-Policy", CSP)
         if _public_https(env):
             response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
-        if response.headers.get("content-type", "").startswith("text/html"):
-            response.headers.setdefault("Cache-Control", "no-store")
+        response.headers.setdefault("Cache-Control", "no-store")
         return response
 
     @app.exception_handler(HTTPException)
@@ -2164,6 +2201,28 @@ def create_app(
 
         return runtime.cfg.store().load() or core.new_state()
 
+    probe_lock = threading.Lock()
+    probe_view: list[tuple[float, dict | None, Exception | None]] = []
+
+    def probe_state() -> tuple[dict | None, Exception | None]:
+        """The state /readyz and /metrics judge: one read, shared for ``PROBE_CACHE_SECONDS``, a failed read too.
+
+        Both are unauthenticated, and each request read and parsed the whole document, so a loop of requests -- or
+        a scrape interval shorter than a pass -- re-read a state that grows with the watch list, and a broken
+        store was hit once per probe. Neither answer can change inside a few seconds, so a view that old is
+        enough; every authenticated page keeps its own live read. One lock covers the refresh: a caller that
+        arrives while a read runs waits for it instead of starting another. Returns ``(state, None)`` or
+        ``(None, the error)``; the error is returned, never re-raised, so a cached one does not grow a traceback.
+        """
+        with probe_lock:
+            now = monotonic()
+            if not probe_view or now >= probe_view[0][0]:
+                try:
+                    probe_view[:] = [(now + PROBE_CACHE_SECONDS, load_state(), None)]
+                except (SourceError, StoreUnavailable) as exc:
+                    probe_view[:] = [(now + PROBE_CACHE_SECONDS, None, exc)]
+            return probe_view[0][1], probe_view[0][2]
+
     @app.get("/login", response_class=HTMLResponse)
     def login_form():
         return page(
@@ -2205,9 +2264,8 @@ def create_app(
         wait = throttle.refusal(peer)
         if wait is not None:
             return throttled(wait)
-        expected = env.get("ADVISORY_RADAR_AUTH_TOKEN", "")
         # constant-time compare: a byte-by-byte comparison leaks how much of the token matched
-        if supplied and expected and hmac.compare_digest(supplied.encode(), expected.encode()):
+        if supplied and hmac.compare_digest(supplied.encode(), token.encode()):
             throttle.succeeded(peer)
             response = RedirectResponse("/", status_code=303)
             # Secure by default: without it a browser may send a seven-day session over plaintext HTTP to the
@@ -2217,7 +2275,7 @@ def create_app(
                 auth.login_cookie(),
                 httponly=True,
                 samesite="lax",
-                secure=not _insecure_cookies(os.environ),
+                secure=not _insecure_cookies(env),
             )
             return response
         throttle.failed(peer)
@@ -2238,7 +2296,7 @@ def create_app(
             "advisory_radar_session",
             httponly=True,
             samesite="lax",
-            secure=not _insecure_cookies(os.environ),
+            secure=not _insecure_cookies(env),
         )
         return response
 
@@ -2720,15 +2778,18 @@ def create_app(
                 f"<input type='hidden' name='token' value='{esc(token)}'>"
                 "<button class='btn btn-danger'>Drop</button></form></div></td></tr>"
             )
+        digest_field = f"<input type='hidden' name='digest' value='{_parked_digest(parked)}'>"
         if rows:
             body = (
                 "<div class='scroll'><table class='compact'><tr><th scope='col'>Tag</th>"
                 "<th scope='col'>Title</th><th scope='col'>IDs</th><th scope='col'>Actions</th></tr>"
                 + "".join(rows)
                 + "</table></div>"
-                f'<div class="bulk"><form method="post" action="/parked/release">{csrf}'
+                # Both bulk forms name the queue this page listed: the action refuses, and changes nothing, when the
+                # queue is no longer that one (see ``parked_bulk``).
+                f'<div class="bulk"><form method="post" action="/parked/release">{csrf}{digest_field}'
                 '<button class="btn">Release all</button></form>'
-                f'<form method="post" action="/parked/drop">{csrf}'
+                f'<form method="post" action="/parked/drop">{csrf}{digest_field}'
                 '<button class="btn btn-danger">Drop all</button></form></div>'
             )
         else:
@@ -2780,27 +2841,45 @@ def create_app(
             return RedirectResponse("/login", status_code=303)
         return parked_decision(index, release=False, request=request)
 
+    def parked_bulk(release: bool, request: Request):
+        """Release or drop the whole parked queue, but only the queue the form's page listed.
+
+        The form carries a digest of the messages it showed. It is compared under the state lock against the
+        queue that is about to change, so a message parked after the page was rendered is never released or dropped
+        unseen: the answer is 409 and nothing is written. A form with no digest (an older tab, a script) names no
+        queue and is refused the same way, never read as "whatever is queued now". The bulk routes block on the
+        lock, as they always have.
+        """
+        from . import core
+
+        expected = first(form_body(request), "digest")
+        if re.fullmatch(r"[0-9a-f]{16}", expected):
+            store = runtime.cfg.store()
+            with store.lock():
+                status = core.manage_parked(store, release=release, now=int(time.time()), expected=expected)
+            if status != PARKED_QUEUE_CHANGED:
+                return RedirectResponse("/parked", status_code=303)
+        return page(
+            "Not changed",
+            "<p>The parked queue is not the one this page listed, so nothing was changed. "
+            "Review the queue again before you decide.</p>"
+            "<p><a href='/parked'>Back to the parked queue</a></p>",
+            active="/parked",
+            actions=sign_out_form(request),
+            status_code=409,
+        )
+
     @app.post("/parked/release", dependencies=[Depends(require_csrf)])
     def parked_release(request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
-        from . import core
-
-        store = runtime.cfg.store()
-        with store.lock():
-            core.manage_parked(store, release=True, now=int(time.time()))
-        return RedirectResponse("/parked", status_code=303)
+        return parked_bulk(release=True, request=request)
 
     @app.post("/parked/drop", dependencies=[Depends(require_csrf)])
     def parked_drop(request: Request):
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
-        from . import core
-
-        store = runtime.cfg.store()
-        with store.lock():
-            core.manage_parked(store, release=False, now=int(time.time()))
-        return RedirectResponse("/parked", status_code=303)
+        return parked_bulk(release=False, request=request)
 
     # --- the settings overlay: /config and the POSTs that write and apply it ---------------------
 
@@ -3073,6 +3152,10 @@ def create_app(
         missing = [key for key in spec.required if not entry.get(key)]
         if missing:
             return None, f"{kind} needs {', '.join(missing)}"
+        # Before the probe or the save acts on it: both expand a reference, and the probe fetches the result.
+        refusal = reference_refusal(entry)
+        if refusal:
+            return None, refusal
         return entry, ""
 
     def new_source_used(form: dict[str, list[str]]) -> bool:
@@ -3086,8 +3169,8 @@ def create_app(
         """The editable keys of one added source, as inline inputs.
 
         The stored value is shown, not the origin: an operator fixing a feed path needs the whole URL. A URL
-        that carries a credential must be written as a ``${NAME}`` reference; the validator treats ``url`` as
-        ordinary configuration and cannot tell the two apart.
+        may hold a reference only as the whole value, and only for a variable the YAML lists under
+        ``overlay_references``; a URL that embeds a credential is configured in the YAML.
         """
         if spec is None:
             return "<span class='muted small'>unknown type</span>"
@@ -3202,7 +3285,7 @@ def create_app(
         """
         items = list(window.items)
         rows = "".join(
-            f"<tr><td>{esc(_short(pipeline.redact(item.title, secrets), 80))}</td>"
+            f"<tr><td>{_short(pipeline.redact(item.title, secrets), 80)}</td>"
             f"<td class='mono nowrap'>{esc(_when(item.published))}</td>"
             f"<td>{esc(redacted_origin(item.link, secrets))}</td></tr>"
             for item in items[:5]
@@ -3220,13 +3303,28 @@ def create_app(
         )
         return _notice(f"Answered with {len(items)} entr{'y' if len(items) == 1 else 'ies'}.", "ok") + truncated + table
 
+    def reference_refusal(entry: dict) -> str:
+        """Why this source entry may not use the references it carries, or "" when it may.
+
+        An entry the page has not saved is still probed, resolved and fetched with the values its references
+        name, and ``${NAME}`` reads any variable of the process. So it is judged against the variables the YAML
+        lists under ``overlay_references`` *before* anything expands it: by the time the save validator ran, a
+        secret would already have left in a URL or a DNS lookup. The live configuration's list is used, which is
+        the stricter reading when the file was edited and not yet reloaded.
+        """
+        return added_source_reference_error(entry, runtime.cfg.overlay_references) or ""
+
     def added_source_error(entry: dict) -> str:
         """Why a source added on this page may not be used, or "" when it may.
 
         The check runs on the *expanded* entry: ``${INTERNAL_HOST}`` is not a hostname, and the address it
         resolves to is the one the fetcher would contact. The stored entry keeps its references. A kind with no
-        remote side (``webhook``) has no destination to judge.
+        remote side (``webhook``) has no destination to judge. A reference is refused first, unexpanded: the
+        address lookup below is itself a request, and a host label built from a secret would carry it out.
         """
+        refusal = reference_refusal(entry)
+        if refusal:
+            return refusal
         try:
             expanded = expand_entry(entry, runtime.environment)
         except ConfigError as exc:
@@ -3267,6 +3365,11 @@ def create_app(
             # URL from the one the pass fetched.
             expanded = dict(entry)
         else:
+            if adding:
+                # A source the YAML does not own is the only one whose references the browser session chose.
+                refusal = reference_refusal(entry)
+                if refusal:
+                    return False, _notice(esc(refusal), "critical")
             try:
                 # Expanded before anything is judged: ``url: ${FEED_URL}`` and ``type: ${SOURCE_KIND}`` are
                 # configured values, and a missing variable must be named as one.
@@ -3810,35 +3913,57 @@ def create_app(
         unusable feed refuses the batch rather than half-importing it. A feed whose URL is already configured,
         or that appears twice in the document, is skipped and counted. Only the URL and the type are stored:
         the catalogue's id derivation reads the URL host, and an OPML title is a label, not a watch tag.
+
+        The document is someone else's text, so it is judged before it is trusted and before the settings lock
+        is taken: at most :data:`OPML_FEED_LIMIT` feeds, and none whose url carries a ``$`` -- an imported
+        ``${NAME}`` would read a secret out of the environment on the strength of a pasted file. Each distinct
+        feed URL is then resolved at most once, outside the lock (the check is per URL, so two feeds on one host
+        are two lookups): a lookup answers at the resolver's pace, and holding the lock for the length of a
+        hundred of them would stall every other settings save.
         """
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         form = form_body(request)
+        back = "<p><a href='/config'>Back to configuration</a></p>"
+
+        def not_added(notice: str, tone: str = "critical"):
+            return page(
+                "Not added",
+                _notice(notice, tone) + back,
+                active="/config",
+                actions=sign_out_form(request),
+                status_code=400,
+            )
+
+        try:
+            importable = feeds.parse_opml(first(form, "opml").encode("utf-8"))
+        except feeds.FeedError as exc:
+            return not_added(f"The OPML document could not be read: {esc(str(exc))}")
+        if not importable:
+            return not_added("The OPML document contains no feed, so nothing was added.", "warning")
+        if len(importable) > OPML_FEED_LIMIT:
+            return not_added(
+                f"The OPML document names {len(importable)} feeds; one import takes at most {OPML_FEED_LIMIT}. "
+                "Split it and import the parts one after another; nothing was added."
+            )
+        for position, (_title, xml_url, _html_url) in enumerate(importable, start=1):
+            if "$" in xml_url:
+                # By position, never by url: the url is the document's text, and may be the reference itself.
+                return not_added(
+                    f"Feed {position} of the OPML document has a '$' in its url. An imported document may not use "
+                    "a ${NAME} reference, because one sends a secret from the environment to the host it names: "
+                    "write that source in the YAML, or spell a literal '$' as %24. Nothing was added."
+                )
+        verdicts = {
+            url: added_source_error({"type": "rss", "url": url})
+            for url in dict.fromkeys(xml_url for _title, xml_url, _html_url in importable)
+        }
         with SETTINGS_LOCK:
             overlay, _ = saved_overlay()
             base, _ = form_document(overlay)
             stale = stale_form(request, form, base)
             if stale is not None:
                 return stale
-            back = "<p><a href='/config'>Back to configuration</a></p>"
-            try:
-                importable = feeds.parse_opml(first(form, "opml").encode("utf-8"))
-            except feeds.FeedError as exc:
-                return page(
-                    "Not added",
-                    _notice(f"The OPML document could not be read: {esc(str(exc))}", "critical") + back,
-                    active="/config",
-                    actions=sign_out_form(request),
-                    status_code=400,
-                )
-            if not importable:
-                return page(
-                    "Not added",
-                    _notice("The OPML document contains no feed, so nothing was added.", "warning") + back,
-                    active="/config",
-                    actions=sign_out_form(request),
-                    status_code=400,
-                )
             values = list(secret_values(runtime.cfg))
             # Expanded so a configured ``url: ${FEED_URL}`` is recognised as the same feed the document names.
             configured = {
@@ -3851,31 +3976,19 @@ def create_app(
             candidates: list[dict] = []
             skipped: list[str] = []
             for title, xml_url, _html_url in importable:
-                # An imported URL may be a ``${NAME}`` reference. Compare what it resolves to, or the same
-                # subscription is added twice: once literal in the YAML and once by reference here. The entry
-                # still stores the reference as written, exactly as a single add would.
-                effective = expand_text(xml_url).strip()
                 # A second occurrence in one document is the same subscription, not a second source; the same
-                # URL already configured must not gain a suffixed id and be polled twice.
-                if effective in seen or effective in configured:
+                # URL already configured must not gain a suffixed id and be polled twice. A feed that is
+                # skipped is never judged: a duplicate of a source already running is not a new destination.
+                if xml_url in seen or xml_url in configured:
                     skipped.append(
                         pipeline.redact(title, values).strip() if title else redacted_origin(xml_url, values)
                     )
                     continue
-                seen.add(effective)
+                seen.add(xml_url)
                 entry = {"id": derive_source_id(xml_url, "rss", taken), "type": "rss", "url": xml_url}
-                problem = added_source_error(entry)
+                problem = verdicts[xml_url]
                 if problem:
-                    return page(
-                        "Not added",
-                        _notice(
-                            f"{esc(redacted_origin(xml_url, values))}: {esc(problem)}; nothing was added.", "critical"
-                        )
-                        + back,
-                        active="/config",
-                        actions=sign_out_form(request),
-                        status_code=400,
-                    )
+                    return not_added(f"{esc(redacted_origin(xml_url, values))}: {esc(problem)}; nothing was added.")
                 taken.add(entry["id"])
                 candidates.append(entry)
             report = f"added {len(candidates)}, skipped {len(skipped)}"
@@ -4355,7 +4468,10 @@ def create_app(
             "<h3>New notifier</h3>"
             "<p class='muted small'>Secrets stay in the environment: a reference field takes ${NAME} or "
             "${NAME_FILE} and is stored instead of the value. A webhook's optional signing secret is one of "
-            "them. A type that needs two references, or a header, is added by editing the YAML.</p>"
+            "them. A type that needs two references, or a header, is added by editing the YAML. A form may name "
+            "only a variable the YAML lists under <code>overlay_references</code>. An smtp notifier whose "
+            "password the YAML holds keeps its host, port and TLS flags from the YAML too, so a saved edit "
+            "cannot send that password elsewhere.</p>"
             "<div class='fields'>"
             "<label>id<input type='text' name='new:id'></label>"
             f"<label>type<select name='new:type'>{type_options}</select></label>"
@@ -4982,7 +5098,7 @@ def create_app(
                 f"<td class='mono nowrap'>{esc(attempt)}</td>"
                 f"<td class='mono nowrap'>{esc(success)}</td>"
                 f"<td class='num'>{esc(str(_number(record.get('items'))))}</td>"
-                f"<td>{esc(_short(error, 90)) if error else ''}</td>"
+                f"<td>{_short(error, 90) if error else ''}</td>"
                 f"<td><form method='post' action='/sources/probe'>{csrf}"
                 f"<input type='hidden' name='id' value='{esc(identifier)}'>"
                 f"<button class='btn'>Test</button></form></td></tr>"
@@ -5117,25 +5233,23 @@ def create_app(
         while the process is alive, which is the only thing a liveness probe may ask. An unreadable state is
         also not ready: every page and the pass itself depend on it.
         """
-        try:
-            state = load_state()
-        except (SourceError, StoreUnavailable) as exc:
+        state, failure = probe_state()
+        if state is None:
             # The probe is unauthenticated: the reason stays in the log, as /metrics does, because the error text
             # can carry the state path or a store detail that an anonymous caller has no use for.
-            LOG.warning("readyz: state unreadable: %s", exc)
+            LOG.warning("readyz: state unreadable: %s", failure)
             return PlainTextResponse("not ready: the state document cannot be read", status_code=503)
         ok, reason = readiness(runtime.cfg, state, int(clock()))
         return PlainTextResponse(reason, status_code=200 if ok else 503)
 
     @app.get("/metrics", response_class=PlainTextResponse)
     def metrics():
-        try:
-            state = load_state()
-        except (SourceError, StoreUnavailable) as exc:
+        state, failure = probe_state()
+        if state is None:
             # The documented alert is `advisory_radar_ready == 0`, and a failed scrape produces no sample at all:
             # an unreadable state must still answer, with the one thing it can honestly report. Nothing else is
             # fabricated, because without the state every other number is unknown rather than zero.
-            LOG.warning("metrics: state unreadable: %s", exc)
+            LOG.warning("metrics: state unreadable: %s", failure)
             return PlainTextResponse(
                 "# HELP advisory_radar_ready 1 when the last pass is recent enough and the state is readable\n"
                 "# TYPE advisory_radar_ready gauge\nadvisory_radar_ready 0\n"
@@ -5207,8 +5321,9 @@ def create_app(
     async def webhook_intake(source_id: str, request: Request):
         """Inbound webhook (generic JSON or changedetection.io native payload).
 
-        Fails closed: ingestion is disabled unless ``ADVISORY_RADAR_WEBHOOK_SECRET`` is set *and* ``source_id``
-        names a configured webhook source. The request must carry ``Authorization: Bearer <secret>``.
+        Fails closed: ingestion is disabled unless ``ADVISORY_RADAR_WEBHOOK_SECRET`` (or its ``_FILE`` form) is
+        set *and* ``source_id`` names a configured webhook source. The request must carry
+        ``Authorization: Bearer <secret>``.
 
         The state transaction runs in a worker thread: a file lock, a read and an fsync write must never block
         the event loop the scheduler and /healthz share, and the lock is taken non-blockingly so a running pass
@@ -5224,11 +5339,10 @@ def create_app(
             webhook_item_from_payload,
         )
 
-        secret = env.get("ADVISORY_RADAR_WEBHOOK_SECRET", "")
-        if not secret or source_id not in webhook_source_ids():
+        if not webhook_secret or source_id not in webhook_source_ids():
             return JSONResponse({"error": "webhook ingestion is not configured"}, status_code=404)
         provided = request.headers.get("authorization", "")
-        if not hmac.compare_digest(provided.encode(), f"Bearer {secret}".encode()):
+        if not hmac.compare_digest(provided.encode(), f"Bearer {webhook_secret}".encode()):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         try:
             body = await _body(request, WEBHOOK_BODY_LIMIT)

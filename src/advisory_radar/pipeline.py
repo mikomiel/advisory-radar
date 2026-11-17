@@ -101,6 +101,19 @@ def _record_health(state: dict, source_id: str, now: int, *, ok: bool, items: in
     }
 
 
+def _last_success(state: dict, source_id: str) -> int:
+    """The epoch of a source's last successful window, or 0 when no success is on record.
+
+    Read before ``_record_health`` writes this pass's outcome, so it is the success *before* the one now being
+    classified: the point from which an outage is measured (see ``core.classify_new``). A removed or disabled
+    source has no record, and neither has one that never answered, so the plain age rule applies to both.
+    """
+    health = state.get("source_health")
+    record = health.get(source_id) if isinstance(health, dict) else None
+    ok_at = record.get("ok_at") if isinstance(record, dict) else 0
+    return ok_at if isinstance(ok_at, int) and not isinstance(ok_at, bool) and ok_at > 0 else 0
+
+
 def _reset_validators_on_policy_change(state: dict, policy: object) -> None:
     """Drop stored feed validators when the scope changed.
 
@@ -145,8 +158,12 @@ def run_pass(
     The lock is held for the whole read/classify/deliver/write transaction, so the scheduler, the web
     UI's "run now" and a CLI ``once`` can never deliver the same pending message twice or overwrite each
     other's state. ``lock_blocking=False`` returns :data:`PASS_BUSY` immediately when another pass holds it,
-    so the web UI can say nothing ran; the blocking default still returns 1 after the lock timeout, which is
-    the failure the CLI and scheduler already report.
+    so the web UI can say nothing ran.
+
+    The blocking default has no timeout: every store waits for the holder however long that takes, so a pass
+    that never finishes keeps each later blocking caller waiting. It returns 1 only when a store refuses the lock
+    outright (``LockBusy`` on a blocking call) or cannot be used (``StoreUnavailable``), which is the failure the
+    CLI and scheduler already report.
     """
     store = cfg.store()
     if dry_run:
@@ -371,6 +388,8 @@ def _run_pass(
             # newly arrived critical advisory.
             quiet_hours=cfg.quiet_hours,
             **language_kwargs,
+            # An item published while this source could not be read is news, however old it is by now.
+            last_ok=_last_success(state, source.id),
         )
         if left:
             carried[source.id] = [core.item_to_state(item) for item in left]

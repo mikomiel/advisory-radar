@@ -16,6 +16,7 @@ jobs:
   ci:
     name: ci
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -28,6 +29,11 @@ jobs:
           python-version: "3.13"
 
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          # An exact release of the uv line the image builds with (the Dockerfile's builder is 0.9), so a new uv
+          # cannot change how CI reads the lock without a commit here. tests/test_ci_hardening.py keeps the
+          # two lines together.
+          version: "0.9.30"
 
       - name: Install dependencies
         run: uv sync --frozen --group dev
@@ -38,11 +44,14 @@ jobs:
         # branch relocked it; this makes that release PR fail here instead.
         run: uv lock --check
 
+      # ruff reads a .gitignore or .ignore in any directory, tracked file or not, and skips what it lists: a new
+      # `.gitignore` under src/ that names a module would hide it from both steps. The flag makes ruff walk every
+      # file under the root; its default excludes (.venv, .git and the like) still apply.
       - name: Ruff lint
-        run: uv run ruff check .
+        run: uv run ruff check --no-respect-gitignore .
 
       - name: Ruff format check
-        run: uv run ruff format --check .
+        run: uv run ruff format --check --no-respect-gitignore .
 
       - name: Tests
         run: uv run pytest -q
@@ -64,6 +73,17 @@ jobs:
           sys.exit(1 if bad else 0)
           PYX
 
+      - name: Compose file is valid
+        # The quickstart compose file is what most self-hosters run, and nothing else in CI reads it. `config`
+        # resolves its schema and interpolation without starting anything. The file's `env_file: .env` must
+        # exist for that, so the check runs on a scratch copy with an empty .env and leaves the checkout alone.
+        run: |
+          set -euo pipefail
+          scratch=$(mktemp -d)
+          cp docker-compose.yml "$scratch/docker-compose.yml"
+          : > "$scratch/.env"
+          docker compose -f "$scratch/docker-compose.yml" config -q
+
       - name: Container image builds and starts
         # A build alone would not have caught a virtualenv relocated to a different path or a data
         # directory the container user cannot write; this starts the image and asks it for /healthz.
@@ -74,9 +94,11 @@ jobs:
           mkdir -p "$tmp/config" "$tmp/data"
           printf 'sources: []\nnotifiers: []\nstate_path: /data/state.json\nweb:\n  port: 8080\n' > "$tmp/config/config.yml"
           chmod -R a+rwX "$tmp"
+          # `run` refuses a login token shorter than 24 characters. A fresh random one per run keeps a literal
+          # secret out of the repository and out of the secret scan.
           docker run -d --name radar-ci -p 18080:8080 \
             -v "$tmp/config:/config:ro" -v "$tmp/data:/data" \
-            -e ADVISORY_RADAR_AUTH_TOKEN=ci-token advisory-radar:ci
+            -e ADVISORY_RADAR_AUTH_TOKEN="$(openssl rand -hex 24)" advisory-radar:ci
           for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:18080/healthz >/dev/null; then break; fi
             sleep 2
@@ -242,6 +264,7 @@ jobs:
   py314:
     name: py314
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -250,6 +273,8 @@ jobs:
           python-version: "3.14"
 
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.9.30"  # the same exact release as the ci job
 
       - name: Install dependencies
         run: uv sync --frozen --group dev --python 3.14

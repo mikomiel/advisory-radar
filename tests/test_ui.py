@@ -6,6 +6,7 @@ followed through the links the page renders, and the mutations are asserted agai
 
 from __future__ import annotations
 
+import base64
 import html
 import importlib.util
 import json
@@ -28,14 +29,14 @@ from advisory_radar.runtime import Runtime
 from advisory_radar.settings import load_settings, load_settings_document, save_settings, settings_path
 from advisory_radar.state import load_state_document, save_state, serialize_json, state_lock
 from advisory_radar.storage import JsonStore
-from advisory_radar.web import _advisory_token, _inbox_also, create_app, inbox_rows
+from advisory_radar.web import _advisory_token, _inbox_also, _parked_digest, create_app, inbox_rows
 
 LOG = logging.getLogger("advisory_radar")
 NOW = 1792600000  # 2026-10-21 16:26:40 UTC
 DAY = 86400
 #: 2026-10-21 00:00:00 UTC and the two midnights around it, for the inclusive day-range tests.
 DAY_START = NOW - (16 * 3600 + 26 * 60 + 40)
-TOKEN = "secret-token"
+TOKEN = "secret-token-0123456789abcdef"
 CSRF_RE = re.compile(r'name="csrf" value="([0-9a-f]{64})"')
 FINGERPRINT_RE = re.compile(r"name='fingerprint' value='([0-9a-f]{64})'")
 REVISION_RE = re.compile(r"name='revision' value='(\d+)'")
@@ -637,6 +638,45 @@ def test_a_malformed_cursor_is_a_400_page_not_a_crash(tmp_path):
         assert "malformed page cursor" in response.text
     # An empty value is not a cursor: the page renders the newest records rather than refusing.
     assert client.get("/alerts", params={"cursor": ""}).status_code == 200
+
+
+def test_a_cursor_that_overflows_is_a_400_page_not_a_500(tmp_path):
+    """``[1e999, "x"]`` is well-formed base64 of well-formed JSON, yet no page position comes from it (W5).
+
+    The parser reads ``1e999`` as an infinity, ``int()`` raises ``OverflowError`` on it, and that is not a
+    ``ValueError``: it used to escape the handler and answer 500 on both list pages and both parameters.
+    """
+    client, token, _ = make_client(tmp_path, state=pagination_state())
+    sign_in(client, token)
+    for path in ("/alerts", "/inbox"):
+        for payload in ('[1e999,"x"]', '[-1e999,"x"]'):
+            cursor = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+            for name in ("cursor", "before"):
+                response = client.get(path, params={name: cursor}, headers={"accept": "text/html"})
+                assert response.status_code == 400, (path, name, payload)
+                assert "malformed page cursor" in response.text
+
+
+def test_a_cursor_the_parser_cannot_nest_is_refused_as_malformed(monkeypatch):
+    """A list nested past the parser's depth limit raises ``RecursionError``, which is not a ``ValueError`` (W5).
+
+    A real request cannot carry enough brackets to prove this over HTTP: httpx caps a query at 64 KiB and
+    Python 3.14's parser needs about 100000 brackets, while 3.13 stops far earlier. The parser is made to
+    raise what it raises there, so the check does not depend on the interpreter that runs it.
+    """
+    from fastapi import HTTPException
+
+    from advisory_radar import web
+
+    def too_deep(_raw):
+        raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+    monkeypatch.setattr(web.json, "loads", too_deep)
+    cursor = base64.urlsafe_b64encode(b'[1,"x"]').decode().rstrip("=")
+    with pytest.raises(HTTPException) as refused:
+        web._cursor_decode(cursor)
+    assert refused.value.status_code == 400
+    assert "malformed page cursor" in refused.value.detail
 
 
 # --- /runs -------------------------------------------------------------------------------------
@@ -1257,7 +1297,9 @@ def test_a_yaml_webhook_secret_survives_a_notifier_form_save(tmp_path):
 
 def test_a_new_webhook_secret_is_entered_and_stored_as_a_reference(tmp_path):
     environment = {"HOOK": "https://hooks.example.net/x", "SIGNING": "s3cret-value"}
-    client, token, runtime = make_client(tmp_path, body="sources: []\nnotifiers: []\n", environment=environment)
+    # The form may only name a variable the YAML lists: that is what makes a reference here the operator's choice.
+    body = "sources: []\nnotifiers: []\noverlay_references: [HOOK, SIGNING]\n"
+    client, token, runtime = make_client(tmp_path, body=body, environment=environment)
     csrf, fingerprint = config_form(client, token)
     saved = client.post(
         "/config/notifiers",
@@ -1560,20 +1602,116 @@ def test_a_per_entry_parked_post_answers_409_while_a_pass_holds_the_lock(tmp_pat
     assert len(stored["parked"]) == 1
 
 
+def bulk_digests(client: TestClient) -> dict[str, str]:
+    """The queue digest each bulk form on the rendered parked page submits, by the action it posts to."""
+    page = client.get("/parked").text
+    forms = re.findall(r'<form method="post" action="(/parked/(?:release|drop))">(.*?)</form>', page, re.S)
+    digests = {}
+    for action, body in forms:
+        match = re.search(r"name=['\"]digest['\"] value=['\"]([0-9a-f]{16})['\"]", body)
+        assert match, f"the {action} form carries no queue digest"
+        digests[action] = match.group(1)
+    return digests
+
+
 def test_the_bulk_parked_actions_still_release_and_drop(tmp_path):
     state = core.new_state()
     state["parked"] = [parked_entry("CVE-2026-1"), parked_entry("CVE-2026-2", "warning")]
     client, token, _ = make_client(tmp_path, state=state)
     csrf = sign_in(client, token)
-    assert client.post("/parked/release", data={"csrf": csrf}, follow_redirects=False).status_code == 303
+    digest = bulk_digests(client)["/parked/release"]
+    assert (
+        client.post("/parked/release", data={"csrf": csrf, "digest": digest}, follow_redirects=False).status_code == 303
+    )
     stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
     assert stored["parked"] == [] and [entry["ids"][0] for entry in stored["pending"]] == ["CVE-2026-1", "CVE-2026-2"]
 
     state["parked"] = [parked_entry("CVE-2026-3")]
     save_state(runtime_state_path(tmp_path), state)
-    assert client.post("/parked/drop", data={"csrf": csrf}, follow_redirects=False).status_code == 303
+    digest = bulk_digests(client)["/parked/drop"]
+    assert client.post("/parked/drop", data={"csrf": csrf, "digest": digest}, follow_redirects=False).status_code == 303
     stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
     assert stored["parked"] == [] and stored["seen"]["CVE-2026-3"]["outcome"] == "dropped"
+
+
+# --- the bulk actions act on the queue the operator saw (W4) -----------------------------------
+
+
+def test_a_bulk_parked_form_carries_a_digest_that_moves_with_the_queue(tmp_path):
+    first, second = parked_entry("CVE-2026-1"), parked_entry("CVE-2026-2", "warning")
+    state = core.new_state()
+    state["parked"] = [first, second]
+    client, token, _ = make_client(tmp_path, state=state)
+    sign_in(client, token)
+    digests = bulk_digests(client)
+    assert set(digests) == {"/parked/release", "/parked/drop"}
+    assert len(set(digests.values())) == 1, "both forms name the same queue"
+    for changed in ([first], [second, first], [first, second, parked_entry("CVE-2026-3")]):
+        state["parked"] = changed
+        save_state(runtime_state_path(tmp_path), state)
+        assert bulk_digests(client)["/parked/release"] != digests["/parked/release"], [e["ids"] for e in changed]
+
+
+@pytest.mark.parametrize("action", ["release", "drop"])
+def test_a_bulk_parked_action_refuses_a_queue_that_changed_since_its_page(tmp_path, action):
+    """ "Release all" acted on whatever was queued when the form arrived, not on what the page listed (W4)."""
+    first, second = parked_entry("CVE-2026-1"), parked_entry("CVE-2026-2", "warning")
+    state = core.new_state()
+    state["parked"] = [first, second]
+    client, token, _ = make_client(tmp_path, state=state)
+    csrf = sign_in(client, token)
+    digest = bulk_digests(client)[f"/parked/{action}"]
+    state["parked"] = [first, second, parked_entry("CVE-2026-3", "warning")]  # parked after the page was rendered
+    save_state(runtime_state_path(tmp_path), state)
+    before = (tmp_path / "state.json").read_bytes()
+    refused = client.post(f"/parked/{action}", data={"csrf": csrf, "digest": digest}, follow_redirects=False)
+    assert refused.status_code == 409
+    assert "nothing was changed" in refused.text
+    assert (tmp_path / "state.json").read_bytes() == before, "a refused bulk action writes nothing"
+    # The operator reloads, sees all three, and decides again.
+    fresh = bulk_digests(client)[f"/parked/{action}"]
+    assert fresh != digest
+    accepted = client.post(f"/parked/{action}", data={"csrf": csrf, "digest": fresh}, follow_redirects=False)
+    assert accepted.status_code == 303
+    stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    assert stored["parked"] == []
+
+
+@pytest.mark.parametrize("digest", [None, "", "not-a-digest", "0" * 16, "G" * 16, "é" * 16])
+@pytest.mark.parametrize("action", ["release", "drop"])
+def test_a_bulk_parked_post_without_a_matching_digest_is_refused(tmp_path, action, digest):
+    """A form that names no queue cannot be defaulted to "whatever is queued now" (W4)."""
+    state = core.new_state()
+    state["parked"] = [parked_entry("CVE-2026-1")]
+    client, token, _ = make_client(tmp_path, state=state)
+    csrf = sign_in(client, token)
+    before = (tmp_path / "state.json").read_bytes()
+    data = {"csrf": csrf} if digest is None else {"csrf": csrf, "digest": digest}
+    refused = client.post(f"/parked/{action}", data=data, follow_redirects=False)
+    assert refused.status_code == 409
+    assert (tmp_path / "state.json").read_bytes() == before
+
+
+def test_core_bulk_parked_refuses_a_queue_other_than_the_one_expected(tmp_path):
+    """``manage_parked`` compares against the queue it loads and then changes; the command line passes nothing."""
+    entries = [parked_entry("CVE-2026-1"), parked_entry("CVE-2026-2", "warning")]
+    state = core.new_state()
+    state["parked"] = list(entries)
+    save_state(tmp_path / "state.json", state)
+    store = JsonStore(tmp_path / "state.json")
+    before = (tmp_path / "state.json").read_bytes()
+    for wrong in (_parked_digest(entries[:1]), _parked_digest(entries[::-1]), _parked_digest([]), "zz", ""):
+        assert core.manage_parked(store, release=True, now=NOW, expected=wrong) == 2, wrong
+        assert (tmp_path / "state.json").read_bytes() == before, "a refusal writes nothing"
+    assert core.manage_parked(store, release=True, now=NOW, expected=_parked_digest(entries)) == 0
+    stored = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    assert stored["parked"] == [] and [entry["ids"][0] for entry in stored["pending"]] == ["CVE-2026-1", "CVE-2026-2"]
+    # No expectation is the command line's: it acts on whatever is queued, and 0 stays "done".
+    state = load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")
+    state["parked"] = [parked_entry("CVE-2026-3")]
+    save_state(tmp_path / "state.json", state)
+    assert core.manage_parked(store, release=False, now=NOW) == 0
+    assert load_state_document(tmp_path / "state.json", core.STATE_SCHEMA, "state")["parked"] == []
 
 
 def runtime_state_path(tmp_path: Path) -> Path:
@@ -1645,7 +1783,10 @@ def test_a_route_added_on_the_form_is_used_by_the_next_pass(tmp_path):
 
 
 def test_a_route_may_select_a_notifier_the_overlay_added(tmp_path):
-    body = "sources: []\nnotifiers:\n  - id: phone\n    type: ntfy\n    url: ${PHONE_HOOK}\n    topic: alerts\n"
+    body = (
+        "sources: []\nnotifiers:\n  - id: phone\n    type: ntfy\n    url: ${PHONE_HOOK}\n    topic: alerts\n"
+        "overlay_references: [OPS_HOOK]\n"
+    )
     client, token, runtime = make_client(tmp_path, body=body, environment=CHANNEL_ENV)
     csrf, fingerprint, _ = routes_page(client, token)
     added = client.post(
