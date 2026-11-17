@@ -551,13 +551,19 @@ def test_the_contributor_guide_describes_the_exemptions_and_the_latest_tag_as_th
     """CONTRIBUTING.md repeats two facts that other files own, and each had drifted from its owner.
 
     The Dependabot exemption is no longer "touches only manifests" (docs/review-and-merge.md and the planner own
-    its conditions), and ``latest`` moves only for the highest stable tag (release.yml owns that rule).
+    its conditions), and ``latest`` moves only for the highest stable tag that is a release of main, one that passes
+    the ancestry and version checks of the release itself (release.yml owns that rule; the guide points at the page
+    that describes it).
     """
     guide = " ".join((ROOT / "CONTRIBUTING.md").read_text().split())
     assert "touches only manifests" not in guide, "the Dependabot exemption is described as manifests only"
     assert "exempt Dependabot manifest change" not in guide
     assert "`dependabot/` branch of this repository" in guide
-    assert "only when the tag is the highest stable `vX.Y.Z` tag, `latest`" in guide
+    rule = "only when the tag is the highest stable `vX.Y.Z` tag that is a release of `main`"
+    assert rule in guide, "the guide leaves out that `latest` needs a tag that is a release of main"
+    assert "(docs/review-and-merge.md#release-tags)" in guide, "the guide does not point at the `latest` rule"
+    docs = (ROOT / "docs" / "review-and-merge.md").read_text()
+    assert "\n## Release tags\n" in docs, "the guide links to a section that review-and-merge.md no longer has"
     release = (ROOT / ".github" / "workflows" / "release.yml").read_text()
     assert "highest stable" in release, "release.yml no longer applies the rule that the guide describes"
 
