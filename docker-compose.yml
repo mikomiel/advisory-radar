@@ -1,25 +1,49 @@
-# Quickstart: docker compose up -d
-# Secrets go in .env (gitignored) or your orchestrator's secret mechanism:
-#   ADVISORY_RADAR_AUTH_TOKEN=...
-#   DISCORD_WEBHOOK_URL=...
+# Quickstart (README.md#quickstart): docker compose up -d --wait
+# Secrets go in .env (mode 600, gitignored), never in this file:
+#   ADVISORY_RADAR_AUTH_TOKEN=...      the one variable a fresh install needs
+# Add a notifier's variable (DISCORD_WEBHOOK_URL=...) when you enable that notifier in config/config.yml.
+#
+# Compose reads .env twice: to fill the ${...} placeholders in this file, and, through env_file below, to pass the
+# variables into the container. Pin a release in .env instead of following the newest one:
+#   ADVISORY_RADAR_TAG=vX.Y.Z          see docs/deployment.md#image-tags-updates-and-rollback
 services:
   advisory-radar:
-    image: ghcr.io/mikomiel/advisory-radar:latest
-    # The image's own user is UID 10001; run as you instead, so ./data stays writable without a chown.
-    user: "${ADVISORY_RADAR_UID:-1000}:${ADVISORY_RADAR_GID:-1000}"
+    image: ghcr.io/mikomiel/advisory-radar:${ADVISORY_RADAR_TAG:-latest}
     restart: unless-stopped
+    # No `user:` here: the image runs as UID 10001, and the named volume below is created owned by that user.
+    # To keep the state in ./data instead, change the data line under `volumes:` to "./data:/data" and either
+    #   mkdir -p data && sudo chown 10001:10001 data         # make the directory writable for the image's user
+    # or run as your own account: set ADVISORY_RADAR_UID and ADVISORY_RADAR_GID in .env (id -u, id -g) and uncomment
+    # user: "${ADVISORY_RADAR_UID:?set ADVISORY_RADAR_UID in .env}:${ADVISORY_RADAR_GID:?set ADVISORY_RADAR_GID in .env}"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
-      - "8080:8080"
+      # Loopback only: the web UI has a login but no TLS. To reach it from other machines, put a TLS-terminating
+      # reverse proxy in front of it (docs/deployment.md#exposing-the-web-ui) rather than widening this address.
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./config:/config:ro
-      - ./data:/data
+      - advisory-radar-data:/data
     env_file:
       - .env
     environment:
       ADVISORY_RADAR_CONFIG: /config/config.yml
+      # To read the login token from a file instead of .env, remove it from .env, create the file as described in
+      # docs/deployment.md#keeping-secrets-out-of-env, then uncomment this line, `secrets:` below and the block at the end:
+      # ADVISORY_RADAR_AUTH_TOKEN_FILE: /run/secrets/advisory_radar_token
+    # secrets:
+    #   - advisory_radar_token
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      # The image's own probe: it asks this instance's /healthz on its own web port (docs/deployment.md#health-checks).
+      test: ["CMD", "advisory-radar", "healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
+volumes:
+  advisory-radar-data:
+# secrets:
+#   advisory_radar_token:
+#     file: ./secrets/advisory_radar_token

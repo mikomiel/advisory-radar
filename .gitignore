@@ -10,9 +10,10 @@ build/
 .ruff_cache/
 .mypy_cache/
 
-# Local state and config
+# Local state, config and secrets (docs/deployment.md#keeping-secrets-out-of-env creates secrets/)
 config/
 data/
+secrets/
 *.db
 *.db-journal
 .env

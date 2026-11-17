@@ -1,15 +1,20 @@
-"""Command line: run | once | dry-run | test-notify | release-parked | drop-parked | sources."""
+"""Command line: run | once | dry-run | test-notify | release-parked | drop-parked | sources | healthcheck."""
 
 from __future__ import annotations
 
 import argparse
+import http.client
 import logging
 import signal
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable, Mapping
 from pathlib import Path
+
+import yaml
 
 from . import core, messages, pipeline
 from .catalogue import SOURCE_SPECS
@@ -21,6 +26,11 @@ from .storage import StoreUnavailable, store_for
 
 LOG = logging.getLogger("advisory_radar")
 DEFAULT_CONFIG = Path("config/config.yml")
+#: How long the container probe waits for ``/healthz``. The image's ``HEALTHCHECK --timeout`` is 5 s, so a probe
+#: that cannot connect reports why before the runtime gives up on it.
+HEALTHCHECK_TIMEOUT = 3.0
+#: The port the web UI binds when ``web.port`` is not set: the default ``config_from_document`` applies.
+DEFAULT_WEB_PORT = 8080
 
 
 def _non_negative(text: str) -> int:
@@ -69,6 +79,10 @@ def _parser() -> argparse.ArgumentParser:
     test = sources_sub.add_parser("test", help="fetch one configured source and print its items; nothing is sent")
     test.add_argument("id", help="the id of the configured source")
     test.add_argument("--limit", type=_non_negative, default=10, metavar="N", help="items to print (default 10)")
+    sub.add_parser(
+        "healthcheck",
+        help="probe /healthz on this instance's own web port and exit 0 when it answers 200 (container probe)",
+    )
     return parser
 
 
@@ -104,6 +118,70 @@ def _list_sources() -> int:
         print(f"  required: {', '.join(spec.required) or '(none)'}")
         print(f"  optional: {', '.join(spec.optional) or '(none)'}")
         print(f"  docs: {spec.docs_anchor}")
+    return 0
+
+
+def _web_port(config_path: Path) -> int:
+    """The port the web UI binds, read from the YAML file and nothing else.
+
+    The probe needs this one number, so it takes nothing more from the configuration: no ``${NAME}`` is expanded,
+    no ``*_FILE`` file is opened, the settings overlay is not merged and no other key is validated. The service
+    does all of that when it starts, and a probe that repeated it would report a running service as unhealthy for
+    a setting the probe never uses. Two facts keep this complete: the overlay cannot carry ``web`` (``web.host``
+    and ``web.port`` are bound when the process starts), and a port written as a ``${NAME}`` expands to a string,
+    which the validator refuses, so there is none to expand. The rule for the value is ``config_from_document``'s;
+    ``tests/test_healthcheck.py`` holds the two together.
+
+    Raises ``ConfigError``, with a message of one line, when the file cannot be read or holds no usable port.
+    """
+    try:
+        document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        # A parser error spans several lines, and a container runtime shows this text as one line of health output.
+        raise ConfigError(f"cannot read {config_path}: {' '.join(str(exc).split())}") from exc
+    if not isinstance(document, dict):
+        raise ConfigError(f"{config_path} is not a mapping")
+    web = document.get("web") or {}
+    if not isinstance(web, dict):
+        raise ConfigError("web must be a mapping")
+    port = web.get("port", DEFAULT_WEB_PORT)
+    if not (isinstance(port, int) and 1 <= port <= 65535):
+        raise ConfigError("web.port must be an integer in 1..65535")
+    return int(port)
+
+
+def _healthcheck(config_path: Path) -> int:
+    """The container probe: ask this instance's own web UI for ``/healthz`` on the loopback address.
+
+    The image, the compose file and the quadlet all run this one command, so the probe has no shell, quoting or
+    interpreter to get wrong. Only ``web.port`` is read, from the YAML file alone (:func:`_web_port`), so the
+    probe fails for two reasons and no other: it cannot tell which port to ask, or ``/healthz`` does not answer
+    200. ``/healthz`` is unauthenticated by design, so the request carries no credential, and it bypasses any
+    proxy in the container's environment, which would otherwise carry a loopback request somewhere else. Exit 0 is
+    an HTTP 200; every other outcome is 1 with one line saying why, which is the text a container runtime shows as
+    the health output.
+    """
+    try:
+        port = _web_port(config_path)
+    except ConfigError as exc:
+        LOG.error("healthcheck: config: %s", exc)
+        return 1
+    url = f"http://127.0.0.1:{port}/healthz"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=HEALTHCHECK_TIMEOUT) as response:
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        LOG.error("healthcheck: %s answered %d", url, exc.code)
+        return 1
+    except (OSError, http.client.HTTPException) as exc:
+        LOG.error("healthcheck: %s: %s", url, exc)
+        return 1
+    if status != 200:
+        LOG.error("healthcheck: %s answered %d", url, status)
+        return 1
+    print(f"ok: {url} answered 200")
     return 0
 
 
@@ -287,6 +365,11 @@ def main(
     # either, so it is dispatched before load_config.
     if args.command == "sources" and args.sources_command == "list":
         return _list_sources()
+    if args.command == "healthcheck":
+        # A probe needs the web port and nothing else: no source or notifier is built, no environment variable or
+        # secret file is read, no state is read and no lock is taken, so it can neither disturb a running pass nor
+        # be blocked by one.
+        return _healthcheck(args.config)
     if args.command == "migrate":
         try:
             cfg = load_config(args.config, environment, lenient=True)

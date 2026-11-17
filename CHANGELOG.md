@@ -11,6 +11,26 @@ release decision: the `vX.Y.Z` tag it creates is what builds and publishes
 section by hand -- [CONTRIBUTING.md](CONTRIBUTING.md#releases) owns the release
 boundary.
 
+## [0.4.0](https://github.com/mikomiel/advisory-radar/compare/v0.3.1...v0.4.0) (2026-11-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **deploy:** compose keeps state in the named volume `advisory-radar-data` instead of ./data (move the data, or switch the volume line back to ./data as docs/deployment.md describes); the web UI is published on 127.0.0.1 only in compose and the quadlet; the example notifier is disabled. The new compose file and quadlet need an image that contains this change.
+* **web:** an auth token or webhook secret shorter than 24 characters now stops startup; settings overlay references to environment variables must be listed in `overlay_references` in config.yml; OPML imports with ${...} references are refused.
+
+### Added
+
+* **messages:** render notifications in English or Polish ([#135](https://github.com/mikomiel/advisory-radar/issues/135)) ([34b9f85](https://github.com/mikomiel/advisory-radar/commit/34b9f85d8d933964e33eeccfb688470620eaecce))
+* **notifiers:** add a log notifier for shadow runs ([#134](https://github.com/mikomiel/advisory-radar/issues/134)) ([5c3b29d](https://github.com/mikomiel/advisory-radar/commit/5c3b29d89b4c8cb27c98cf13cfaa5820a9e21b17))
+
+
+### Fixed
+
+* **deploy:** make the container deployment paths start and stay healthy ([#142](https://github.com/mikomiel/advisory-radar/issues/142)) ([77186ac](https://github.com/mikomiel/advisory-radar/commit/77186acd446ac04d152ec835fdb23ce064369393))
+* **pipeline:** harden outage backlog, store faults, delivery order and fetch limits ([#140](https://github.com/mikomiel/advisory-radar/issues/140)) ([a86fefa](https://github.com/mikomiel/advisory-radar/commit/a86fefa5f492c95e1d98aa3cc023e49083971b64))
+* **web:** harden overlay references, proxy trust, probes and secret loading ([#141](https://github.com/mikomiel/advisory-radar/issues/141)) ([3d068a8](https://github.com/mikomiel/advisory-radar/commit/3d068a8dcb594d1d51e0133382be8246cb1b244e))
+
 ## [0.3.1](https://github.com/mikomiel/advisory-radar/compare/v0.3.0...v0.3.1) (2026-11-15)
 
 
