@@ -19,7 +19,7 @@ RUN uv sync --frozen --no-dev --no-install-project --extra postgres
 COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable --extra postgres
 
-FROM python:3.13-slim-bookworm
+FROM python:3.15-slim-bookworm
 RUN useradd --system --uid 10001 --home /data radar
 # /data must exist, owned by the runtime user, before it is declared a VOLUME: a new named volume copies the owner and
 # mode of the image's mount point, and WORKDIR alone creates it as root, which uid 10001 cannot write.
