@@ -154,6 +154,17 @@ one the page says the destination cannot be predicted rather than guessing. A nu
 score per CVE it judged, so an advisory-level score is not a measurement a rule can read, and
 the page asks for the CVE id instead of inventing one.
 
+Set the message kind to Escalation to preview the later message about a watched CVE instead.
+An escalation carries no source and no product, so a rule that names either never matches
+it. The page lists those rules as skipped, routes the escalation with the same entry the
+daily pass queues (its tag, its one CVE id, that CVE's score and EPSS, and its KEV
+membership), and says which fallback wins when no rule matches: the `default` notifiers, or
+every enabled notifier. The source you pick only chooses the thresholds that judge the CVE,
+as the source that queued the watch does, and the product is ignored. Give exactly one CVE
+id: an escalation names that CVE and no other identifier. The page reads no state, so it
+cannot tell whether the daily pass sends the escalation, which depends on what the first
+message told; it shows where an escalation would go if one is sent.
+
 ## Routing
 
 By default every message goes to every enabled notifier. A `routes` list in `config.yml`
@@ -164,7 +175,7 @@ wins**, so the most specific rule goes first. A rule matches on one or more of:
 |---|---|
 | `source` | the message came from the source with that id; an escalation or an Adobe bulletin has no source, so it never matches a source rule |
 | `tag` | the message's severity is exactly that value (`critical` or `warning`) |
-| `product` | the item matched that watchlist product id; a message without a product match never matches a product rule |
+| `product` | the item matched that watchlist product id; a message without a product match, such as an escalation, never matches a product rule |
 | `ids` | any id in the message matches the pattern, case-insensitively (`CVE-2026-*`, `GHSA-*`) |
 | `min_cvss` | the highest CVSS measured for a CVE the message names is at least this number (`0 < x <= 10`) |
 | `epss_gte` | the highest EPSS measured for a CVE the message names is at least this number (`0 < x <= 1`) |
@@ -177,7 +188,9 @@ advisory-level OSV label, not a CVE measurement — and an unmeasured KEV member
 the catalog could not be read, satisfies neither `kev: true` nor `kev: false`: the rule
 describes evidence the message does not have, and a route chosen for a fact nobody observed
 is worse than no rule. An escalation carries the score and EPSS of the CVE it names, so the
-predicates apply to it; it still matches no `source` rule.
+predicates apply to it; it carries no source and no product, so it matches no `source` rule
+and no `product` rule, and `/thresholds` with the message kind set to Escalation shows which
+of your rules that skips.
 
 A `match.tag` outside `critical` and `warning` is refused when the configuration loads: a
 message can carry no other tag, so such a rule could never fire. A `match.min_cvss` outside

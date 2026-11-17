@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import re
 import textwrap
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from advisory_radar import core
+from advisory_radar import core, routing
 from advisory_radar.config import DEFAULT_THRESHOLDS, ConfigError, Thresholds, load_config
 from advisory_radar.runtime import Runtime
 from advisory_radar.settings import load_settings, save_settings, settings_path
@@ -1035,3 +1036,464 @@ def test_the_preview_uses_the_previewed_sources_block(tmp_path):
     ghost = preview(client, cvss="7.5", remote="1", source="ghost")
     assert "Warning" in ghost, "an id no source defines is judged by the global numbers too"
     assert "overrides the global block" not in ghost
+
+
+# --- the /thresholds preview of an escalation --------------------------------------------------
+#
+# ``core.reevaluate`` queues an escalation with no ``source_id`` and no ``products``, so a rule that names a
+# source or a product never matches it (#89). The preview has to say so, and what it says has to be what delivery
+# does: each routing case below queues a real escalation through ``core.reevaluate``, delivers it through
+# ``core.deliver`` and previews the same facts, so the two cannot drift apart unnoticed.
+
+ESCALATION_BODY = """\
+sources:
+  - id: nodejs
+    type: rss
+    url: https://feeds.example.net/nodejs.xml
+    thresholds: {critical_cvss: 7.0}
+notifiers:
+  - id: ops
+    type: ntfy
+    url: ${OPS_HOOK}
+    topic: advisories
+  - id: phone
+    type: ntfy
+    url: ${PHONE_HOOK}
+    topic: alerts
+"""
+ESCALATED_CVE = "CVE-2026-1234"
+ROUTING_LINE = re.compile(r"Routing: <b>([^<]*)</b> · (?:notifiers <b>([^<]*)</b>|no notifier)")
+
+
+@dataclass(frozen=True)
+class Measured:
+    """One watched CVE: who queued it, what its first message told, and what the next evaluation measures.
+
+    ``product`` and ``also`` are typed into the preview only. A watch entry records neither, which is the point:
+    an escalation does not carry them.
+    """
+
+    cvss: float | None
+    epss: float | None = None
+    kev: bool = False
+    kev_known: bool = True
+    remote: bool = False
+    told: str = "warning"
+    source: str = ""
+    product: str = ""
+    also: str = ""
+
+    def current(self) -> core.CveFacts:
+        return facts(self.cvss, self.epss, remote=self.remote)
+
+    def query(self) -> dict[str, str]:
+        """The preview's inputs for the same facts, as the form submits them."""
+        query = {
+            "preview": "1",
+            "kind": "escalation",
+            "ids": f"{ESCALATED_CVE} {self.also}".strip(),
+            "cvss": "" if self.cvss is None else str(self.cvss),
+            "epss": "" if self.epss is None else str(self.epss),
+            "kev": "yes" if self.kev else ("" if self.kev_known else "unknown"),
+            "source": self.source,
+            "product": self.product,
+        }
+        if self.remote:
+            query["remote"] = "1"
+        return query
+
+
+#: Critical through KEV, whatever the first message told.
+KEV_HIT = Measured(9.8, epss=0.4, kev=True)
+#: A CVE recorded as LOW and never sent, now measured above the floor: the one way an escalation is a warning.
+NOW_ABOVE_THE_FLOOR = Measured(5.0, told="suppressed")
+
+
+class Recorder:
+    """A notifier stub that accepts everything and records what delivery offered it."""
+
+    def __init__(self, notifier_id: str) -> None:
+        self.id = notifier_id
+        self.sent: list[dict] = []
+
+    def send(self, entry, http) -> int:
+        self.sent.append(entry)
+        return 200
+
+
+def routed(*rules: tuple[str, str], default: str = "") -> str:
+    """The ``routes`` and ``default`` blocks of a configuration: one ``(match, notifier)`` pair per rule."""
+    text = ""
+    if rules:
+        text = "routes:\n" + "".join(f"  - match: {match}\n    notifiers: [{notifier}]\n" for match, notifier in rules)
+    return text + (f"default: [{default}]\n" if default else "")
+
+
+def evaluate(runtime: Runtime, measured: Measured) -> dict:
+    """The state the daily pass leaves for a watched CVE that now measures ``measured``."""
+    state = core.new_state()
+    extra = {"source_id": measured.source} if measured.source else {}
+    state["watch"][ESCALATED_CVE] = watch_entry(
+        ESCALATED_CVE,
+        level=measured.told,
+        # What the CVE scored when it was queued, so that the score now measured is news to the remote rule.
+        cvss=3.0 if measured.told == "suppressed" else 5.0,
+        # The numbers it was judged under: a watch without them looks like a threshold change and stays silent.
+        thresholds=runtime.cfg.thresholds_for(measured.source).snapshot(),
+        **extra,
+    )
+    core.reevaluate(
+        state,
+        Facts(**{ESCALATED_CVE: measured.current()}),
+        frozenset({ESCALATED_CVE}) if measured.kev else frozenset(),
+        measured.kev_known,
+        NOW,
+        "",
+        thresholds=runtime.cfg.thresholds,
+        source_thresholds=runtime.cfg.source_thresholds,
+    )
+    return state
+
+
+def previewed_route(page: str) -> tuple[str, list[str]]:
+    """The rule or fallback and the sorted notifier ids on the page's ``Routing:`` line."""
+    match = ROUTING_LINE.search(page)
+    assert match, "the preview must answer with a Routing line"
+    return match.group(1), sorted(match.group(2).split(", ")) if match.group(2) else []
+
+
+@pytest.mark.parametrize(
+    ("config", "measured", "expected"),
+    [
+        pytest.param(
+            routed(("{source: nodejs}", "phone"), default="ops"),
+            Measured(9.8, epss=0.4, kev=True, source="nodejs"),
+            ("default", ["ops"]),
+            id="a source rule never matches an escalation, even from the source that queued the watch",
+        ),
+        pytest.param(
+            routed(("{product: magento}", "phone"), default="ops"),
+            Measured(9.8, epss=0.4, kev=True, product="magento"),
+            ("default", ["ops"]),
+            id="a product rule never matches an escalation, whatever product was typed",
+        ),
+        pytest.param(
+            routed(
+                ("{source: nodejs, tag: critical}", "phone"),
+                ("{product: magento}", "phone"),
+                ("{tag: critical}", "ops"),
+                default="phone",
+            ),
+            Measured(9.8, epss=0.4, kev=True, source="nodejs", product="magento"),
+            ("route 3", ["ops"]),
+            id="source and product rules are skipped and the first rule that can match wins",
+        ),
+        pytest.param(
+            routed(("{tag: critical}", "phone"), default="ops"),
+            KEV_HIT,
+            ("route 1", ["phone"]),
+            id="a tag rule routes a critical escalation",
+        ),
+        pytest.param(
+            routed(("{tag: warning}", "phone"), default="ops"),
+            NOW_ABOVE_THE_FLOOR,
+            ("route 1", ["phone"]),
+            id="a tag rule routes a warning escalation",
+        ),
+        pytest.param(
+            routed(("{tag: critical}", "phone"), default="ops"),
+            NOW_ABOVE_THE_FLOOR,
+            ("default", ["ops"]),
+            id="a critical-only rule leaves a warning escalation to the default",
+        ),
+        pytest.param(
+            routed(("{ids: 'CVE-2026-*'}", "phone"), default="ops"),
+            KEV_HIT,
+            ("route 1", ["phone"]),
+            id="an ids rule matches the CVE the escalation names",
+        ),
+        pytest.param(
+            routed(("{ids: 'CVE-2025-*'}", "phone"), default="ops"),
+            KEV_HIT,
+            ("default", ["ops"]),
+            id="an ids rule for another year does not",
+        ),
+        pytest.param(
+            routed(("{ids: 'GHSA-*'}", "phone"), default="ops"),
+            Measured(9.8, epss=0.4, kev=True, also="GHSA-aaaa-bbbb-cccc"),
+            ("default", ["ops"]),
+            id="an escalation carries only its CVE id, not the other ids typed for the advisory",
+        ),
+        pytest.param(
+            routed(("{min_cvss: 9.5}", "phone"), default="ops"),
+            KEV_HIT,
+            ("route 1", ["phone"]),
+            id="min_cvss reads the score the escalation carries",
+        ),
+        pytest.param(
+            routed(("{min_cvss: 9.9}", "phone"), default="ops"),
+            KEV_HIT,
+            ("default", ["ops"]),
+            id="a higher min_cvss does not match",
+        ),
+        pytest.param(
+            routed(("{epss_gte: 0.3}", "phone"), default="ops"),
+            KEV_HIT,
+            ("route 1", ["phone"]),
+            id="epss_gte reads the EPSS the escalation carries",
+        ),
+        pytest.param(
+            routed(("{epss_gte: 0.5}", "phone"), default="ops"),
+            KEV_HIT,
+            ("default", ["ops"]),
+            id="a higher epss_gte does not match",
+        ),
+        pytest.param(
+            routed(("{kev: true}", "phone"), default="ops"),
+            KEV_HIT,
+            ("route 1", ["phone"]),
+            id="kev: true matches the KEV hit that decided the escalation",
+        ),
+        pytest.param(
+            routed(("{kev: false}", "phone"), default="ops"),
+            KEV_HIT,
+            ("default", ["ops"]),
+            id="kev: false does not",
+        ),
+        pytest.param(
+            routed(("{tag: critical}", "phone"), default="ops"),
+            Measured(7.5, remote=True, source="nodejs"),
+            ("route 1", ["phone"]),
+            id="the source still picks the thresholds that make the escalation critical, though not its route",
+        ),
+        pytest.param(
+            routed(("{tag: warning}", "phone")),
+            KEV_HIT,
+            ("all", ["ops", "phone"]),
+            id="no rule matches and no default is set: every enabled notifier",
+        ),
+        pytest.param(
+            routed(default="ops"),
+            KEV_HIT,
+            ("all", ["ops", "phone"]),
+            id="a default without any route changes nothing: every enabled notifier",
+        ),
+    ],
+)
+def test_the_escalation_preview_is_what_delivery_selects(tmp_path, config, measured, expected):
+    client, _, runtime = make_client(tmp_path, body=ESCALATION_BODY + config)
+    sign_in(client)
+
+    # The real thing: a watched CVE that the daily pass re-evaluates queues the escalation, and delivery routes it.
+    state = evaluate(runtime, measured)
+    [queued] = [entry for entry in state["pending"] if entry["kind"] == "escalation"]
+    assert "source_id" not in queued and "products" not in queued, "the premise: an escalation has no context"
+    enabled = [str(entry["id"]) for entry in runtime.cfg.notifiers]
+    selected, label = routing.select(dict(queued), runtime.cfg.routes, runtime.cfg.default_notifiers, enabled)
+    recorders = [Recorder(identifier) for identifier in enabled]
+    assert core.deliver(state, recorders, None, NOW, routes=runtime.cfg.routes, default=runtime.cfg.default_notifiers)
+    delivered = sorted(recorder.id for recorder in recorders if recorder.sent)
+    assert delivered == sorted(selected)
+    assert (label, delivered) == expected, "the case must exercise the rule it names"
+
+    page = client.get("/thresholds", params=measured.query()).text
+
+    assert previewed_route(page) == (label, delivered), "the preview must equal what delivery selects"
+
+
+def test_the_escalation_preview_lists_the_rules_it_skips(tmp_path):
+    config = routed(
+        ("{source: nodejs, tag: critical}", "phone"),
+        ("{product: magento}", "phone"),
+        ("{tag: warning}", "phone"),
+        ("{source: legacy, product: magento}", "phone"),
+        default="ops",
+    )
+    client, _, _ = make_client(tmp_path, body=ESCALATION_BODY + config)
+    sign_in(client)
+    measured = Measured(9.8, epss=0.4, kev=True, source="nodejs", product="magento")
+
+    page = client.get("/thresholds", params=measured.query()).text
+
+    assert previewed_route(page) == ("default", ["ops"])
+    assert "rule 1 (source)" in page and "rule 2 (product)" in page and "rule 4 (source and product)" in page
+    assert "rule 3" not in page, "a tag rule can match an escalation, so it is not listed as skipped"
+    assert "No rule matches this escalation, so the default notifiers win" in page
+    assert "<option value='escalation' selected>Escalation</option>" in page
+    # The same facts as a new advisory from that source do reach the source's rule: the message kind is the difference.
+    assert previewed_route(client.get("/thresholds", params={**measured.query(), "kind": ""}).text) == (
+        "route 1",
+        ["phone"],
+    )
+
+
+FALLBACK_SENTENCES = (
+    "No rule matches this escalation, so the default notifiers win.",
+    "No rule matches this escalation and no default is set, so every enabled notifier gets it.",
+    "No routes are configured, so every enabled notifier gets it.",
+)
+
+
+@pytest.mark.parametrize(
+    ("config", "route", "sentence"),
+    [
+        pytest.param(
+            routed(("{source: nodejs}", "phone"), default="ops"),
+            ("default", ["ops"]),
+            FALLBACK_SENTENCES[0],
+            id="the default wins when no rule can match",
+        ),
+        pytest.param(
+            routed(("{source: nodejs}", "phone")),
+            ("all", ["ops", "phone"]),
+            FALLBACK_SENTENCES[1],
+            id="every enabled notifier wins when there is no default either",
+        ),
+        pytest.param(
+            "",
+            ("all", ["ops", "phone"]),
+            FALLBACK_SENTENCES[2],
+            id="every enabled notifier gets it when no route is configured",
+        ),
+        pytest.param(
+            routed(("{source: nodejs}", "phone"), ("{tag: critical}", "ops"), default="phone"),
+            ("route 2", ["ops"]),
+            None,
+            id="no fallback applies when a rule matches",
+        ),
+    ],
+)
+def test_the_escalation_preview_names_the_fallback_that_wins(tmp_path, config, route, sentence):
+    client, _, _ = make_client(tmp_path, body=ESCALATION_BODY + config)
+    sign_in(client)
+
+    page = client.get("/thresholds", params=KEV_HIT.query()).text
+
+    assert previewed_route(page) == route
+    assert [text for text in FALLBACK_SENTENCES if text in page] == ([sentence] if sentence else [])
+
+
+def test_the_escalation_preview_says_it_does_not_know_whether_the_cve_escalates(tmp_path):
+    client, _, _ = make_client(tmp_path, body=ESCALATION_BODY + routed(("{tag: critical}", "phone"), default="ops"))
+    sign_in(client)
+    page = client.get("/thresholds", params=KEV_HIT.query()).text
+    assert "depends on what its first message told" in page
+
+
+def test_the_escalation_preview_shows_the_note_an_escalation_carries(tmp_path):
+    client, _, _ = make_client(tmp_path, body=ESCALATION_BODY + routed(("{tag: critical}", "phone"), default="ops"))
+    sign_in(client)
+    escalation = client.get("/thresholds", params=KEV_HIT.query()).text
+    assert core.change_note("kev") in escalation, "an escalation says what changed, not why the CVE is critical"
+    advisory = client.get("/thresholds", params={**KEV_HIT.query(), "kind": ""}).text
+    assert core.change_note("kev") not in advisory
+
+
+@pytest.mark.parametrize(
+    "measured",
+    [
+        pytest.param(Measured(2.0, told="suppressed"), id="a CVE measured LOW is recorded, not escalated"),
+        pytest.param(
+            Measured(2.0, told="suppressed", kev_known=False),
+            id="a scored CVE below the floor with the catalogue unknown is not escalated either",
+        ),
+        pytest.param(Measured(None, told="suppressed"), id="a CVE with no score is not escalated"),
+    ],
+)
+def test_the_escalation_preview_routes_nothing_for_facts_that_never_escalate(tmp_path, measured):
+    client, _, runtime = make_client(
+        tmp_path, body=ESCALATION_BODY + routed(("{tag: warning}", "phone"), default="ops")
+    )
+    sign_in(client)
+    assert evaluate(runtime, measured)["pending"] == [], "the premise: the daily pass queues nothing for these facts"
+
+    page = client.get("/thresholds", params=measured.query()).text
+
+    assert "Routing:" not in page, "no escalation is queued, so nothing is routed"
+    assert "No escalation is queued for these facts" in page
+
+
+def test_the_escalation_preview_needs_exactly_one_cve_id(tmp_path):
+    client, _, _ = make_client(tmp_path, body=ESCALATION_BODY + routed(("{ids: 'GHSA-*'}", "phone"), default="ops"))
+    sign_in(client)
+    query = KEV_HIT.query()
+
+    for ids in ("", "GHSA-aaaa-bbbb-cccc", "CVE-2026-1234 CVE-2026-5678"):
+        page = client.get("/thresholds", params={**query, "ids": ids}).text
+        assert "Routing:" not in page, ids
+        assert "exactly one CVE" in page.split("<h2>Result</h2>")[1], ids
+
+    # One CVE id decides. It may be written in either case or twice, and another id typed beside it never reaches
+    # an escalation: a new advisory with the same ids would match the GHSA rule, an escalation does not.
+    expected = ("default", ["ops"])
+    for ids in ("CVE-2026-1234", "cve-2026-1234 GHSA-aaaa-bbbb-cccc", "CVE-2026-1234, cve-2026-1234"):
+        assert previewed_route(client.get("/thresholds", params={**query, "ids": ids}).text) == expected, ids
+    advisory = client.get("/thresholds", params={**query, "kind": "", "ids": "CVE-2026-1234 GHSA-aaaa-bbbb-cccc"})
+    assert previewed_route(advisory.text) == ("route 1", ["phone"])
+
+
+def test_the_escalation_preview_will_not_predict_a_kev_rule_against_an_unknown_catalogue(tmp_path):
+    client, _, _ = make_client(tmp_path, body=ESCALATION_BODY + routed(("{kev: true}", "phone"), default="ops"))
+    sign_in(client)
+    page = client.get("/thresholds", params=Measured(9.8, epss=0.4, kev_known=False).query()).text
+    assert "Routing:" not in page
+    assert "matches on KEV membership" in page and "cannot be predicted" in page
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        {"cvss": "9.8", "kev": "yes", "source": "nodejs"},
+        {"cvss": "5.0", "source": "nodejs"},
+        {"cvss": "2.0"},
+        {"cvss": "9.8", "epss": "0.4", "kev": "yes", "ids": ESCALATED_CVE, "product": "magento"},
+        {"cvss": "7.5", "remote": "1", "source": "nodejs", "ids": "GHSA-aaaa-bbbb-cccc"},
+        {},
+    ],
+)
+def test_the_default_message_kind_previews_a_new_advisory_as_before(tmp_path, query):
+    config = routed(("{source: nodejs, tag: critical}", "phone"), ("{product: magento}", "phone"), default="ops")
+    client, _, _ = make_client(tmp_path, body=ESCALATION_BODY + config)
+    sign_in(client)
+
+    plain = client.get("/thresholds", params={"preview": "1", **query}).text
+    explicit = client.get("/thresholds", params={"preview": "1", "kind": "", **query}).text
+
+    assert plain == explicit, "an absent kind and an empty one are both a new advisory"
+    assert "<option value='' selected>New advisory</option>" in plain
+    result = plain.split("<h2>Result</h2>")[1].split("</main>")[0]
+    assert "escalation" not in result.lower(), "nothing about an escalation leaks into a new advisory's answer"
+
+
+def test_the_preview_form_offers_the_message_kind_and_keeps_it_without_a_preview(tmp_path):
+    client, _, _ = make_client(tmp_path)
+    sign_in(client)
+
+    page = client.get("/thresholds", params={"kind": "escalation"})
+
+    assert page.status_code == 200
+    assert "<select name='kind'>" in page.text
+    assert "<option value='escalation' selected>Escalation</option>" in page.text
+    assert "<h2>Result</h2>" not in page.text, "no preview was asked for"
+    assert "carries no source and no product" in page.text, "the form says what an escalation lacks"
+
+
+def test_the_preview_refuses_an_unknown_message_kind(tmp_path):
+    client, _, _ = make_client(tmp_path)
+    sign_in(client)
+    for kind in ("digest", "new", "ESCALATION"):
+        response = client.get("/thresholds", params={"preview": "1", "kind": kind})
+        assert response.status_code == 400, kind
+        assert "kind must be empty or escalation" in response.text, kind
+
+
+def test_the_routes_section_says_source_and_product_rules_do_not_apply_to_escalations(tmp_path):
+    client, _, _ = make_client(tmp_path)
+    sign_in(client)
+
+    routes = client.get("/config").text.split("<span class='sec-num'>05</span>Routes</h2>")[1]
+
+    assert "carries no source and no product" in routes
+    assert "never matches it" in routes
+    assert "then the default notifiers, then every enabled notifier" in routes
+    assert "href='/thresholds?kind=escalation'" in routes, "the preview that shows it for these rules"
