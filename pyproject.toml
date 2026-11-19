@@ -14,6 +14,7 @@ authors = [{ name = "Mikołaj Mielczarek" }]
 dependencies = [
     "fastapi>=0.115",
     "itsdangerous>=2.2",
+    "jsonschema>=4.26.0",
     "pyyaml>=6.0",
     "uvicorn>=0.30",
 ]

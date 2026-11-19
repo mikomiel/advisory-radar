@@ -330,12 +330,15 @@ language: pl                 # en (the default) or pl
 English is the wording the service has always used, so a configuration without the key sends
 exactly the messages earlier versions sent. Only text the service writes is translated. The
 heading and excerpt of an advisory come from its feed and stay as the publisher wrote them, apart
-from three things the service writes itself: the short excerpt for a PHP or Node.js release it
+from four things the service writes itself: the short excerpt for a PHP or Node.js release it
 read from the release page, the summary of a changed changedetection.io watch
-(`Page changed (last_changed=...)`), and the words of a native changedetection.io webhook payload
+(`Page changed (last_changed=...)`), the words of a native changedetection.io webhook payload
 that names neither a watch title nor a URL (the title `change`) or that carries no diff (the
-summary `page changed`). A watch title or a diff the sender supplies is the sender's text and is
-never translated, even when it reads the same. Identifiers and the names CVSS, EPSS, SSVC, KEV
+summary `page changed`), and the sentence that opens the summary of a CSAF item (`Vendor
+statements, revision ... of ...; not a check of your installed versions.`). A watch title or a
+diff the sender supplies is the sender's text and is never translated, even when it reads the
+same, and neither is the list of statements that follows the CSAF sentence: it is built from the
+vendor's CVE ids, status names and product names. Identifiers and the names CVSS, EPSS, SSVC, KEV
 and GHSA are never translated.
 
 The `tag` of a message (`critical` or `warning`) is a routing value, not text, so it stays
@@ -617,5 +620,7 @@ window, and the pass fails loudly when a full window shares nothing with the
 previous one — that is how silently missed advisories surface. An `rss` source is
 bounded by its publisher, and the changedetection.io source reports no
 truncation at all, so a skipped item there cannot be detected; poll those sources
-often enough that rotation is unlikely.
+often enough that rotation is unlikely. A `csaf` source reads by a cursor instead: a document it
+tried to read and could not is reported as a failure, and so is a backlog, once the oldest listed
+document it has not read yet was listed more than 12 hours ago ([CSAF directories](sources.md#csaf-directories)).
 

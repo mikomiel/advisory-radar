@@ -10,7 +10,7 @@ from dataclasses import replace
 
 from . import core, watchlist
 from .config import Config, secret_values
-from .http import Http, RedactFilter, urllib_http
+from .http import Http, RedactFilter, log_safe, urllib_http
 from .kev import load_kev
 from .notifiers import build_notifier
 from .plugins import Source, SourceWindow
@@ -21,6 +21,10 @@ from .storage import Store, StoreUnavailable
 LOG = logging.getLogger("advisory_radar")
 
 KEV_CACHE_NAME = "kev.json"
+
+#: The longest ``source_health`` error a window's problems are stored as. A raised fault is one short line; the
+#: problems of a window are a few, each naming a document, and the page and the metrics show the start.
+HEALTH_ERROR_LIMIT = 1000
 
 #: ``run_pass`` exit code for "another pass held the lock, so nothing ran" on the non-blocking path. It is
 #: separate from 1 so a caller (the web UI's Run a pass now) can tell a skipped request from a failed one.
@@ -55,7 +59,7 @@ def _drop_removed_sources(
     else:
         for stale in [source_id for source_id in carried if source_id not in declared_ids]:
             carried.pop(stale, None)
-        for stored in (state.get("feeds"), state.get("changedetection")):
+        for stored in (state.get("feeds"), state.get("changedetection"), state.get("csaf")):
             if isinstance(stored, dict):
                 for stale in [source_id for source_id in stored if source_id not in declared_ids]:
                     stored.pop(stale, None)
@@ -273,6 +277,7 @@ def _run_pass(
             tuple(_namespaced(item, source.id) for item in window.items),
             window.truncated,
             window.host,
+            window.problems,
         )
         previous = stored_windows.get(source.id)
         # Only a source that knows its own page size can prove it returned a complete window (a FreshRSS
@@ -398,7 +403,15 @@ def _run_pass(
             # Health follows the same rule as the validators: recorded only once this window's candidates are
             # durable, so a crash between fetch and classification cannot report a source healthy for work it
             # never queued.
-            _record_health(state, source.id, now, ok=True, items=len(window.items))
+            if window.problems:
+                # The window read what it could: its items were classified above and its cursor is committed
+                # below. What it could not read turns the source red and fails the pass until it can.
+                source_ok = False
+                error = redact("; ".join(window.problems), secret_values(cfg))[:HEALTH_ERROR_LIMIT]
+                LOG.error("source %s: %s", source.id, log_safe(error))
+                _record_health(state, source.id, now, ok=False, items=len(window.items), error=error)
+            else:
+                _record_health(state, source.id, now, ok=True, items=len(window.items))
         # A source that tracks a cursor advances it only now: the same write carries the candidates, so a crash
         # between fetch and classification cannot skip an advisory forever.
         commit = getattr(source, "commit", None)

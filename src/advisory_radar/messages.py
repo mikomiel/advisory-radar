@@ -72,6 +72,10 @@ _EN = {
     # written, not when the source is read.
     "item.summary.page_changed": "Page changed (last_changed={changed}).",
     "item.summary.no_diff": "page changed",
+    # The summary of a CSAF advisory. The words around the statements are the service's and the statements are the
+    # vendor's; every language says they are not a check of the versions the reader runs.
+    "item.summary.csaf": "Vendor statements, revision {version} of {id}; not a check of your installed versions. "
+    "{statements}",
     "item.title.change": "change",
     # A digest. The title is ``<LEVEL>: <this>``; the count picks the singular or the plural form.
     "digest.title.one": "digest of {count} advisory",
@@ -145,6 +149,8 @@ _PL = {
     "excerpt.nodejs": "Wydanie bezpieczeństwa Node.js; linie: {lines}",
     "item.summary.page_changed": "Strona uległa zmianie (last_changed={changed}).",
     "item.summary.no_diff": "strona uległa zmianie",
+    "item.summary.csaf": "Oświadczenia dostawcy, rewizja {version} dokumentu {id}; to nie jest sprawdzenie Twoich "
+    "zainstalowanych wersji. {statements}",
     "item.title.change": "zmiana",
     # "zestawienie" takes the genitive: one form for a single advisory, one for every other count.
     "digest.title.one": "zestawienie {count} biuletynu",
