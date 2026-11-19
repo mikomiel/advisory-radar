@@ -88,6 +88,19 @@ SOURCE_SPECS: dict[str, SourceSpec] = {
         example={"id": "vendor-webhook", "type": "webhook"},
         docs_anchor="docs/sources.md",
     ),
+    "csaf": SourceSpec(
+        kind="csaf",
+        summary="A vendor's CSAF 2.0 provider directory, read through its changes.csv; each new or revised "
+        "advisory becomes one item of vendor statements.",
+        required=("url",),
+        optional=("enabled",),
+        example={
+            "id": "vendor-csaf",
+            "type": "csaf",
+            "url": "https://vendor.example.net/csaf/advisories/",
+        },
+        docs_anchor="docs/sources.md",
+    ),
 }
 
 

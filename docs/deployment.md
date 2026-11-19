@@ -471,9 +471,9 @@ that is, `/data/data/state.db`.
 
 The key is YAML-only. The overlay cannot move the store, and a reload refuses a changed
 `storage:` as it refuses a changed `state_path`, so moving it is a restart.
-`settings.json`, the KEV cache and the default `watchlist.json` stay beside `state_path` and are
-not part of the document, which is why `state_path` is still required when the document lives
-elsewhere.
+`settings.json`, the KEV cache, the default `watchlist.json`, the imported `inventory.json` and the
+[state-archive files](#state-size-and-retention) stay beside `state_path` and are not part of the
+document, which is why `state_path` is still required when the document lives elsewhere.
 
 Whichever store holds it, a document that cannot be locked or written (a full disk, a read-only
 volume, a bad permission on the JSON file) fails the pass with `the state store at <path> is
@@ -505,6 +505,138 @@ The rest of the PostgreSQL behaviour is unit-tested against a fake connection ra
 a live server: the advisory lock, the connection that carries it and the credential
 scrubbing are pinned by tests, so treat a switch to the PostgreSQL store as a change to verify
 on the target database first.
+
+### State size and retention
+
+The state is one document and every store keeps it whole: a page loads all of it and a save writes
+all of it. A pass saves it once after each source, once before the first message is sent, once for
+each notifier that accepts a message, once after delivery and once for the run record, which is
+`sources + 3` saves plus one per acknowledgement. Most of the document is bounded: `watch` drops a
+CVE after 14 days, the KEV cache lasts a day and `runs` keeps the last 200 passes. Two parts grow
+with use: `seen`, one short record for every identifier ever reported, and `deliveries`, one
+snapshot of about 0.5 KiB for every delivered message.
+
+**What a pass moves.** A pass moves every delivery snapshot older than two years (730 days, counted
+back from the start of the UTC day, so the first pass of a day moves everything that expired and
+the others find nothing) into `state-archive-<day>-<digest>.json` beside `state_path`, before its
+first save, and the document drops them with that save. The file is written the way the state is: a
+temporary file, synced, renamed, then the directory synced, with mode 0600. It holds the snapshots
+unchanged in a `deliveries` map, with the line it was cut at (`before`) and the time of the pass
+(`archived_at`). The name carries a digest of the content, so a pass that stops after the file was
+written and runs again the same day finds the same name. It does not take the name on trust: it
+reads that one file, and it drops the snapshots only when the file is a regular file that declares
+the archive schema and holds every one of them unchanged, so it writes nothing twice. Anything else
+at that name (an empty or damaged file, an archive of other records, a directory, or a symbolic
+link, which is never followed) is left as it is and never replaced: the pass logs a warning and the
+snapshots stay in the state, because a copy that cannot be shown to exist is not one. Move what is
+in the way aside and the next pass writes the archive. Otherwise the day in the name changes after
+midnight, and the first pass of the next day, which finds nothing at its name, writes a file, so a
+retry after midnight may also write a second file with the same snapshots. Apart from that check, no
+pass reads an archive file and nothing in the product does: to bring snapshots back, stop the
+service and merge the `deliveries` map into the state by hand. An archive that cannot be written (a
+full disk, a read-only volume) is logged as a warning and the snapshots stay in the state until a
+pass that can write it. A dry run moves nothing.
+
+**What stays.** Seen records are never archived. They are the deduplication: a pass reports an
+identifier only when no record claims it, and an item with no date, an item whose date was changed
+and a new bulletin that names an old CVE carry nothing that says "old", so without its record each
+of them would be reported again. A seen record whose snapshot moved keeps its outcome, its time and
+its pointer. Its advisory page says that the details moved to the archive, and `/alerts` and
+`/inbox` list the row without a tag, source id or title. Pending and parked messages, the first-seen
+time of every identifier and the ownership of queued messages are not touched: the pass settles
+ownership before it moves anything. The price is that `seen` keeps growing, linearly, and retention
+does not bound it.
+
+**Rollback and migration.** A release without retention reads the document as it is, and its pages
+already show a seen record without a snapshot with "not recorded" in its detail cells, so going back
+needs no undo and the archive files stay where they are. `advisory-radar migrate` copies only the
+document, so the files do not travel with it. With PostgreSQL, each instance writes its own files on
+the volume of its own `state_path`.
+
+**Supported scale.** One instance supports 100,000 seen identifiers and 20,000 live deliveries (the
+deliveries of the last two years) with `/alerts` under 1 s and a state save under 2 s, with either
+store. The measurement below meets both budgets there, so this release does not change the storage:
+the JSON file stays the default, and SQLite and PostgreSQL stay a choice for one-file backups or
+shared state, not a remedy for size.
+
+`scripts/benchmark_state.py` produced the numbers (standard library only, seed 1, real `fsync`,
+times in seconds, medians of five runs for the first six rows and of three for the others). The
+first three histories were measured in one run and each of the others in a run of its own, a few
+minutes apart, on one shared Linux host with Python 3.14.10 and SQLite 3.53.1. A 4 KiB `fsync`
+took between 17 and 55 ms across the five runs, and the saves move with it: a slower disk makes
+every save slower, so run the script on the volume you use, and repeat a row that lands near a
+budget. The histories are invented: a delivered message names one to three
+identifiers (1.8 on average), and the other seen identifiers are backlog, suppressed, alias,
+not-security and filtered. A real history with larger snapshots is heavier.
+
+| history (seen / deliveries) | store | document MiB | load | save | `/alerts` | `/alerts?q=` | advisory page |
+|---|---|---|---|---|---|---|---|
+| 1,000 / 200 | JSON | 0.2 | 0.001 | 0.108 | 0.003 | 0.003 | 0.002 |
+| | SQLite | 0.3 | 0.002 | 0.090 | 0.004 | 0.004 | 0.003 |
+| **100,000 / 20,000 (the target)** | JSON | 16.9 | 0.182 | 0.418 | 0.531 | 0.332 | 0.207 |
+| | SQLite | 24.8 | 0.184 | 0.549 | 0.597 | 0.363 | 0.220 |
+| 100,000 / 10,018 (the target over four years, after the first pass archived 9,982) | JSON | 11.8 | 0.154 | 0.231 | 0.469 | 0.252 | 0.158 |
+| | SQLite | 17.2 | 0.149 | 0.460 | 0.455 | 0.244 | 0.155 |
+| 150,000 / 30,000 (1.5 times the target) | JSON | 25.5 | 0.305 | 0.510 | 0.893 | 0.640 | 0.391 |
+| | SQLite | 37.4 | 0.330 | 0.743 | 0.940 | 0.582 | 0.355 |
+| 200,000 / 20,000 (twice the seen) | JSON | 22.9 | 0.302 | 0.428 | 0.796 | 0.489 | 0.313 |
+| | SQLite | 33.5 | 0.289 | 0.904 | 0.796 | 0.489 | 0.331 |
+| 200,000 / 40,000 (twice the target) | JSON | 34.0 | 0.420 | 0.736 | 1.167 | 0.714 | 0.464 |
+| | SQLite | 49.9 | 0.414 | 1.149 | 1.280 | 0.771 | 0.477 |
+| 400,000 / 20,000 (four times the seen) | JSON | 34.9 | 0.529 | 0.560 | 1.221 | 0.811 | 0.579 |
+| | SQLite | 50.5 | 0.509 | 0.700 | 1.299 | 0.795 | 0.622 |
+
+At the target both stores are inside both budgets: `/alerts` takes 0.53 s with the JSON file and
+0.60 s with SQLite, and a save 0.42 s and 0.55 s. Past the target the first budget to fail is
+`/alerts`. It still passes at 1.5 times the target (0.89 s and 0.94 s) and at twice the seen set
+alone (0.80 s with both stores), with a margin that run-to-run noise can use up, and it fails at
+twice the target (1.2 s and 1.3 s) and at four times the seen set (1.2 s and 1.3 s). A save stays
+under 2 s in every row, at most 1.15 s. The SQLite and PostgreSQL stores keep the indented text,
+which is 1.5 times the compact JSON file (24.8 against 16.9 MiB at the target).
+
+**What a pass writes.** The same run counted the saves of a real pass with one source and one
+notifier at the target, and the bytes each save handed to the kernel (`/proc/self/io`, so Linux
+only). A pass with nothing to do saves 4 times. A pass that delivers the most messages one pass
+may, 5, saves 9 times, because each acknowledgement saves the document again to record that one
+message:
+
+| store | pass | saves | written MiB | each save, times the document | time in saves (s) |
+|---|---|---|---|---|---|
+| JSON | nothing to do | 4 | 67.5 | 1.0 1.0 1.0 1.0 | 1.43 |
+| JSON | 5 messages delivered | 9 | 152.0 | 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0 | 2.93 |
+| SQLite | nothing to do | 4 | 100.0 | 2.0 2.0 0.0 0.0 | 1.63 |
+| SQLite | 5 messages delivered | 9 | 399.8 | 2.0 2.0 2.0 2.0 2.0 2.0 2.0 2.0 0.0 | 7.35 |
+
+The document is the text a store keeps, 16.9 MiB for the JSON file and 24.8 MiB for SQLite. The
+JSON file is written whole by every save. SQLite writes what a save changes to its write-ahead log
+and then copies it into the database file, so a save that rewrites the whole text, as each
+acknowledgement does, writes it twice. A save whose text is the stored text writes nothing, as the
+third save of a pass with nothing to do shows, and the last save of a pass, which adds only the run
+record, wrote almost nothing.
+One acknowledgement writes 16.9 MiB with the JSON file to record 950 bytes of new state, and 50.0
+MiB with SQLite to record 1,400 bytes of its indented text. A pass that delivers five messages
+takes 3.4 s of wall time with the JSON file and 8.0 s with SQLite. The memory peaks at the target
+are Python allocations above the baseline (`tracemalloc`), not the resident size of the process: a
+load takes 100 MiB with the JSON file and 108 MiB with SQLite, a save 34 and 50 MiB, and an
+`/alerts` request 120 MiB.
+
+The first pass over the four-year history moved 9,982 deliveries into a 5.1 MiB archive file in
+0.39 s and cut the document from 16.9 to 11.8 MiB. PostgreSQL is not measured, because it needs a
+server; it keeps the same text as SQLite.
+
+Run it from a checkout of the same release (the image carries no `scripts/`), on the volume that
+holds the state:
+
+```bash
+uv run python scripts/benchmark_state.py --workdir /path/on/the/data/volume
+uv run python scripts/benchmark_state.py --seen 200000 --deliveries 40000 --repeat 3
+uv run python scripts/benchmark_state.py --check    # exit 1 when a row misses a budget
+```
+
+The defaults measure the first three histories with both stores. `--json` prints every
+measurement, and `--alerts-budget` and `--save-budget` change the limits `--check` applies. A
+history with no delivery (`--deliveries 0`, or a `--seen` below 5, whose default fifth is none) has
+no advisory page to open, so that column reads `n/a` (null with `--json`) and the rest is measured.
 
 ### The settings overlay
 
@@ -691,12 +823,16 @@ written in the YAML is carried over by id when the notifier form rewrites the li
 `/alerts` keeps its filters in the URL (`tag`, `source` — the configured source id, never the
 advisory heading — `outcome`, `q`, `since` and `until`, the dates as inclusive UTC days) and
 pages by keyset cursor rather than an offset, so a reload, a bookmark or a shared link shows
-the same rows and adding an advisory cannot shift a page. Each row links to the advisory's
-page (the identifier is encoded in the path, so one containing slashes still opens), which
+the same rows and adding an advisory cannot shift a page. While an [inventory](inventory.md) is
+imported, `inventory` (`applies`, `not_affected` or `unknown`) filters by the evidence it gives.
+Each row links to the advisory's page (the identifier is encoded in the path, so one containing
+slashes still opens), which
 shows the stored classification and delivery record — tag, source id and heading, title,
 identifiers and CVEs, KEV-only CVEs, matched products, per-CVE level and CVSS, and the
 notifiers that accepted the message — and says the details were not recorded for a seen
-record written by an older version, instead of inventing them. Later escalation and Adobe
+record written by an older version, and that they moved to the state archive for a delivery
+older than two years ([State size and retention](#state-size-and-retention)), instead of
+inventing them. Later escalation and Adobe
 delivery events are listed below it (an Adobe bulletin has no other record), and `/alerts`
 shows the latest of them under **Recent notifications**. The page never renders the message body: a
 delivered record does not retain it, while a pending or parked entry still carries its body

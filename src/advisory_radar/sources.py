@@ -1,11 +1,14 @@
-"""Built-in source plugins: generic RSS/Atom and the FreshRSS GReader export."""
+"""Built-in source plugins: generic RSS/Atom, the FreshRSS GReader export, changedetection.io, webhooks and CSAF."""
 
 from __future__ import annotations
 
 import hashlib
+import time
 import urllib.parse
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 
-from . import feeds, messages
+from . import csaf, feeds, messages
 from .catalogue import SOURCE_SPECS
 from .core import Item, _host, dsa_id, extract_ids, stored_text_keys
 from .http import Http, json_text, parse_json
@@ -200,6 +203,276 @@ class ChangedetectionSource:
         self._pending_cursors = {}
 
 
+def _csaf_directory(url: object) -> str:
+    """The provider directory URL with a trailing slash, or ``ValueError`` naming what is wrong with it.
+
+    Every document is requested as this URL plus a path from ``changes.csv`` and is shown to the reader as the
+    provenance of an alert, so a URL that carries a credential of its own (user information, a query, a fragment)
+    is refused here rather than printed later. A message never repeats the URL: a rejected one may be a credential.
+    """
+    if not isinstance(url, str) or not url.isascii() or any(char.isspace() or not char.isprintable() for char in url):
+        raise ValueError("csaf source: url must be a plain ASCII web address")
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname
+    except ValueError:
+        raise ValueError("csaf source: url is not a valid web address") from None
+    if parts.scheme not in ("http", "https") or not host:
+        raise ValueError("csaf source: url must be an http or https address with a host")
+    if "@" in parts.netloc:
+        raise ValueError("csaf source: url must not carry a user name or password")
+    if "?" in url or "#" in url:
+        raise ValueError("csaf source: url must not carry a query or a fragment")
+    return url if url.endswith("/") else url + "/"
+
+
+@dataclass(frozen=True)
+class _Cursor:
+    """How far a directory's ``changes.csv`` has been read: a second, and the rows read within that very second.
+
+    A provider can list a score of documents within one second, so the second alone cannot say whether a row dated
+    within it was read. The rows read in that second travel with it, each as its listing (``csaf.Row.listing``: the
+    path, and the fraction of the second when the index is finer than one): a row is unread when its second is
+    later than the cursor's, or is the cursor's and its listing is not among them. That is also what reads a row
+    that is listed late inside a second already read, at whatever fraction, which a bare second would skip for good,
+    and a document revised and listed again within the second it was read in, which only the fraction tells apart.
+    The second stays a whole number of epoch seconds, as the state has always held it.
+    """
+
+    release: int
+    at: frozenset[str]
+
+    def is_new(self, row: csaf.Row) -> bool:
+        return row.release > self.release or (row.release == self.release and row.listing not in self.at)
+
+    def advance(self, passed: Sequence[csaf.Row]) -> _Cursor:
+        """The cursor after ``passed``: the first unread rows in index order, so the newest of them is the last."""
+        if not passed:
+            return self
+        release = max(self.release, passed[-1].release)
+        kept = self.at if release == self.release else frozenset()
+        return _Cursor(release, kept | {row.listing for row in passed if row.release == release})
+
+
+def _shaped(value: object, **kinds: type) -> bool:
+    """Whether ``value`` is a dict holding every named key as the named type (a bool is never an int)."""
+    return isinstance(value, dict) and all(
+        isinstance(value.get(key), kind) and not (kind is int and isinstance(value.get(key), bool))
+        for key, kind in kinds.items()
+    )
+
+
+@dataclass(frozen=True)
+class _Stored:
+    """What ``state["csaf"][id]`` holds that is still valid for this source: every field is checked, none trusted."""
+
+    cursor: _Cursor | None = None
+    #: The one document being retried: its listing (``csaf.Row.listing``, stored as ``path``), the second the index
+    #: lists it at, and how many reads of it failed. A revision listed again is a new listing, with attempts of its own.
+    retry: tuple[str, int, int] | None = None
+    #: Documents given up on, by path: ``{"release": int, "since": int, "reason": str}``.
+    given_up: dict[str, dict] = field(default_factory=dict)
+
+
+class CsafSource:
+    """A vendor's CSAF 2.0 provider directory, read through its ``changes.csv``: one item per new or revised advisory.
+
+    The index says which documents changed and when; the source reads the ones its cursor has not passed, oldest
+    first, at most ``csaf.MAX_DOCUMENTS`` and for at most ``csaf.PASS_SECONDS`` a pass (the first document is always
+    read), validates each against the CSAF 2.0 schema (``csaf.parse_document``) and turns what the vendor states into
+    an item. The item says whose words they are and that they are not a check of anything the reader runs: this
+    source compares no version, and a ``known_not_affected`` statement can neither raise an alert nor take the
+    identity of one that another source raises (``csaf.concerned_cves``).
+
+    A failure is never an empty window, and neither is falling behind. An index that cannot be read raises, so the
+    pass records the source as failed and keeps its cursor. A document that cannot be read or validated stops the
+    pass at that document for ``csaf.MAX_ATTEMPTS`` reads, so a transient fault does not skip it; then it is given
+    up, the pass goes on past it, and the window reports it in ``problems`` until a newer revision of it replaces
+    the report or ``csaf.PROBLEM_RETENTION`` ends. Documents read before the failure are delivered in the same
+    window. Rows the pass did not reach are read next time, and once the oldest of them was listed more than
+    ``csaf.LAG_LIMIT`` ago the window says so in ``problems`` too, which turns the source red and keeps it red
+    until it has caught up.
+
+    State, under ``state["csaf"][id]``: the cursor, the one document being retried, and the documents given up on,
+    all written by ``commit`` and keyed by a digest of the directory URL (which is configuration and may be private).
+    """
+
+    kind = "csaf"
+
+    def __init__(
+        self,
+        source_id: str,
+        url: str,
+        *,
+        clock: Callable[[], float] = time.time,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.id = source_id
+        self.base = _csaf_directory(url)
+        self._digest = _url_digest(self.base)
+        self._clock = clock
+        self._monotonic = monotonic
+        #: The record ``commit`` stores. Set by a successful ``fetch`` and cleared by every one, so a fetch that
+        #: raises cannot leave an earlier window's record behind for the pipeline's next ``commit`` to store.
+        self._pending: dict | None = None
+
+    def fetch(self, http: Http, state: dict) -> SourceWindow:
+        self._pending = None
+        started = self._monotonic()
+        now = int(self._clock())
+        rows = self._index(http, now)
+        stored = self._stored(state, now)
+        cursor = stored.cursor
+        if cursor is None:
+            # A new source starts from the newest documents: the older ones are history, and a directory lists
+            # tens of thousands of them. Rows before the newest few are passed without being read.
+            cursor = _Cursor(0, frozenset()).advance(rows[: max(0, len(rows) - csaf.START_DOCUMENTS)])
+        given_up = dict(stored.given_up)
+        items: list[Item] = []
+        passed: list[csaf.Row] = []
+        retry: dict | None = None
+        retrying = ""
+        unread = [row for row in rows if cursor.is_new(row)]
+        for number, row in enumerate(unread[: csaf.MAX_DOCUMENTS]):
+            if number and self._monotonic() - started >= csaf.PASS_SECONDS:
+                break  # out of time: the rest is read next pass, and the first document of a pass is always read
+            given_up.pop(row.path, None)  # a newer revision replaces what was reported about the older one
+            try:
+                document = self._document(http, row)
+            except csaf.CsafError as exc:
+                same = stored.retry is not None and stored.retry[:2] == (row.listing, row.release)
+                attempt = stored.retry[2] + 1 if same and stored.retry else 1
+                if attempt < csaf.MAX_ATTEMPTS:
+                    # Stop here and read this document again next pass: going on would move the cursor past it.
+                    retry = {"path": row.listing, "release": row.release, "n": attempt}
+                    retrying = f"{row.path}: {exc} (attempt {attempt} of {csaf.MAX_ATTEMPTS})"
+                    break
+                given_up[row.path] = {"release": row.release, "since": now, "reason": str(exc)}
+                passed.append(row)
+                continue
+            passed.append(row)
+            item = _csaf_item(document, self.base + row.path)
+            if item is not None:
+                items.append(item)
+        cursor = cursor.advance(passed)
+        newest = sorted(given_up.items(), key=lambda entry: (-entry[1]["release"], entry[0]))
+        record: dict = {"dir": self._digest, "release": cursor.release, "at": sorted(cursor.at)}
+        if retry is not None:
+            record["retry"] = retry
+        if newest:
+            record["given_up"] = dict(newest[: csaf.MAX_KEPT_PROBLEMS])
+        self._pending = record
+        # What this pass did not reach, oldest first. A source is behind when the oldest of it has waited too long.
+        waiting = unread[len(passed) :]
+        problems = []
+        if waiting and now - waiting[0].release > csaf.LAG_LIMIT:
+            age = _ago(now - waiting[0].release)
+            problems.append(f"behind: {len(waiting)} listed document(s) not read yet, the oldest listed {age} ago")
+        if retrying:
+            problems.append(retrying)
+        problems += [
+            f"{path}: {entry['reason']} (given up after {csaf.MAX_ATTEMPTS} attempt(s))"
+            for path, entry in newest[: csaf.MAX_LISTED_PROBLEMS]
+        ]
+        if len(newest) > csaf.MAX_LISTED_PROBLEMS:
+            problems.append(f"{len(newest) - csaf.MAX_LISTED_PROBLEMS} more document(s) given up")
+        return SourceWindow(self.id, tuple(items), False, _host(self.base), tuple(problems))
+
+    def commit(self, state: dict) -> None:
+        """Store the cursor and the failure record once the pipeline has captured this window's candidates.
+
+        The same rule the other cursors follow: moving the cursor before the items are durable would pass
+        advisories that were never queued, and they would never be read again.
+        """
+        record, self._pending = self._pending, None
+        if record is None:
+            return  # the fetch failed: the stored cursor stays where it was
+        group = state.get("csaf")
+        if not isinstance(group, dict):
+            group = state["csaf"] = {}
+        group[self.id] = record
+
+    def _index(self, http: Http, now: int) -> tuple[csaf.Row, ...]:
+        status, _, raw = http("GET", self.base + "changes.csv", {"Accept": "text/csv, */*;q=0.1"}, None)
+        if status != 200:
+            raise csaf.CsafError("changes.csv: unreachable" if status == 0 else f"changes.csv: HTTP {status}")
+        return csaf.parse_index(raw, now)
+
+    def _document(self, http: Http, row: csaf.Row) -> csaf.Document:
+        status, _, raw = http("GET", self.base + row.path, {"Accept": "application/json"}, None)
+        if status != 200:
+            raise csaf.CsafError("unreachable" if status == 0 else f"HTTP {status}")
+        return csaf.parse_document(raw)
+
+    def _stored(self, state: dict, now: int) -> _Stored:
+        """The stored record for this source and directory, field by field; anything damaged counts as absent.
+
+        A record that names another directory is dropped whole: its cursor describes another index. A cursor dated
+        beyond the clock (a damaged file, or a clock that was wrong) would hide every later row, so it is dropped
+        too and the source starts over from the newest documents.
+        """
+        group = state.get("csaf")
+        record = group.get(self.id) if isinstance(group, dict) else None
+        if not (_shaped(record, dir=str) and record["dir"] == self._digest):
+            return _Stored()
+        cursor = None
+        release, at = record.get("release"), record.get("at")
+        if isinstance(release, int) and not isinstance(release, bool) and 0 <= release <= now + csaf.FUTURE_SLACK:
+            paths = frozenset(path for path in at if isinstance(path, str)) if isinstance(at, list) else frozenset()
+            cursor = _Cursor(release, paths)
+        retry = record.get("retry")
+        retrying = (
+            (retry["path"], retry["release"], retry["n"]) if _shaped(retry, path=str, release=int, n=int) else None
+        )
+        given_up: dict[str, dict] = {}
+        stored = record.get("given_up")
+        for path, entry in (stored if isinstance(stored, dict) else {}).items():
+            if not (isinstance(path, str) and len(path) <= csaf.MAX_PATH_CHARS):
+                continue
+            if (
+                _shaped(entry, release=int, since=int, reason=str)
+                and -csaf.FUTURE_SLACK < now - entry["since"] < csaf.PROBLEM_RETENTION
+            ):
+                given_up[path] = {"release": entry["release"], "since": entry["since"], "reason": entry["reason"][:300]}
+        return _Stored(cursor, retrying, given_up)
+
+
+def _ago(seconds: int) -> str:
+    """A span as one number an operator reads at a glance: hours up to two days, then days."""
+    hours = seconds // 3600
+    return f"{hours} h" if hours < 48 else f"{hours // 24} d"
+
+
+def _csaf_item(document: csaf.Document, url: str) -> Item | None:
+    """The item for a document that makes a statement other than "not affected", else None.
+
+    The guid is the document's identity and the digest of its statements, so a revision that says something else
+    is a new item and a file that is rewritten to say the same is never one twice. The vendor's version number
+    cannot be the revision here: the first provider writes the same one into every document it has. ``explicit``
+    claims only the vulnerabilities the document concerns: the alert pipeline dedupes by claimed identifier across
+    sources, so a claim made on a not-affected vulnerability would silently drop another source's alert for it. The
+    item is dated by when the vendor last changed the document, so an old advisory that is written again is history
+    and not news. The words are the service's, in the catalogue (``item.summary.csaf``), and the statements in them
+    are the vendor's.
+    """
+    cves = csaf.concerned_cves(document)
+    if not cves:
+        return None
+    fields = {"version": document.version, "id": document.id, "statements": csaf.statements_text(document)}
+    return Item(
+        f"{document.id}@{document.revision}",
+        document.title,
+        document.url or url,
+        _english("item.summary.csaf", **fields),
+        document.release,
+        cves,
+        document.publisher,
+        url,
+        summary_key="item.summary.csaf",
+        text_fields=tuple(fields.items()),
+    )
+
+
 class WebhookSource:
     """Items pushed to ``POST /webhooks/<id>`` land in ``state["webhook_inbox"][id]``; this source reads them."""
 
@@ -361,6 +634,7 @@ SOURCE_BUILDERS = {
     "freshrss": lambda cfg, env: FreshRssSource(cfg["id"], cfg["url"], cfg["token"], cfg.get("user", "admin")),
     "changedetection": lambda cfg, env: ChangedetectionSource(cfg["id"], cfg["url"], cfg["api_key"], cfg.get("tag")),
     "webhook": lambda cfg, env: WebhookSource(cfg["id"]),
+    "csaf": lambda cfg, env: CsafSource(cfg["id"], cfg["url"]),
 }
 
 
@@ -374,6 +648,7 @@ def build_source(cfg: dict, env: dict[str, str]) -> Source:
 
 __all__ = [
     "ChangedetectionSource",
+    "CsafSource",
     "FreshRssSource",
     "RssSource",
     "SOURCE_BUILDERS",

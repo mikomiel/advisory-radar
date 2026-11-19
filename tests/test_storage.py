@@ -557,6 +557,54 @@ def test_a_configured_sqlite_store_at_an_auxiliary_file_is_refused(tmp_path):
     assert (kev.read_bytes(), overlay.read_bytes(), scope.read_bytes()) == before, "a refused target writes nothing"
 
 
+def written_beside(data: Path) -> tuple[list[str], dict[str, bytes]]:
+    """Every name in ``data`` and the bytes of each file: what a refused target must leave exactly as it was."""
+    return sorted(path.name for path in data.iterdir()), {path.name: path.read_bytes() for path in data.iterdir()}
+
+
+def test_a_sqlite_target_at_the_imported_inventory_beside_state_path_is_refused(tmp_path, monkeypatch):
+    """An upload or a dropped file replaces ``inventory.json`` whole, so a state document there would be destroyed."""
+    data = tmp_path / "data"
+    data.mkdir()
+    state_path = data / "state.json"
+    inventory = data / "inventory.json"
+    inventory.write_text('{"schema": "advisory-radar-inventory.v1", "components": []}', encoding="utf-8")
+    before = written_beside(data)
+
+    with pytest.raises(ValueError) as caught:
+        storage.store_for(f"sqlite:///{inventory}", state_path)
+    message = str(caught.value)
+    assert "imported inventory" in message, "the refusal names the file's role"
+    assert str(inventory) not in message, "the refusal never names the path"
+
+    # Three slashes are relative to the working directory: this spelling is the same file as the absolute one.
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match="imported inventory"):
+        storage.store_for("sqlite:///data/inventory.json", state_path)
+    assert written_beside(data) == before, "a refused target writes nothing"
+
+    # A SQLite document beside the inventory is exactly what a store is for.
+    assert isinstance(storage.store_for(f"sqlite:///{data}/state.db", state_path), storage.SqliteStore)
+
+
+def test_a_configured_sqlite_store_at_the_imported_inventory_is_refused(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    inventory = data / "inventory.json"
+    inventory.write_text('{"schema": "advisory-radar-inventory.v1", "components": []}', encoding="utf-8")
+    before = written_beside(data)
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        f"sources: []\nnotifiers: []\nstate_path: {data}/state.json\nstorage: sqlite:///{inventory}\n"
+    )
+
+    with pytest.raises(ConfigError) as caught:
+        load_config(config_path, {})
+    assert "imported inventory" in str(caught.value)
+    assert str(inventory) not in str(caught.value)
+    assert written_beside(data) == before, "a refused configuration writes nothing"
+
+
 # --------------------------------------------------------------------------
 # PostgreSqlStore
 

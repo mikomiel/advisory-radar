@@ -9,8 +9,8 @@ deduplicated alert per new advisory to the channels you choose.
 
 ## What it does
 
-- Watches RSS/Atom/JSON Feed, FreshRSS, changedetection.io and inbound webhooks,
-  with vendor parsing for Debian DSA, php.net, Node.js and Adobe bulletins.
+- Watches RSS/Atom/JSON Feed, FreshRSS, changedetection.io, CSAF 2.0 vendor directories and
+  inbound webhooks, with vendor parsing for Debian DSA, php.net, Node.js and Adobe bulletins.
 - Enriches each advisory with CVE.org, NVD, EPSS, CISA KEV, OSV and the Debian
   tracker, re-evaluates it inside the window and escalates once per level.
 - Judges a level per CVE — critical, warning or suppressed — from global and
@@ -69,6 +69,8 @@ Kubernetes.
 
 - [Configuration](docs/configuration.md) — watchlist, thresholds, routing,
   delivery, settings, storage and gap detection.
+- [Inventory](docs/inventory.md) - SBOM and scan-result import, and the version-aware
+  evidence it adds to an advisory.
 - [Sources](docs/sources.md) — the source catalogue, probe behaviour, intervals
   and OPML import.
 - [Notifiers](docs/notifiers.md) - the notifier catalogue, the settings form and
