@@ -11,6 +11,17 @@ release decision: the `vX.Y.Z` tag it creates is what builds and publishes
 section by hand -- [CONTRIBUTING.md](CONTRIBUTING.md#releases) owns the release
 boundary.
 
+## [0.6.0](https://github.com/mikomiel/advisory-radar/compare/v0.5.0...v0.6.0) (2026-11-19)
+
+
+### Added
+
+* **inventory:** import SBOM and OSV-Scanner results as evidence ([#163](https://github.com/mikomiel/advisory-radar/issues/163)) ([e379483](https://github.com/mikomiel/advisory-radar/commit/e379483a04e5a884006ea544806d18082341f74d))
+* **pipeline:** add a pass time budget and durable CVE enrichment ([#160](https://github.com/mikomiel/advisory-radar/issues/160)) ([56c0229](https://github.com/mikomiel/advisory-radar/commit/56c0229cb2ebaf343171413d871f9d7eefdb5e63))
+* **sources:** add a CSAF source for the Red Hat provider ([#162](https://github.com/mikomiel/advisory-radar/issues/162)) ([a45dc51](https://github.com/mikomiel/advisory-radar/commit/a45dc51a505d033f669496efaa7142d36f9a48d4))
+* **state:** archive delivery history after two years, add benchmark ([#161](https://github.com/mikomiel/advisory-radar/issues/161)) ([bdf747d](https://github.com/mikomiel/advisory-radar/commit/bdf747d50ff571d8199e34782e07dc2062e7dfc5))
+* **web:** catalogue-driven source and notifier forms with test send ([#159](https://github.com/mikomiel/advisory-radar/issues/159)) ([4eaa333](https://github.com/mikomiel/advisory-radar/commit/4eaa33386e10c4c2d30d1c908fe9e98263c901c7))
+
 ## [0.5.0](https://github.com/mikomiel/advisory-radar/compare/v0.4.0...v0.5.0) (2026-11-17)
 
 
