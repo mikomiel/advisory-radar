@@ -39,8 +39,9 @@ FORMATS = ("osv-scanner", "cyclonedx", "spdx")
 #: One import is read whole, so it is capped like a feed: the same 8 MiB, for the same reason (a parsed tree costs
 #: many times its source in memory).
 MAX_INVENTORY_BYTES = MAX_FEED_BYTES
-#: Components, and separately findings, one import may hold. A larger inventory is refused, never truncated: a
-#: truncated one would answer "no matching component" for packages it dropped.
+#: The most one import may list of each kind: SBOM components (the subject included) and, in a scan, packages, findings
+#: and call-analysis groups, each counted as the file lists it, repeats included. A larger inventory is refused, never
+#: truncated: a truncated one would answer "no matching component" for packages it dropped.
 MAX_ENTRIES = 20_000
 #: The deepest nesting of CycloneDX components that is followed.
 MAX_DEPTH = 12
@@ -164,23 +165,30 @@ def _sbom_component(purl: str, version: str) -> dict | None:
 def _cyclonedx(document: Mapping) -> tuple[list[dict], str, int]:
     _text(document.get("specVersion"), "specVersion", 16, required=True)
     metadata = document.get("metadata")
-    created = _text(_object(metadata, "metadata").get("timestamp"), "metadata.timestamp", 40) if metadata else ""
+    info = _object(metadata, "metadata") if metadata else {}
+    created = _text(info.get("timestamp"), "metadata.timestamp", 40)
     found: list[dict] = []
     skipped = visited = 0
-    stack = [(item, 1) for item in reversed(_list(document.get("components"), "components"))]
+    stack = [(item, 1, "components[]") for item in reversed(_list(document.get("components"), "components"))]
+    # The subject (``metadata.component``) is the software the document describes, and it can carry components of its
+    # own. It is read like a top-level component, from the same stack, so it shares their count, depth and field
+    # checks, and a subject that cannot be placed is skipped like any other. ``null`` is no subject; any other type
+    # is refused when it is read. It goes on last so that it is read first, as the document lists it.
+    subject = info.get("component")
+    if subject is not None:
+        stack.append((subject, 1, "metadata.component"))
     while stack:
-        item, depth = stack.pop()
+        item, depth, where = stack.pop()
         visited += 1
         if visited > MAX_ENTRIES:
             raise InventoryError(f"the document has more than {MAX_ENTRIES} components")
-        where = "components[]"
         entry = _object(item, where)
         purl = _text(entry.get("purl"), f"{where}.purl", MAX_PURL_CHARS)
         version = _text(entry.get("version"), f"{where}.version", MAX_VERSION_CHARS)
         children = _list(entry.get("components"), f"{where}.components")
         if children and depth >= MAX_DEPTH:
             raise InventoryError(f"components are nested deeper than {MAX_DEPTH} levels")
-        stack.extend((child, depth + 1) for child in reversed(children))
+        stack.extend((child, depth + 1, "components[]") for child in reversed(children))
         component = _sbom_component(purl, version) if purl else None
         if component is None:
             skipped += 1
@@ -222,11 +230,11 @@ def _spdx(document: Mapping) -> tuple[list[dict], str, int]:
 _ANALYSIS_KEYS = ("experimentalAnalysis", "experimental_analysis")
 
 
-def _called(groups: list, ids: Iterable[str]) -> bool | None:
-    """The scanner's reachability verdict for one finding: ``True`` if any analysis says called, ``False`` if all
-    say not called, ``None`` when no analysis names it. An annotation only: it never removes a finding."""
-    wanted = set(ids)
-    seen: list[bool] = []
+def _analysis(groups: list) -> dict[str, bool]:
+    """The call analysis of one package, read and validated once: every identifier an analysis names, normalised, and
+    whether any analysis says it is called. Each finding of the package then looks its ids up here; rescanning
+    ``groups`` for every finding cost findings x groups visits, which a small file could make enormous."""
+    called: dict[str, bool] = {}
     for group in groups:
         group = _object(group, "groups[]")
         for key in _ANALYSIS_KEYS:
@@ -234,10 +242,18 @@ def _called(groups: list, ids: Iterable[str]) -> bool | None:
             if analysis is None:
                 continue
             for identifier, detail in _object(analysis, f"groups[].{key}").items():
-                called = detail.get("called") if isinstance(detail, dict) else None
-                if normalise_id(identifier) in wanted and isinstance(called, bool):
-                    seen.append(called)
-    return None if not seen else any(seen)
+                verdict = detail.get("called") if isinstance(detail, dict) else None
+                if isinstance(verdict, bool):
+                    identifier = normalise_id(identifier)
+                    called[identifier] = called.get(identifier, False) or verdict
+    return called
+
+
+def _called(analysis: Mapping[str, bool], ids: Iterable[str]) -> bool | None:
+    """The scanner's reachability verdict for one finding: ``True`` if any analysis says called, ``False`` if all
+    say not called, ``None`` when no analysis names it. An annotation only: it never removes a finding."""
+    verdicts = [analysis[identifier] for identifier in ids if identifier in analysis]
+    return any(verdicts) if verdicts else None
 
 
 def _merge_called(first: bool | None, second: bool | None) -> bool | None:
@@ -274,11 +290,24 @@ def _osv_scanner(document: Mapping) -> tuple[list[dict], list[dict]]:
 
     A finding is one vulnerability the scanner matched to one installed package version: its ids (the record id
     and its aliases), the package, the fix and, when the scan ran call analysis, whether the code is reachable.
+
+    The work is bounded by what the file lists, not by the product of two lists. Packages, vulnerability records and
+    call-analysis groups are each counted as listed, repeats included, over the whole file, and a list over the
+    bound is refused before any of it is read. The groups of a package are indexed once, not rescanned per record.
     """
     components: dict[tuple, dict] = {}
     findings: dict[tuple, dict] = {}
+    listed = {"packages": 0, "findings": 0, "call-analysis groups": 0}
+
+    def count(what: str, items: list) -> None:
+        listed[what] += len(items)
+        if listed[what] > MAX_ENTRIES:
+            raise InventoryError(f"the document has more than {MAX_ENTRIES} {what}")
+
     for result in _list(document.get("results"), "results"):
-        for item in _list(_object(result, "results[]").get("packages"), "results[].packages"):
+        packages = _list(_object(result, "results[]").get("packages"), "results[].packages")
+        count("packages", packages)
+        for item in packages:
             entry = _object(item, "results[].packages[]")
             package = _object(entry.get("package"), "results[].packages[].package")
             where = "results[].packages[].package"
@@ -287,7 +316,11 @@ def _osv_scanner(document: Mapping) -> tuple[list[dict], list[dict]]:
             version = _text(package.get("version"), f"{where}.version", MAX_VERSION_CHARS)
             components[(ecosystem, name, version)] = _component(ecosystem, name, version)
             groups = _list(entry.get("groups"), "results[].packages[].groups")
-            for record in _list(entry.get("vulnerabilities"), "results[].packages[].vulnerabilities"):
+            vulnerabilities = _list(entry.get("vulnerabilities"), "results[].packages[].vulnerabilities")
+            count("call-analysis groups", groups)
+            count("findings", vulnerabilities)
+            analysis = _analysis(groups)
+            for record in vulnerabilities:
                 record = _object(record, "results[].packages[].vulnerabilities[]")
                 where = "results[].packages[].vulnerabilities[]"
                 raw = [_text(record.get("id"), f"{where}.id", MAX_ID_CHARS, required=True)]
@@ -297,7 +330,7 @@ def _osv_scanner(document: Mapping) -> tuple[list[dict], list[dict]]:
                 raw += [_text(alias, f"{where}.aliases[]", MAX_ID_CHARS, required=True) for alias in aliases]
                 ids = list(dict.fromkeys(normalise_id(identifier) for identifier in raw))
                 key = (tuple(ids), ecosystem, name, version)
-                called = _called(groups, ids)
+                called = _called(analysis, ids)
                 previous = findings.get(key)
                 if previous is not None:  # the same finding in another lockfile of one scan
                     previous["called"] = _merge_called(previous["called"], called)
@@ -308,10 +341,6 @@ def _osv_scanner(document: Mapping) -> tuple[list[dict], list[dict]]:
                     "fixed": _fixed(ecosystem, name, version, record.get("affected")),
                     "called": called,
                 }
-                if len(findings) > MAX_ENTRIES:
-                    raise InventoryError(f"the document has more than {MAX_ENTRIES} findings")
-            if len(components) > MAX_ENTRIES:
-                raise InventoryError(f"the document has more than {MAX_ENTRIES} packages")
     return list(components.values()), list(findings.values())
 
 
@@ -415,13 +444,12 @@ class Inventory:
             self.findings = _stored(document.get("findings"), "findings", ("ecosystem", "name", "version", "fixed"))
         except InventoryError as exc:
             raise InventoryError(f"the stored inventory is damaged: {exc}") from None
-        self._versions: dict[tuple[str, str], list[str]] = {}
+        # A dict per package keeps the listed order and makes the repeat check constant-time (a list made it quadratic).
+        seen: dict[tuple[str, str], dict[str, None]] = {}
         for component in self.components:
-            known = self._versions.setdefault(
-                (component["ecosystem"], normalise_name(component["ecosystem"], component["name"])), []
-            )
-            if component["version"] not in known:
-                known.append(component["version"])
+            key = (component["ecosystem"], normalise_name(component["ecosystem"], component["name"]))
+            seen.setdefault(key, {})[component["version"]] = None
+        self._versions: dict[tuple[str, str], list[str]] = {key: list(versions) for key, versions in seen.items()}
         self._by_id: dict[str, list[dict]] = {}
         for finding in self.findings:
             ids = finding.get("ids")

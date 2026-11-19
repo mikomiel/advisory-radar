@@ -31,7 +31,9 @@ def sbom_component(name: str, version: str | None, ecosystem: str = "npm") -> di
     return entry
 
 
-def cyclonedx(*components: dict, timestamp: str = "2026-10-20T10:00:00Z") -> bytes:
+def cyclonedx(*components: dict, timestamp: str = "2026-10-20T10:00:00Z", subject: object = None) -> bytes:
+    """A CycloneDX document: ``components`` at the top level and, when given, ``subject`` as ``metadata.component``,
+    the software the document describes. ``subject`` is written as given, whatever its type, unless it is ``None``."""
     document = {
         "bomFormat": "CycloneDX",
         "specVersion": "1.5",
@@ -39,6 +41,8 @@ def cyclonedx(*components: dict, timestamp: str = "2026-10-20T10:00:00Z") -> byt
         "metadata": {"timestamp": timestamp},
         "components": list(components),
     }
+    if subject is not None:
+        document["metadata"]["component"] = subject
     return json.dumps(document).encode()
 
 

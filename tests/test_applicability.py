@@ -141,6 +141,22 @@ def test_an_event_with_a_version_that_is_not_text_reads_as_unknown_never_as_an_o
     assert summary(found) == ("unknown", "no_facts")
 
 
+@pytest.mark.parametrize(
+    "events",
+    [
+        pytest.param([], id="no event"),
+        pytest.param([{"fixed": "2.3.1"}], id="only a fix"),
+        pytest.param([{"introduced": 0}, {"fixed": "2.3.1"}], id="an introduced event whose version is not text"),
+    ],
+)
+def test_a_range_that_introduces_no_version_is_kept_but_never_marked_complete(events):
+    """Kept, because a sibling range or a listed version of the entry can still establish that an advisory applies;
+    incomplete, because nothing in the range says which versions are outside it."""
+    entries, complete = applicability.trim_affected([affected_entry(PACKAGE, *events)])
+    assert complete is False
+    assert [(item["name"], len(item["ranges"])) for item in entries] == [(PACKAGE, 1)]
+
+
 # --- facts kept in the state --------------------------------------------------------------------------
 
 
@@ -290,6 +306,28 @@ def test_an_advisory_with_no_comparable_facts_is_unknown_never_not_affected():
     assert summary(judged(stored, entries=applicability.trim_affected(git)[0])) == ("unknown", "no_facts")
 
 
+def test_an_affected_range_with_no_events_reads_unknown_never_not_affected_for_an_installed_package():
+    """End to end: the OSV record's affected list as the pass keeps it, and a fresh SBOM that lists the package."""
+    state: dict = {}
+    applicability.record_facts(state, {GHSA: osv_facts([affected_entry(PACKAGE)], CVE)}, NOW)
+    stored = sbom(sbom_component(PACKAGE, "1.0.0"))
+    assert summary(applicability.evidence_for(state, stored, [GHSA, CVE], NOW, 30)) == ("unknown", "no_facts")
+
+
+def test_facts_stored_as_complete_with_an_empty_range_still_cannot_clear_an_advisory():
+    """Facts recorded before this check hold such an entry as complete, so the judge must not trust the flag alone."""
+    empty = {"type": "SEMVER", "events": []}
+    recorded_before = [{"ecosystem": "npm", "name": PACKAGE, "ranges": [empty], "versions": []}]
+    found = judged(sbom(sbom_component(PACKAGE, "1.0.0")), entries=recorded_before, complete=True)
+    assert summary(found) == ("unknown", "no_facts")
+
+
+def test_an_empty_range_beside_a_listed_version_still_says_applies():
+    entries, complete = applicability.trim_affected([{**affected_entry(PACKAGE), "versions": ["1.0.0"]}])
+    found = judged(sbom(sbom_component(PACKAGE, "1.0.0")), entries=entries, complete=complete)
+    assert summary(found) == ("applies", "affected")
+
+
 def test_incomplete_facts_can_still_confirm_that_an_advisory_applies():
     found = judged(sbom(sbom_component(PACKAGE, "2.3.0")), complete=False)
     assert summary(found) == ("applies", "affected")
@@ -334,6 +372,44 @@ def test_an_sbom_that_skipped_a_component_cannot_say_a_package_it_lacks_is_not_i
     assert summary(judged(sbom(fixed_a, purl_less), entries=entries)) == ("unknown", "no_component")
     other_type = {"type": "library", "name": "lib-b", "version": "1.0.0", "purl": "pkg:deb/debian/lib-b@1.0.0"}
     assert summary(judged(sbom(fixed_a, other_type), entries=entries)) == ("unknown", "no_component")
+
+
+def fixed_in_two(*names: str) -> list[dict]:
+    """The stored affected entries of an advisory that names each package, fixed in 2.0.0 for all of them."""
+    raw = [affected_entry(name, {"introduced": "0"}, {"fixed": "2.0.0"}) for name in names]
+    return applicability.trim_affected(raw)[0]
+
+
+def test_a_vulnerable_subject_beside_a_fixed_dependency_applies():
+    """The SBOM describes lib-a, which is affected, and lists only its dependency lib-b, which is fixed. Reading only
+    the listed components cleared the advisory for software that is the vulnerable package itself."""
+    stored = inventory_of(cyclonedx(sbom_component("lib-b", "2.0.0"), subject=sbom_component("lib-a", "1.0.0")))
+    found = judged(stored, entries=fixed_in_two("lib-a", "lib-b"))
+    assert (summary(found), found.package, found.installed, found.fixed) == (
+        ("applies", "affected"),
+        "npm lib-a",
+        "1.0.0",
+        "2.0.0",
+    )
+
+
+def test_an_sbom_that_lists_only_its_subject_is_judged_by_the_version_of_the_subject():
+    entries = fixed_in_two("lib-a")
+    assert summary(judged(inventory_of(cyclonedx(subject=sbom_component("lib-a", "1.0.0"))), entries=entries)) == (
+        "applies",
+        "affected",
+    )
+    assert summary(judged(inventory_of(cyclonedx(subject=sbom_component("lib-a", "2.0.0"))), entries=entries)) == (
+        "not_affected",
+        "fixed",
+    )
+
+
+def test_a_subject_that_cannot_be_placed_may_be_the_package_so_an_absent_one_is_not_proven_absent():
+    """Counted as skipped like any component the reader cannot place: it may be a copy of lib-b."""
+    unplaced = {"type": "application", "name": "lib-b", "version": "1.0.0"}
+    stored = inventory_of(cyclonedx(sbom_component("lib-a", "2.0.0"), subject=unplaced))
+    assert summary(judged(stored, entries=fixed_in_two("lib-a", "lib-b"))) == ("unknown", "no_component")
 
 
 def test_an_absent_package_of_an_ecosystem_whose_names_are_not_compared_hides_a_clearance():

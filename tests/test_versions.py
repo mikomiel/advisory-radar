@@ -188,6 +188,35 @@ def test_a_range_that_cannot_be_read_never_becomes_a_confident_answer(ranges):
     assert evaluate("npm", "2.3.0", ranges).affected is None
 
 
+@pytest.mark.parametrize(
+    "events",
+    [
+        pytest.param([], id="no event"),
+        pytest.param([{"fixed": "2.3.1"}], id="only a fix"),
+        pytest.param([{"last_affected": "2.3.0"}], id="only a last affected version"),
+        pytest.param([{"fixed": "2.3.1"}, {"last_affected": "3.0.0"}], id="a fix and a last affected version"),
+    ],
+)
+def test_a_range_that_introduces_no_version_establishes_nothing_so_it_never_clears_one(events):
+    """An empty event list read as "no version is affected": a confident answer from no data at all."""
+    ranges = semver_range(*events)
+    assert [evaluate("npm", installed, ranges).affected for installed in ("0.1.0", "2.3.0", "9.9.9")] == [None] * 3
+
+
+def test_a_range_without_events_keeps_every_other_range_and_listed_version_from_clearing_a_version():
+    empty = {"type": "SEMVER", "events": []}
+    assert evaluate("npm", "2.3.1", [empty, *FIXED_IN_231]).affected is None
+    assert evaluate("npm", "9.9.9", [*FIXED_IN_231, empty]).affected is None
+    assert evaluate("npm", "1.2.4", [empty], ["1.2.3"]).affected is None
+
+
+def test_another_range_or_a_listed_version_still_establishes_that_a_version_is_affected_beside_an_empty_range():
+    empty = {"type": "SEMVER", "events": []}
+    beside_a_range = evaluate("npm", "2.3.0", [empty, *FIXED_IN_231])
+    assert (beside_a_range.affected, beside_a_range.fixed) == (True, "2.3.1")
+    assert evaluate("npm", "1.2.3", [empty], ["1.2.3"]).affected is True
+
+
 def test_an_installed_version_that_cannot_be_compared_is_unknown():
     for installed in ("", "main", "2.3", "1" * (MAX_VERSION_CHARS + 1)):
         assert evaluate("npm", installed, FIXED_IN_231).affected is None

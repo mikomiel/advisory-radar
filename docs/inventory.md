@@ -13,7 +13,7 @@ refused import changes nothing.
 
 | Input | Format read | What it gives |
 |---|---|---|
-| SBOM | CycloneDX JSON (`bomFormat: CycloneDX`, nested `components` included) | every component that has a package URL |
+| SBOM | CycloneDX JSON (`bomFormat: CycloneDX`; the subject in `metadata.component` and nested `components` included) | every component that has a package URL |
 | SBOM | SPDX 2.x JSON (`spdxVersion: SPDX-2.x`), a package URL in `externalRefs` | every package that has one |
 | Scan result | OSV-Scanner v2 JSON (`results[].packages[]`) | the installed packages the scanner reported, the vulnerabilities it matched to them, and its reachability analysis when it ran one; it can confirm that an advisory applies, never that it does not |
 
@@ -76,7 +76,10 @@ installed version.
 
 - **Versions are compared** for npm, Go modules and crates.io (semantic versioning) and PyPI (PEP
   440). Another ecosystem is listed but its versions are not compared. A version that does not parse
-  completely is unknown, not guessed.
+  completely is unknown, not guessed. A range with no `introduced` event (no event at all, or only
+  fixes) is not read either, because it shows no version as outside it: it never clears an advisory,
+  and the advisory's stored data is marked incomplete, like a cut list of versions. Another range or a
+  listed version can still show that the installed version is affected.
 - **An advisory that names several packages** is judged by the strongest evidence: one installed
   affected version makes it "applies"; otherwise any version that cannot be compared keeps it
   "unknown". A package an SBOM does not list is taken as not installed only when the import skipped
@@ -85,7 +88,9 @@ installed version.
 - **A component the reader cannot place** (no package URL, or a type not read) is counted as skipped
   and shown on `/inventory`, but it is never compared. It can be another copy of a package the SBOM
   lists at a fixed version, so "not affected" says that the listed versions are fixed, not that no
-  other copy exists.
+  other copy exists. The subject of a CycloneDX SBOM (`metadata.component`, the software the document
+  describes) is read like a component. When it has no readable package URL, it is skipped like any
+  other, so an SBOM with such a subject cannot say that a package it does not list is not installed.
 - **An SBOM that contradicts itself** (a `version` that differs from the package URL's) records no
   version for that component.
 - **Staleness.** After `inventory.max_age_days` (default 30) the inventory can no longer clear an
@@ -143,10 +148,18 @@ offending value, when:
 | Limit | Value |
 |---|---|
 | File size | 8 MiB (an upload body may carry 64 KiB of form framing on top) |
-| Components, packages or findings | 20,000 each |
-| Nesting of CycloneDX components | 12 levels |
+| Components of an SBOM (a CycloneDX subject and its nested components included) | 20,000 |
+| Packages, findings and call-analysis groups of a scan | 20,000 each, over the whole file |
+| Nesting of CycloneDX components (a subject counts as the first level) | 12 levels |
 | Package name, package URL, version | 256, 512 and 128 characters |
 | Identifiers per finding | 32 |
+
+A scan's packages, findings (the records of `vulnerabilities[]`) and call-analysis groups (`groups[]`)
+are counted as the file lists them, repeats included: the same package in two lockfiles, or the same
+record twice, counts each time. Each list is counted before it is read, so a file over a bound is
+refused before any of that list is processed. The groups of a package are read once, however many
+vulnerabilities the package lists, so what a scan costs follows what it lists and not the product of
+two of its lists.
 
 An SBOM with no component that has a package URL of a supported type is refused as empty rather than
 stored. Package URL types read: `npm`, `pypi`, `golang`, `cargo`, `maven`, `gem`, `nuget` and

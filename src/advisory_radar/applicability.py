@@ -26,7 +26,7 @@ from dataclasses import dataclass, replace
 
 from .core import CVE_RE, GHSA_RE
 from .inventory import Inventory, normalise_id
-from .versions import MAX_VERSION_CHARS, SUPPORTED_ECOSYSTEMS, evaluate, version_key
+from .versions import MAX_VERSION_CHARS, SUPPORTED_ECOSYSTEMS, evaluate, has_introduced, version_key
 
 DAY = 86400
 #: Advisories whose affected data the state keeps; the oldest go first. One advisory is a few hundred bytes.
@@ -81,6 +81,8 @@ def trim_affected(affected: object) -> tuple[list[dict], bool]:
     bound is cut, and the advisory is marked incomplete: a later verdict can still say "applies" from what was kept
     but never "not affected" from it. A cut list loses affected versions without inventing any, so the entry and
     its ranges stay; a cut range or event list could drop a ``fixed`` event and read as open, so that entry goes.
+    A range that introduces no version (no event, or only fixes) stays too, since a sibling range or a listed version
+    can still show that an advisory applies, but it marks the advisory incomplete: it shows no version as outside it.
     """
     if not isinstance(affected, list):
         return [], False
@@ -109,21 +111,16 @@ def trim_affected(affected: object) -> tuple[list[dict], bool]:
             continue
         head = versions[:MAX_LISTED_VERSIONS]
         listed = [version for version in head if isinstance(version, str) and len(version) <= MAX_VERSION_CHARS]
-        complete = complete and len(listed) == len(versions)
-        kept.append(
+        trimmed = [
             {
-                "ecosystem": ecosystem,
-                "name": name,
-                "ranges": [
-                    {
-                        "type": item.get("type") if isinstance(item.get("type"), str) else "",
-                        "events": [_event(event) for event in item["events"]],
-                    }
-                    for item in ranges
-                ],
-                "versions": listed,
+                "type": item.get("type") if isinstance(item.get("type"), str) else "",
+                "events": [_event(event) for event in item["events"]],
             }
-        )
+            for item in ranges
+        ]
+        # Judged on the reduced events: an ``introduced`` whose version is not text has been emptied by ``_event``.
+        complete = complete and len(listed) == len(versions) and all(has_introduced(item["events"]) for item in trimmed)
+        kept.append({"ecosystem": ecosystem, "name": name, "ranges": trimmed, "versions": listed})
     return kept, complete
 
 

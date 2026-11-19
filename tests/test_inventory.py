@@ -177,6 +177,104 @@ def test_an_sbom_with_no_usable_component_is_refused_not_stored_as_empty():
             document_of(data)
 
 
+# --- the subject of a CycloneDX SBOM ------------------------------------------------------------------
+
+
+def subject_of(name: str, version: str, *children: dict) -> dict:
+    """A CycloneDX subject (``metadata.component``): the software the document describes, with components of its own."""
+    return {**sbom_component(name, version), "type": "application", "components": list(children)}
+
+
+def test_a_cyclonedx_sbom_that_lists_only_its_subject_imports_it():
+    data = cyclonedx(subject=sbom_component("subject-lib", "1.0.0"))
+    assert components_of(data) == [("npm", "subject-lib", "1.0.0")]
+    document = document_of(data)
+    assert (document["complete"], document["skipped"]) == (True, 0)
+
+
+def test_the_subject_and_the_components_nested_in_it_come_before_the_listed_components():
+    subject = subject_of("subject-lib", "1.0.0", sbom_component("bundled-lib", "2.0.0"))
+    listed = {**sbom_component("parent-lib", "3.0.0"), "components": [sbom_component("child-lib", "4.0.0")]}
+    assert components_of(cyclonedx(listed, subject=subject)) == [
+        ("npm", "subject-lib", "1.0.0"),
+        ("npm", "bundled-lib", "2.0.0"),
+        ("npm", "parent-lib", "3.0.0"),
+        ("npm", "child-lib", "4.0.0"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "subject",
+    [
+        pytest.param({"type": "application", "name": "my-service", "version": "1.0.0"}, id="no package URL"),
+        pytest.param({"type": "container", "name": "base", "purl": "pkg:oci/base@sha256%3Aabc"}, id="a type not read"),
+        pytest.param({}, id="an empty object"),
+    ],
+)
+def test_a_subject_that_names_no_readable_package_is_counted_as_skipped(subject):
+    """Like any component the reader cannot place: it may be a copy of a package an advisory names, so an SBOM that
+    holds one cannot say that a package it does not list is absent."""
+    document = document_of(cyclonedx(sbom_component(PACKAGE, "2.3.0"), subject=subject))
+    assert ([item["name"] for item in document["components"]], document["skipped"]) == ([PACKAGE], 1)
+
+
+def test_a_subject_that_names_no_readable_package_does_not_make_an_otherwise_empty_sbom_importable():
+    with pytest.raises(InventoryError, match="no component with a package URL"):
+        document_of(cyclonedx(subject={"type": "application", "name": "my-service", "version": "1.0.0"}))
+
+
+def test_a_null_subject_is_no_subject():
+    document = json.loads(cyclonedx(sbom_component(PACKAGE, "2.3.0")))
+    document["metadata"]["component"] = None
+    assert document_of(json.dumps(document).encode())["skipped"] == 0
+
+
+def test_the_subject_counts_towards_the_component_bound(monkeypatch):
+    monkeypatch.setattr(inventory, "MAX_ENTRIES", 3)
+    listed = [sbom_component(f"lib-{number}", "1.0.0") for number in range(3)]
+    with pytest.raises(InventoryError, match="more than 3 components"):
+        document_of(cyclonedx(*listed, subject=sbom_component("subject-lib", "1.0.0")))
+    assert len(document_of(cyclonedx(*listed[:2], subject=sbom_component("subject-lib", "1.0.0")))["components"]) == 3
+
+
+def test_components_nested_under_the_subject_are_followed_to_the_same_depth_and_no_deeper():
+    def chain(levels: int) -> bytes:
+        node = sbom_component("leaf", "1.0.0")
+        for number in range(levels - 1):
+            node = {**sbom_component(f"level-{number}", "1.0.0"), "components": [node]}
+        return cyclonedx(sbom_component("listed-lib", "1.0.0"), subject=node)
+
+    assert len(document_of(chain(inventory.MAX_DEPTH))["components"]) == inventory.MAX_DEPTH + 1
+    with pytest.raises(InventoryError, match="nested deeper than 12 levels"):
+        document_of(chain(inventory.MAX_DEPTH + 1))
+
+
+@pytest.mark.parametrize(
+    ("subject", "message"),
+    [
+        pytest.param("text", r"^metadata\.component must be an object$", id="a string"),
+        pytest.param([], r"^metadata\.component must be an object$", id="a list"),
+        pytest.param(False, r"^metadata\.component must be an object$", id="false"),
+        pytest.param({"purl": 5}, r"^metadata\.component\.purl must be a string$", id="purl"),
+        pytest.param(
+            {"purl": "pkg:npm/x", "version": "1" * 500},
+            r"^metadata\.component\.version is longer than 128 characters$",
+            id="version",
+        ),
+        pytest.param(
+            {"purl": "pkg:npm/x", "components": {}}, r"^metadata\.component\.components must be a list$", id="children"
+        ),
+        pytest.param(
+            {"purl": "pkg:npm/x", "components": [5]}, r"^components\[\] must be an object$", id="a nested component"
+        ),
+    ],
+)
+def test_the_subject_is_checked_field_by_field_like_a_component(subject, message):
+    with pytest.raises(InventoryError, match=message) as refused:
+        document_of(cyclonedx(sbom_component(PACKAGE, "2.3.0"), subject=subject))
+    assert refused.value.__cause__ is None, "refused by the check of the reader itself, not by the safety net"
+
+
 # --- scan results -------------------------------------------------------------------------------------
 
 
@@ -394,6 +492,150 @@ def test_a_refusal_names_the_limit_or_field_and_never_echoes_the_offending_value
         assert secret not in str(raised.value), text
 
 
+# --- the work a scan costs is bounded by what it lists, not by the product of two of its lists -----------
+
+
+class Work:
+    """What reading a scan did: ``groups`` entries read, ``records`` vulnerability records decorated with a fix.
+
+    ``budget`` is the most group reads the test allows; a read past it fails the test at once, so a regression
+    that costs billions of visits fails in milliseconds instead of hanging the run. ``None`` allows any number.
+    """
+
+    def __init__(self) -> None:
+        self.groups = 0
+        self.records = 0
+        self.budget: int | None = None
+
+
+@pytest.fixture
+def work(monkeypatch) -> Work:
+    """Counts the reads of ``groups[]`` and the records processed by the scan reader, and changes neither."""
+    done = Work()
+    read, decorate = inventory._object, inventory._fixed
+
+    def visit(value, where):
+        if where == "groups[]":
+            done.groups += 1
+            if done.budget is not None and done.groups > done.budget:
+                pytest.fail(f"the scan reader read a group {done.groups} times; the test allows {done.budget}")
+        return read(value, where)
+
+    def process(*args):
+        done.records += 1
+        return decorate(*args)
+
+    monkeypatch.setattr(inventory, "_object", visit)
+    monkeypatch.setattr(inventory, "_fixed", process)
+    return done
+
+
+def raw_scan(*sources: list[dict]) -> bytes:
+    """A scan result with one ``results[]`` entry per list of package entries (one lockfile each)."""
+    return json.dumps({"results": [{"packages": packages} for packages in sources]}).encode()
+
+
+def crowded(*, vulnerabilities: int = 1, groups: int = 0, distinct: bool = False) -> dict:
+    """A scan package with that many vulnerability records and that many empty groups.
+
+    The records all carry one id unless ``distinct``: a scan that lists the same finding again (another lockfile of
+    the same project) is what deduplication would hide from a count taken afterwards.
+    """
+    records = [{"id": f"GHSA-aaaa-bbbb-{number if distinct else 0:04d}"} for number in range(vulnerabilities)]
+    return {
+        "package": {"name": PACKAGE, "version": "2.3.0", "ecosystem": "npm"},
+        "vulnerabilities": records,
+        "groups": [{} for _ in range(groups)],
+    }
+
+
+def test_a_packages_call_analysis_is_read_once_however_many_vulnerabilities_it_lists(work):
+    """Every group is validated and indexed once per package. Rescanning all of them for each vulnerability made a
+    package of V records and G groups cost V x G visits, so a file well under 8 MiB could hold a pass for minutes."""
+    total = 40
+    ids = [f"GHSA-aaaa-bbbb-{number:04d}" for number in range(total)]
+    records = [{"id": identifier, "aliases": [f"CVE-2026-{number:04d}"]} for number, identifier in enumerate(ids)]
+    groups = []
+    for number, identifier in enumerate(ids):
+        group: dict = {"ids": [identifier]}
+        if number % 3 == 0:
+            group["experimentalAnalysis"] = {identifier: {"called": True}}
+        elif number % 3 == 1:
+            group["experimental_analysis"] = {f"cve-2026-{number:04d}": {"called": False}}  # the alias, in lower case
+        groups.append(group)
+    package = crowded(vulnerabilities=0)
+    package.update(vulnerabilities=records, groups=groups)
+    document = document_of(raw_scan([package]))
+    expected = [(True, False, None)[number % 3] for number in range(total)]
+    assert [item["called"] for item in document["findings"]] == expected
+    assert work.groups == total, "one read per group, not one per group per vulnerability"
+
+
+def test_the_most_a_package_may_list_still_reads_each_group_once(work):
+    """20,000 vulnerability records and 20,000 groups is the largest package the bounds admit. It costs one read per
+    group; rescanning for each record made it 400 million."""
+    count = inventory.MAX_ENTRIES
+    work.budget = count
+    document = document_of(raw_scan([crowded(vulnerabilities=count, groups=count, distinct=True)]))
+    assert len(document["findings"]) == count and work.groups == count
+
+
+@pytest.mark.parametrize(
+    ("data", "limit"),
+    [
+        pytest.param(raw_scan([crowded()] * 4), "packages", id="packages: one repeated in a lockfile"),
+        pytest.param(raw_scan([crowded(vulnerabilities=4)]), "findings", id="findings: a record repeated in a package"),
+        pytest.param(raw_scan([crowded(groups=4)]), "call-analysis groups", id="groups: four in one package"),
+    ],
+)
+def test_a_list_over_the_bound_is_refused_by_what_it_lists_and_before_any_of_it_is_read(monkeypatch, work, data, limit):
+    """The bound counts the entries the file lists, repeats included: counting what survives deduplication let one
+    record repeated a million times past it. The refusal comes before the first group is read or record decorated."""
+    monkeypatch.setattr(inventory, "MAX_ENTRIES", 3)
+    work.budget = 0
+    with pytest.raises(InventoryError, match=rf"^the document has more than 3 {limit}$") as refused:
+        document_of(data)
+    assert refused.value.__cause__ is None, "refused by the check of the reader itself, not by the safety net"
+    assert (work.groups, work.records) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    ("data", "limit"),
+    [
+        pytest.param(raw_scan([crowded()] * 2, [crowded()] * 2), "packages", id="packages: across lockfiles"),
+        pytest.param(raw_scan([crowded(vulnerabilities=2)] * 2), "findings", id="findings: across packages"),
+        pytest.param(raw_scan([crowded(groups=2)] * 2), "call-analysis groups", id="groups: across packages"),
+    ],
+)
+def test_the_bound_is_one_total_for_the_whole_file_and_the_work_before_a_refusal_stays_within_it(
+    monkeypatch, work, data, limit
+):
+    monkeypatch.setattr(inventory, "MAX_ENTRIES", 3)
+    with pytest.raises(InventoryError, match=rf"^the document has more than 3 {limit}$"):
+        document_of(data)
+    assert work.groups <= 3 and work.records <= 3
+
+
+def test_the_scan_that_held_a_pass_for_billions_of_visits_is_refused_up_front(work):
+    """The reported file at its size: one package with 20,000 vulnerability records and 100,000 empty groups. It fits
+    under the 8 MiB bound and cost 2 billion group visits, all while the pass held the state lock."""
+    data = raw_scan([crowded(vulnerabilities=inventory.MAX_ENTRIES, groups=5 * inventory.MAX_ENTRIES)])
+    assert len(data) < inventory.MAX_INVENTORY_BYTES, "the size bound alone does not keep this file out"
+    work.budget = 0
+    with pytest.raises(InventoryError, match=r"^the document has more than 20000 call-analysis groups$"):
+        document_of(data)
+    assert (work.groups, work.records) == (0, 0)
+
+
+def test_a_packages_groups_are_checked_even_when_it_lists_no_vulnerability():
+    """The call analysis is validated with the package, once, not lazily for each record: a malformed group refuses
+    the scan whether or not a record would have looked at it."""
+    package = crowded(vulnerabilities=0)
+    package["groups"] = ["not an object"]
+    with pytest.raises(InventoryError, match=r"^groups\[\] must be an object$"):
+        document_of(raw_scan([package]))
+
+
 # --- no member of a file can fail an import any way but a refusal --------------------------------------
 
 #: Stands in for a member that is removed rather than replaced.
@@ -495,6 +737,26 @@ def test_no_single_member_of_any_format_can_get_past_the_checks_of_its_reader(fm
         if found:
             failures.append((path, value, found))
     assert checked > 300, "the sweep must reach the members of the document"
+    assert not failures, failures
+
+
+def test_no_single_member_of_a_cyclonedx_subject_can_get_past_the_checks_of_its_reader():
+    """The sweep above starts from a document with no subject, so it never damages one. This one does, member by
+    member, on a subject with a nested component of its own."""
+    subject = subject_of("subject-lib", "1.0.0", sbom_component("bundled-lib", "2.0.0"))
+    data = cyclonedx(sbom_component("listed-lib", "3.0.0"), subject=subject)
+    assert [item["name"] for item in document_of(data)["components"]] == ["subject-lib", "bundled-lib", "listed-lib"], (
+        "the sweep starts from a valid document whose subject is read"
+    )
+    checked, failures = 0, []
+    for path, value, mutant in mutants(json.loads(data)):
+        if path[:2] != ("metadata", "component"):
+            continue
+        checked += 1
+        found = escape_of(json.dumps(mutant).encode())
+        if found:
+            failures.append((path, value, found))
+    assert checked > 100, "the sweep must reach the members of the subject"
     assert not failures, failures
 
 

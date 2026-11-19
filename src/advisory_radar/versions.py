@@ -6,7 +6,9 @@ crates.io) and PEP 440 (PyPI). Every other ecosystem is unsupported on purpose. 
 ``None`` ("cannot tell"), never a guess and never a plain string comparison.
 
 The range logic follows the OSV schema: a range is a list of ``introduced``, ``fixed`` and ``last_affected``
-events, read in version order. ``GIT`` ranges name commits, not versions, and are never evaluated.
+events, read in version order. ``GIT`` ranges name commits, not versions, and are never evaluated. A range that
+introduces no version (an empty list, or only fixes) is unreadable too: it never says which versions are affected,
+so it can never say that one is not.
 """
 
 from __future__ import annotations
@@ -112,13 +114,27 @@ class RangeVerdict:
     fixed: str = ""
 
 
+def has_introduced(events: object) -> bool:
+    """Whether ``events`` is a list of events that names at least one ``introduced`` event.
+
+    The OSV schema requires at least one in every range. A range without it (an empty list, or only fixes) says
+    where an affected span ends but never where one begins, so no version can be called outside it.
+    """
+    return (
+        isinstance(events, Sequence)
+        and not isinstance(events, str)
+        and any(isinstance(event, Mapping) and "introduced" in event for event in events)
+    )
+
+
 def _events(ecosystem: str, events: object) -> list[tuple[Key, str, str]] | None:
     """The events of one range as ``(key, kind, version)`` in version order, or ``None`` when any is unreadable.
 
     An event that names none of the three kinds read here, and a ``limit`` event (a git-range bound), make the
-    whole range unreadable: ignoring either could turn an unknown into a confident answer.
+    whole range unreadable: ignoring either could turn an unknown into a confident answer. So does a range that
+    introduces no version (:func:`has_introduced`): "outside" it would be a guess from no data.
     """
-    if not isinstance(events, Sequence) or isinstance(events, str):
+    if not has_introduced(events):
         return None
     ordered: list[tuple[Key, str, str]] = []
     for event in events:
@@ -161,8 +177,8 @@ def evaluate(
     """Judge one installed ``version`` against one OSV ``affected`` entry's ``ranges`` and ``versions``.
 
     Affected as soon as any range, or the explicit version list, says so. Unaffected only when every range
-    could be read and none applies. A range that cannot be read (a ``GIT`` range, an unparseable event), an
-    unparseable installed version and an entry that says nothing at all are all ``None``.
+    could be read and none applies. A range that cannot be read (a ``GIT`` range, an unparseable event, no
+    ``introduced`` event), an unparseable installed version and an entry that says nothing at all are all ``None``.
     """
     key = version_key(ecosystem, version)
     if key is None:
