@@ -147,7 +147,7 @@ the scan),
 `release-please-config.json` and `.release-please-manifest.json` (the tag format, what a
 release contains, and the version it starts from), `AGENTS.md` and `CLAUDE.md` at the
 repository root (the rules a coding agent follows in this repository), `tests/` and
-`scripts/` (the guard and the approval rule are policy too: the workflows execute them from
+`scripts/` (the guard, the approval rule and the merge loop are policy too: the workflows execute them from
 the default branch, so they need the same human merge as the workflows themselves), and the
 files that configure how the checks run, which would otherwise let a pull request switch the
 checks off without touching `tests/`: `conftest.py` at any depth, the root files `ruff.toml`,
@@ -164,14 +164,31 @@ pull request touching one of those paths is never auto-merged: the workflow skip
 human merges it. The guard therefore means "a person merges these", not "a second person
 approved them".
 
-`.github/workflows/automerge.yml` does the merging itself: an approved pull request whose
+`.github/workflows/automerge.yml` does the merging itself, and its one step runs
+[`scripts/automerge_loop.py`](../scripts/automerge_loop.py): an approved pull request whose
 checks are green is squash-merged (with `--match-head-commit`, so a head that moved is
-refused) when `ci` finishes, when `review-gate` finishes, or on a 30-minute sweep. It also
+refused) when `ci` finishes, when `review-gate` finishes, or on a 30-minute sweep. The loop is a
+standard-library Python script that calls `gh`, the approval rule, the guard and the branch cleanup,
+so a test can run it against a stub `gh`; the workflow holds no merge logic of its own. It also
 deletes the head branch: the *automatically delete head branches* setting did not delete the
 branch an automerge left behind (#36, #43), so
 [`scripts/delete_merged_branch.py`](../scripts/delete_merged_branch.py) removes the merged ref — only for a
 same-repository head, and only while the branch still points at the commit that was merged; a branch that
 moved, or a fork's branch, is left in place and the run warns.
+
+The loop reports whether it merged anything through the step output `merged`, and the order of its
+writes is the contract. It writes `merged=false` before it reads the queue, and `merged=true` the
+moment `gh pr merge` succeeds, before the branch cleanup and the comment. The `release` job runs when
+the run is not cancelled and `merged` is `'true'`, so a merge that landed is released even when a later
+candidate fails and turns the run red. A failed read of the queue, of a pull request, of its reviews or of its
+head and base before the merge ends the run with an `::error::` line and a non-zero exit; it never
+passes for an empty queue. The comparison that the guard reads fails closed the other way: a comparison
+that cannot be read leaves the pull request for a person, and the loop goes on. A merge that GitHub
+refuses is likewise only a skip: the loop goes on to the next candidate and the output stays as it was.
+[`tests/test_automerge_loop.py`](../tests/test_automerge_loop.py) runs the real script against a
+stub `gh` and pins that order, and
+[`tests/test_workflow_pins.py`](../tests/test_workflow_pins.py) pins the release gate and that the
+workflow step is only the call to the script.
 
 The workflow only runs from the default branch — `workflow_run` and `schedule`,
 never `pull_request*` and not `workflow_dispatch` (a dispatcher can pick another
