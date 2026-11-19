@@ -11,6 +11,8 @@ import email.utils
 import json
 from pathlib import Path
 
+import pytest
+
 from advisory_radar import core, enrichment
 from advisory_radar.config import DEFAULT_THRESHOLDS
 from advisory_radar.state import save_state
@@ -231,6 +233,62 @@ def test_a_daily_re_score_the_budget_cut_does_not_hold_the_drain_back_either(tmp
     assert (entry["enrich"]["state"], entry["enrich"]["tries"]) == (enrichment.DEFERRED, 0)
 
 
+@pytest.mark.parametrize("seconds", [12, 13], ids=["answers_with_nothing_left", "is_cut"])
+def test_a_daily_re_score_whose_epss_request_spends_the_budget_takes_its_turn_and_frees_the_drain(tmp_path, seconds):
+    """The EPSS request is made before any CVE.org lookup, so it can be what uses up the refresh share (12 s of a one
+    minute budget). The due CVE was named in it: without a turn it is due, and first, in every pass."""
+    due, waiting = "CVE-2026-6001", "CVE-2026-6002"
+    prepare(
+        tmp_path,
+        watch={
+            due: aged(3),
+            waiting: aged(3, kev_only=True, source_id="b", last_eval=NOW - 60),
+        },
+    )
+    clock = Clock()
+    net = Scored(clock)
+    net.cost[f"{core.EPSS_URL}{due}"] = seconds
+    cfg = config(tmp_path, ids=("a", "b"), pass_budget="1m")
+    start = len(net.calls)
+    assert run(cfg, net, clock) == 0
+    assert looked_up(net, start) == [], "the request spent the refresh share: no CVE.org lookup began"
+    state = stored(tmp_path)
+    entry = state["watch"][due]
+    assert entry["last_eval"] == NOW, "the due CVE had its turn: it is due again after the next interval"
+    assert (entry["enrich"]["state"], entry["enrich"]["tries"]) == (enrichment.DEFERRED, 0)
+    assert state["watch"][waiting]["kev_only"] is True and state["watch"][waiting]["enrich"]["at"] == 0
+    assert "enrich_cursor" not in state, "the drain never began, so it took no turn"
+    start = len(net.calls)
+    assert run(cfg, net, clock) == 0
+    assert looked_up(net, start) == [waiting], "the drain has the refresh share to itself"
+    assert stored(tmp_path)["watch"][waiting]["kev_only"] is False
+
+
+def test_a_drain_batch_whose_epss_request_spends_the_budget_takes_its_turn_and_the_cves_behind_it_are_reached(tmp_path):
+    """One EPSS request names the ten CVEs of a drain. When it uses up the refresh share, none of them could begin; left
+    where they were they would be the first ten in every pass, and the seven behind them would never be asked."""
+    cfg, net, clock = delivered_advisories(tmp_path, big=25, small=12)
+    state = stored(tmp_path)
+    assert (len(capped(state, "a")), len(capped(state, "b"))) == (15, 2)
+    now = int(clock.now)
+    picks = enrichment.select(state, now)
+    behind = capped(state) - set(picks)
+    assert len(picks) == enrichment.PER_PASS and len(behind) == 7
+    net.cost[f"{core.EPSS_URL}{picks[0]}"] = 500  # longer than the refresh share, and only the request that names these
+    start = len(net.calls)
+    assert run(cfg, net, clock) == 0
+    assert looked_up(net, start) == [], "the request spent the refresh share: no lookup began"
+    state = stored(tmp_path)
+    assert capped(state) == set(picks) | behind, "nothing was measured"
+    for cve in picks:
+        marker = state["watch"][cve]["enrich"]
+        assert (marker["state"], marker["tries"], marker["at"]) == (enrichment.DEFERRED, 0, now)
+    assert all("enrich" not in state["watch"][cve] for cve in behind), "the CVEs behind it never began"
+    assert state["enrich_cursor"] == state["watch"][picks[-1]]["source_id"], "the batch took its turn"
+    assert run(cfg, net, clock) == 0
+    assert not capped(stored(tmp_path)) & behind, "the CVEs that waited behind the batch are measured next"
+
+
 def test_a_failed_lookup_is_recorded_waits_a_day_and_does_not_hold_the_others_back(tmp_path):
     cfg, net, clock = delivered_advisories(tmp_path)
     target = sorted(capped(stored(tmp_path), "a"))[3]
@@ -401,6 +459,48 @@ def test_intel_tells_a_lookup_the_budget_cut_from_one_it_never_started():
     assert {cve for cve, fact in facts.items() if fact.interrupted} == {"CVE-2026-4001"}, (
         "the second was never asked, so it is deferred and no more"
     )
+
+
+@pytest.mark.parametrize("answers", [True, False], ids=["answers_with_nothing_left", "is_cut"])
+def test_intel_marks_every_cve_of_an_epss_request_that_spends_the_budget_interrupted(answers):
+    spent = False
+    asked: list[str] = []
+
+    def http(method, url, headers, body):
+        nonlocal spent
+        asked.append(url)
+        assert url.startswith(core.EPSS_URL), "no CVE.org lookup can begin once the budget is spent"
+        spent = True  # this request is the one that uses up what is left
+        if not answers:
+            return 0, {}, b""
+        rows = [{"cve": cve, "epss": "0.01", "percentile": "0.40"} for cve in url.split("cve=", 1)[1].split(",")]
+        return 200, {}, json.dumps({"data": rows}).encode()
+
+    intel = core.Intel(http, {}, lambda: 0.0, lambda seconds: None, remaining=lambda: -1.0 if spent else 100.0)
+    named = ["CVE-2026-4001", "CVE-2026-4002"]
+    deferred: set[str] = set()
+    facts = intel.cves(named, deferred=deferred)
+    assert len(asked) == 1 and deferred == set(named) and not any(fact.complete for fact in facts.values())
+    assert {cve for cve, fact in facts.items() if fact.interrupted} == set(named), "the one request named both"
+    later: set[str] = set()
+    facts = intel.cves(["CVE-2026-4003"], deferred=later)
+    assert len(asked) == 1 and later == {"CVE-2026-4003"}, "a call that finds the budget spent asks nothing"
+    assert not facts["CVE-2026-4003"].interrupted, "and what never began is only deferred"
+
+
+def test_intel_does_not_call_a_failed_epss_request_interrupted_while_time_is_left():
+    def http(method, url, headers, body):
+        if url.startswith(core.EPSS_URL):
+            return 500, {}, b""  # the provider failed; the budget is not what ended it
+        metric = {"cvssV3_1": {"baseScore": 7.5, "vectorString": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N"}}
+        record = {"cveMetadata": {"cveId": url.rsplit("/", 1)[1], "state": "PUBLISHED"}}
+        record["containers"] = {"cna": {"metrics": [metric]}}
+        return 200, {}, json.dumps(record).encode()
+
+    intel = core.Intel(http, {}, lambda: 0.0, lambda seconds: None, remaining=lambda: 100.0)
+    deferred: set[str] = set()
+    fact = intel.cves(["CVE-2026-4001"], deferred=deferred)["CVE-2026-4001"]
+    assert not fact.complete and not fact.interrupted and deferred == set(), "a provider failure is not a budget cut"
 
 
 def test_the_window_stretches_to_thirty_days_only_for_entries_with_outstanding_enrichment():

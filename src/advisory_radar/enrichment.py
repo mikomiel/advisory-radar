@@ -13,9 +13,10 @@ Fairness. ``select`` serves one waiting CVE per source in turn, starting after t
 No source can hold the pass while another waits, and when there are more sources than the cap the cursor makes the
 unserved ones go first next time. Inside a source the CVE tried longest ago goes first. A lookup that never began
 (the budget or the NVD allowance ended before its request) keeps its place, and one that failed goes to the back. So
-does one whose request began and the budget cut (``interrupted``): it spent the time the others needed, so without a
-turn of its own a persistently slow CVE would be first in every pass and the rest would never start. It is stored as
-``deferred``, because no provider failed: it is asked again next pass, behind the CVEs that waited.
+does one whose request began and the budget ended (``interrupted``): its own CVE.org or NVD request, or the EPSS
+request that named it together with the rest of its batch. It spent the time the others needed, so without a turn of
+its own a persistently slow CVE, or batch, would be first in every pass and the rest would never start. It is stored
+as ``deferred``, because no provider failed: it is asked again next pass, behind the CVEs that waited.
 
 Window. A watch entry is kept for ``core.REEVAL_WINDOW``, and up to ``EXTENDED_WINDOW`` while its enrichment is
 outstanding, so a CVE the passes could not measure in time is not dropped unmeasured. The counts and the oldest wait
@@ -107,7 +108,7 @@ def record(entry: dict, outcome: str, now: int) -> None:
 
     ``measured`` means complete facts: the entry joins the daily re-evaluation. ``deferred`` means the time budget
     or the NVD allowance ended the lookup, not a provider, so no try is counted. ``interrupted`` is a ``deferred``
-    one whose request began and was cut by the budget: no try is counted either, but ``at`` moves to ``now``, which
+    one whose request began and the budget ended: no try is counted either, but ``at`` moves to ``now``, which
     sends it behind the CVEs that waited (``select``). ``failed`` means a request was made and a provider did not
     answer in full.
     """
@@ -169,7 +170,7 @@ def select(state: Mapping, now: int, limit: int = PER_PASS) -> list[str]:
 def served(state: dict, picks: Sequence[str], outcomes: Mapping[str, str]) -> None:
     """Move the cursor to the source of the last pick that took a turn.
 
-    A pick took one when its request was made: it was measured, a provider failed it, or the budget cut it
+    A pick took one when a request for it was made: it was measured, a provider failed it, or the budget ended it
     (``interrupted``). A pick the budget ended before any request is no turn, so its source goes first again.
     """
     watch = state.get("watch")

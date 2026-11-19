@@ -422,8 +422,9 @@ class CveFacts:
     skipped: bool = False
     #: The metric that gave ``cvss`` has a vector with ``AV:N``, ``PR:N`` and ``UI:N`` (see ``remote_unauth``).
     remote_unauth: bool = False
-    #: A request for this CVE began and the pass budget ended the lookup. It is no failure of a provider, but unlike a
-    #: lookup that never began it spent the budget, so a caller that orders its work must give it a turn.
+    #: A request for this CVE began and the pass budget ended the lookup. The EPSS request names every CVE of a call, so
+    #: one that spends the budget counts for each of them. It is no failure of a provider, but unlike a lookup that
+    #: never began it spent the budget, so a caller that orders its work must give it a turn.
     interrupted: bool = False
 
 
@@ -777,7 +778,11 @@ class Intel:
 
         A deferred CVE whose request began and was cut by the pass budget is also marked ``interrupted`` on its
         facts: it is no failure of a provider, yet it spent the budget that the CVEs behind it needed, so a caller
-        that orders the next attempt puts it behind them. One the budget ended before any request is only deferred.
+        that orders the next attempt puts it behind them. The EPSS request of a call of up to ``EPSS_BATCH`` ids names
+        every CVE of it, so when it spends the budget (it is cut, or answers with nothing left) each of them is
+        marked; a larger call makes one request per batch and may mark a CVE whose batch never began, which no
+        caller reads. One the budget ended before any request of the call, or in the lookup of another CVE, is only
+        deferred.
         """
         deferred = set() if deferred is None else deferred
         nvd_calls = 0
@@ -807,6 +812,12 @@ class Intel:
                 deferred.add(cve)
             return facts
         epss = self._epss(missing[:MAX_EPSS_IDS])
+        # There was time left before that request, so a budget that is spent now was spent by it: it was cut, or it
+        # answered with nothing left. It names every CVE of a call of up to EPSS_BATCH ids (the re-scores and the
+        # drain ask for ten at most, and only they read the mark), so each has had its turn, though no lookup of its
+        # own can begin. A CVE that finds the budget spent later, in the loop, only waits behind the lookup that
+        # spent it.
+        epss_spent = self.out_of_time()
         for position, cve in enumerate(missing):
             if position >= MAX_EPSS_IDS:
                 # Past the budget this id was not measured at all: unknown, never suppressed.
@@ -817,7 +828,7 @@ class Intel:
                 facts[cve] = CveFacts(None, None, score, percentile, False, skipped=True)
                 continue
             if self.out_of_time():
-                facts[cve] = CveFacts(None, None, score, percentile, False)
+                facts[cve] = CveFacts(None, None, score, percentile, False, interrupted=epss_spent)
                 deferred.add(cve)
                 continue
             complete, cvss, ssvc, remote = self._cve_org(cve)

@@ -663,7 +663,7 @@ classification of what was fetched, with the Adobe Commerce pass, by the whole b
 | A source whose fetch the budget ended | its health record says so (`ok` false, the budget as the error); no cursor or validator moves, so the same window is read again | reads it again, behind the deferred ones |
 | A candidate not yet classified, or one whose lookups the budget cut short | the candidate, in the carried queue, never acknowledged and with no retry clock started | classifies it ahead of the source's newer items |
 | A watched CVE whose lookup the budget never began | the watch entry, with `last_eval` unchanged and an `enrich` record in state `deferred` ([Capped CVEs](#capped-cves)) | looks it up again first: it is still due, or still waiting in the drain |
-| A watched CVE whose lookup began and the budget cut | the same record, with `at` and `last_eval` set to this pass's time; it is not counted as a try | asks again behind the others: a capped CVE on the next pass, a CVE due for its daily re-score after a day, as after a failed one |
+| A watched CVE whose lookup began and the budget cut, or whose EPSS request spent the budget (the daily re-scores, and the drain, each ask EPSS for all their CVEs in one request) | the same record, with `at` and `last_eval` set to this pass's time; it is not counted as a try | asks again behind the others: a capped CVE on the next pass, a CVE due for its daily re-score after a day, as after a failed one |
 | An Adobe Commerce bulletin whose detail page the budget refused or cut | the bulletin stays outstanding in the `backlog` of the `adobe` state; a cut is no failure of the page, so it starts no retry clock | reads the page again; the message goes out without details only after the page itself has been failing for two hours |
 
 A source that reads no network (a `webhook` source reads its own inbox) is never deferred. A source that was never
@@ -717,9 +717,12 @@ last. A large advisory therefore cannot hold the pass while another source's adv
 ended early does not move the cursor past a source it never served. Inside a source the CVE tried longest ago goes
 first, and a failed one is not asked again for a day. A lookup the budget ended before its request began keeps its
 place. One the budget cut after its request began has had its turn: it is no failure of a provider and is asked
-again on the next pass, but behind the CVEs that were waiting, and its source counts as served. A CVE whose lookup
-always outlasts the budget therefore cannot hold the pass while the others never start. A CVE that turns out
-critical is escalated once, like a CVE that a daily re-score finds critical.
+again on the next pass, but behind the CVEs that were waiting, and its source counts as served. The daily
+re-scores, and the drain, each ask EPSS for the scores of all their CVEs in one request, so when that request
+spends the budget (it is cut, or it answers with nothing left) each of those CVEs has had its turn. One the
+budget ended later, behind the lookup of another CVE, keeps its place. A CVE whose lookup always outlasts the
+budget, or a batch whose EPSS request does, therefore cannot hold the pass while the others never start. A CVE
+that turns out critical is escalated once, like a CVE that a daily re-score finds critical.
 
 What bounds the lookups of one pass is therefore explicit, and none of it is a setting:
 
