@@ -87,12 +87,13 @@ def _adobe_turn(
 
     Deferred means the budget was spent before it could start, so it is read first next pass. Cut means the budget
     ended one of its requests: the pass reads its bulletin list before anything else and records nothing when that
-    fails, so a failure that came with a refused request is the budget's and not the source's.
+    fails, so a failure that came with a refused request is the budget's and not the source's. It is told when the
+    budget is spent (``out_of_time``) so that a detail page the budget cut is not counted as one Adobe failed.
     """
     if upstream.expired():
         return True, "deferred"
     refused = upstream.refused
-    ok = core.adobe_pass(state, upstream, kev, kev_known, now, **language_kwargs)
+    ok = core.adobe_pass(state, upstream, kev, kev_known, now, out_of_time=upstream.expired, **language_kwargs)
     if upstream.refused > refused:
         return True, "cut"
     return ok, "ran"

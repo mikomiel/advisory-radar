@@ -4007,3 +4007,114 @@ def test_a_webhook_that_answers_200_and_then_stalls_its_body_is_still_a_200(monk
         assert gone.wait(3), "the client stopped waiting at the deadline"
         assert (status, payload) == (200, b""), "a receiver that answered 200 was not asked twice"
         assert transport.urllib_http("GET", url, {}, None) == (0, {}, b""), "a document read is still incomplete"
+
+
+# ---------------------------------------------------------------------------
+# PR #160 review round: the request ceiling bounds the connection too, not only the answer
+
+
+def _connecting_to(monkeypatch, *addresses: str, connect):
+    """``urllib_http`` on a hand-moved clock, with a name that resolves to ``addresses`` and a ``connect`` of ours.
+
+    No packet leaves the machine: ``connect(clock, sock, address)`` stands in for the kernel's, so a test decides how
+    long each address takes and whether it answers. The limits are the ones the transport ships with.
+    """
+    import socket
+    import types
+
+    from advisory_radar import http as transport
+
+    clock = _Clock()
+    monkeypatch.setattr(transport, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+    monkeypatch.setattr(transport, "HTTP_TIMEOUT", 30)
+    monkeypatch.setattr(transport, "HTTP_DEADLINE", 120)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *args, **kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (a, port)) for a in addresses],
+    )
+    monkeypatch.setattr(socket.socket, "connect", lambda sock, address: connect(clock, sock, address))
+    # An environment proxy would take the request to a place this test did not stub.
+    monkeypatch.setenv("no_proxy", "*")
+    monkeypatch.setenv("NO_PROXY", "*")
+    return clock, transport
+
+
+def test_a_name_with_several_unreachable_addresses_gets_the_deadline_not_a_timeout_per_address(monkeypatch):
+    """``socket.create_connection`` gives every address the whole socket timeout, one after the other, so a name that
+    resolves to four dead addresses held a request for four timeouts however little the pass budget had left."""
+    waited: list[float] = []
+
+    def blackhole(clock, sock, address):
+        waited.append(sock.gettimeout())
+        clock.now += sock.gettimeout()  # nobody answers: the attempt lasts as long as it is allowed to
+        raise TimeoutError("timed out")
+
+    clock, transport = _connecting_to(
+        monkeypatch, "192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4", connect=blackhole
+    )
+    start = clock.now
+    with transport.request_ceiling(lambda: 50.0 - (clock.now - start)):
+        assert transport.urllib_http("GET", "http://feeds.example.com/slow", {}, None) == (0, {}, b"")
+    assert clock.now - start <= 50.0, "the request outlived what the budget left it"
+    assert waited == [30.0, 20.0], "an attempt waits for what is left, and none is started once nothing is"
+
+
+def test_the_tls_handshake_gets_what_the_connect_left_of_the_deadline(monkeypatch):
+    """The handshake takes its time from the socket's timeout. A connect that used 25 of the 50 seconds the budget left
+    must therefore have set it again: left as the attempt set it, the handshake would be given 30 seconds of 25."""
+    import ssl
+
+    handshakes: list[float] = []
+
+    def slow(clock, sock, address):
+        clock.now += 25.0  # the address answers, after half of what the request has
+
+    def stalls(context, sock, *args, **kwargs):
+        handshakes.append(sock.gettimeout())
+        raise ssl.SSLError("the handshake timed out")
+
+    clock, transport = _connecting_to(monkeypatch, "192.0.2.1", connect=slow)
+    monkeypatch.setattr(ssl.SSLContext, "wrap_socket", stalls)
+    start = clock.now
+    with transport.request_ceiling(lambda: 50.0 - (clock.now - start)):
+        assert transport.urllib_http("GET", "https://feeds.example.com/slow", {}, None) == (0, {}, b"")
+    assert handshakes == [25.0]
+
+
+def test_a_tls_handshake_that_stalls_ends_at_the_deadline_not_at_the_socket_timeout(monkeypatch):
+    """A peer that accepts the connection and never speaks TLS: the handshake waits for it, and for no longer than the
+    request has left. The silent server here is the scripted one with nothing to say."""
+    transport = _short_limits(monkeypatch)
+    with _scripted_server(monkeypatch) as (url, _):
+        started = time.monotonic()
+        result = transport.urllib_http("GET", url.replace("http://", "https://", 1), {}, None)
+        elapsed = time.monotonic() - started
+    assert result == (0, {}, b"")
+    assert elapsed < 2.5, "the handshake was cut at the 0.4 s deadline; the socket timeout (5 s) never applied"
+
+
+def test_an_address_that_refuses_falls_through_to_the_next_one_that_answers(monkeypatch):
+    """The control for the tests above: a refusal is instant, so the next address of the name serves the request."""
+    import socket
+
+    transport = _short_limits(monkeypatch, deadline=10)
+    refusing = socket.socket()
+    refusing.bind(("127.0.0.1", 0))  # bound and never listening: a connect to it is refused at once
+    try:
+        with _scripted_server(monkeypatch, _HTTP_200 + b"Content-Length: 5\r\n\r\n", b"hello") as (url, _):
+            port = urlsplit(url).port
+            monkeypatch.setattr(
+                socket,
+                "getaddrinfo",
+                lambda host, number, *args, **kwargs: [
+                    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", refusing.getsockname()[1])),
+                    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port)),
+                ],
+            )
+            monkeypatch.setenv("no_proxy", "*")
+            monkeypatch.setenv("NO_PROXY", "*")
+            status, _, payload = transport.urllib_http("GET", f"http://feeds.example.com:{port}/", {}, None)
+    finally:
+        refusing.close()
+    assert (status, payload) == (200, b"hello")

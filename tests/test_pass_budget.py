@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from advisory_radar import core, pipeline
+from advisory_radar import adobe, core, pipeline
 from advisory_radar import http as http_module
 from advisory_radar.config import ConfigError, load_config
 from advisory_radar.plugins import SourceWindow
@@ -366,6 +366,94 @@ def test_an_adobe_pass_the_budget_cut_short_is_incomplete_not_failed(tmp_path, m
     record = stored(tmp_path)["runs"][-1]
     assert (record["code"], record["outcome"], record["deferred"]) == (0, "incomplete", 1)
     assert "fetch_deferred" not in stored(tmp_path), "it was started, so it keeps its place and is not deferred"
+
+
+APSB = "APSB26-02"
+#: A state that has seen one bulletin already, so ``APSB`` is the new one (a first Adobe pass queues nothing).
+ADOBE_SEEN = {
+    "window": ["APSB26-01"],
+    "seen": {"APSB26-01": {"cves": [], "at": NOW - 86400, "exploited": False}},
+}
+BULLETIN_PAGE = (
+    b'<div class="table"><div><div>Product</div><div>Version</div></div>'
+    b"<div><div>Adobe Commerce</div><div>2.4.8-p9</div></div></div>"
+)
+
+
+class AdobeNet(Net):
+    """The fake internet with the Adobe Commerce list and the page of ``APSB`` on it; ``page`` is that page's status."""
+
+    def __init__(self, clock: Clock) -> None:
+        super().__init__(clock)
+        self.page = 200
+
+    def __call__(self, method, url, headers, body):
+        status, answer_headers, answer = super().__call__(method, url, headers, body)
+        if status != 404:  # the parent charged the request and answered it, or cut it at the ceiling
+            return status, answer_headers, answer
+        if url == adobe.CAAS_URL:
+            cards = [
+                {
+                    "contentArea": {
+                        "detailText": adobe.COMMERCE_MNEMONIC,
+                        "title": apsb,
+                        "description": "Priority 2",
+                        "url": f"https://helpx.example.com/{apsb.lower()}.html",
+                    },
+                    "search": {"search": "CVE-2026-2002"},
+                }
+                for apsb in ("APSB26-01", APSB)
+            ]
+            return 200, {}, json.dumps({"cards": cards}).encode()
+        if url == adobe.detail_url(APSB):
+            return self.page, {}, BULLETIN_PAGE if self.page == 200 else b""
+        return status, answer_headers, answer
+
+
+def test_a_bulletin_detail_the_budget_cut_is_asked_again_and_never_sent_without_its_details(tmp_path):
+    prepare(tmp_path, adobe=ADOBE_SEEN)
+    clock = Clock()
+    net = AdobeNet(clock)
+    net.cost[adobe.detail_url(APSB)] = 700  # longer than the whole budget: every read of the page is cut at the ceiling
+    cfg = config(tmp_path, ids=("a",), adobe_commerce="true")
+    for _ in range(4):  # an hour apart, so the passes together outlast the window of the retry clock
+        assert run(cfg, net, clock) == 0, "a pass the budget cut is incomplete, not failed"
+        clock.advance(3600)
+        assert APSB not in stored(tmp_path)["adobe"]["seen"], "no message was sent for a page nobody asked Adobe for"
+        assert net.posts == []
+    assert clock.now - NOW > core.ADOBE_DETAIL_RETRY_SECONDS
+    net.cost.clear()
+    assert run(cfg, net, clock) == 0
+    state = stored(tmp_path)["adobe"]
+    assert APSB in state["seen"] and "retry" not in state and "backlog" not in state
+    (message,) = net.posts
+    assert "2.4.8-p9" in json.dumps(message), "the page was read on the first pass that had time, and its details sent"
+
+
+def test_the_retry_clock_of_a_bulletin_detail_starts_when_adobe_is_asked_and_does_not_answer(tmp_path):
+    prepare(tmp_path, adobe=ADOBE_SEEN)
+    clock = Clock()
+    net = AdobeNet(clock)
+    net.cost[adobe.detail_url(APSB)] = 700
+    cfg = config(tmp_path, ids=("a",), adobe_commerce="true")
+    assert run(cfg, net, clock) == 0
+    assert "retry" not in stored(tmp_path)["adobe"], "a read the budget cut is not a failure of Adobe's page"
+    clock.advance(3600)
+    net.cost.clear()
+    net.page = 500  # Adobe is asked now, and does not answer
+    asked = int(clock.now)
+    assert run(cfg, net, clock) == 0
+    assert stored(tmp_path)["adobe"]["retry"] == {APSB: asked}, "the clock starts with the first real failure"
+    clock.advance(core.ADOBE_DETAIL_RETRY_SECONDS - 60)
+    assert run(cfg, net, clock) == 0
+    assert net.posts == [], "the window is not over yet"
+    clock.advance(120)
+    assert run(cfg, net, clock) == 0
+    assert APSB in stored(tmp_path)["adobe"]["seen"], (
+        "a page that keeps failing still ends in the message without details"
+    )
+    (message,) = net.posts
+    assert "2.4.8-p9" not in json.dumps(message)
 
 
 def test_a_state_written_before_the_budget_existed_still_runs(tmp_path):

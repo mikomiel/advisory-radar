@@ -11,8 +11,11 @@ written before them reads as "every ``kev_only`` entry is waiting and nothing ha
 
 Fairness. ``select`` serves one waiting CVE per source in turn, starting after the cursor, and stops at ``PER_PASS``.
 No source can hold the pass while another waits, and when there are more sources than the cap the cursor makes the
-unserved ones go first next time. Inside a source the CVE tried longest ago goes first: a lookup the budget deferred
-keeps its place and one that failed goes to the back.
+unserved ones go first next time. Inside a source the CVE tried longest ago goes first. A lookup that never began
+(the budget or the NVD allowance ended before its request) keeps its place, and one that failed goes to the back. So
+does one whose request began and the budget cut (``interrupted``): it spent the time the others needed, so without a
+turn of its own a persistently slow CVE would be first in every pass and the rest would never start. It is stored as
+``deferred``, because no provider failed: it is asked again next pass, behind the CVEs that waited.
 
 Window. A watch entry is kept for ``core.REEVAL_WINDOW``, and up to ``EXTENDED_WINDOW`` while its enrichment is
 outstanding, so a CVE the passes could not measure in time is not dropped unmeasured. The counts and the oldest wait
@@ -41,6 +44,8 @@ RETRY_AFTER = _DAY
 
 KEV_ONLY, DEFERRED, FAILED, MEASURED = "kev_only", "deferred", "failed", "measured"
 STATES = (MEASURED, KEV_ONLY, DEFERRED, FAILED)
+#: An outcome, never a state: a lookup whose request began and the pass budget cut. It is recorded as ``deferred``.
+INTERRUPTED = "interrupted"
 
 
 @dataclass(frozen=True)
@@ -101,8 +106,10 @@ def record(entry: dict, outcome: str, now: int) -> None:
     """Note what one lookup of the entry's CVE came to.
 
     ``measured`` means complete facts: the entry joins the daily re-evaluation. ``deferred`` means the time budget
-    or the NVD allowance ended the lookup, not a provider, so no try is counted. ``failed`` means a request was
-    made and a provider did not answer in full.
+    or the NVD allowance ended the lookup, not a provider, so no try is counted. ``interrupted`` is a ``deferred``
+    one whose request began and was cut by the budget: no try is counted either, but ``at`` moves to ``now``, which
+    sends it behind the CVEs that waited (``select``). ``failed`` means a request was made and a provider did not
+    answer in full.
     """
     if outcome == MEASURED:
         entry.pop("enrich", None)
@@ -115,10 +122,10 @@ def record(entry: dict, outcome: str, now: int) -> None:
         began = _int(entry.get("since")) if entry.get("kev_only") is True else None
     tries = _int(held.get("tries")) or 0
     entry["enrich"] = {
-        "state": outcome,
+        "state": DEFERRED if outcome == INTERRUPTED else outcome,
         "since": now if began is None else began,
         "tries": tries + (outcome == FAILED),
-        "at": now if outcome == FAILED else _int(held.get("at")) or 0,
+        "at": now if outcome in (FAILED, INTERRUPTED) else _int(held.get("at")) or 0,
     }
 
 
@@ -160,10 +167,14 @@ def select(state: Mapping, now: int, limit: int = PER_PASS) -> list[str]:
 
 
 def served(state: dict, picks: Sequence[str], outcomes: Mapping[str, str]) -> None:
-    """Move the cursor to the source of the last pick that got a lookup; a deferred pick got none, so it is no turn."""
+    """Move the cursor to the source of the last pick that took a turn.
+
+    A pick took one when its request was made: it was measured, a provider failed it, or the budget cut it
+    (``interrupted``). A pick the budget ended before any request is no turn, so its source goes first again.
+    """
     watch = state.get("watch")
     watch = watch if isinstance(watch, dict) else {}
-    done = [cve for cve in picks if outcomes.get(cve) in (MEASURED, FAILED)]
+    done = [cve for cve in picks if outcomes.get(cve) in (MEASURED, FAILED, INTERRUPTED)]
     if done and isinstance(watch.get(done[-1]), dict):
         state["enrich_cursor"] = _source(watch[done[-1]])
     if not any(isinstance(entry, dict) and entry.get("kev_only") is True for entry in watch.values()):

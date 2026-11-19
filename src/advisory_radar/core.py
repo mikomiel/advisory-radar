@@ -422,6 +422,9 @@ class CveFacts:
     skipped: bool = False
     #: The metric that gave ``cvss`` has a vector with ``AV:N``, ``PR:N`` and ``UI:N`` (see ``remote_unauth``).
     remote_unauth: bool = False
+    #: A request for this CVE began and the pass budget ended the lookup. It is no failure of a provider, but unlike a
+    #: lookup that never began it spent the budget, so a caller that orders its work must give it a turn.
+    interrupted: bool = False
 
 
 @dataclass(frozen=True)
@@ -767,10 +770,14 @@ class Intel:
     ) -> dict[str, CveFacts]:
         """Facts per CVE. Only the first ``lookup_limit`` uncached CVEs go to CVE.org/NVD; EPSS is capped.
 
-        ``deferred`` collects the CVEs on which the NVD budget ran out before a request: those were not
-        measured, so a caller that schedules the next attempt must not count them as tried. ``nvd_limit`` holds this
+        ``deferred`` collects the CVEs that the pass budget or the NVD allowance kept from a measurement: those were
+        not measured, so a caller that schedules the next attempt must not count them as tried. ``nvd_limit`` holds this
         call to that many NVD requests, for a caller that must leave the rest of the pass's ``MAX_NVD_CALLS`` to
         others; a CVE that needs one beyond it is deferred, like one past the cap.
+
+        A deferred CVE whose request began and was cut by the pass budget is also marked ``interrupted`` on its
+        facts: it is no failure of a provider, yet it spent the budget that the CVEs behind it needed, so a caller
+        that orders the next attempt puts it behind them. One the budget ended before any request is only deferred.
         """
         deferred = set() if deferred is None else deferred
         nvd_calls = 0
@@ -826,10 +833,13 @@ class Intel:
                     # avoid advancing its daily clock on a CVE it never actually checked.
                     complete = False
                     deferred.add(cve)
-            if not complete and self.out_of_time():
+            interrupted = not complete and self.out_of_time()
+            if interrupted:
                 deferred.add(cve)  # the budget, not the provider, ended this lookup
             complete = complete and epss is not None
-            facts[cve] = CveFacts(cvss, ssvc, score, percentile, complete, remote_unauth=remote)
+            facts[cve] = CveFacts(
+                cvss, ssvc, score, percentile, complete, remote_unauth=remote, interrupted=interrupted
+            )
             if complete:
                 self._cache[cve] = {
                     "at": int(self._clock()),
@@ -1994,7 +2004,7 @@ def _is_history(item: Item, now: int, last_ok: int, trusted: Collection[str]) ->
 
 
 def _never() -> bool:
-    """The default ``out_of_time`` of ``classify_new``: no pass budget, so the time never runs out."""
+    """The default ``out_of_time`` of ``classify_new`` and ``adobe_pass``: with no pass budget time never runs out."""
     return False
 
 
@@ -2415,9 +2425,9 @@ def reevaluate(
 
     ``work`` is the capped CVEs the caller chose to measure now (``enrichment.select``), whatever their daily clock
     says; they are judged exactly like a due CVE, so one that turns out critical is escalated once. ``outcomes``
-    receives what each lookup of this call (due or chosen) came to: ``measured``, ``deferred`` or ``failed``
-    (``enrichment``). A capped CVE is read against the KEV catalogue on every pass, not on its daily clock: that is a
-    local set and costs no request, so observed exploitation waits neither for a lookup nor for a day.
+    receives what each lookup of this call (due or chosen) came to: ``measured``, ``deferred``, ``interrupted`` or
+    ``failed`` (``enrichment``). A capped CVE is read against the KEV catalogue on every pass, not on its daily clock:
+    that is a local set and costs no request, so observed exploitation waits neither for a lookup nor for a day.
 
     Each entry is judged by the numbers of the source that queued it (``source_thresholds``, from
     ``Config.thresholds_for``), so a per-source override behaves exactly like the global block: a *threshold*
@@ -2454,6 +2464,8 @@ def reevaluate(
         result = (
             enrichment.MEASURED
             if facts[cve].complete
+            else enrichment.INTERRUPTED
+            if facts[cve].interrupted
             else enrichment.DEFERRED
             if cve in deferred
             else enrichment.FAILED
@@ -2471,8 +2483,12 @@ def reevaluate(
         # Membership is positive evidence on its own; kev_known only gates the *absence*-based suppression.
         deciding = critical_reason(current, cve in kev, thresholds=entry_thresholds)
         if cve in deferred and not deciding:
-            # No request was made and nothing independently decisive is known: try again next pass rather
-            # than waiting a whole day. KEV or SSVC evidence still escalates now.
+            # Nothing independently decisive is known: try again next pass rather than waiting a whole day.
+            # KEV or SSVC evidence still escalates now. A lookup the budget cut took its turn, though: its
+            # clock moves as a failed one does, so it goes behind the due CVEs it kept from being looked up
+            # instead of spending the next pass's budget first as well. One that never began keeps its place.
+            if current.interrupted:
+                entry["last_eval"] = now
             continue
         if not current.complete and not deciding:
             # A failed lookup changes nothing unless an independently sufficient signal (KEV, SSVC active,
@@ -2771,7 +2787,14 @@ def _adobe_list(http: Http, stored: object) -> tuple[adobe.Bulletin, ...] | str:
 
 
 def adobe_pass(
-    state: dict, http: Http, kev: frozenset[str], kev_known: bool, now: int, *, language: str = DEFAULT_LANGUAGE
+    state: dict,
+    http: Http,
+    kev: frozenset[str],
+    kev_known: bool,
+    now: int,
+    *,
+    language: str = DEFAULT_LANGUAGE,
+    out_of_time: Callable[[], bool] = _never,
 ) -> bool:
     """Queue the Commerce bulletins nobody has been told about; False after a source fault.
 
@@ -2787,6 +2810,12 @@ def adobe_pass(
     the one complete message. Once ``ADOBE_DETAIL_RETRY_SECONDS`` have passed, the message goes out once without
     details. A detail fault is not a source fault: the return value stays True. State written before ``retry``
     existed has none. ``language`` is the language the queued messages are written in (``messages``).
+
+    ``out_of_time`` says the pass budget is spent (``budget``). A detail page that was not answered while it is true
+    was refused or cut by the budget, not failed by Adobe: the pass stops reading pages and leaves the bulletin as
+    it was. A cut therefore starts no retry clock and never sends a bulletin without its details. A clock that a
+    failure of the page started keeps counting wall time, cut passes included: the next failure of the page after
+    ``ADOBE_DETAIL_RETRY_SECONDS`` ends it.
     """
     stored = state.get("adobe")
     bulletins = _adobe_list(http, stored)
@@ -2867,6 +2896,14 @@ def adobe_pass(
             followed += 1
     for bulletin in fresh:
         detail = _adobe_detail(http, bulletin.apsb)
+        if detail is None and out_of_time():
+            # The budget ended this read, not Adobe: counting it would start the retry clock for a page nobody was
+            # asked for, and enough short passes would then send the bulletin without its details. Nothing after it
+            # can be read either, so it and the bulletins behind it are read again next pass.
+            LOG.warning(
+                "adobe commerce: the pass budget ended the read of %s; it is read again next pass", bulletin.apsb
+            )
+            break
         if detail is None:
             first = retry.setdefault(bulletin.apsb, now)
             backlog.setdefault(bulletin.apsb, {"cves": list(bulletin.cves), "url": bulletin.url})["first"] = first

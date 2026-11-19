@@ -63,10 +63,13 @@ as long as the server liked. A request ended this way is an unreachable source f
 like any other network error. Every wait for the server's answer is cut at what is left of the
 120 seconds: the status line, each header, the size line and the trailer of a chunked body, and
 the body itself. A server that sends any of those a few bytes at a time is therefore ended at
-120 seconds, and so is one that says nothing. The connection attempt (the TCP connect and the
-TLS handshake) and the sending of the request are not waits for the answer: they have the
-30-second limit alone, and a connection attempt that has used up the whole budget ends the
-request at its first wait for the answer.
+120 seconds, and so is one that says nothing. The connection attempt shares the same 120
+seconds: a host name that resolves to several addresses is tried one address after another,
+each for at most 30 seconds or what is left of the 120, and the TLS handshake gets what the
+connect left. Several unreachable addresses therefore cannot hold a request for 30 seconds
+each. Resolving the host name is a wait no limit here covers, because the system resolver
+offers none. The sending of the request is not a wait for the answer: it keeps the 30-second
+limit and is not cut at the 120 seconds.
 
 A document is read whole or not at all: a source or a lookup whose body cannot be received in
 full is unreachable for that pass. A notification is judged by its status alone, so a receiver

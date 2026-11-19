@@ -185,6 +185,52 @@ def test_the_drain_is_held_to_the_refresh_share_of_the_pass_budget_and_keeps_wha
     assert set(again[:6]) == deferred, "what the budget deferred is looked up first next time"
 
 
+def test_a_lookup_the_budget_cut_takes_its_turn_and_cannot_starve_the_other_sources(tmp_path):
+    """One CVE whose lookup outlasts the refresh share must not be picked first for ever.
+
+    Its request spends the whole share on every pass, so nothing behind it can start. A lookup that began and was cut
+    has had its turn: the next pass starts after its source and tries it last inside that source.
+    """
+    cfg, net, clock = delivered_advisories(tmp_path, big=13, small=11)
+    state = stored(tmp_path)
+    slow = min(capped(state, "a"))  # the one the drain picks first
+    assert len(capped(state)) == 4 and slow in capped(state, "a")
+    net.cost[f"{core.CVE_ORG_URL}{slow}"] = 500  # longer than the whole refresh share
+    for _ in range(2):
+        assert run(cfg, net, clock) == 0
+    state = stored(tmp_path)
+    assert capped(state) == {slow}, "every other waiting CVE, of both sources, was measured within two passes"
+    marker = state["watch"][slow]["enrich"]
+    assert (marker["state"], marker["tries"]) == (enrichment.DEFERRED, 0), "a cut lookup is no failure of a provider"
+    start = len(net.calls)
+    assert run(cfg, net, clock) == 0
+    assert looked_up(net, start) == [slow], "it is asked again on the next pass, not after a day as a failed one is"
+    assert enrichment.coverage(stored(tmp_path)["watch"], int(clock.now)).failed == 0
+
+
+def test_a_daily_re_score_the_budget_cut_does_not_hold_the_drain_back_either(tmp_path):
+    """The re-scores go first in the same stage, so one whose lookup never finishes would starve the drain as well."""
+    due, waiting = "CVE-2026-6001", "CVE-2026-6002"
+    prepare(
+        tmp_path,
+        watch={
+            due: aged(3),
+            waiting: aged(3, kev_only=True, source_id="b", last_eval=NOW - 60),
+        },
+    )
+    clock = Clock()
+    net = Scored(clock)
+    net.cost[f"{core.CVE_ORG_URL}{due}"] = 500
+    cfg = config(tmp_path, ids=("a", "b"))
+    for _ in range(2):
+        assert run(cfg, net, clock) == 0
+    state = stored(tmp_path)
+    assert state["watch"][waiting]["kev_only"] is False, "the waiting CVE was measured on the second pass"
+    entry = state["watch"][due]
+    assert entry["last_eval"] == NOW, "the cut re-score had its turn: it is due again after the next interval"
+    assert (entry["enrich"]["state"], entry["enrich"]["tries"]) == (enrichment.DEFERRED, 0)
+
+
 def test_a_failed_lookup_is_recorded_waits_a_day_and_does_not_hold_the_others_back(tmp_path):
     cfg, net, clock = delivered_advisories(tmp_path)
     target = sorted(capped(stored(tmp_path), "a"))[3]
@@ -317,6 +363,44 @@ def test_a_pass_the_budget_ended_does_not_move_the_cursor_past_a_source_it_never
     assert state["enrich_cursor"] == "a", "only the lookup that was made counts as a turn"
     enrichment.served(state, picks, {pick: enrichment.DEFERRED for pick in picks})
     assert state["enrich_cursor"] == "a", "a pass that made no lookup moves nothing"
+
+
+def test_an_interrupted_lookup_takes_a_turn_and_goes_behind_the_rest_without_counting_a_try():
+    state = core.new_state()
+    for name, cve in (("a", "CVE-2026-0001"), ("a", "CVE-2026-0002"), ("b", "CVE-2026-0003")):
+        state["watch"][cve] = {"since": NOW - DAY, "last_eval": NOW, "kev_only": True, "source_id": name}
+    picks = enrichment.select(state, NOW)
+    assert picks == ["CVE-2026-0001", "CVE-2026-0003", "CVE-2026-0002"]
+    outcomes = {"CVE-2026-0001": enrichment.INTERRUPTED, "CVE-2026-0003": enrichment.DEFERRED}
+    enrichment.record(state["watch"]["CVE-2026-0001"], enrichment.INTERRUPTED, NOW)
+    enrichment.served(state, picks, outcomes)
+    assert state["enrich_cursor"] == "a", "the lookup that began is a turn, though it did not finish"
+    marker = state["watch"]["CVE-2026-0001"]["enrich"]
+    assert marker == {"state": enrichment.DEFERRED, "since": NOW - DAY, "tries": 0, "at": NOW}
+    assert enrichment.outstanding(state["watch"]["CVE-2026-0001"]) == enrichment.DEFERRED
+    assert enrichment.select(state, NOW + 1) == ["CVE-2026-0003", "CVE-2026-0002", "CVE-2026-0001"]
+    enrichment.record(state["watch"]["CVE-2026-0001"], enrichment.DEFERRED, NOW + 2)
+    assert state["watch"]["CVE-2026-0001"]["enrich"]["at"] == NOW, "a later deferral does not give the turn back"
+
+
+def test_intel_tells_a_lookup_the_budget_cut_from_one_it_never_started():
+    spent = False
+
+    def http(method, url, headers, body):
+        nonlocal spent
+        if url.startswith(core.CVE_ORG_URL):
+            spent = True  # this request is the one that outlasts the budget
+            return 0, {}, b""
+        rows = [{"cve": cve, "epss": "0.01", "percentile": "0.40"} for cve in url.split("cve=", 1)[1].split(",")]
+        return 200, {}, json.dumps({"data": rows}).encode()
+
+    intel = core.Intel(http, {}, lambda: 0.0, lambda seconds: None, remaining=lambda: -1.0 if spent else 100.0)
+    deferred: set[str] = set()
+    facts = intel.cves(["CVE-2026-4001", "CVE-2026-4002"], deferred=deferred)
+    assert deferred == {"CVE-2026-4001", "CVE-2026-4002"} and not any(fact.complete for fact in facts.values())
+    assert {cve for cve, fact in facts.items() if fact.interrupted} == {"CVE-2026-4001"}, (
+        "the second was never asked, so it is deferred and no more"
+    )
 
 
 def test_the_window_stretches_to_thirty_days_only_for_entries_with_outstanding_enrichment():

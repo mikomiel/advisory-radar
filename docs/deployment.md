@@ -402,8 +402,11 @@ The [pass budget](configuration.md#the-pass-budget) bounds how long the pass can
 the cap on messages per pass, so the longest a pass holds the lock is its budget plus its delivery. The pass makes
 its requests one after another; the budget adds no parallel requests.
 
-Nothing cancels a running pass. The budget does not interrupt running code: it cuts each request at what is left
-and stops the next from starting, so a pass can overrun it only by work that is not a request. `SIGTERM` and `SIGINT`
+Nothing cancels a running pass. The budget does not interrupt running code: it cuts each request at what is left,
+whether the request is connecting to one of the addresses of a host name, in its TLS handshake or waiting for the
+answer, and stops the next from starting. A pass can therefore overrun it only by work that is not a request, by
+resolving a host name, which the system resolver does not let anyone cut short, and by sending a request, which keeps
+its 30-second limit. `SIGTERM` and `SIGINT`
 stop the web server, then ask the scheduler to stop and wait 5 seconds for it. The scheduler checks that request
 between passes only, so a pass that is still running when the process exits is ended where it stands. That loses
 nothing the state had already recorded:
