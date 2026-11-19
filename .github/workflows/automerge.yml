@@ -2,20 +2,21 @@
 #
 # This is the GitHub-native equivalent of the estate's reviewed-CI automerge executor. The gate is
 # "the reviewer approved *this exact head commit*" + "the required ci check is green on that commit".
-# GitHub's branch protection validates both again at merge time; this script only decides *whether to ask*.
+# GitHub's branch protection validates both again at merge time; scripts/automerge_loop.py, the script this
+# workflow runs, only decides *whether to ask*.
 #
 # A human decision is required for every change that widens what this automation can reach: a PR touching
 # SENSITIVE_PATHS below is never merged here. That is not advisory - the early exit is the enforcement, and
 # the repository has exactly one human account, which cannot approve its own pull requests, so a
 # "require code owner approval" rule would deadlock maintenance instead of adding a second check.
 #
-# Enforcement rests on two halves. This file decides from the immutable $base...$head comparison and re-reads
+# Enforcement rests on two halves. The script decides from the immutable $base...$head comparison and re-reads
 # both refs immediately before merging; branch protection's required status check is **strict** ("require
 # branches to be up to date"), so GitHub itself refuses a head whose base advanced. Neither half alone is
-# enough: the workflow cannot see a base advance that GitHub would accept, and strict alone does not know
+# enough: the script cannot see a base advance that GitHub would accept, and strict alone does not know
 # which paths are sensitive.
 #
-# Safety rules this file must keep (see docs in the PR that added it):
+# Safety rules this file and its script must keep (see docs in the PR that added it):
 #   * never check out or execute pull-request / workflow_run head code - this job only reads PR metadata;
 #   * the approving review must be at the current head SHA, by the configured reviewer identity;
 #   * the required status context must be present and SUCCESS on that SHA;
@@ -83,136 +84,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          # The default is written before the loop and a merge overwrites it immediately, so a
-          # later candidate's failure can neither lose a merge that landed nor invent one.
-          echo "merged=false" >> "$GITHUB_OUTPUT"
-          # gh paginates internally up to this bound, which is far above any realistic queue; the comment is a
-          # bound, not "to completion".
-          # An enumeration failure must fail the job: inside process substitution its exit status is lost and
-          # an API error would look like an empty queue.
-          # Selection is deliberately narrow: drafts are skipped here, and nothing else is decided by this
-          # filter. The approval rule has one owner -- scripts/review_state.py, called in the loop below -- so
-          # pre-filtering on GitHub's `reviewDecision` would be a second copy of it. That copy is also wrong:
-          # branch protection requires zero approving reviews, so GitHub reports no `reviewDecision` at all and
-          # such a filter matches nothing.
-          if ! listing=$(gh pr list --repo "$REPO" --state open --base main --limit 1000 \
-            --json number,mergeable,isDraft \
-            --jq '.[] | select(.isDraft == false) | .number'); then
-            echo "::error::cannot enumerate open pull requests"
-            exit 1
-          fi
-          if [ -z "$listing" ]; then
-            echo "no approved pull requests to consider"
-            exit 0
-          fi
-          mapfile -t candidates <<<"$listing"
-
-          for pr in "${candidates[@]}"; do
-            meta=$(gh pr view "$pr" --repo "$REPO" \
-              --json headRefOid,baseRefOid,mergeable,reviews,statusCheckRollup,changedFiles,headRefName,isCrossRepository)
-
-            head=$(jq -r '.headRefOid' <<<"$meta")
-            mergeable=$(jq -r '.mergeable' <<<"$meta")
-            if [ "$mergeable" != "MERGEABLE" ]; then
-              echo "skip #$pr: mergeable=$mergeable (retry on the next trigger)"
-              continue
-            fi
-
-            # The approval rule has one owner: scripts/review_state.py, tested by tests/test_review_state.py
-            # and shared with review-gate.yml, which reports the required `review` status from it. Two
-            # copies of this rule is how a status says "approved" while the merge refuses, or the reverse.
-            # Read over REST: .user.type distinguishes an App bot from a human account of the same name, and
-            # .user.login keeps the "[bot]" suffix that the GraphQL shape drops.
-            # jq -s 'add': --paginate emits one JSON array per page, and selecting the latest review per page
-            # would return several answers (an eligible approval on a later page would look like a mismatch).
-            reviews=$(gh api --paginate "repos/$REPO/pulls/$pr/reviews?per_page=100" | jq -s -c 'add')
-            if ! review_line=$(printf '%s' "$reviews" | python3 scripts/review_state.py \
-                 --reviewer "$REVIEWER_LOGIN" --type "$REVIEWER_TYPE" --head "$head"); then
-              echo "skip #$pr: ${review_line#*$'\t'}"
-              continue
-            fi
-
-            # Positive assertion: the required check answered SUCCESS for this head.
-            green=$(jq -r --arg check "$REQUIRED_CHECK" '
-              [.statusCheckRollup[] | select(.name == $check and .conclusion == "SUCCESS")] | length' <<<"$meta")
-            if [ "$green" -eq 0 ]; then
-              echo "skip #$pr: $REQUIRED_CHECK is not SUCCESS on $head"
-              continue
-            fi
-            # Everything must be terminal and acceptable: a check run reports .conclusion, a legacy commit
-            # status reports .state, and a queued/in-progress one has neither a conclusion nor a state of
-            # success. Anything other than SUCCESS/NEUTRAL/SKIPPED skips the merge - pending included, so an
-            # additional check cannot start failing after we merged.
-            # statusCheckRollup is bounded (100 contexts); at that size an omitted check could be the failing
-            # one, so refuse to merge rather than trust an incomplete list.
-            contexts=$(jq -r '.statusCheckRollup | length' <<<"$meta")
-            if [ "$contexts" -ge 100 ]; then
-              echo "skip #$pr: $contexts check contexts - the rollup may be truncated, cannot verify completeness"
-              continue
-            fi
-
-            not_green=$(jq -r --argjson _ 0 '[.statusCheckRollup[]
-              | (.conclusion // .state // "PENDING")
-              | select(. != "SUCCESS" and . != "NEUTRAL" and . != "SKIPPED")] | length' <<<"$meta")
-            if [ "$not_green" != "0" ]; then
-              echo "skip #$pr: $not_green check(s) not green (pending, failing or errored)"
-              continue
-            fi
-
-            # A change to what the automation can reach needs a person: workflow edits, this file, the
-            # published artifact and its packaging. Such a PR is left for a human merge, always.
-            #
-            # The file list comes from the immutable comparison of the two SHAs, never from the pull request's
-            # mutable state: /pulls/{n}/files follows the branch, so a head that moved A -> B -> A could show
-            # B's harmless files while A merges. Both sides of a rename count (previous_filename).
-            base=$(jq -r '.baseRefOid' <<<"$meta")
-            # The comparison carries its file list on the first page only; following pages paginate commits
-            # without a `files` array. One request, and the script refuses a list it cannot trust.
-            declared=$(jq -r '.changedFiles // 0' <<<"$meta")
-            if ! gh api "repos/$REPO/compare/$base...$head" \
-                 | python3 scripts/guard_sensitive_paths.py --declared "$declared"; then
-              echo "skip #$pr: a person merges this one (the guard's reason is on the line above)"
-              continue
-            fi
-
-            # Merge now rather than installing a standing auto-merge order: a later push would move the
-            # head past the review this check just validated.
-            # The guard above compared $base...$head. If the base advanced since, that comparison no longer
-            # describes this merge, so re-read and refuse. Branch protection's "require branches to be up to
-            # date" (strict) is the server-side half of this: GitHub itself refuses a head behind the base.
-            current=$(gh pr view "$pr" --repo "$REPO" --json headRefOid,baseRefOid)
-            if [ "$(jq -r '.baseRefOid' <<<"$current")" != "$base" ] || [ "$(jq -r '.headRefOid' <<<"$current")" != "$head" ]; then
-              echo "skip #$pr: base or head moved during the check; a fresh run decides"
-              continue
-            fi
-
-            # --match-head-commit: if the head moved between the checks above and this call, GitHub refuses
-            # instead of merging a commit the reviewer never saw.
-            if gh pr merge "$pr" --repo "$REPO" --squash --match-head-commit "$head"; then
-              # Persist the outcome at the merge, before the branch cleanup and the comment
-              # below can fail the step: the release of a landed merge must not depend on them.
-              echo "merged=true" >> "$GITHUB_OUTPUT"
-              echo "merged #$pr at $head (approval by $REVIEWER_LOGIN)"
-              # The branch is deleted by a tested script, not from this line: the repository setting did not
-              # cover a merge made through the API, and the script's delete is a lease on this exact head, so a
-              # push that landed after the merge is never removed. The call is a condition, so a refusal or a
-              # failed delete warns instead of failing the run whose merge already happened.
-              branch=$(jq -r '.headRefName' <<<"$meta")
-              cross=$(jq -r '.isCrossRepository' <<<"$meta")
-              if python3 scripts/delete_merged_branch.py --repo "$REPO" --branch "$branch" --head "$head" \
-                   --cross-repository "$cross"; then
-                echo "deleted head branch $branch"
-              else
-                echo "::warning::merged #$pr; its head branch was left in place (the reason is above)"
-              fi
-              gh pr comment "$pr" --repo "$REPO" \
-                --body "Merged by automerge: $REQUIRED_CHECK green and approved at \`$head\` by $REVIEWER_LOGIN." || true
-            else
-              echo "skip #$pr: GitHub refused the merge (protection, or a check changed)"
-            fi
-          done
+        # The loop is scripts/automerge_loop.py, a tested script on the default branch. It owns the `merged` output
+        # that the release job reads, and the order of its writes: `false` before the queue is read, `true` at the
+        # merge itself, before the branch cleanup and the comment, so that a later failure cannot lose a merge that
+        # landed. tests/test_automerge_loop.py runs it against a stub `gh` and pins that order, and
+        # tests/test_workflow_pins.py keeps this step nothing but the call.
+        run: python3 scripts/automerge_loop.py
 
   release:
     # Called, not observed: a `workflow_run` trigger on this workflow fired on
