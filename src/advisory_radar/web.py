@@ -1436,7 +1436,10 @@ def _seen_advisory(
     delivery: Mapping | None = None,
     events: Sequence[tuple[str, Mapping]] = (),
 ) -> str:
-    """The detail page for an identifier the state has seen: the snapshot, or only what an older record held."""
+    """The detail page for an identifier the state has seen: the snapshot, or only what the seen record holds.
+
+    That is all an older record ever held, and all that is left of one whose snapshot moved to an archive file.
+    """
     outcome = _field(record.get("outcome"))
     facts: list[tuple[str, str]] = [
         ("Outcome", _badge(outcome, _outcome_tone(outcome)) if outcome else "<span class='muted'>—</span>"),
@@ -1444,14 +1447,24 @@ def _seen_advisory(
     ]
     # The seen record's pointer to the event it already shows; the snapshot itself does not carry it.
     reference = record.get("delivery")
+    # A pointer whose snapshot is gone: a pass moved it to an archive file (see ``retention``).
+    archived = isinstance(reference, str) and not isinstance(delivery, Mapping)
     record = delivery if isinstance(delivery, Mapping) else record
     back = "<p class='back'><a href='/alerts'>← Back to alerts</a></p>"
     if not any(key in record for key in ("tag", "source", "title", "levels", "scores", "delivered_to")):
-        return (
-            "<p>The state holds this identifier, but only its outcome and when it was recorded.</p>"
-            "<p class='muted'>The delivered message's details were not recorded: this record was written by an "
+        explanation = (
+            "<p class='muted'>The delivered message's details are no longer in the state: a pass moves the details "
+            "of a delivery older than two years into a state-archive file beside the state file, and nothing reads "
+            "that file back into the state. The identifier, its outcome and when it was recorded stay here, so this "
+            "advisory is still known and is not reported again.</p>"
+            if archived
+            else "<p class='muted'>The delivered message's details were not recorded: this record was written by an "
             "older version of advisory-radar, or no message was delivered for this identifier. Nothing is "
             "reconstructed here, and the message body is not retained.</p>"
+        )
+        return (
+            "<p>The state holds this identifier, but only its outcome and when it was recorded.</p>"
+            + explanation
             + _facts(facts)
             # A suppressed CVE gets no snapshot, so its original record is minimal -- but a later escalation
             # still added an event, and the page must show it rather than hide the only explanation.
@@ -2668,7 +2681,8 @@ def create_app(
         body = (
             filter_form + f"<p class='muted small'>{len(rows)} matching record(s). A dash means the record carries no "
             "value for that column: one written before the delivery snapshot has no tag, source id or title, "
-            "and a source filter matches only the configured source id, never the advisory heading.</p>" + table
+            "and neither does one whose snapshot moved to an archive file after two years. A source filter matches "
+            "only the configured source id, never the advisory heading.</p>" + table
         )
         if pager:
             body += f"<nav class='pager' aria-label='Pages'>{''.join(pager)}</nav>"

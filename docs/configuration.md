@@ -374,7 +374,9 @@ It never renders the message body: a delivered record does not retain it, and a 
 parked queue entry still carries its own body only until it leaves the queue. The record is
 stored once per delivered message and each identifier points at it, so an advisory that names
 thousands of identifiers does not multiply it. A record written by an older version says its
-details were not recorded instead of inventing them. `/parked` releases or drops a
+details were not recorded instead of inventing them, and a delivery older than two years says
+its details moved to a state-archive file (`deployment.md`, "State size and retention").
+`/parked` releases or drops a
 single message per row while keeping the bulk actions, and `/runs` filters by exit code and
 day; the writer keeps only the last 200 passes, so that page states the cap rather than
 paging. The dashboard's **Run a pass now** reports the result of that request above the

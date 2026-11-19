@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import replace
 
-from . import core, watchlist
+from . import core, retention, watchlist
 from .config import Config, secret_values
 from .http import Http, RedactFilter, log_safe, urllib_http
 from .kev import load_kev
@@ -239,6 +239,9 @@ def _run_pass(
     _reset_validators_on_policy_change(state, policy)
     state.setdefault("parked", [])
     core._prune(state, now)
+    if not dry_run:
+        # After ownership was settled above, which reads the snapshots it is about to move.
+        retention.retire_deliveries(state, cfg.state_path, now)
     # Both of these must come from the state document that is actually written: a detached dict never
     # reaches disk, so the first window was lost and the 24h cache was never persisted.
     windows = _source_windows(state)
