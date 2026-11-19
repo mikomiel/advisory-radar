@@ -81,7 +81,7 @@ class Net:
         if method == "POST":
             self.posts.append(json.loads(body))
             return 200, {}, b"ok"
-        if "cisa.gov" in url:
+        if url == core.KEV_URL:
             catalogue = {"catalogVersion": "1", "vulnerabilities": [{"cveID": "CVE-2020-0001"}]}
             return 200, {"ETag": "k"}, json.dumps(catalogue).encode()
         if url.startswith(core.CVE_ORG_URL):
