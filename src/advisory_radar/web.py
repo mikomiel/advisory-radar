@@ -31,7 +31,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from itsdangerous import BadSignature, URLSafeSerializer
 
-from . import __version__, core, delivery, feeds, pipeline, watchlist
+from . import __version__, core, delivery, enrichment, feeds, pipeline, watchlist
 from .catalogue import SOURCE_SPECS
 from .config import (
     DEFAULT_THRESHOLDS,
@@ -1541,6 +1541,17 @@ def last_pass_code(state: dict) -> int:
     return _number(runs[-1].get("code"), -1)
 
 
+def _budget_deferred(run: object) -> int | None:
+    """The units of work a pass's time budget left for the next pass, or ``None`` when the pass was not incomplete.
+
+    Only a record that says ``incomplete`` counts, so an older record, or a hand-edited one, is never read as a pass
+    that ran out of budget. The outcome is a second fact beside the exit code: an incomplete pass still exits 0.
+    """
+    if not isinstance(run, dict) or run.get("outcome") != "incomplete":
+        return None
+    return _number(run.get("deferred"))
+
+
 #: A pass may be this many poll intervals late before the instance is not ready. Two skipped runs of slack keeps a
 #: slow source from flapping the probe, and a stopped scheduler still surfaces within a few intervals.
 READY_AGE_FACTOR = 3
@@ -2443,6 +2454,7 @@ def create_app(
             sum(len(items) for items in carry.values() if isinstance(items, list)) if isinstance(carry, dict) else 0
         )
         deferred_enrichment = _length(state.get("enrich_retry")) + _length(state.get("enrich_pending"))
+        coverage = enrichment.coverage(state.get("watch"), now)
         health = state.get("source_health")
         health = health if isinstance(health, dict) else {}
         unhealthy = sum(
@@ -2466,6 +2478,7 @@ def create_app(
         delivered_today = counted({"state": "delivered"}, start=today_start)
         deferred = len(pending) + len(parked) + carried
         code_text, code_tone = _exit_code(last.get("code"))
+        left_by_budget = _budget_deferred(last)
         when = _when(last.get("at"))
         completed = _when(last.get("finished_at"))
         successful = next(
@@ -2478,6 +2491,14 @@ def create_app(
         success_text = esc(success_when) if success_when else "<span class='muted'>none recorded</span>"
         if not when:
             pass_line = "<p class='grow'><span class='dot'></span>No pass has completed yet.</p>"
+        elif code_tone == "ok" and left_by_budget is not None:
+            # Exit 0 and incomplete are both true: the pass did not fail, and its time budget ran out before it
+            # was done. The next pass starts with what it left.
+            pass_line = (
+                f"<p class='grow'><span class='dot'></span>Last pass: {esc(when)} {_badge(code_text, code_tone)} "
+                f"{_badge('incomplete', 'warning')} its time budget ran out with {left_by_budget} unit(s) of work "
+                "left for the next pass</p>"
+            )
         elif code_tone == "ok" and deferred:
             # Exit 0 says the pass finished, not that nothing is left: the two facts stay separate.
             pass_line = (
@@ -2541,6 +2562,17 @@ def create_app(
                         else "<span class='muted'>none</span>",
                     ),
                     (
+                        "CVE enrichment",
+                        f"{coverage.measured} measured · {coverage.deferred} deferred · {coverage.failed} failed · "
+                        f"{coverage.kev_only} KEV-only",
+                    ),
+                    (
+                        "Oldest outstanding enrichment",
+                        f"{esc(_age_text(coverage.oldest_age))}"
+                        if coverage.oldest_age is not None
+                        else "<span class='muted'>none outstanding</span>",
+                    ),
+                    (
                         "Sources not healthy",
                         f"{unhealthy} <a class='small' href='/sources?state=unhealthy'>review sources</a>"
                         if unhealthy
@@ -2559,6 +2591,11 @@ def create_app(
             + "<p class='muted small'>Each count links to the filtered view it describes. Delivery is "
             "transport, not remediation. A pass that exited 0 while work is outstanding says 'deferred "
             "work', because finishing is not the same as having nothing left.</p>"
+            + "<p class='muted small'>CVE enrichment counts the watched CVEs by how their lookups stand. KEV-only ones "
+            "were named by a message but never measured: they are checked against the KEV catalogue on every pass "
+            "and measured a few per pass, one source in turn. A CVE stays watched for "
+            f"{core.REEVAL_WINDOW // core.DAY} days after its message, and for up to "
+            f"{enrichment.EXTENDED_WINDOW // core.DAY} days while its enrichment is outstanding.</p>"
         )
         return page("Dashboard", body, active="/", actions=sign_out_form(request))
 
@@ -5399,12 +5436,19 @@ def create_app(
 
         def run_row(run: dict) -> str:
             code_text, code_tone = _exit_code(run.get("code"))
+            left_by_budget = _budget_deferred(run)
+            # An incomplete pass keeps its own exit code (usually 0); the budget's outcome is shown beside it.
+            incomplete = (
+                ""
+                if left_by_budget is None
+                else f" {_badge('incomplete', 'warning')} <span class='muted small'>{left_by_budget} deferred</span>"
+            )
             return (
                 f"<tr><td class='nowrap'>{esc(_when(run.get('at')))}</td>"
                 f"<td class='num'>{esc(run.get('sent', 0))}</td>"
                 f"<td class='num'>{esc(run.get('parked', 0))}</td>"
                 f"<td class='num'>{esc(run.get('pending', 0))}</td>"
-                f"<td>{_badge(code_text, code_tone)}</td></tr>"
+                f"<td>{_badge(code_text, code_tone)}{incomplete}</td></tr>"
             )
 
         rows = "".join(run_row(run) for run in shown)
@@ -5474,6 +5518,7 @@ def create_app(
         runs = raw_runs if isinstance(raw_runs, list) else []
         last = runs[-1] if runs and isinstance(runs[-1], dict) else {}
         ok, _ = readiness(runtime.cfg, state, int(clock()))
+        coverage = enrichment.coverage(state.get("watch"), int(clock()))
         gauges = [
             ("pending", "Pending messages awaiting delivery", "gauge", _length(state.get("pending"))),
             ("parked", "Parked messages awaiting an operator decision", "gauge", _length(state.get("parked"))),
@@ -5491,6 +5536,24 @@ def create_app(
             ("last_pass_sent", "Messages delivered by the last pass", "gauge", _number(last.get("sent"))),
             ("last_pass_parked", "Messages parked by the last pass", "gauge", _number(last.get("parked"))),
             ("last_pass_pending", "Messages left pending by the last pass", "gauge", _number(last.get("pending"))),
+            (
+                "last_pass_incomplete",
+                "1 when the last pass ran out of its time budget and left work for the next pass",
+                "gauge",
+                int(_budget_deferred(last) is not None),
+            ),
+            (
+                "last_pass_deferred",
+                "Units of work the last pass's time budget left for the next pass",
+                "gauge",
+                _budget_deferred(last) or 0,
+            ),
+            (
+                "enrichment_oldest_age_seconds",
+                "Seconds the longest-waiting CVE with outstanding enrichment has waited (0 when none is outstanding)",
+                "gauge",
+                coverage.oldest_age or 0,
+            ),
             ("state_readable", "1 when the state document could be read", "gauge", 1),
             ("ready", "1 when the last pass is recent enough and the state is readable", "gauge", int(ok)),
         ]
@@ -5499,6 +5562,14 @@ def create_app(
             lines.append(f"# HELP advisory_radar_{name} {help_text}")
             lines.append(f"# TYPE advisory_radar_{name} {kind}")
             lines.append(f"advisory_radar_{name} {value}")
+        # Watched CVEs by how their enrichment stands. The label values are the fixed ``enrichment.STATES``, so the
+        # set is bounded, and every state has a sample, 0 included: a dashboard can tell "none waiting" from "unknown".
+        lines.append("# HELP advisory_radar_enrichment_cves Watched CVEs by how their enrichment stands")
+        lines.append("# TYPE advisory_radar_enrichment_cves gauge")
+        for name, count in zip(
+            enrichment.STATES, (coverage.measured, coverage.kev_only, coverage.deferred, coverage.failed), strict=True
+        ):
+            lines.append(f'advisory_radar_enrichment_cves{{state="{name}"}} {count}')
         # Per-source health, labelled by the configured source id. That id is a *name*: the validator refuses a
         # whole ``${NAME}`` reference in one, so a label cannot carry a credential, and a composed id
         # (``tenant-${X}``) is a naming choice its author publishes in routes and logs as well. The charset is

@@ -32,6 +32,12 @@ turns critical, and never re-sends what you already received.
   classification, delivery record and later notification events. The source filter matches the
   configured source id,
   never the advisory heading
+- A wall-clock budget per pass (`pass_budget`, 10 minutes by default): the sources, candidates and Adobe Commerce read a
+  pass has no time for are deferred and handled first by the next pass, never dropped; such a pass exits 0, is marked
+  `incomplete` in `/runs` and `/metrics`, and delivery of queued messages is outside the budget
+- The CVEs a message named beyond the lookup cap are durable work, not forgotten ones: each pass measures a few, one
+  source in turn, inside the same budget; KEV evidence escalates at once; the dashboard and `/metrics` count the
+  CVEs by state and show the oldest wait, and a CVE with enrichment outstanding stays watched for up to 30 days
 - Web UI + REST API, in-process scheduler (default every 15 min), atomic state on a volume:
   a JSON file by default, SQLite or PostgreSQL when `storage` says so
 - Per-entry release/drop on the parked queue, next to the bulk actions: each row shows its

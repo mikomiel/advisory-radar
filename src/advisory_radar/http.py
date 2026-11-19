@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import functools
 import http.client
 import io
@@ -13,7 +15,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 
 USER_AGENT = "advisory-radar (+https://github.com/mikomiel/advisory-radar)"
 #: One Discord message holds 2000 characters; titles and bodies are capped below it.
@@ -37,6 +39,34 @@ HTTP_TIMEOUT = 30
 #: receives of the answer and keep ``HTTP_TIMEOUT`` alone; a connect that spends the whole budget ends the request
 #: at its first receive.
 HTTP_DEADLINE = 120
+#: What the pass budget leaves for a request: set by ``request_ceiling`` around the calls a pass makes upstream, read
+#: when a request starts. A context variable, so ``urllib_http`` keeps the four-argument ``Http`` shape every
+#: plugin and test double is written against, and one thread's pass cannot cap another thread's request.
+_CEILING: contextvars.ContextVar[Callable[[], float] | None] = contextvars.ContextVar(
+    "advisory_radar_http_ceiling", default=None
+)
+
+
+@contextlib.contextmanager
+def request_ceiling(remaining: Callable[[], float]) -> Iterator[None]:
+    """Cap every request made inside the block at ``remaining()`` seconds, read as each request starts.
+
+    The request then takes ``min(HTTP_DEADLINE, remaining())`` for the whole response and ``min(HTTP_TIMEOUT,
+    remaining())`` for its connection, and none is started once nothing remains.
+    """
+    token = _CEILING.set(remaining)
+    try:
+        yield
+    finally:
+        _CEILING.reset(token)
+
+
+def ceiling_left() -> float | None:
+    """The seconds the innermost ``request_ceiling`` allows now, or ``None`` outside one."""
+    ceiling = _CEILING.get()
+    return None if ceiling is None else ceiling()
+
+
 #: One read of a body. Small enough that the deadline is checked often, large enough not to cost many calls.
 _READ_CHUNK = 64 * 1024
 
@@ -239,16 +269,22 @@ def urllib_http(
         # ``urllib`` opens its other handlers too -- ``file://`` would read a local file as a feed. Every source
         # and notifier this program talks to is HTTP(S), so any other scheme is a refused request, not a fetch.
         return 0, {}, b""
+    allowance, timeout = HTTP_DEADLINE, HTTP_TIMEOUT
+    left = ceiling_left()
+    if left is not None:
+        if left <= 0:
+            return 0, {}, b""  # the pass budget is spent: a request that could not finish is not started
+        allowance, timeout = min(allowance, left), min(timeout, left)
     # Taken before the connection is opened, so the time spent connecting counts against it; every receive after
     # that is capped at what is left of it (``_DeadlineReader``).
-    deadline = time.monotonic() + HTTP_DEADLINE
+    deadline = time.monotonic() + allowance
     try:
         # Built inside the guard: a malformed URL raises a ValueError whose text carries the URL, and a URL
         # can carry a token.
         request = _Request(
             url, data=body, headers={"User-Agent": USER_AGENT, **headers}, method=method, deadline=deadline
         )
-        with _OPENER.open(request, timeout=HTTP_TIMEOUT) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             status, response_headers = response.status, dict(response.headers)
             try:
                 payload = _read_within(response, MAX_RESPONSE_BYTES + 1, deadline)

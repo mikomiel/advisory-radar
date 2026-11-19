@@ -8,7 +8,8 @@ import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import replace
 
-from . import core, watchlist
+from . import core, enrichment, watchlist
+from .budget import CLASSIFY_STAGE, FETCH_STAGE, BudgetedHttp, PassBudget
 from .config import Config, secret_values
 from .http import Http, RedactFilter, urllib_http
 from .kev import load_kev
@@ -25,6 +26,76 @@ KEV_CACHE_NAME = "kev.json"
 #: ``run_pass`` exit code for "another pass held the lock, so nothing ran" on the non-blocking path. It is
 #: separate from 1 so a caller (the web UI's Run a pass now) can tell a skipped request from a failed one.
 PASS_BUSY = 2
+
+#: The Adobe Commerce pass in ``state["fetch_deferred"]``: it is deferred and resumed like a source. The ``@`` keeps
+#: it from ever equalling a configured source id.
+ADOBE_UNIT = "@adobe"
+
+#: The health error of a source whose fetch the pass budget ended. The source did nothing wrong, so it is not a fault
+#: of the pass (``source_ok``), but its health record still has to say that it did not answer.
+BUDGET_CUT_ERROR = "the pass budget ended this fetch before the source answered; it is read again next pass"
+
+
+def _stored_deferred(state: dict) -> list[str]:
+    """The units the last pass's budget left for this pass, in the order it left them."""
+    stored = state.get("fetch_deferred")
+    return list(dict.fromkeys(item for item in stored if isinstance(item, str))) if isinstance(stored, list) else []
+
+
+def _fetch_order(sources: Sequence[Source], state: dict) -> list[Source]:
+    """The sources in the order this pass reads them: the ones the last pass's budget deferred first.
+
+    A source the budget cut short, or that failed, is not in the list: it had its turn, so it goes behind the
+    deferred ones and one slow source cannot keep the sources after it waiting for ever. The rest keep the
+    configured order.
+    """
+    first = [source for identifier in _stored_deferred(state) for source in sources if source.id == identifier]
+    return [*first, *(source for source in sources if source not in first)]
+
+
+def _set_deferred(state: dict, identifiers: Sequence[str]) -> None:
+    """Record which due units the pass budget left for the next pass; the key exists only while any are waiting."""
+    if identifiers:
+        state["fetch_deferred"] = list(identifiers)
+    else:
+        state.pop("fetch_deferred", None)
+
+
+def _discard_pending(source: Source) -> None:
+    """Forget the validators or cursors a dropped window staged on its source.
+
+    A source stages them in ``fetch`` and writes them in ``commit``. Committing into a throwaway document empties
+    that staging without advancing anything the state holds; a later ``commit`` for the same source (one that is
+    only carrying candidates) would otherwise write the dropped window's validators.
+    """
+    commit = getattr(source, "commit", None)
+    if commit is not None:
+        commit({})
+
+
+def _record_cut(state: dict, source: Source, now: int) -> None:
+    """Note a source whose fetch the pass budget ended: its window is dropped whole, so no cursor or validator moves."""
+    _discard_pending(source)
+    LOG.warning("source %s: the pass budget ended its fetch; it is read again next pass", source.id)
+    _record_health(state, source.id, now, ok=False, error=BUDGET_CUT_ERROR)
+
+
+def _adobe_turn(
+    upstream: BudgetedHttp, state: dict, kev: frozenset[str], kev_known: bool, now: int, **language_kwargs: str
+) -> tuple[bool, str]:
+    """Run the Adobe Commerce pass inside the budget: ``(ok, status)`` with status ``ran``, ``deferred`` or ``cut``.
+
+    Deferred means the budget was spent before it could start, so it is read first next pass. Cut means the budget
+    ended one of its requests: the pass reads its bulletin list before anything else and records nothing when that
+    fails, so a failure that came with a refused request is the budget's and not the source's.
+    """
+    if upstream.expired():
+        return True, "deferred"
+    refused = upstream.refused
+    ok = core.adobe_pass(state, upstream, kev, kev_known, now, **language_kwargs)
+    if upstream.refused > refused:
+        return True, "cut"
+    return ok, "ran"
 
 
 def _drop_removed_sources(
@@ -152,6 +223,7 @@ def run_pass(
     sleep: Callable[[float], None] = time.sleep,
     dry_run: bool = False,
     lock_blocking: bool = True,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> int:
     """Run one pass under the state lock: exit 0 when every owed message landed, 1 on any fault.
 
@@ -160,6 +232,11 @@ def run_pass(
     other's state. ``lock_blocking=False`` returns :data:`PASS_BUSY` immediately when another pass holds it,
     so the web UI can say nothing ran.
 
+    The time the pass spends waiting on upstream servers is bounded by ``cfg.pass_budget_seconds``, measured on
+    ``monotonic`` so that a step of the wall clock cannot stretch or shorten it (see ``budget``). Work the budget
+    leaves undone is deferred and recorded, and a pass that deferred some still exits 0: it is incomplete, not
+    failed. Delivery is outside the budget.
+
     The blocking default has no timeout: every store waits for the holder however long that takes, so a pass
     that never finishes keeps each later blocking caller waiting. It returns 1 only when a store refuses the lock
     outright (``LockBusy`` on a blocking call) or cannot be used (``StoreUnavailable``), which is the failure the
@@ -167,10 +244,14 @@ def run_pass(
     """
     store = cfg.store()
     if dry_run:
-        return _run_pass(cfg, store, sources, notifiers, http=http, clock=clock, sleep=sleep, dry_run=True)
+        return _run_pass(
+            cfg, store, sources, notifiers, http=http, clock=clock, sleep=sleep, monotonic=monotonic, dry_run=True
+        )
     try:
         with store.lock(blocking=lock_blocking):
-            return _run_pass(cfg, store, sources, notifiers, http=http, clock=clock, sleep=sleep, dry_run=False)
+            return _run_pass(
+                cfg, store, sources, notifiers, http=http, clock=clock, sleep=sleep, monotonic=monotonic, dry_run=False
+            )
     except LockBusy:
         LOG.warning("another pass holds the state lock; skipped this run")
         return 1 if lock_blocking else PASS_BUSY
@@ -190,10 +271,15 @@ def _run_pass(
     http: Http,
     clock: Callable[[], float],
     sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
     dry_run: bool,
 ) -> int:
     """The pass itself; ``run_pass`` owns the state lock around it."""
     now = int(clock())
+    # Started with the lock held, so time spent waiting for the lock is not time spent upstream. Everything that
+    # reads from another server goes through ``upstream``; delivery below is handed the plain ``http``.
+    budget = PassBudget(cfg.pass_budget_seconds, monotonic)
+    upstream = BudgetedHttp(http, budget)
     try:
         stored = store.load()
     except (SourceError, StoreUnavailable) as exc:
@@ -227,12 +313,16 @@ def _run_pass(
     live_guids: set[str] = set()
     gap = False
     source_ok = True
-    kev, kev_known = load_kev(http, cfg.state_path.with_name(KEV_CACHE_NAME), save=not dry_run)
-    intel = core.Intel(http, cache, clock, sleep, nvd_key=cfg.nvd_api_key)
+    kev, kev_known = load_kev(upstream, cfg.state_path.with_name(KEV_CACHE_NAME), save=not dry_run)
+    intel = core.Intel(upstream, cache, clock, sleep, nvd_key=cfg.nvd_api_key, remaining=upstream.remaining)
     # Re-evaluate before classification: both share one NVD budget, and a busy news day must not starve a due
     # watch of the measurement that could escalate it. A watch created later this pass is evaluated next pass.
     # Every clause of the decision reads a source's own numbers, so both entry points take the resolved block:
     # the global one is the fallback, never a second opinion about a source that states its own.
+    # The CVEs a delivered message left unmeasured are drained here, one source in turn, inside the same stage: the
+    # refresh share of the pass budget bounds their time with the daily re-scores, ``enrichment.PER_PASS`` their count.
+    work = enrichment.select(state, now)
+    outcomes: dict[str, str] = {}
     core.reevaluate(
         state,
         intel,
@@ -242,12 +332,25 @@ def _run_pass(
         "",
         thresholds=cfg.thresholds,
         source_thresholds=cfg.source_thresholds,
+        work=work,
+        outcomes=outcomes,
         **language_kwargs,
     )
+    enrichment.served(state, work, outcomes)
 
     fetched_ids: set[str] = set()
     answered: list[tuple[object, object]] = []
-    for source in sources:
+    # What the pass budget keeps from this pass. A unit it never started is deferred, and the next pass starts with
+    # it. A source whose fetch it ended has had its turn: it is read again, but behind the deferred ones.
+    deferred_ids: list[str] = []
+    cut_short = 0
+    adobe_ok, adobe_status = True, ""
+    # The Adobe Commerce pass runs after classification, unless the budget deferred it last time: then it goes first.
+    adobe_first = cfg.adobe_commerce and ADOBE_UNIT in _stored_deferred(state)
+    upstream.stage = FETCH_STAGE
+    if adobe_first:
+        adobe_ok, adobe_status = _adobe_turn(upstream, state, kev, kev_known, now, **language_kwargs)
+    for source in _fetch_order(sources, state):
         interval = cfg.source_intervals.get(source.id)
         health = state.get("source_health")
         if interval and not _fetch_due(health.get(source.id) if isinstance(health, dict) else None, now, interval):
@@ -255,9 +358,20 @@ def _run_pass(
             # a source with carried candidates still joins the fairness rotation.
             LOG.debug("source %s: not due until %ds after its last fetch", source.id, interval)
             continue
+        if source.kind != "webhook" and upstream.expired():
+            # The fetch stage is over. A webhook source reads no network, so the budget cannot help it; this one
+            # is deferred whole, with no health recorded, and the next pass reads it first.
+            deferred_ids.append(source.id)
+            continue
+        refused = upstream.refused
         try:
-            window = source.fetch(http, state)
+            window = source.fetch(upstream, state)
         except Exception as exc:  # a source fault fails the pass but keeps state
+            if upstream.refused > refused:
+                # The budget ended a request of this fetch, so the fault is the budget's and not the source's.
+                _record_cut(state, source, now)
+                cut_short += 1
+                continue
             LOG.error("source %s: %s: %s; state kept", source.id, type(exc).__name__, exc)
             source_ok = False
             _record_health(
@@ -268,6 +382,12 @@ def _run_pass(
                 error=redact(f"{type(exc).__name__}: {exc}", secret_values(cfg)),
             )
             continue  # other sources still bootstrap; this one is seeded when it first answers
+        if upstream.refused > refused:
+            # A window that came back after a request of its fetch was refused may be partial, and a source need not
+            # check: dropping it whole costs one read next pass, while adopting it could skip an advisory for ever.
+            _record_cut(state, source, now)
+            cut_short += 1
+            continue
         window = SourceWindow(
             source.id,
             tuple(_namespaced(item, source.id) for item in window.items),
@@ -307,6 +427,12 @@ def _run_pass(
         # after another source persist this one's new window before its candidates were classified.
         answered.append((source, window))
 
+    # Written with the first save below, so the next pass finds the deferral. Losing it would cost only the order:
+    # a source that was never read is still due.
+    _set_deferred(state, deferred_ids)
+    # The fetch stage is over; what was captured is classified in the rest of the budget.
+    upstream.stage = CLASSIFY_STAGE
+
     carried = state.setdefault("carry", {})
     enabled_ids = {source.id for source in sources}
     answered_now = {source.id for source, _ in answered}
@@ -328,6 +454,7 @@ def _run_pass(
     # What the state already owns, read once: an out-of-scope webhook retry must not record a disposition for
     # an identifier that a queued or parked message owns and will report itself.
     claimed_before = core._claimed(state)
+    budget_carried = 0
     for source, window in units:
         if window is None:
             host = ""
@@ -390,9 +517,13 @@ def _run_pass(
             **language_kwargs,
             # An item published while this source could not be read is news, however old it is by now.
             last_ok=_last_success(state, source.id),
+            # Once the pass budget is spent the rest is carried to the next pass rather than looked up.
+            out_of_time=intel.out_of_time,
         )
         if left:
             carried[source.id] = [core.item_to_state(item) for item in left]
+            if intel.out_of_time():
+                budget_carried += len(left)  # carried either way; the spent budget makes the pass incomplete
         if window is not None:
             windows[source.id] = [item.guid for item in window.items]
             # Health follows the same rule as the validators: recorded only once this window's candidates are
@@ -446,7 +577,10 @@ def _run_pass(
     if not carried:
         state.pop("carry", None)  # only after every source has written into the attached dict
 
-    if stored is None and not fetched_ids and not cfg.adobe_commerce:
+    # Nothing was read, but only the pass budget is to blame: that is an incomplete pass like any other (the sources
+    # are deferred, and the next one starts with them), not the failure the branch below reports.
+    budget_only = source_ok and bool(deferred_ids or cut_short)
+    if stored is None and not fetched_ids and not cfg.adobe_commerce and not budget_only:
         # Nothing was read, so nothing may be classified -- but a failed read is evidence, and a fresh install
         # whose every source fails would otherwise report "not polled yet" for each of them while this log line
         # said otherwise. Only health is added to a seeded-empty document: no validator moves and no source is
@@ -473,7 +607,13 @@ def _run_pass(
         kept = {guid for guid in (state.get(key) or {}) if guid.split(":", 1)[0] not in fetched_ids or guid in live}
         core._prune_enrich_clock(state, key, kept)
 
-    adobe_ok = core.adobe_pass(state, http, kev, kev_known, now, **language_kwargs) if cfg.adobe_commerce else True
+    if cfg.adobe_commerce and not adobe_first:
+        adobe_ok, adobe_status = _adobe_turn(upstream, state, kev, kev_known, now, **language_kwargs)
+    if adobe_status == "deferred":
+        deferred_ids.append(ADOBE_UNIT)
+    elif adobe_status == "cut":
+        cut_short += 1
+    _set_deferred(state, deferred_ids)
 
     if dry_run:
         for entry in state["pending"][: core.DELIVERY_CAP]:
@@ -514,18 +654,31 @@ def _run_pass(
         )
     code = 0 if delivered and not state["parked"] and not gap and adobe_ok and source_ok else 1
     runs = state.setdefault("runs", [])
-    runs.append(
-        {
-            # ``at`` is the pass start, which is what the record has always held; ``finished_at`` is what
-            # readiness and the metric must measure, or a slow pass reports itself stale on completion.
-            "at": now,
-            "finished_at": int(clock()),
-            "sent": sent,
-            "parked": newly_parked,
-            "pending": len(state["pending"]),
-            "code": code,
-        }
-    )
+    record = {
+        # ``at`` is the pass start, which is what the record has always held; ``finished_at`` is what
+        # readiness and the metric must measure, or a slow pass reports itself stale on completion.
+        "at": now,
+        "finished_at": int(clock()),
+        "sent": sent,
+        "parked": newly_parked,
+        "pending": len(state["pending"]),
+        "code": code,
+    }
+    left_over = len(deferred_ids) + cut_short + budget_carried
+    if left_over:
+        # Incomplete is an outcome beside the code, not a failure: the budget did what it is for, and the work it
+        # left is stored. A pass that left none writes neither key, as a record has always looked.
+        record["outcome"] = "incomplete"
+        record["deferred"] = left_over
+        LOG.warning(
+            "pass incomplete: the %d s budget left %d unit(s) of work (%d deferred, %d cut short, %d candidate(s))",
+            cfg.pass_budget_seconds,
+            left_over,
+            len(deferred_ids),
+            cut_short,
+            budget_carried,
+        )
+    runs.append(record)
     del runs[:-200]
     store.save(state)  # the run record is part of the state, so it must be saved
     return code

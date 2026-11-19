@@ -5,6 +5,12 @@
 # How often sources are polled (<n><s|m|h>, at most 168h; default 15m).
 poll_interval: 15m
 
+# The most one pass may spend waiting on upstream servers (<n><s|m|h>, from 1m to 1h; default 10m).
+# Work it has no time for is deferred to the next pass, never dropped; the pass is marked
+# `incomplete` in /runs and /metrics and still exits 0. Delivery of queued messages is outside it.
+# YAML-only: /config does not edit it.
+# pass_budget: 10m
+
 # Where the auxiliary files are kept inside the container: the settings overlay,
 # the KEV cache and -- with no `storage:` below -- the state document itself.
 state_path: /data/state.json
