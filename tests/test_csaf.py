@@ -627,6 +627,53 @@ def test_an_offset_date_is_read_as_the_instant_it_names():
     assert row.release == epoch("2026-03-02T00:00:00Z")
 
 
+def test_an_index_time_keeps_its_fraction_of_a_second_to_the_nanosecond():
+    # The date-time of the index may carry one to nine digits after the second. Two rows that differ only in the
+    # ninth are two instants: the oldest-first order and the cursor of the source both depend on that.
+    base = epoch("2026-03-02T00:00:00Z")
+    rows = csaf.parse_index(
+        index(
+            ("2026/e.json", "2026-03-02T00:00:00.900Z"),
+            ("2026/b.json", "2026-03-02T00:00:00.123456789Z"),
+            ("2026/a.json", "2026-03-02T00:00:00.123456788+00:00"),
+            ("2026/d.json", "2026-03-02T00:00:00.1Z"),
+            ("2026/c.json", "2026-03-02T00:00:00Z"),
+        ),
+        NOW,
+    )
+    assert rows == (
+        csaf.Row("2026/c.json", base),
+        csaf.Row("2026/d.json", base, 100_000_000),
+        csaf.Row("2026/a.json", base, 123_456_788),
+        csaf.Row("2026/b.json", base, 123_456_789),
+        csaf.Row("2026/e.json", base, 900_000_000),
+    )
+
+
+def test_a_fraction_is_a_number_and_not_its_spelling():
+    rows = csaf.parse_index(
+        index(("2026/a.json", "2026-03-02T00:00:00.1Z"), ("2026/b.json", "2026-03-02T00:00:00.100000000Z")), NOW
+    )
+    assert {(row.release, row.nanos) for row in rows} == {(epoch("2026-03-02T00:00:00Z"), 100_000_000)}
+
+
+def test_an_offset_date_keeps_its_fraction():
+    (row,) = csaf.parse_index(index(("2026/a.json", "2026-03-02T02:00:00.5+02:00")), NOW)
+    assert (row.release, row.nanos) == (epoch("2026-03-02T00:00:00Z"), 500_000_000)
+
+
+def test_a_row_is_remembered_by_its_path_and_its_fraction():
+    # The cursor of the source remembers the rows it read by this. A row in whole seconds is its bare path, which is
+    # what an earlier version stored; one with a fraction adds it.
+    assert csaf.Row("2026/a.json", 5).listing == "2026/a.json"
+    assert csaf.Row("2026/a.json", 5, 7).listing == "2026/a.json@7"
+
+
+def test_a_document_is_dated_to_the_second_whatever_fraction_its_date_carries():
+    document = advisory(released="2026-03-10T10:00:00.750Z")
+    assert csaf.parse_document(body(document)).release == epoch("2026-03-10T10:00:00Z")
+
+
 @pytest.mark.parametrize(
     "raw",
     [
@@ -669,6 +716,12 @@ def test_an_offset_date_is_read_as_the_instant_it_names():
 def test_an_index_that_cannot_be_trusted_is_refused_whole(raw):
     with pytest.raises(csaf.CsafError, match="changes.csv"):
         csaf.parse_index(raw, NOW)
+
+
+def test_a_path_with_an_at_sign_is_refused():
+    # ``Row.listing`` joins a path and a fraction with ``@``: that is unambiguous only because no path holds one.
+    with pytest.raises(csaf.CsafError, match="changes.csv"):
+        csaf.parse_index(index(("2026/a@7.json", "2026-03-02T00:00:00Z")), NOW)
 
 
 def test_an_index_larger_than_the_cap_is_refused_unparsed(monkeypatch):

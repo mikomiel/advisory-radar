@@ -215,10 +215,12 @@ provider that answers slowly still makes progress. A new source starts at the ne
 the index lists, because older ones are history and not news
 ([first sight](configuration.md#first-sight-backlog-and-outages)). What a pass does not reach is read
 by the next one, in order, and nothing is skipped. A document the vendor revises is listed again
-with a later time and is read again. Rows listed at one second are all read, and a row listed late
-within a second already read is still read. The cursor, the document being retried and the documents
-given up on are kept in the state under `csaf`, keyed by a digest of the directory URL, which is
-never written there; pointing a source id at another directory starts it over.
+with a later time and is read again, also when that time is within the second the document was read
+in: an index may time a row to a fraction of a second, to the ninth digit, and the cursor tells such
+rows apart by it. Rows listed at one second are all read, and a row listed late within a second
+already read is still read, whatever its fraction. The cursor, the document being retried and the
+documents given up on are kept in the state under `csaf`, keyed by a digest of the directory URL,
+which is never written there; pointing a source id at another directory starts it over.
 
 **Falling behind is reported.** The limit is 200 because 20 was too few. The advisories index of
 2026-11-19 lists 24,719 documents last changed from 2026-11-05 on, 8,758 of them in the single
@@ -238,8 +240,11 @@ outage ([first sight](configuration.md#first-sight-backlog-and-outages)), and it
 read is not lost. A source that is down keeps the time of its last success. An item is history only
 when it is older than 7 days and was published more than a day before that time, so a document read
 a week and more after it was listed is still delivered, as long as the source was down all that
-time. `tests/test_csaf_source.py` runs this through whole passes, and pins the limit to at most
-half of that day.
+time. A source that gave up on a document is red for 30 days, so one that starts with such a document
+may never have a last success; it is measured from the pass at which it first answered instead. A
+document published after that is delivered however late it is read, and one published more than a
+day before it is history, as it is for any new source. `tests/test_csaf_source.py` runs both through
+whole passes, and pins the limit to at most half of that day.
 
 **What identifies and dates an item.** An item is identified by the document's id and a 16-digit
 hexadecimal digest of the statements it carries, the same however the vendor orders them. A revision

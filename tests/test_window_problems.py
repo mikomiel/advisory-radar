@@ -206,3 +206,93 @@ def test_a_problem_a_document_supplied_is_escaped_in_the_probe(tmp_path):
     response = probe(tmp_path, provider)
     assert "<script>alert(1)" not in response.text
     assert "&lt;script&gt;alert(1)" in response.text
+
+
+# --------------------------------------------------------------------------
+# A source that never reads cleanly: its outage baseline is its first answer
+
+DAY = 86400
+
+
+class Down:
+    """A source that cannot be read at all: its fetch raises, so it never answers a window."""
+
+    kind = "feed"
+
+    def __init__(self, source_id: str) -> None:
+        self.id = source_id
+
+    def fetch(self, http, state=None):
+        raise OSError("unreachable")
+
+
+def item_at(guid: str, cve: str, published: int) -> core.Item:
+    return core.Item(guid, f"Vendor advisory {cve}", "https://vendor.example.com/a", f"Fixes {cve}.", published, (cve,))
+
+
+def run_at(cfg, source, now: int, notifier=None) -> int:
+    """One pass at ``now``, for a test that lets days go by between passes."""
+    return pipeline.run_pass(
+        cfg,
+        [source],
+        [notifier or FakeNotifier(200)],
+        http=fake_http,
+        clock=lambda: float(now),
+        sleep=lambda seconds: None,
+    )
+
+
+def outcome(tmp_path, cve: str) -> str:
+    return json.loads((tmp_path / "state.json").read_text())["seen"][cve]["outcome"]
+
+
+def test_a_source_that_never_read_cleanly_is_measured_from_its_first_answer(tmp_path):
+    # A source with a document it cannot read is red, so it records no last success; without a baseline an outage
+    # of more than seven days would file everything it reads late as history. It keeps the pass it first answered at.
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path)
+    source = ProblemSource("test", [], ["doc-7.json: gone"])
+    assert run_at(cfg, source, CLOCK) == 1
+    assert health_of(tmp_path)["ok_at"] == 0, "red is not a success"
+
+    source.items = (
+        item_at("news", "CVE-2026-4343", CLOCK + 3600),  # published after the source began, read 9 days later
+        item_at("old", "CVE-2026-4444", CLOCK - 30 * DAY),  # published a month before the source began
+    )
+    assert run_at(cfg, source, CLOCK + 9 * DAY) == 1
+    assert outcome(tmp_path, "CVE-2026-4343") == "delivered"
+    assert outcome(tmp_path, "CVE-2026-4444") == "backlog"
+    health = health_of(tmp_path)
+    assert health["ok_at"] == 0, "the source never read cleanly"
+    assert health["first_at"] == CLOCK, "and the baseline stays where its first answer put it"
+
+
+def test_the_first_answer_is_not_the_first_attempt(tmp_path):
+    # A source that was unreachable has read nothing, so nothing was seen from which to measure an outage; it is
+    # bootstrapped when it first answers, as it always was.
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path)
+    assert run_at(cfg, Down("test"), CLOCK) == 1
+    assert health_of(tmp_path)["first_at"] == 0
+    assert run_at(cfg, ProblemSource("test", [], ["doc-7.json: gone"]), CLOCK + 10 * DAY) == 1
+    assert health_of(tmp_path)["first_at"] == CLOCK + 10 * DAY
+    assert run_at(cfg, Down("test"), CLOCK + 11 * DAY) == 1
+    assert health_of(tmp_path)["first_at"] == CLOCK + 10 * DAY, "a later failure keeps it"
+
+
+def test_the_last_success_outranks_the_first_answer_once_there_is_one(tmp_path):
+    make_policy(tmp_path)
+    cfg = make_config(tmp_path)
+    source = ProblemSource("test", [], ["doc-7.json: gone"])
+    assert run_at(cfg, source, CLOCK) == 1
+    source.problems = ()
+    clean = CLOCK + 20 * DAY
+    assert run_at(cfg, source, clean) == 0
+    health = health_of(tmp_path)
+    assert health["ok_at"] == clean and health["first_at"] == CLOCK
+    source.problems = ("doc-7.json: gone",)
+    # Published five days after the source began: news to a baseline of its first answer, but more than a day before
+    # the last clean pass, which is the instant the source has been measured from since.
+    source.items = (item_at("mid", "CVE-2026-4545", CLOCK + 5 * DAY),)
+    assert run_at(cfg, source, CLOCK + 40 * DAY) == 1
+    assert outcome(tmp_path, "CVE-2026-4545") == "backlog"

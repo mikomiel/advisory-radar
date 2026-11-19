@@ -228,19 +228,22 @@ def _csaf_directory(url: object) -> str:
 
 @dataclass(frozen=True)
 class _Cursor:
-    """How far a directory's ``changes.csv`` has been read: an instant, and the rows read at that very instant.
+    """How far a directory's ``changes.csv`` has been read: a second, and the rows read within that very second.
 
-    The index has a resolution of one second and a provider can list a score of documents within one, so the
-    instant alone cannot say whether a row dated exactly at the cursor was read. The paths read at that second
-    travel with it: a row is unread when it is newer than the instant, or at it and not among them. That is also
-    what reads a row that is listed late inside a second already read, which a bare instant would skip for good.
+    A provider can list a score of documents within one second, so the second alone cannot say whether a row dated
+    within it was read. The rows read in that second travel with it, each as its listing (``csaf.Row.listing``: the
+    path, and the fraction of the second when the index is finer than one): a row is unread when its second is
+    later than the cursor's, or is the cursor's and its listing is not among them. That is also what reads a row
+    that is listed late inside a second already read, at whatever fraction, which a bare second would skip for good,
+    and a document revised and listed again within the second it was read in, which only the fraction tells apart.
+    The second stays a whole number of epoch seconds, as the state has always held it.
     """
 
     release: int
     at: frozenset[str]
 
     def is_new(self, row: csaf.Row) -> bool:
-        return row.release > self.release or (row.release == self.release and row.path not in self.at)
+        return row.release > self.release or (row.release == self.release and row.listing not in self.at)
 
     def advance(self, passed: Sequence[csaf.Row]) -> _Cursor:
         """The cursor after ``passed``: the first unread rows in index order, so the newest of them is the last."""
@@ -248,7 +251,7 @@ class _Cursor:
             return self
         release = max(self.release, passed[-1].release)
         kept = self.at if release == self.release else frozenset()
-        return _Cursor(release, kept | {row.path for row in passed if row.release == release})
+        return _Cursor(release, kept | {row.listing for row in passed if row.release == release})
 
 
 def _shaped(value: object, **kinds: type) -> bool:
@@ -264,7 +267,8 @@ class _Stored:
     """What ``state["csaf"][id]`` holds that is still valid for this source: every field is checked, none trusted."""
 
     cursor: _Cursor | None = None
-    #: The one document being retried: its path, the release of the revision, and how many reads of it failed.
+    #: The one document being retried: its listing (``csaf.Row.listing``, stored as ``path``), the second the index
+    #: lists it at, and how many reads of it failed. A revision listed again is a new listing, with attempts of its own.
     retry: tuple[str, int, int] | None = None
     #: Documents given up on, by path: ``{"release": int, "since": int, "reason": str}``.
     given_up: dict[str, dict] = field(default_factory=dict)
@@ -336,11 +340,11 @@ class CsafSource:
             try:
                 document = self._document(http, row)
             except csaf.CsafError as exc:
-                same = stored.retry is not None and stored.retry[:2] == (row.path, row.release)
+                same = stored.retry is not None and stored.retry[:2] == (row.listing, row.release)
                 attempt = stored.retry[2] + 1 if same and stored.retry else 1
                 if attempt < csaf.MAX_ATTEMPTS:
                     # Stop here and read this document again next pass: going on would move the cursor past it.
-                    retry = {"path": row.path, "release": row.release, "n": attempt}
+                    retry = {"path": row.listing, "release": row.release, "n": attempt}
                     retrying = f"{row.path}: {exc} (attempt {attempt} of {csaf.MAX_ATTEMPTS})"
                     break
                 given_up[row.path] = {"release": row.release, "since": now, "reason": str(exc)}

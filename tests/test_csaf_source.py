@@ -371,6 +371,130 @@ def test_a_row_that_arrives_late_in_a_second_already_read_is_still_read(monkeypa
     assert read(source, provider, state).items == ()
 
 
+def listed_at(provider: Provider, number: int, age: int, fraction: str) -> None:
+    """List document ``number`` at ``age`` seconds ago and ``fraction`` of the next: an index that times rows finer."""
+    provider.rows[path_of(number)] = stamp(age).replace("Z", f".{fraction}Z")
+
+
+@pytest.mark.parametrize(
+    ("first", "second"), [("100", "900"), ("123456788", "123456789")], ids=["milliseconds", "ninth-digit"]
+)
+def test_a_revision_listed_within_the_second_its_predecessor_was_read_in_is_read_again(first, second):
+    # An index may time its rows to a fraction of a second, and the vendor can revise a document within one. The
+    # revision is listed under the same whole second, so a cursor that kept whole seconds would find the path read
+    # already and never fetch it. The nanosecond is the finest a date-time of the index can say.
+    provider, source, state = Provider(), make_source(), {}
+    provider.publish(1, 300)
+    listed_at(provider, 1, 300, first)
+    assert guids(read(source, provider, state)) == [guid_of(1)]
+    provider.publish(1, 300, version="2", known_affected=["WIDGET-2"])  # a revision that says something else
+    listed_at(provider, 1, 300, second)
+    revised = read(source, provider, state)
+    assert provider.documents_read() == [path_of(1)], "the revision is fetched"
+    assert guids(revised) == [guid_of(1, known_affected=["WIDGET-2"])]
+    assert read(source, provider, state).items == (), "and once"
+    assert provider.documents_read() == []
+
+
+def test_a_row_that_arrives_late_in_a_second_already_read_is_read_whatever_its_fraction():
+    # The guarantee of a second already read holds for an index finer than a second: the late row is listed within
+    # the second, at an earlier fraction than the document the cursor passed.
+    provider, source, state = Provider(), make_source(), {}
+    provider.publish(5, 500)
+    listed_at(provider, 5, 500, "900")
+    read(source, provider, state)
+    provider.publish(4, 500)
+    listed_at(provider, 4, 500, "100")
+    assert guids(read(source, provider, state)) == [guid_of(4)]
+    assert read(source, provider, state).items == ()
+
+
+def test_rows_that_differ_only_in_their_fraction_are_read_in_the_order_they_were_listed(monkeypatch):
+    monkeypatch.setattr(csaf, "MAX_DOCUMENTS", 1)
+    provider, source, state = Provider(), make_source(), {}
+    provider.publish(0, 1000)
+    read(source, provider, state)
+    for number, fraction in ((1, "300"), (2, "100"), (3, "200")):  # paths sort the other way round
+        provider.publish(number, 500)
+        listed_at(provider, number, 500, fraction)
+    order: list[str] = []
+    for _ in range(4):
+        read(source, provider, state)
+        order += provider.documents_read()
+    assert order == [path_of(2), path_of(3), path_of(1)]
+
+
+def test_a_revision_in_the_same_second_as_a_failing_one_has_its_attempts_to_itself():
+    # What identifies a failing document is the revision the index lists, not the path and the whole second.
+    provider, source, state = Provider(), make_source(), {}
+    provider.publish(1, 300)
+    break_title(provider, 1)
+    listed_at(provider, 1, 300, "100")
+    for attempt in (1, 2):
+        (problem,) = read(source, provider, state).problems
+        assert f"attempt {attempt} of 3" in problem
+    listed_at(provider, 1, 300, "900")  # the vendor lists it again, and it still fails
+    (problem,) = read(source, provider, state).problems
+    assert "attempt 1 of 3" in problem, "a document listed anew is a new revision, not a third read of the old one"
+    assert "@" not in problem, "what the operator reads names the document, not how the cursor remembers it"
+
+
+def test_a_fractional_row_that_keeps_failing_is_given_up_and_its_relisting_in_that_second_is_read():
+    # The attempts, the cursor and the report of a failing document reach the next pass through the state file
+    # whatever fraction its row was listed at; a document listed again within that second is a revision to read.
+    provider, state = Provider(), {}
+    provider.publish(1, 300)
+    break_title(provider, 1)
+    listed_at(provider, 1, 300, "100")
+    for attempt in range(1, csaf.MAX_ATTEMPTS):
+        window = read(make_source(), provider, state)
+        assert provider.documents_read() == [path_of(1)]
+        assert f"attempt {attempt} of 3" in window.problems[0]
+        state = json.loads(json.dumps(state))
+    given_up = read(make_source(), provider, state)
+    assert provider.documents_read() == [path_of(1)]
+    assert "given up" in given_up.problems[0]
+    state = json.loads(json.dumps(state))
+    assert read(make_source(), provider, state).problems == given_up.problems, "a document given up on stays reported"
+    assert provider.documents_read() == [], "and is not read again"
+    provider.publish(1, 300, version="2")  # the vendor corrects it, and the index lists it within the same second
+    listed_at(provider, 1, 300, "900")
+    corrected = read(make_source(), provider, state)
+    assert provider.documents_read() == [path_of(1)]
+    assert guids(corrected) == [guid_of(1)]
+    assert corrected.problems == ()
+
+
+def test_a_cursor_stored_before_fractions_were_kept_still_loads():
+    # What an index in whole seconds leaves in the state is what it has always been: whole seconds and bare paths.
+    provider, state = Provider(), {}
+    provider.publish(1, 300)
+    provider.publish(2, 200)
+    read(make_source(), provider, state)
+    digest = state["csaf"]["vendor"]["dir"]
+    stored = {"csaf": {"vendor": {"dir": digest, "release": CLOCK - 200, "at": [path_of(2)]}}}
+    assert state == stored
+    provider.publish(3, 100)
+    window = read(make_source(), provider, json.loads(json.dumps(stored)))
+    assert provider.documents_read() == [path_of(3)], "what the old cursor passed is not read again"
+    assert guids(window) == [guid_of(3)]
+
+
+def test_a_stored_bare_path_cannot_vouch_for_a_listing_with_a_fraction():
+    # A cursor stored by an earlier version holds paths without the fraction their row was listed at. When the index
+    # lists such a document at the cursor's second with a fraction, the stored path does not say which listing it
+    # was: the document is read once more rather than skipped, and the cursor then remembers the listing.
+    provider, state = Provider(), {}
+    provider.publish(1, 100)
+    read(make_source(), provider, state)
+    digest = state["csaf"]["vendor"]["dir"]
+    stored = {"csaf": {"vendor": {"dir": digest, "release": CLOCK - 100, "at": [path_of(1)]}}}
+    listed_at(provider, 1, 100, "500")
+    assert guids(read(make_source(), provider, stored)) == [guid_of(1)]
+    assert read(make_source(), provider, stored).items == ()
+    assert provider.documents_read() == []
+
+
 def test_the_directory_url_may_omit_its_trailing_slash():
     provider = Provider()
     provider.publish(1, 300)
@@ -754,6 +878,36 @@ def test_a_source_that_falls_behind_for_days_is_red_and_still_delivers_what_it_r
     assert [state["seen"][f"CVE-2026-{number:04d}"]["outcome"] for number in range(1, 6)] == ["delivered"] * 5
     assert len(notifier.sent) == 5, "the advisory read twelve days after it was listed is still delivered"
     assert state["source_health"]["vendor-csaf"]["ok_at"] == CLOCK + 12 * DAY
+
+
+def test_a_source_that_is_red_from_its_first_pass_still_delivers_what_it_reads_late(tmp_path, monkeypatch):
+    # A document the source cannot read keeps it red for a month, and a red source records no last success, so a
+    # source that starts with one never has an instant to measure an outage from. It is measured from its first pass
+    # instead: what was listed after that is news however late it is read, and what the vendor dated more than a day
+    # before it is history, as it is for every new source.
+    monkeypatch.setattr(csaf, "MAX_DOCUMENTS", 1)
+    clock, cfg, provider, notifier = Clock(), csaf_config(tmp_path), Provider(), FakeNotifier(200)
+    provider.publish(1, 60)
+    break_title(provider, 1)  # unreadable from the first pass on, and never replaced
+    source = csaf_source(clock)
+    exits = [run_pass(cfg, [source], provider, notifier, clock)]
+    for number in range(2, 6):  # listed after the source began, within a minute
+        provider.publish(number, -number, cve=f"CVE-2026-{number:04d}")
+    # Listed after the source began as well, but the vendor wrote it a month before.
+    provider.publish_regenerated(6, initial=60 * DAY, updated=30 * DAY, generated=-6, cve="CVE-2026-0006")
+    for _ in range(8):  # the first document is given up on, then a pass reads one a time, three days apart
+        clock.advance(3 * DAY)
+        exits.append(run_pass(cfg, [source], provider, notifier, clock))
+    assert exits == [1] * 9, "the source is never green"
+    state = state_of(tmp_path)
+    assert state["source_health"]["vendor-csaf"]["ok_at"] == 0
+    assert "given up" in state["source_health"]["vendor-csaf"]["error"]
+    outcomes = {cve: entry["outcome"] for cve, entry in state["seen"].items()}
+    assert outcomes == {
+        **{f"CVE-2026-{number:04d}": "delivered" for number in range(2, 6)},
+        "CVE-2026-0006": "backlog",
+    }, "read 9 to 18 days after it was listed, news is delivered; what was dated before the source began is history"
+    assert len(notifier.sent) == 4
 
 
 def test_an_old_advisory_the_provider_writes_again_is_history_and_a_revision_of_it_is_news(tmp_path):

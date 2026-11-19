@@ -609,9 +609,11 @@ one of them as history. So the pass compares the item with the source's last suc
 an item is `backlog` only when it is older than 7 days **and** was published more than one day
 before that read. Anything newer was not in a window an earlier pass read, so it is alerted
 however old it now is. The day covers a publisher that dates an entry slightly before the pass
-that first listed it. A source that has never been read successfully, or that was removed or
+that first listed it. A source that has never answered, or that was removed or
 disabled and later brought back (its health record is dropped while it does not run), keeps the
-plain 7-day rule, and an item carried over from an earlier pass is never history.
+plain 7-day rule. A source that has answered but never read cleanly (a window with problems turns it
+red, and a `csaf` directory reports them) has no last read; it is measured from the pass at which it
+first answered instead. An item carried over from an earlier pass is never history.
 
 ## Gap detection
 

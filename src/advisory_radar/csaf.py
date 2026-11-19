@@ -67,9 +67,10 @@ START_DOCUMENTS = 20
 MAX_DOCUMENTS = 200
 PASS_SECONDS = 120
 #: How long before now the oldest unread row may have been listed before the source says it is behind, in seconds.
-#: A source that says so is red, and a red source keeps the instant of its last success, from which ``core`` judges
-#: whether an item is news: this limit is at most half of ``core.BACKLOG_OUTAGE_SLACK``, so what a late pass reads
-#: is still news (``tests/test_csaf_source.py`` pins the relation).
+#: A source that says so is red, and a red source keeps the instant of its last success (of its first answer, when it
+#: has had none), from which ``core`` judges whether an item is news: this limit is at most half of
+#: ``core.BACKLOG_OUTAGE_SLACK``, so what a late pass reads is still news (``tests/test_csaf_source.py`` pins the
+#: relation).
 LAG_LIMIT = 12 * 60 * 60
 #: How many times one revision of one document may fail before the source gives up on it and goes on.
 MAX_ATTEMPTS = 3
@@ -116,9 +117,10 @@ _CVE = re.compile(r"CVE-[0-9]{4}-[0-9]{4,}")
 #: Every character a CSAF file name may hold (the standard lowercases the id and replaces the rest with ``_``),
 #: with a ``/`` between folders. No percent sign, query or fragment can occur, so a path is never quoted.
 _PATH = re.compile(r"[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*\.json")
-#: RFC 3339 ``date-time``, ASCII only and with a zone: the form CSAF and the provider indexes use.
+#: RFC 3339 ``date-time``, ASCII only and with a zone: the form CSAF and the provider indexes use. The groups are the
+#: time to the second, the fraction of the second (one to nine digits) and the zone.
 _DATE_TIME = re.compile(
-    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})"
+    r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]{1,9}))?(Z|[+-][0-9]{2}:[0-9]{2})"
 )
 
 
@@ -171,7 +173,21 @@ class Row:
     """One line of ``changes.csv``: a document path below the directory and the instant it last changed."""
 
     path: str
+    #: The instant, in whole seconds of the epoch.
     release: int
+    #: The nanoseconds after those seconds: an index may time a row finer than a second, to the ninth digit.
+    nanos: int = 0
+
+    @property
+    def listing(self) -> str:
+        """What a cursor remembers of a row it read: the path, and the fraction of the second when there is one.
+
+        A document revised within the second it was read in is listed again with the same path and the same whole
+        second, so the fraction is all that tells the revision from the row already read. A row in whole seconds is
+        its bare path, which is what an earlier version stored. The two forms never collide because no path holds an
+        ``@`` (``_PATH``).
+        """
+        return f"{self.path}@{self.nanos}" if self.nanos else self.path
 
 
 def _clean(text: str, limit: int) -> str:
@@ -185,14 +201,27 @@ def _clean(text: str, limit: int) -> str:
     return line if len(line) <= limit else line[: max(limit - 3, 0)] + "..."
 
 
-def _instant(value: object) -> int | None:
-    """The epoch of an RFC 3339 date-time with a zone, or None for anything else (a bare date, no zone, nonsense)."""
-    if not isinstance(value, str) or _DATE_TIME.fullmatch(value) is None:
+def _moment(value: object) -> tuple[int, int] | None:
+    """An RFC 3339 date-time with a zone as whole epoch seconds and the nanoseconds after them, else None.
+
+    None is anything else (a bare date, no zone, nonsense). The fraction is read from the text, to the ninth digit
+    the pattern accepts, because ``datetime`` keeps six and a float timestamp fewer still.
+    """
+    match = _DATE_TIME.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
         return None
+    clock, fraction, zone = match.groups()
     try:
-        return int(datetime.fromisoformat(value).timestamp())
+        seconds = int(datetime.fromisoformat(clock + zone).timestamp())
     except (ValueError, OverflowError, OSError):
         return None
+    return seconds, int((fraction or "").ljust(9, "0"))
+
+
+def _instant(value: object) -> int | None:
+    """The epoch second of an RFC 3339 date-time with a zone, or None: a document is dated to the second."""
+    moment = _moment(value)
+    return None if moment is None else moment[0]
 
 
 def _unique_items(validator, unique, instance, schema):
@@ -470,7 +499,7 @@ def _row_path_ok(path: str) -> bool:
 
 
 def parse_index(raw: bytes, now: float) -> tuple[Row, ...]:
-    """``changes.csv`` as rows, oldest first (ties by path), or ``CsafError`` when any part of it cannot be trusted.
+    """``changes.csv`` as rows, oldest first to the nanosecond (ties by path), or ``CsafError`` if any is untrusted.
 
     The index is refused whole rather than read around: a row that is skipped is a document that is never read,
     and nothing would say so. Every path must be a plain relative ``.json`` name below the directory (no scheme,
@@ -495,17 +524,18 @@ def parse_index(raw: bytes, now: float) -> tuple[Row, ...]:
             path, stamp = fields
             if not _row_path_ok(path):
                 raise CsafError(f"changes.csv row {number}: the path is not a plain relative .json name")
-            release = _instant(stamp)
-            if release is None:
+            moment = _moment(stamp)
+            if moment is None:
                 raise CsafError(f"changes.csv row {number}: the timestamp is not an RFC 3339 date-time with a zone")
+            release, nanos = moment
             if release > latest:
                 raise CsafError(f"changes.csv row {number}: the timestamp is in the future")
             if path in seen:
                 raise CsafError(f"changes.csv row {number}: the path is listed twice")
             seen.add(path)
-            rows.append(Row(path, release))
+            rows.append(Row(path, release, nanos))
     except csv.Error:
         raise CsafError("changes.csv is not well-formed CSV") from None
     if not rows:
         raise CsafError("changes.csv lists no documents")
-    return tuple(sorted(rows, key=lambda row: (row.release, row.path)))
+    return tuple(sorted(rows, key=lambda row: (row.release, row.nanos, row.path)))
