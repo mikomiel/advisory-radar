@@ -691,8 +691,10 @@ written in the YAML is carried over by id when the notifier form rewrites the li
 `/alerts` keeps its filters in the URL (`tag`, `source` — the configured source id, never the
 advisory heading — `outcome`, `q`, `since` and `until`, the dates as inclusive UTC days) and
 pages by keyset cursor rather than an offset, so a reload, a bookmark or a shared link shows
-the same rows and adding an advisory cannot shift a page. Each row links to the advisory's
-page (the identifier is encoded in the path, so one containing slashes still opens), which
+the same rows and adding an advisory cannot shift a page. While an [inventory](inventory.md) is
+imported, `inventory` (`applies`, `not_affected` or `unknown`) filters by the evidence it gives.
+Each row links to the advisory's page (the identifier is encoded in the path, so one containing
+slashes still opens), which
 shows the stored classification and delivery record — tag, source id and heading, title,
 identifiers and CVEs, KEV-only CVEs, matched products, per-CVE level and CVSS, and the
 notifiers that accepted the message — and says the details were not recorded for a seen

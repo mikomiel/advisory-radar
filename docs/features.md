@@ -32,6 +32,11 @@ turns critical, and never re-sends what you already received.
   classification, delivery record and later notification events. The source filter matches the
   configured source id,
   never the advisory heading
+- Installed-software evidence: import an SBOM (CycloneDX or SPDX 2.x JSON) or an OSV-Scanner v2 result
+  by upload on `/inventory` or from a drop directory, and the advisory page says whether the
+  installed version applies (with the fix), is not affected, or is unknown, kept apart from text
+  relevance, with the file, digest and time it came from; bounded, never executed, and with no
+  effect on routing or notifications ([details](inventory.md))
 - Web UI + REST API, in-process scheduler (default every 15 min), atomic state on a volume:
   a JSON file by default, SQLite or PostgreSQL when `storage` says so
 - Per-entry release/drop on the parked queue, next to the bulk actions: each row shows its

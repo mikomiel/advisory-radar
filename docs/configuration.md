@@ -354,10 +354,12 @@ message's title as it was written.
 ## Advisories, filters and the queue
 
 `/alerts` filters the seen advisories by severity tag, the configured source id the message
-was queued from, outcome, a case-insensitive text search (identifier and title) and an
-inclusive UTC day range. The source filter matches the stored `source_id` exactly and never
-the advisory heading: the heading is display text, and a record written before source ids
-were stored carries none, so the filter excludes it rather than matching an empty value.
+was queued from, outcome, a case-insensitive text search (identifier and title), an
+inclusive UTC day range and, while an [inventory](inventory.md) is imported, the evidence it
+gives (`inventory=applies`, `not_affected` or `unknown`). The source filter matches the stored
+`source_id` exactly and never the advisory heading: the heading is display text, and a record
+written before source ids were stored carries none, so the filter excludes it rather than
+matching an empty value.
 Every filter lives in the URL query string, so a reload or a shared link keeps it. The list
 is paged with a keyset cursor (50 rows, newest first by time then identifier) instead of a
 fixed cap, and each row links to the advisory's page (the identifier is encoded in the path,
@@ -453,6 +455,25 @@ event is the only history that names it. `/advisories/<id>` lists those events u
 **Notifications**, and `/alerts` shows the latest 20 escalation and Adobe events under
 **Recent notifications**, independent of the filters — the general history still discovers a
 notification after its queue entry has left.
+
+## Inventory
+
+An imported SBOM or scan result adds version-aware evidence to the advisory page and a filter to
+`/alerts`; it changes no routing, priority or notification. The web UI uploads a file on
+`/inventory`, and the YAML can name a directory that a scanner or a CI job writes into:
+
+```yaml
+inventory:
+  dir: /data/inventory     # optional: the newest *.json file here is read at the start of each pass
+  max_age_days: 30         # 1..3650: after this an inventory can no longer clear an advisory
+```
+
+`dir` is YAML-only (the overlay cannot set it) and must be a directory inside the directory of
+`state_path` or of the configuration file, and not contain the directory of `state_path`; a
+relative name is relative to the directory of `state_path`. With the shipped compose file `/data`
+is the data volume, so `/data/inventory` is a directory of that volume. Without `dir`, an upload on
+`/inventory` is the only way in. Formats, limits and the meaning of each result are in
+[inventory.md](inventory.md).
 
 ## Settings without a restart
 

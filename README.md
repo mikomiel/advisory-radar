@@ -69,6 +69,8 @@ Kubernetes.
 
 - [Configuration](docs/configuration.md) — watchlist, thresholds, routing,
   delivery, settings, storage and gap detection.
+- [Inventory](docs/inventory.md) - SBOM and scan-result import, and the version-aware
+  evidence it adds to an advisory.
 - [Sources](docs/sources.md) — the source catalogue, probe behaviour, intervals
   and OPML import.
 - [Deployment](docs/deployment.md) — compose, Podman, health and metrics.
