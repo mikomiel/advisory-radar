@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import replace
 
-from . import core, retention, watchlist
+from . import applicability, core, inventory, retention, watchlist
 from .config import Config, secret_values
 from .http import Http, RedactFilter, log_safe, urllib_http
 from .kev import load_kev
@@ -242,6 +242,10 @@ def _run_pass(
     if not dry_run:
         # After ownership was settled above, which reads the snapshots it is about to move.
         retention.retire_deliveries(state, cfg.state_path, now)
+    # An imported inventory only adds evidence to a page: it is read here so the OSV records fetched below can be
+    # kept for it, and it never changes what is classified, queued, routed or delivered. A dry run writes nothing,
+    # so it does not look at the drop directory either.
+    watching = None if dry_run else inventory.refresh(cfg.state_path, cfg.inventory_dir, state, now)
     # Both of these must come from the state document that is actually written: a detached dict never
     # reaches disk, so the first window was lost and the 24h cache was never persisted.
     windows = _source_windows(state)
@@ -513,6 +517,8 @@ def _run_pass(
         LOG.info("dry run: nothing sent, no state written")
         return 0 if source_ok and adobe_ok and not gap else 1
 
+    if watching is not None:
+        applicability.record_facts(state, intel.affected, now)
     store.save(state)  # pending is durable before the first POST
     queued, parked_before = len(state["pending"]), len(state["parked"])
     if not notifiers and state["pending"]:

@@ -23,7 +23,10 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from email.message import Message
+from email.parser import HeaderParser
 from pathlib import Path
 
 import yaml
@@ -31,7 +34,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from itsdangerous import BadSignature, URLSafeSerializer
 
-from . import __version__, core, delivery, feeds, pipeline, watchlist
+from . import __version__, applicability, core, delivery, feeds, inventory, pipeline, watchlist
 from .catalogue import SOURCE_SPECS
 from .config import (
     DEFAULT_THRESHOLDS,
@@ -238,6 +241,7 @@ _NAV = (
     ("/config", "Config"),
     ("/sources", "Sources"),
     ("/watchlist", "Watchlist"),
+    ("/inventory", "Inventory"),
     ("/runs", "Runs"),
 )
 
@@ -454,7 +458,7 @@ def _day_text(value: object) -> str:
 #: One page of /alerts: a screenful of rows, and small enough to stay fast on a phone.
 ALERT_PAGE_SIZE = 50
 #: The filters /alerts keeps in the URL. One tuple, so the form and the pagination links cannot disagree.
-ALERT_FILTERS = ("tag", "source", "outcome", "q", "since", "until")
+ALERT_FILTERS = ("tag", "source", "outcome", "q", "since", "until", "inventory")
 #: The outcomes a seen record can carry. A filter value outside this list matches nothing.
 SEEN_OUTCOMES = ("delivered", "dropped", "filtered", "suppressed", "backlog", "alias", "not-security")
 #: The states one inbox row can carry, most current first. ``open`` is a filter over the queue states, never a
@@ -1435,6 +1439,7 @@ def _seen_advisory(
     record: Mapping,
     delivery: Mapping | None = None,
     events: Sequence[tuple[str, Mapping]] = (),
+    evidence: tuple[str, str] | None = None,
 ) -> str:
     """The detail page for an identifier the state has seen: the snapshot, or only what the seen record holds.
 
@@ -1465,7 +1470,7 @@ def _seen_advisory(
         return (
             "<p>The state holds this identifier, but only its outcome and when it was recorded.</p>"
             + explanation
-            + _facts(facts)
+            + _facts([*facts, *([evidence] if evidence else [])])
             # A suppressed CVE gets no snapshot, so its original record is minimal -- but a later escalation
             # still added an event, and the page must show it rather than hide the only explanation.
             + _notification_history(events, exclude=reference if isinstance(reference, str) else None)
@@ -1490,6 +1495,8 @@ def _seen_advisory(
         ("CVEs in this message", _identifier_list(record.get("cves"))),
         ("KEV-only (not scored here)", _identifier_list(record.get("kev_only"))),
         ("Matched products", _identifier_list(record.get("products"))),
+        # Confirmed applicability sits under the text relevance it is kept apart from.
+        *([evidence] if evidence else []),
         ("Accepted by", delivered),
         ("Advisory", _external_link(record.get("link")) or "<span class='muted'>not recorded</span>"),
     ]
@@ -1503,7 +1510,12 @@ def _seen_advisory(
     )
 
 
-def _queued_advisory(state_label: str, entry: Mapping, events: Sequence[tuple[str, Mapping]] = ()) -> str:
+def _queued_advisory(
+    state_label: str,
+    entry: Mapping,
+    events: Sequence[tuple[str, Mapping]] = (),
+    evidence: tuple[str, str] | None = None,
+) -> str:
     """The detail page for a pending or parked message: everything the queued entry itself holds.
 
     ``events`` is the identifier's delivery history, if it has one: an escalation about an already-delivered
@@ -1528,6 +1540,7 @@ def _queued_advisory(state_label: str, entry: Mapping, events: Sequence[tuple[st
         ("CVEs in this message", _identifier_list(entry.get("cves"))),
         ("KEV-only (not scored here)", _identifier_list(entry.get("kev_only"))),
         ("Matched products", _identifier_list(entry.get("products"))),
+        *([evidence] if evidence else []),
         ("Accepted by", _identifier_list(accepted)),
         ("Delivery attempts", attempts_text),
         ("First attempt (UTC)", esc(first) or "<span class='muted'>not attempted yet</span>"),
@@ -1842,6 +1855,258 @@ async def _body(request: Request, limit: int) -> bytes:
             raise BodyTooLarge
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+# --- the installed-software inventory ----------------------------------------------------------------------
+
+#: What an inventory upload carries besides the file: the form token and the multipart framing.
+UPLOAD_OVERHEAD_BYTES = 64 * 1024
+#: The whole request body an upload may have. A larger one is refused while it streams, before it is held in full.
+MAX_INVENTORY_UPLOAD_BYTES = inventory.MAX_INVENTORY_BYTES + UPLOAD_OVERHEAD_BYTES
+_UPLOAD_PARTS = frozenset({CSRF_FIELD, "file"})
+_BOUNDARY = re.compile(r"[0-9A-Za-z'()+_,\-./:=?]{1,70}")
+_PART_HEAD_LIMIT = 2048
+
+
+class UploadRefused(ValueError):
+    """An upload body that is not the one form this page offers. The message is fixed text, never request content."""
+
+
+def _header_text(value: object) -> str | None:
+    """A multipart header parameter as text, or ``None`` when it is not plain text (an RFC 2231 tuple, or absent)."""
+    return value if isinstance(value, str) else None
+
+
+def parse_upload(body: bytes, content_type: str) -> tuple[bytes, str, bytes]:
+    """The form token, the file name and the file content of an inventory upload, read strictly.
+
+    Exactly two parts are accepted, ``csrf`` and ``file``, once each, with nothing before the first boundary and
+    nothing after the last. This reads the one form the Inventory page offers, not multipart in general, and it
+    needs no third-party parser.
+    """
+    header = Message()
+    header["content-type"] = content_type
+    boundary = header.get_boundary()
+    if header.get_content_type() != "multipart/form-data" or not boundary or not _BOUNDARY.fullmatch(boundary):
+        raise UploadRefused("the upload is not a multipart form")
+    chunks = (b"\r\n" + body).split(b"\r\n--" + boundary.encode("ascii"))
+    closing = chunks[-1]
+    if len(chunks) < 3 or chunks[0] or not closing.startswith(b"--") or closing[2:].strip(b" \t\r\n"):
+        raise UploadRefused("the multipart body is malformed")
+    fields: dict[str, tuple[str | None, bytes]] = {}
+    for part in chunks[1:-1]:
+        head, found, content = part[2:].partition(b"\r\n\r\n")
+        if not part.startswith(b"\r\n") or not found or len(head) > _PART_HEAD_LIMIT:
+            raise UploadRefused("the multipart body is malformed")
+        # A browser sends a file name as raw UTF-8. Decoded here, the email parser sees text and keeps it; handed
+        # the bytes, it would replace every non-ASCII character of the name.
+        headers = HeaderParser().parsestr(head.decode("utf-8", "replace"))
+        name = _header_text(headers.get_param("name", header="content-disposition"))
+        if headers.get_content_disposition() != "form-data" or name not in _UPLOAD_PARTS or name in fields:
+            raise UploadRefused("the form carries a part this page does not offer")
+        fields[name] = (_header_text(headers.get_filename()), content)
+    uploaded = fields.get("file")
+    if uploaded is None or uploaded[0] is None:
+        raise UploadRefused("the form carries no file")
+    return fields.get(CSRF_FIELD, (None, b""))[1], uploaded[0], uploaded[1]
+
+
+#: The sentence of each verdict: ``(label, tone, text)``. The label is what the filter and the page call it.
+def _evidence_text(found: applicability.Evidence, max_age_days: int) -> tuple[str, str, str]:
+    installed = found.installed or "no version"
+    package = found.package
+    match found.reason:
+        case "affected":
+            fix = f"fixed in {found.fixed}" if found.fixed else "no fixed version recorded"
+            return "applies", "critical", f"installed {found.installed or 'version not recorded'}, {fix} ({package})"
+        case "fixed":
+            return "not affected", "ok", f"installed {installed} is at or after the fix, {found.fixed} ({package})"
+        case "outside":
+            return "not affected", "ok", f"installed {installed} is outside the affected versions ({package})"
+        case "no_component":
+            return (
+                "unknown",
+                "neutral",
+                f"no matching component in the inventory for {package}: an SBOM or a scan can omit packages",
+            )
+        case "unknown_version":
+            return (
+                "unknown",
+                "neutral",
+                f"the inventory lists {package} without a version that can be compared ({installed})",
+            )
+        case "unsupported":
+            ecosystem = package.split(" ", 1)[0]
+            return "unknown", "neutral", f"versions of {ecosystem} packages are not compared ({package}, {installed})"
+        case "partial":
+            return (
+                "unknown",
+                "neutral",
+                "the inventory is a scan, which lists only the packages it found something in, so it cannot rule out "
+                f"another installed version ({package}, installed {installed})",
+            )
+        case "stale":
+            return (
+                "unknown",
+                "warning",
+                f"the inventory is {found.age_days} days old (limit {max_age_days}): it can no longer confirm that "
+                f"this advisory does not apply ({package}, installed {installed})",
+            )
+        case _:
+            return (
+                "unknown",
+                "neutral",
+                "no comparable affected-version data is recorded for this advisory, or not for every vulnerability "
+                "it names",
+            )
+
+
+@dataclass(frozen=True)
+class _InventoryView:
+    """The stored inventory as one request sees it: loaded once, or the reason it could not be."""
+
+    stored: inventory.Inventory | None
+    problem: str
+    now: int
+    max_age_days: int
+
+    @property
+    def active(self) -> bool:
+        return self.stored is not None or bool(self.problem)
+
+    def evidence(self, state: Mapping, ids: Sequence[str]) -> applicability.Evidence | None:
+        if self.stored is None:
+            return None
+        return applicability.evidence_for(state, self.stored, ids, self.now, self.max_age_days)
+
+    def matches(self, state: Mapping, ids: Sequence[str], status: str) -> bool:
+        if self.stored is None:
+            # The page says "unknown" for an inventory that cannot be read, so the filter lists it as unknown too.
+            return self.active and status == "unknown"
+        found = self.evidence(state, ids)
+        return found is not None and found.status == status
+
+    def row(self, state: Mapping, ids: Sequence[str]) -> tuple[str, str] | None:
+        """The advisory page's fact row, or ``None`` when no inventory was ever imported."""
+        if not self.active:
+            return None
+        label = "Inventory evidence"
+        if self.stored is None:
+            return label, (
+                f"{_badge('unknown')} no evidence can be shown because the stored inventory cannot be read "
+                f"({esc(self.problem)}). <a href='/inventory'>Open Inventory</a>."
+            )
+        found = self.evidence(state, ids)
+        assert found is not None
+        name, tone, text = _evidence_text(found, self.max_age_days)
+        extra = ""
+        if found.status == "applies" and self.stored.format == "osv-scanner":
+            # A scan that ran no call analysis for this finding (or for its language) says nothing: unknown, never
+            # "not called".
+            reach = "unknown" if found.called is None else "called" if found.called else "not called"
+            extra = f" Reachability (scanner call analysis): {reach}, extra evidence only."
+        if found.stale and found.reason != "stale":
+            extra += f" The inventory is {found.age_days} days old (limit {self.max_age_days})."
+        source = f"{self.stored.format} {self.stored.name}, imported {_when(self.stored.imported_at)} UTC"
+        return label, (
+            f"{_badge(name, tone)} {esc(text)}.{esc(extra)}"
+            f"<br><span class='muted small'>From {esc(source)}. Text relevance is shown separately above.</span>"
+        )
+
+
+def _evidence_ids(identifier: str, *records: object) -> list[str]:
+    """The identifiers an advisory goes by: the one asked for, and every id its records name."""
+    ids = [identifier]
+    for record in records:
+        if isinstance(record, Mapping):
+            ids += _stored_strings(record.get("ids"))
+    return list(dict.fromkeys(ids))
+
+
+def _inventory_body(view: _InventoryView, directory: Path | None, drop: object, csrf: str, notice: str = "") -> str:
+    """The Inventory page: what is stored, how to replace it, and where the drop directory stands."""
+    if view.stored is not None:
+        stored = view.stored
+        age = max(0, view.now - stored.imported_at)
+        stale = age > view.max_age_days * 86400
+        facts = [
+            ("Format", _badge(stored.format)),
+            ("File name", esc(stored.name)),
+            ("SHA-256", f"<code>{esc(stored.sha256)}</code>"),
+            ("Size", f"{stored.size:,} bytes"),
+            ("Imported (UTC)", esc(_when(stored.imported_at))),
+            ("Imported by", "web upload" if stored.origin == "upload" else "drop directory"),
+            ("Document time", esc(stored.created) or "<span class='muted'>not stated</span>"),
+            ("Components", str(len(stored.components))),
+        ]
+        if stored.format == "osv-scanner":
+            facts.append(("Scan findings", str(len(stored.findings))))
+        if stored.skipped:
+            facts.append(("Skipped", f"{stored.skipped} without a package URL of a supported type"))
+        facts.append(
+            (
+                "Lists",
+                "every component the SBOM declares"
+                if stored.complete
+                else "only the packages the scan found something in; an absent package says nothing",
+            )
+        )
+        facts.append(
+            (
+                "Age",
+                f"{_age_text(age)} "
+                + (
+                    _badge(f"stale after {view.max_age_days} days", "warning")
+                    if stale
+                    else f"<span class='muted'>fresh for {view.max_age_days} days</span>"
+                ),
+            )
+        )
+        current = _facts(facts)
+    elif view.problem:
+        current = _notice(f"<strong>The stored inventory cannot be read.</strong> {esc(view.problem)}.", "critical")
+    else:
+        current = _empty(
+            "No inventory has been imported. Advisories are matched on text only, and no applicability evidence "
+            "is shown until one is."
+        )
+    if directory is None:
+        drop_text = (
+            "<p class='muted'>No drop directory is configured. Set <code>inventory.dir</code> in the YAML "
+            "configuration to pick up a file a scanner or a CI job writes there.</p>"
+        )
+    else:
+        look = drop if isinstance(drop, Mapping) else {}
+        outcome = _field(look.get("outcome"))
+        last = (
+            f"Last file looked at: {esc(_field(look.get('name')))}, {esc(outcome)} at {esc(_when(look.get('at')))} UTC"
+            + (f" ({esc(_field(look.get('error')))})" if look.get("error") else "")
+            + "."
+            if outcome
+            else "No file has been picked up yet."
+        )
+        drop_text = (
+            f"<p>Drop directory: <code>{esc(directory)}</code>. The newest <code>*.json</code> file is read at the "
+            f"start of each pass and replaces the inventory when its content changed. {last}</p>"
+        )
+    limit = inventory.MAX_INVENTORY_BYTES // (1024 * 1024)
+    form = (
+        '<form method="post" action="/inventory/upload" enctype="multipart/form-data">'
+        f'<input type="hidden" name="{CSRF_FIELD}" value="{esc(csrf)}">'
+        "<label>OSV-Scanner JSON, CycloneDX JSON or SPDX 2.x JSON "
+        '<input type="file" name="file" accept=".json,application/json" required></label> '
+        '<button class="btn btn-primary">Import</button></form>'
+    )
+    return (
+        notice
+        + current
+        + "<h2>Replace the inventory</h2>"
+        + form
+        + f"<p class='muted small'>Up to {limit} MiB and {inventory.MAX_ENTRIES:,} components. The file is read as "
+        "data only: nothing in it is run, fetched or followed. A file that is refused leaves the current inventory "
+        "in place, and an import replaces the previous inventory as a whole.</p>"
+        "<h2>Drop directory</h2>" + drop_text
+    )
 
 
 class InboxFull(Exception):
@@ -2600,6 +2865,7 @@ def create_app(
         before = _cursor_decode(request.query_params["before"]) if request.query_params.get("before") else None
         deliveries = state.get("deliveries")
         deliveries = deliveries if isinstance(deliveries, dict) else {}
+        held = inventory_view()
 
         def resolved(record: dict) -> dict:
             """The snapshot a seen record points at; the record's own time and outcome stay authoritative.
@@ -2618,6 +2884,9 @@ def create_app(
                 continue
             view = resolved(record)
             if _matches_seen(identifier, view, filters, since, until):
+                wanted = filters["inventory"]
+                if wanted and not held.matches(state, _evidence_ids(identifier, view), wanted):
+                    continue  # confirmed applicability is a separate filter from the text ones above
                 rows.append((_position(identifier, view), view))
         window, previous, following = _alert_page(rows, cursor, before)
 
@@ -2634,6 +2903,10 @@ def create_app(
         outcome_values = SEEN_OUTCOMES
         if filters["outcome"] and filters["outcome"] not in SEEN_OUTCOMES:
             outcome_values = (*SEEN_OUTCOMES, filters["outcome"])
+        inventory_options = "".join(option(value, filters["inventory"]) for value in ("", *applicability.STATUSES))
+        inventory_select = (
+            f"<label>Inventory<select name='inventory'>{inventory_options}</select></label>" if held.active else ""
+        )
         filter_form = (
             "<form class='toolbar' method='get' action='/alerts'>"
             f"<label>Tag<select name='tag'>{''.join(option(value, filters['tag']) for value in ('', *TAGS))}"
@@ -2641,6 +2914,7 @@ def create_app(
             f"<label>Source id<input type='text' name='source' value='{esc(filters['source'])}'></label>"
             f"<label>Outcome<select name='outcome'>"
             f"{''.join(option(value, filters['outcome']) for value in ('', *outcome_values))}</select></label>"
+            f"{inventory_select}"
             f"<label>Text<input type='text' name='q' value='{esc(filters['q'])}'></label>"
             f"<label>Since<input type='date' name='since' value='{esc(filters['since'])}'></label>"
             f"<label>Until<input type='date' name='until' value='{esc(filters['until'])}'></label>"
@@ -2854,9 +3128,12 @@ def create_app(
                 snapshot = (
                     deliveries.get(reference) if isinstance(deliveries, dict) and isinstance(reference, str) else None
                 )
-                body = _seen_advisory(record, snapshot if isinstance(snapshot, dict) else None, events)
+                evidence = inventory_view().row(state, _evidence_ids(identifier, record, snapshot))
+                body = _seen_advisory(record, snapshot if isinstance(snapshot, dict) else None, events, evidence)
             else:
-                body = _queued_advisory(label, record, events)
+                body = _queued_advisory(
+                    label, record, events, inventory_view().row(state, _evidence_ids(identifier, record))
+                )
             return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
         if events:
             # An Adobe bulletin is recorded only as its delivery event: it never had a seen record, so the
@@ -2866,6 +3143,77 @@ def create_app(
         # The detail is display text and a JSON encoder cannot write a raw surrogate, so it is escaped here;
         # the identifier itself was already compared exactly above.
         raise HTTPException(status_code=404, detail=f"no advisory {_response_text(identifier)} is recorded")
+
+    def inventory_view() -> _InventoryView:
+        """The stored inventory for one request, loaded once; an unreadable one carries its reason, not silence."""
+        cfg = runtime.cfg
+        try:
+            stored, problem = inventory.load(inventory.inventory_path(cfg.state_path)), ""
+        except inventory.InventoryError as exc:
+            stored, problem = None, str(exc)
+        return _InventoryView(stored, problem, int(clock()), cfg.inventory_max_age_days)
+
+    def inventory_page(request: Request, *, status: int = 200, notice: str = ""):
+        try:
+            drop = load_state().get("inventory_drop")
+        except (SourceError, StoreUnavailable):
+            drop = None  # the page is still the way to replace an inventory while the store is unreadable
+        body = _inventory_body(inventory_view(), runtime.cfg.inventory_dir, drop, csrf_token(request), notice)
+        return page("Inventory", body, active="/inventory", actions=sign_out_form(request), status_code=status)
+
+    @app.get("/inventory", response_class=HTMLResponse)
+    def inventory_get(request: Request):
+        """What is imported, with its provenance, and the form that replaces it."""
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        done = request.query_params.get("imported") == "1"
+        notice = (
+            _notice("<strong>Imported.</strong> The inventory below replaced the previous one.", "ok") if done else ""
+        )
+        return inventory_page(request, notice=notice)
+
+    async def require_upload(request: Request) -> None:
+        """Refuse an inventory upload in the order that costs least: session, size, framing, then the form token.
+
+        ``require_csrf`` cannot serve here: its body is a 64 KiB urlencoded form, and the token of this form is a
+        part of the multipart body. The body is read once, bounded while it streams, and kept on the request.
+        """
+        if not auth.valid(request):  # the endpoint itself redirects an unauthenticated caller
+            return
+        try:
+            raw = await _body(request, MAX_INVENTORY_UPLOAD_BYTES)
+        except BodyTooLarge:
+            raise HTTPException(status_code=413, detail="the upload is too large") from None
+        try:
+            supplied, filename, content = parse_upload(raw, request.headers.get("content-type", ""))
+        except UploadRefused as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        sent = request.headers.get(CSRF_HEADER, "").encode("utf-8", "surrogatepass") or supplied
+        if not sent or not hmac.compare_digest(csrf_token(request).encode(), sent):
+            raise HTTPException(status_code=403, detail="invalid form token; reload the page and try again")
+        request.state.upload = (filename, content)
+
+    @app.post("/inventory/upload", dependencies=[Depends(require_upload)])
+    def inventory_upload(request: Request):
+        """Import the uploaded file as the inventory, or refuse it whole and keep the current one."""
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        filename, content = request.state.upload
+        try:
+            document = inventory.parse(content, name=filename, now=int(clock()), origin="upload")
+        except inventory.InventoryError as exc:
+            # The message names a limit or a field, never the offending value; it is escaped all the same.
+            refusal = _notice(
+                f"<strong>Not imported.</strong> {esc(exc)}. The current inventory is unchanged.", "critical"
+            )
+            return inventory_page(request, status=400, notice=refusal)
+        try:
+            inventory.save(inventory.inventory_path(runtime.cfg.state_path), document)
+        except OSError:
+            LOG.exception("the inventory could not be stored")
+            failed = _notice("<strong>Not imported.</strong> The inventory could not be stored.", "critical")
+            return inventory_page(request, status=500, notice=failed)
+        return RedirectResponse("/inventory?imported=1", status_code=303)
 
     @app.get("/parked", response_class=HTMLResponse)
     def parked_page(request: Request):

@@ -667,6 +667,10 @@ class Intel:
         self._changelogs: dict[str, dict[str, tuple[str | None, tuple[str, ...], tuple[str, ...]]] | None] = {}
         #: The Node.js posts read in this pass by slug, ``None`` after a fault. Never in the state file.
         self._nodejs: dict[str, NodejsRelease | None] = {}
+        #: What each OSV record fetched in this pass says about its advisory, by advisory id: the CVE ids it aliases
+        #: (``cves``) and its raw ``affected`` list. Only the pass reads it, and only to keep applicability evidence
+        #: for an imported inventory; it never reaches a verdict.
+        self.affected: dict[str, dict] = {}
 
     def _get(self, url: str, extra_headers: Mapping[str, str] | None = None) -> tuple[int, object]:
         headers = {"Accept": "application/json"}
@@ -1004,6 +1008,9 @@ class Intel:
         # unknown, and it must not be suppressed by a LOW sibling. A withdrawn record also makes no completeness
         # claim, so an item naming it is never suppressed while its lifecycle is unknown to the verdict.
         complete = not withdrawn and (bool(cves) or cvss is not None)
+        affected = document.get("affected")
+        if isinstance(affected, list) and affected and not withdrawn:
+            self.affected[_normalise_id(identifier)] = {"cves": list(cves), "affected": affected}
         self._cache[ghsa] = {
             "at": int(self._clock()),
             "cves": list(cves),
