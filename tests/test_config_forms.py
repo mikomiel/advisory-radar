@@ -357,6 +357,27 @@ OFF = "  - id: standby\n    type: log\n    enabled: false\n"
 WITH_OFF = "sources: []\nnotifiers:\n" + OPS + OFF + REFERENCES
 TEST_TITLE = messages.level_title("en", "warning", messages.text("en", "test.title"))
 TEST_BODY = messages.text("en", "test.body")
+CONFIRM_FORM = 'action="/config/notifiers/test/confirm"'
+
+
+def confirmation_form(text: str) -> dict[str, str]:
+    """The fields the confirmation page's form posts back, as a browser would send them."""
+    form = block(text, CONFIRM_FORM, "</form>")
+    return {
+        html.unescape(name): html.unescape(value)
+        for name, value in re.findall(r"name=['\"]([^'\"]+)['\"] value=['\"]([^'\"]*)['\"]", form)
+    }
+
+
+def confirm(page: Page, identifier: str):
+    """Send the test message the way a browser does: ask, then post the form the confirmation page returned.
+
+    The form carries the binding to the notifier it was shown for, so a send is only ever made from a page that was
+    asked for; the binding is read from the page, never computed here.
+    """
+    ask = page.post("/config/notifiers/test", id=identifier)
+    assert ask.status_code == 200, "the confirmation page is offered"
+    return page.client.post("/config/notifiers/test/confirm", data=confirmation_form(ask.text))
 
 
 def test_a_row_offers_a_test_message_only_while_it_is_enabled(tmp_path):
@@ -381,14 +402,15 @@ def test_the_confirmation_form_is_what_actually_sends(tmp_path):
     ask = page.post("/config/notifiers/test", id="ops")
     csrf = CSRF_RE.search(ask.text)
     assert csrf, "the confirmation page carries its own form token"
-    sent = page.client.post("/config/notifiers/test/confirm", data={"csrf": csrf.group(1), "id": "ops"})
+    live = confirmation_form(ask.text)["live"]  # the binding the page carries, read the way a browser reads it
+    sent = page.client.post("/config/notifiers/test/confirm", data={"csrf": csrf.group(1), "id": "ops", "live": live})
     assert sent.status_code == 200
     assert len(page.sent) == 1
 
 
 def test_confirming_sends_one_real_message_through_the_running_notifier_and_shows_the_status(tmp_path):
     page = Page(tmp_path)
-    response = page.post("/config/notifiers/test/confirm", id="ops")
+    response = confirm(page, "ops")
     assert response.status_code == 200
     assert [item["url"] for item in page.sent] == [ENV["OPS_HOOK"]]
     payload = json.loads(page.sent[0]["body"])
@@ -401,12 +423,12 @@ def test_confirming_sends_one_real_message_through_the_running_notifier_and_show
 def test_a_notifier_takes_three_test_messages_a_minute_and_the_others_are_not_affected(tmp_path):
     page = Page(tmp_path)
     for _ in range(3):
-        assert page.post("/config/notifiers/test/confirm", id="ops").status_code == 200
-    refused = page.post("/config/notifiers/test/confirm", id="ops")
+        assert confirm(page, "ops").status_code == 200
+    refused = confirm(page, "ops")
     assert refused.status_code == 429
     assert int(refused.headers["retry-after"]) >= 1
     assert [item["url"] for item in page.sent] == [ENV["OPS_HOOK"]] * 3, "the refused one sent nothing"
-    assert page.post("/config/notifiers/test/confirm", id="hook").status_code == 200
+    assert confirm(page, "hook").status_code == 200
     assert page.sent[-1]["url"] == ENV["HOOK_URL"]
 
 
@@ -430,6 +452,184 @@ def test_a_notifier_saved_while_a_pass_holds_the_lock_is_not_tested_until_it_is_
     assert page.sent == []
 
 
+# A test goes through the notifier that is running, so the row, the confirmation and the send have to agree on it: an
+# id that is running as something else than the saved row says is not tested, and a confirmation is only good for
+# the notifier it was shown for.
+
+DISCORD_OPS = "sources: []\nnotifiers:\n  - id: ops\n    type: discord_webhook\n    url: ${OPS_HOOK}\n" + REFERENCES
+SMTP_OPS = (
+    "sources: []\nnotifiers:\n  - id: ops\n    type: smtp\n    host: smtp.example.net\n    from: radar@example.net\n"
+    "    to: ops@example.net\n    password: ${SMTP_PASSWORD}\n" + REFERENCES
+)
+
+
+def edit_yaml(page: Page, body: str) -> None:
+    """Replace the YAML file the way an operator does by hand: the running process has not read it."""
+    page.config_path.write_text(f"{body}\nstate_path: {page.tmp_path / 'state.json'}\n")
+
+
+def test_a_notifier_whose_type_was_edited_in_the_yaml_is_not_tested_before_the_reload(tmp_path):
+    page = Page(tmp_path, body=DISCORD_OPS)
+    edit_yaml(page, SMTP_OPS)  # the notifier that is running is still the Discord webhook
+    assert "not live yet" in notifier_rows(page.get().text)["ops"], "the row says that a test would not reach it"
+    for path in ("/config/notifiers/test", "/config/notifiers/test/confirm"):
+        refused = page.post(path, id="ops")
+        assert refused.status_code == 409
+        assert "not running" in refused.text and "Nothing was sent" in refused.text
+        assert CONFIRM_FORM not in refused.text, "there is nothing to confirm"
+    assert page.sent == []
+
+
+def test_a_notifier_whose_topic_was_saved_while_a_pass_holds_the_lock_is_not_tested_until_it_is_live(tmp_path):
+    page = Page(tmp_path, body=ONE)
+    with state_lock(page.runtime.cfg.state_path):
+        assert page.post("/config/notifiers", **{"enabled:ops": "1", "field:ops:topic": "elsewhere"}).status_code == 303
+        assert page.overlay()["notifiers"][0]["topic"] == "elsewhere"
+        assert "not live yet" in notifier_rows(page.get().text)["ops"], "the saved row is not what is running"
+        for path in ("/config/notifiers/test", "/config/notifiers/test/confirm"):
+            refused = page.post(path, id="ops")
+            assert refused.status_code == 409
+            assert "not running" in refused.text and CONFIRM_FORM not in refused.text
+    assert page.sent == []
+    # Once the reload has applied it, the same row is live and a test goes to the topic it shows.
+    assert page.post("/reload").status_code == 303
+    assert "not live yet" not in notifier_rows(page.get().text)["ops"]
+    assert confirm(page, "ops").status_code == 200
+    assert json.loads(page.sent[0]["body"])["topic"] == "elsewhere"
+
+
+def test_the_whole_confirmation_form_sends_when_nothing_changed_in_between(tmp_path):
+    page = Page(tmp_path, body=ONE)
+    assert "not live yet" not in notifier_rows(page.get().text)["ops"], "a row that is running as saved is not marked"
+    ask = page.post("/config/notifiers/test", id="ops")
+    assert ask.status_code == 200 and "<span class='muted'>ntfy</span>" in ask.text
+    form = confirmation_form(ask.text)
+    assert set(form) == {"csrf", "id", "live"}
+    assert re.fullmatch(r"[0-9a-f]{64}", form["live"]), "the form is bound to the notifier it was shown for"
+    sent = page.client.post("/config/notifiers/test/confirm", data=form)
+    assert sent.status_code == 200 and "Accepted" in sent.text
+    assert [item["url"] for item in page.sent] == [ENV["OPS_HOOK"]]
+
+
+@pytest.mark.parametrize("kind", NOTIFIER_SPECS)
+def test_a_notifier_that_runs_as_saved_is_not_marked_and_is_bound_whatever_its_type(tmp_path, kind):
+    example = NOTIFIER_SPECS[kind].example
+    env = {name: "dummy-value" for name in re.findall(r"\$\{([A-Z_][A-Z0-9_]*)\}", yaml.safe_dump(example))}
+    page = Page(tmp_path, body=yaml.safe_dump({"sources": [], "notifiers": [example]}), extra_env=env)
+    assert "not live yet" not in notifier_rows(page.get().text)[example["id"]]
+    # Asked and never confirmed: an smtp notifier does not go through the recording transport.
+    ask = page.post("/config/notifiers/test", id=example["id"])
+    assert ask.status_code == 200
+    assert re.fullmatch(r"[0-9a-f]{64}", confirmation_form(ask.text)["live"])
+
+
+def test_a_secret_file_replaced_after_the_last_reload_is_not_tested_until_it_is_reloaded(tmp_path):
+    secret = tmp_path / "ops-url"
+    secret.write_text("https://ntfy.example.net/OLD-SECRET\n")
+    body = "sources: []\nnotifiers:\n  - id: ops\n    type: ntfy\n    url: ${OPS_URL_FILE}\n    topic: advisories\n"
+    page = Page(tmp_path, body=body, extra_env={"OPS_URL_FILE": str(secret)})
+    secret.write_text("https://ntfy.example.net/NEW-SECRET\n")  # the notifier that is running still holds the old one
+    assert "not live yet" in notifier_rows(page.get().text)["ops"]
+    assert page.post("/config/notifiers/test/confirm", id="ops").status_code == 409
+    assert page.sent == []
+    assert page.post("/reload").status_code == 303
+    assert confirm(page, "ops").status_code == 200
+    assert [item["url"] for item in page.sent] == ["https://ntfy.example.net/NEW-SECRET"]
+
+
+@pytest.mark.parametrize(
+    ("written", "rewritten"),
+    [("topic: advisories", "topic: elsewhere"), ("url: ${OPS_HOOK}", "url: ${HOOK_URL}")],
+    ids=["another topic", "another variable for the url"],
+)
+def test_a_reload_between_the_confirmation_and_the_send_refuses_the_send(tmp_path, written, rewritten):
+    page = Page(tmp_path, body=ONE)
+    ask = page.post("/config/notifiers/test", id="ops")
+    assert ask.status_code == 200
+    form = confirmation_form(ask.text)
+    page.config_path.write_text(page.config_path.read_text().replace(written, rewritten))
+    assert page.post("/reload").status_code == 303
+    assert "not live yet" not in notifier_rows(page.get().text)["ops"], "the edit is live: row and notifier agree"
+    refused = page.client.post("/config/notifiers/test/confirm", data=form)
+    assert refused.status_code == 409
+    assert "changed after this confirmation" in refused.text and "Nothing was sent" in refused.text
+    assert page.sent == []
+    # Asking again confirms what is running now, and that form sends.
+    again = page.post("/config/notifiers/test", id="ops")
+    assert page.client.post("/config/notifiers/test/confirm", data=confirmation_form(again.text)).status_code == 200
+    assert len(page.sent) == 1
+
+
+def test_a_secret_file_replaced_and_reloaded_between_the_confirmation_and_the_send_refuses_the_send(tmp_path):
+    secret = tmp_path / "ops-url"
+    secret.write_text("https://ntfy.example.net/OLD-SECRET\n")
+    body = "sources: []\nnotifiers:\n  - id: ops\n    type: ntfy\n    url: ${OPS_URL_FILE}\n    topic: advisories\n"
+    page = Page(tmp_path, body=body, extra_env={"OPS_URL_FILE": str(secret)})
+    form = confirmation_form(page.post("/config/notifiers/test", id="ops").text)
+    secret.write_text("https://ntfy.example.net/NEW-SECRET\n")  # the entry reads the same, the destination does not
+    assert page.post("/reload").status_code == 303
+    assert "not live yet" not in notifier_rows(page.get().text)["ops"], "the new secret is live: row and notifier agree"
+    refused = page.client.post("/config/notifiers/test/confirm", data=form)
+    assert refused.status_code == 409 and "changed after this confirmation" in refused.text
+    assert page.sent == []
+
+
+def test_a_literal_url_edited_and_reloaded_between_the_confirmation_and_the_send_refuses_the_send(tmp_path):
+    page = Page(tmp_path, body=ONE.replace("url: ${OPS_HOOK}", "url: https://ntfy.example.net/first"))
+    form = confirmation_form(page.post("/config/notifiers/test", id="ops").text)
+    page.config_path.write_text(page.config_path.read_text().replace("/first", "/second"))
+    assert page.post("/reload").status_code == 303
+    refused = page.client.post("/config/notifiers/test/confirm", data=form)
+    assert refused.status_code == 409 and "changed after this confirmation" in refused.text
+    assert page.sent == []
+
+
+def test_the_binding_of_a_confirmation_cannot_be_recomputed_from_the_notifier_it_names(tmp_path):
+    bound = []
+    for name in ("one", "other"):  # one configuration, two apps: a digest of the entry alone would agree
+        (tmp_path / name).mkdir()
+        bound.append(confirmation_form(Page(tmp_path / name).post("/config/notifiers/test", id="ops").text)["live"])
+    assert bound[0] != bound[1], "anyone holding the entry's text could check a guess at its credential against it"
+
+
+@pytest.mark.parametrize(
+    "bound", ["", "0" * 64, "not-a-digest", "café"], ids=["empty", "another notifier", "not a digest", "not ASCII"]
+)
+def test_a_confirmation_bound_to_something_else_than_the_running_notifier_sends_nothing(tmp_path, bound):
+    page = Page(tmp_path)
+    refused = page.post("/config/notifiers/test/confirm", id="ops", live=bound)
+    assert refused.status_code == 409
+    assert "changed after this confirmation" in refused.text
+    assert page.sent == []
+
+
+def test_a_refused_confirmation_does_not_use_up_the_test_quota(tmp_path):
+    page = Page(tmp_path)
+    for _ in range(4):  # a notifier takes three test messages a minute: counted, the fourth would be a 429
+        assert page.post("/config/notifiers/test/confirm", id="ops", live="0" * 64).status_code == 409
+    assert confirm(page, "ops").status_code == 200
+    assert len(page.sent) == 1
+
+
+def test_a_confirmation_without_the_binding_sends_nothing_and_uses_no_quota(tmp_path):
+    page = Page(tmp_path)
+    for _ in range(4):  # no `live` field at all, as in a request that never came from the confirmation page
+        refused = page.post("/config/notifiers/test/confirm", id="ops")
+        assert refused.status_code == 409
+        assert "changed after this confirmation" in refused.text and "Nothing was sent" in refused.text
+    assert page.sent == []
+    for _ in range(3):  # a notifier takes three test messages a minute, and none of them went to the refusals
+        assert confirm(page, "ops").status_code == 200
+    assert confirm(page, "ops").status_code == 429
+    assert len(page.sent) == 3
+
+
+def test_the_confirmation_page_carries_no_value_a_reference_names(tmp_path):
+    ask = Page(tmp_path).post("/config/notifiers/test", id="ops")
+    assert ask.status_code == 200
+    assert not [name for name, value in ENV.items() if value in ask.text], "a value a reference names is on the page"
+
+
 def test_both_test_routes_need_the_session_and_the_form_token(tmp_path):
     page = Page(tmp_path)
     anonymous = TestClient(page.app)
@@ -441,7 +641,7 @@ def test_both_test_routes_need_the_session_and_the_form_token(tmp_path):
 
 def test_a_destination_that_refuses_is_reported_as_not_delivered(tmp_path):
     page = Page(tmp_path, http=lambda method, url, headers, body: (500, {}, b""))
-    response = page.post("/config/notifiers/test/confirm", id="ops")
+    response = confirm(page, "ops")
     assert response.status_code == 200
     assert "Not delivered" in response.text and "500" in response.text
 
@@ -451,7 +651,7 @@ def test_an_error_while_sending_is_reported_without_the_destination(tmp_path):
         raise RuntimeError(f"cannot reach {url}")
 
     page = Page(tmp_path, http=broken)
-    response = page.post("/config/notifiers/test/confirm", id="ops")
+    response = confirm(page, "ops")
     assert response.status_code == 200
     assert "Not delivered" in response.text and "RuntimeError" in response.text
     assert "OPS-HOOK-VALUE" not in response.text
@@ -461,8 +661,7 @@ def test_a_test_message_writes_neither_state_nor_overlay(tmp_path):
     page = Page(tmp_path)
     state_file = tmp_path / "state.json"
     before = state_file.read_bytes()
-    assert page.post("/config/notifiers/test", id="ops").status_code == 200
-    assert page.post("/config/notifiers/test/confirm", id="ops").status_code == 200
+    assert confirm(page, "ops").status_code == 200  # asks first, then confirms: neither writes anything
     assert len(page.sent) == 1
     assert state_file.read_bytes() == before
     assert not page.overlay_file.exists()
@@ -471,7 +670,7 @@ def test_a_test_message_writes_neither_state_nor_overlay(tmp_path):
 def test_a_sent_test_message_is_logged_once_without_the_destination(tmp_path, caplog):
     page = Page(tmp_path)
     with caplog.at_level(logging.INFO, logger="advisory_radar"):
-        page.post("/config/notifiers/test/confirm", id="ops")
+        confirm(page, "ops")
     lines = [record.getMessage() for record in caplog.records if "test message" in record.getMessage()]
     assert lines == ["test message sent through ops: status 200"]
 

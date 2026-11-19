@@ -25,6 +25,8 @@ import urllib.parse
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from secrets import token_bytes
+from typing import NamedTuple
 
 import yaml
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -47,6 +49,7 @@ from .config import (
 )
 from .http import Http, json_text, log_safe, private_destination, resolve_host, urllib_http
 from .notifiers import delivery_test_entry
+from .plugins import Notifier
 from .runtime import Runtime
 from .settings import (
     SECRET_KEYS,
@@ -2002,6 +2005,22 @@ class LoginThrottle:
         self._failures.pop(peer, None)
 
 
+class RunningNotifier(NamedTuple):
+    """The notifier a test message goes through, read from one snapshot of the live configuration.
+
+    The confirmation page and the send both use it, so they describe and reach the same notifier: ``live`` is the
+    expanded entry ``notifier`` was built from, ``cfg`` the configuration it runs under (the message language, the
+    values to keep off a page) and ``binding`` what a confirmation form carries to say which notifier it was shown
+    for.
+    """
+
+    id: str
+    notifier: Notifier
+    live: dict
+    cfg: Config
+    binding: str
+
+
 class BodyTooLarge(Exception):
     """The request body exceeded the endpoint's limit; it is refused before it is fully read."""
 
@@ -2490,6 +2509,9 @@ def create_app(
     throttle = LoginThrottle()
     test_throttle = LoginThrottle(window=TEST_SEND_WINDOW_SECONDS, attempts=TEST_SEND_MAX, clock=clock)
     test_throttle_lock = threading.Lock()
+    #: Made when the app starts, kept in memory and shown to nobody: it keys the digest a test confirmation carries
+    #: (see ``confirmation_binding``). One process serves the page, as its throttles above assume.
+    confirmation_key = token_bytes(32)
 
     def require_auth(request: Request) -> bool:
         return auth.valid(request)
@@ -3302,13 +3324,17 @@ def create_app(
         kind = entry.get("type")
         return NOTIFIER_SPECS.get(kind) if isinstance(kind, str) else None
 
-    def notifier_form_entries(entries, live_ids: set[str] | None = None, draft: Mapping[str, str] | None = None) -> str:
+    def notifier_form_entries(
+        entries, running: Mapping[str, tuple[Notifier, dict]] | None = None, draft: Mapping[str, str] | None = None
+    ) -> str:
         """One block per configured notifier: enabled, the keys its type reads, and its secret reference.
 
-        ``live_ids`` are the ids of the notifiers running now; an enabled row outside them is marked, because a test
-        message would not reach it. ``None`` (a runtime with no configuration file) marks nothing. ``draft`` is the
-        refused submission of this very form: every row shows what was typed in it, the way the save would have read
-        it (a box missing from the submission is unchecked), and a reference field gets only a whole reference back.
+        ``running`` is what runs now, by id (see :func:`running_notifiers`); an enabled row it does not run as the row
+        is saved is marked, because a test message would not reach it: the id is not running, or its notifier was
+        built from an entry that has been edited or saved since. ``None`` (a runtime with no configuration file)
+        marks nothing. ``draft`` is the refused submission of this very form: every row shows what was typed in it,
+        the way the save would have read it (a box missing from the submission is unchecked), and a reference field
+        gets only a whole reference back.
         """
         rows = []
         for entry in entries:
@@ -3340,7 +3366,7 @@ def create_app(
             note = "; ".join(part for part in (notifier_notes(entry), esc(unknown)) if part)
             pending = (
                 " " + _badge("not live yet", "warning")
-                if checked and live_ids is not None and effective_id(entry) not in live_ids
+                if checked and running is not None and not runs_as_saved(entry, running)
                 else ""
             )
             # The button submits this form's body to the confirmation page through ``formaction``, as a source's
@@ -3450,6 +3476,46 @@ def create_app(
     def effective_id(entry: dict) -> str:
         """The id this configured entry occupies once its references are expanded."""
         return expand_text(entry["id"]) or entry["id"]
+
+    def running_notifiers() -> tuple[Config, dict[str, tuple[Notifier, dict]]]:
+        """The live configuration and, by id, each notifier it runs with the expanded entry it was built from.
+
+        One read of the snapshot: ``cfg.notifiers`` and the built notifiers are the same list twice, so a reload
+        landing between two separate reads could pair an entry with another configuration's notifier. A runtime
+        made from a bare ``Config`` builds none, so nothing there is running.
+        """
+        cfg, _, built = runtime.snapshot()
+        return cfg, {notifier.id: (notifier, live) for live, notifier in zip(cfg.notifiers, built, strict=False)}
+
+    def runs_as_saved(entry: dict, running: Mapping[str, tuple[Notifier, dict]]) -> bool:
+        """Whether the live snapshot runs this saved entry as it stands: the id is there, built from the same keys.
+
+        The saved entry is compared as the loader would expand it, so a type, a topic or a reference changed in the
+        YAML or the overlay and not reloaded yet is not running as saved. An entry whose references cannot be
+        resolved cannot have been built, so it is not running either.
+        """
+        found = running.get(effective_id(entry))
+        if found is None:
+            return False
+        try:
+            return expand_entry(entry, runtime.environment) == found[1]
+        except ConfigError:
+            return False
+
+    def confirmation_binding(live: dict, language: str) -> str:
+        """What a test confirmation is bound to: the entry the running notifier was built from, and the language.
+
+        A confirmation is good for the notifier it was shown for, so a reload that replaces that notifier before
+        the button is pressed is refused instead of sending through the new one, whatever it changed: a topic, a
+        variable, a literal URL or what a ``${NAME}_FILE`` secret holds. The entry carries its credentials, and
+        the destination is usually one of them, so the digest is an HMAC under ``confirmation_key``: a page holds
+        a value nobody can reverse or check a guess at a credential against without that key, and a restart, which
+        makes a new key, refuses the confirmation it outlived.
+        """
+        canonical = json.dumps(
+            {"notifier": live, "language": language}, sort_keys=True, separators=(",", ":"), default=str
+        )
+        return hmac.new(confirmation_key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
 
     def source_entry_by_id(overlay: dict, identifier: str, *, effective: bool) -> dict | None:
         """The configured entry the submitted id names, looked up the way the page that submitted it renders.
@@ -4454,12 +4520,14 @@ def create_app(
         )
 
     def running_notifier(request: Request, form: dict[str, list[str]]):
-        """The saved notifier a test button named, the notifier running for it now, and the page refusing when none.
+        """The notifier a test button named as it runs now, and the page refusing when it cannot be tested.
 
         The button submits a raw id, as ``/config`` renders it, which is looked up in the saved document. What
-        sends is the notifier in the live snapshot under the id that entry expands to: one that is disabled, or was
-        saved after the last reload, is not there, and a test is refused rather than sent through anything but
-        what the row says.
+        sends is the notifier in the live snapshot under the id that entry expands to, and only when it was built
+        from the very entry the row shows: one that is disabled, was saved after the last reload or has been edited
+        since is not the notifier the row describes, and a test is refused rather than sent through anything but
+        what the row says. The notifier, the entry it was built from and the configuration come from one snapshot,
+        so the confirmation and the send cannot describe one notifier and use another.
         """
         identifier = first(form, "id").strip()
         document, _ = form_document(saved_overlay()[0])
@@ -4473,40 +4541,46 @@ def create_app(
         )
         if entry is None:
             notice = _notice(f"No configured notifier has id {safe_text(identifier)}.", "critical")
-            return None, None, notifier_test_page(request, notice, status_code=404)
-        wanted = effective_id(entry)
-        live = (
-            None
-            if entry.get("enabled", True) is False
-            else next((item for item in runtime.notifiers if item.id == wanted), None)
-        )
-        if live is None:
+            return None, notifier_test_page(request, notice, status_code=404)
+        cfg, running = running_notifiers()
+        found = None if entry.get("enabled", True) is False else running.get(effective_id(entry))
+        if found is None:
             notice = _notice(
                 f"{safe_text(identifier)} is not running: it is disabled, or it was saved after the last reload. "
                 "Nothing was sent.",
                 "warning",
             )
-            return entry, None, notifier_test_page(request, notice, status_code=409)
-        return entry, live, None
+            return None, notifier_test_page(request, notice, status_code=409)
+        if not runs_as_saved(entry, running):
+            notice = _notice(
+                f"{safe_text(identifier)} is not running as saved: the notifier that runs now was built from an entry "
+                "that has been edited or saved since the last reload. Reload the configuration, then test it. "
+                "Nothing was sent.",
+                "warning",
+            )
+            return None, notifier_test_page(request, notice, status_code=409)
+        notifier, live = found
+        return RunningNotifier(entry["id"], notifier, live, cfg, confirmation_binding(live, cfg.language)), None
 
     @app.post("/config/notifiers/test", dependencies=[Depends(require_csrf)])
     def ask_notifier_test(request: Request):
         """Show what a test would send and through which notifier. Nothing is sent: the person confirms here."""
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
-        entry, _, refusal = running_notifier(request, form_body(request))
+        running, refusal = running_notifier(request, form_body(request))
         if refusal is not None:
             return refusal
-        message = delivery_test_entry(runtime.cfg.language)
+        message = delivery_test_entry(running.cfg.language)
         return page(
             "Send a test message",
-            f"<h2>{safe_text(entry['id'])} <span class='muted'>{safe_text(entry.get('type', ''))}</span></h2>"
+            f"<h2>{safe_text(running.id)} <span class='muted'>{safe_text(running.live.get('type', ''))}</span></h2>"
             "<p>This sends one real message through the notifier that is running now, to the destination it is "
             "configured with. It uses the saved and applied configuration, never unsaved edits, and stores "
             "nothing.</p>"
             f"<pre>{esc(message['title'])}\n{esc(message['body'])}</pre>"
             f'<form method="post" action="/config/notifiers/test/confirm">{csrf_field(request)}'
-            f"<input type='hidden' name='id' value='{esc(entry['id'])}'>"
+            f"<input type='hidden' name='id' value='{esc(running.id)}'>"
+            f"<input type='hidden' name='live' value='{esc(running.binding)}'>"
             "<button class='btn btn-primary'>Send the test message</button> "
             "<a class='btn btn-quiet' href='/config#notifiers'>Cancel</a></form>",
             active="/config",
@@ -4515,38 +4589,53 @@ def create_app(
 
     @app.post("/config/notifiers/test/confirm", dependencies=[Depends(require_csrf)])
     def send_notifier_test(request: Request):
-        """Send one test message through a running notifier and show what the destination answered; store nothing."""
+        """Send one test message through a running notifier and show what the destination answered; store nothing.
+
+        The confirmation form says which notifier it was shown for, and only a form that carries the binding of the
+        notifier running now is sent: a form for another one, one that lost the field and a request that never came
+        from the confirmation page are refused before anything is counted or sent.
+        """
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
-        entry, live, refusal = running_notifier(request, form_body(request))
+        form = form_body(request)
+        running, refusal = running_notifier(request, form)
         if refusal is not None:
             return refusal
+        # A missing field reads as empty and fails the comparison. It runs on bytes, like the form token's: a field is
+        # attacker-supplied and a non-ASCII str is a TypeError.
+        if not hmac.compare_digest(first(form, "live").encode("utf-8", "surrogatepass"), running.binding.encode()):
+            notice = _notice(
+                f"{safe_text(running.id)} changed after this confirmation was shown, so it is not the notifier you "
+                "confirmed. Nothing was sent; ask for the test again to confirm the notifier that is running now.",
+                "warning",
+            )
+            return notifier_test_page(request, notice, status_code=409)
         with test_throttle_lock:
-            wait = test_throttle.refusal(live.id)
+            wait = test_throttle.refusal(running.notifier.id)
             if wait is None:
                 # Counted before the send: one that raises or hangs may still have reached the destination.
-                test_throttle.failed(live.id)
+                test_throttle.failed(running.notifier.id)
         if wait is not None:
             notice = _notice(
-                f"{safe_text(entry['id'])} takes at most {TEST_SEND_MAX} test messages in "
+                f"{safe_text(running.id)} takes at most {TEST_SEND_MAX} test messages in "
                 f"{TEST_SEND_WINDOW_SECONDS} seconds. Nothing was sent; try again in {wait} seconds.",
                 "warning",
             )
             return notifier_test_page(request, notice, status_code=429, headers={"Retry-After": str(wait)})
         try:
-            status = live.send(delivery_test_entry(runtime.cfg.language), http)
+            status = running.notifier.send(delivery_test_entry(running.cfg.language), http)
         except Exception as exc:  # an unreachable destination is the answer, not a traceback
-            LOG.warning("test message through %s raised %s", log_safe(live.id), type(exc).__name__)
-            detail = pipeline.redact(f"{type(exc).__name__}: {exc}", secret_values(runtime.cfg))
+            LOG.warning("test message through %s raised %s", log_safe(running.notifier.id), type(exc).__name__)
+            detail = pipeline.redact(f"{type(exc).__name__}: {exc}", secret_values(running.cfg))
             return notifier_test_page(request, _notice(f"Not delivered: {esc(detail)}", "critical"))
-        LOG.info("test message sent through %s: status %s", log_safe(live.id), status)
+        LOG.info("test message sent through %s: status %s", log_safe(running.notifier.id), status)
         if 200 <= status < 300:
             notice = _notice(f"Accepted: the destination answered {esc(status)}.", "ok")
         elif status == 0:
             notice = _notice("Not delivered: the destination did not answer.", "critical")
         else:
             notice = _notice(f"Not delivered: the destination answered {esc(status)}.", "critical")
-        return notifier_test_page(request, f"<h2>{safe_text(entry['id'])}</h2>{notice}")
+        return notifier_test_page(request, f"<h2>{safe_text(running.id)}</h2>{notice}")
 
     def refuse_notifier(request: Request, form: dict[str, list[str]], message: str):
         """The configuration page again, with the notifier form as it was submitted and the reason it was refused."""
@@ -4874,7 +4963,7 @@ def create_app(
         digest_checked = " checked" if digest_text.strip().lower() in {"1", "true", "yes", "on"} else ""
         raw_quiet_hours = document.get("quiet_hours", "")
         quiet_hours_text = raw_quiet_hours if isinstance(raw_quiet_hours, str) else ""
-        live_ids = {notifier.id for notifier in runtime.notifiers} if runtime.config_path is not None else None
+        running = running_notifiers()[1] if runtime.config_path is not None else None
         draft_notifiers = draft if draft_section == "notifiers" else None
         if draft_notifiers is not None:
             add_notifier = draft_notifiers.get("new:type", add_notifier)
@@ -5030,7 +5119,7 @@ def create_app(
             "elsewhere.</p>"
             f"{notifier_catalogue_table()}"
             f'<form method="post" action="/config/notifiers">{csrf}{form_state}'
-            f"{notifier_form_entries(notifiers, live_ids, draft_notifiers)}"
+            f"{notifier_form_entries(notifiers, running, draft_notifiers)}"
             f"{new_notifier}"
             "<button class='btn btn-primary'>Save notifiers</button></form>"
             "<h2 id='routes'><span class='sec-num'>05</span>Routes</h2>"

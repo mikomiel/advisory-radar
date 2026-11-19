@@ -522,7 +522,9 @@ import are not catalogue-driven and still answer a refusal with a short page tha
 what was typed. A form that went stale is still refused with `409`, on the page it always had.
 
 An enabled notifier row has **Send test message**. It asks first, then sends one real message
-through the notifier that is running now (see `notifiers.md`). It stores nothing.
+through the notifier that is running now (see `notifiers.md`). It stores nothing. A row whose saved
+entry is not what is running, because it was edited or saved since the last reload, is marked
+**not live yet** and is not tested until a reload applies it.
 
 ### Which variables the overlay may reference
 

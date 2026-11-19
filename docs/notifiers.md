@@ -42,12 +42,24 @@ Every enabled notifier row on `/config` has **Send test message**; a disabled ro
 confirmation first and sends nothing on the first click. The confirmation page names the notifier and shows the
 message; **Send the test message**
 then sends one real message through the notifier that is running now, the same message `advisory-radar
-test-notify` sends. Two consequences follow:
+test-notify` sends. Four consequences follow:
 
 - The test uses the live configuration, never unsaved edits. A notifier that is disabled, or was saved after the
   last reload, is not in it, and the page says so instead of sending.
+- It also has to be running as its row is saved. An entry edited in the YAML, or saved while a pass held the lock
+  (a new type, topic or variable), and not reloaded yet leaves the row marked **not live yet**, and a test is
+  refused with `409`: it would reach the notifier that is still running, not the one the row shows. So does a
+  `${NAME_FILE}` secret replaced since the last reload, because the running notifier still holds the old value.
+  Reload, then test.
+- The confirmation is bound to the notifier it was shown for. If a reload changes that notifier (any key of its
+  entry, a literal URL or what a `${NAME_FILE}` secret holds included, or the message language) before **Send the
+  test message** is pressed, the send is refused with `409` and nothing is sent; ask again to confirm what is
+  running now. The binding is an HMAC under a random key that the process makes when it starts and never shows or
+  stores, so the page holds no credential and nobody can check a guess at one against it. A restart between the
+  two clicks refuses the send in the same way, and so does a request that carries no binding or the wrong one: a
+  test is only sent from the form of a confirmation page that was asked for.
 - A notifier takes at most three test messages a minute. The fourth is answered with `429` and a
-  `Retry-After` header.
+  `Retry-After` header. A refused confirmation is not counted.
 
 The result page shows the HTTP status the destination answered, or that it did not answer. A test sends the
 message and nothing else: it writes no state and no overlay, and it is not recorded as an alert. A `log`
