@@ -77,11 +77,11 @@ def _detach_log_redaction():
 
 
 def fake_http(method, url, headers, body):
-    if "cveawg.mitre.org" in url:
+    if url.startswith(core.CVE_ORG_URL):
         return 200, {}, json.dumps(CVE_ORG).encode()
-    if "api.first.org" in url:
+    if url.startswith(core.EPSS_URL):
         return 200, {}, json.dumps(EPSS).encode()
-    if "cisa.gov" in url:
+    if url == core.KEV_URL:
         return 200, {"ETag": "k1"}, json.dumps(KEV).encode()
     return 404, {}, b""
 
