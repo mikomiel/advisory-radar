@@ -330,12 +330,15 @@ language: pl                 # en (the default) or pl
 English is the wording the service has always used, so a configuration without the key sends
 exactly the messages earlier versions sent. Only text the service writes is translated. The
 heading and excerpt of an advisory come from its feed and stay as the publisher wrote them, apart
-from three things the service writes itself: the short excerpt for a PHP or Node.js release it
+from four things the service writes itself: the short excerpt for a PHP or Node.js release it
 read from the release page, the summary of a changed changedetection.io watch
-(`Page changed (last_changed=...)`), and the words of a native changedetection.io webhook payload
+(`Page changed (last_changed=...)`), the words of a native changedetection.io webhook payload
 that names neither a watch title nor a URL (the title `change`) or that carries no diff (the
-summary `page changed`). A watch title or a diff the sender supplies is the sender's text and is
-never translated, even when it reads the same. Identifiers and the names CVSS, EPSS, SSVC, KEV
+summary `page changed`), and the sentence that opens the summary of a CSAF item (`Vendor
+statements, revision ... of ...; not a check of your installed versions.`). A watch title or a
+diff the sender supplies is the sender's text and is never translated, even when it reads the
+same, and neither is the list of statements that follows the CSAF sentence: it is built from the
+vendor's CVE ids, status names and product names. Identifiers and the names CVSS, EPSS, SSVC, KEV
 and GHSA are never translated.
 
 The `tag` of a message (`critical` or `warning`) is a routing value, not text, so it stays
@@ -354,10 +357,12 @@ message's title as it was written.
 ## Advisories, filters and the queue
 
 `/alerts` filters the seen advisories by severity tag, the configured source id the message
-was queued from, outcome, a case-insensitive text search (identifier and title) and an
-inclusive UTC day range. The source filter matches the stored `source_id` exactly and never
-the advisory heading: the heading is display text, and a record written before source ids
-were stored carries none, so the filter excludes it rather than matching an empty value.
+was queued from, outcome, a case-insensitive text search (identifier and title), an
+inclusive UTC day range and, while an [inventory](inventory.md) is imported, the evidence it
+gives (`inventory=applies`, `not_affected` or `unknown`). The source filter matches the stored
+`source_id` exactly and never the advisory heading: the heading is display text, and a record
+written before source ids were stored carries none, so the filter excludes it rather than
+matching an empty value.
 Every filter lives in the URL query string, so a reload or a shared link keeps it. The list
 is paged with a keyset cursor (50 rows, newest first by time then identifier) instead of a
 fixed cap, and each row links to the advisory's page (the identifier is encoded in the path,
@@ -456,6 +461,25 @@ event is the only history that names it. `/advisories/<id>` lists those events u
 **Recent notifications**, independent of the filters — the general history still discovers a
 notification after its queue entry has left.
 
+## Inventory
+
+An imported SBOM or scan result adds version-aware evidence to the advisory page and a filter to
+`/alerts`; it changes no routing, priority or notification. The web UI uploads a file on
+`/inventory`, and the YAML can name a directory that a scanner or a CI job writes into:
+
+```yaml
+inventory:
+  dir: /data/inventory     # optional: the newest *.json file here is read at the start of each pass
+  max_age_days: 30         # 1..3650: after this an inventory can no longer clear an advisory
+```
+
+`dir` is YAML-only (the overlay cannot set it) and must be a directory inside the directory of
+`state_path` or of the configuration file, and not contain the directory of `state_path`; a
+relative name is relative to the directory of `state_path`. With the shipped compose file `/data`
+is the data volume, so `/data/inventory` is a directory of that volume. Without `dir`, an upload on
+`/inventory` is the only way in. Formats, limits and the meaning of each result are in
+[inventory.md](inventory.md).
+
 ## Settings without a restart
 
 The `/config` page changes ten things without editing the YAML or restarting the
@@ -497,6 +521,36 @@ Secrets stay in the environment. The overlay stores a notifier's `url`, `key`,
 `password`, `token` or signing `secret` only as a `${NAME}` or `${NAME_FILE}` reference,
 refuses a literal value, and does not accept `headers` at all. Changing an environment
 variable still needs a restart, because the process reads the environment when it starts.
+
+### The configuration page
+
+`/config` is one page with five anchored sections: Settings, Risk thresholds, Sources, Notifiers
+and Routes (`#settings`, `#thresholds`, `#sources`, `#notifiers`, `#routes`). It needs no script.
+The Sources and Notifiers sections list every built-in type before anything is submitted: what
+the type does, the keys it needs, and which of them take a reference. These tables draw the same
+catalogue as `sources.md` and `notifiers.md`, and the test suite pins the three together, so a
+type added to the catalogue appears on the page without a separate edit.
+
+Choose a type (`/config?add_source=<type>#new-source` or `/config?add_notifier=<type>#new-notifier`)
+and the form that opens asks for that type's keys only. A required key is marked, a reference key
+takes `${NAME}` or `${NAME_FILE}`, and a key only the YAML can set, a `webhook` notifier's
+`headers`, is named as such. Every other key a configured entry carries stays as written when its
+row is saved.
+
+A refused save of the Sources or the Notifiers form gives the page back with that form as it was
+typed, the reason, fresh form state and nothing written. So does a test of an unsaved source that
+fails or cannot start, except that it gives back only the new-source block: the rows are drawn
+from what is saved, because the test was not about them and the page may be older than a save.
+Plain fields come back as typed. A credential field comes back only when it holds a whole
+`${NAME}` reference: a literal secret is refused and never shown again, and a reference is never
+replaced by the value it names. The Settings, Risk thresholds and Routes forms and the OPML
+import are not catalogue-driven and still answer a refusal with a short page that keeps nothing of
+what was typed. A form that went stale is still refused with `409`, on the page it always had.
+
+An enabled notifier row has **Send test message**. It asks first, then sends one real message
+through the notifier that is running now (see `notifiers.md`). It stores nothing. A row whose saved
+entry is not what is running, because it was edited or saved since the last reload, is marked
+**not live yet** and is not tested until a reload applies it.
 
 ### Which variables the overlay may reference
 
@@ -582,8 +636,8 @@ one document between instances and needs the optional `postgres` extra
 (`uv sync --extra postgres` for a source install; the container image already installs it, so
 PostgreSQL needs no separate image build). The YAML owns the key: the overlay cannot move
 the store, and a reload refuses a changed `storage:` exactly as it refuses a changed
-`state_path`. `settings.json` and the KEV cache stay beside `state_path`; neither is part of
-the document.
+`state_path`. `settings.json`, the KEV cache and the imported `inventory.json` stay beside
+`state_path`; none of them is part of the document.
 
 `advisory-radar migrate --config config/config.yml --to sqlite:////data/state.db` copies the
 document read through the configured store into another one, and prints both stores — never
@@ -608,9 +662,11 @@ one of them as history. So the pass compares the item with the source's last suc
 an item is `backlog` only when it is older than 7 days **and** was published more than one day
 before that read. Anything newer was not in a window an earlier pass read, so it is alerted
 however old it now is. The day covers a publisher that dates an entry slightly before the pass
-that first listed it. A source that has never been read successfully, or that was removed or
+that first listed it. A source that has never answered, or that was removed or
 disabled and later brought back (its health record is dropped while it does not run), keeps the
-plain 7-day rule, and an item carried over from an earlier pass is never history.
+plain 7-day rule. A source that has answered but never read cleanly (a window with problems turns it
+red, and a `csaf` directory reports them) has no last read; it is measured from the pass at which it
+first answered instead. An item carried over from an earlier pass is never history.
 
 ## Gap detection
 
@@ -619,7 +675,9 @@ window, and the pass fails loudly when a full window shares nothing with the
 previous one — that is how silently missed advisories surface. An `rss` source is
 bounded by its publisher, and the changedetection.io source reports no
 truncation at all, so a skipped item there cannot be detected; poll those sources
-often enough that rotation is unlikely.
+often enough that rotation is unlikely. A `csaf` source reads by a cursor instead: a document it
+tried to read and could not is reported as a failure, and so is a backlog, once the oldest listed
+document it has not read yet was listed more than 12 hours ago ([CSAF directories](sources.md#csaf-directories)).
 
 
 ## The pass budget

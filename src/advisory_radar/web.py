@@ -23,16 +23,21 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from email.message import Message
+from email.parser import HeaderParser
 from pathlib import Path
+from secrets import token_bytes
+from typing import NamedTuple
 
 import yaml
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from itsdangerous import BadSignature, URLSafeSerializer
 
-from . import __version__, core, delivery, enrichment, feeds, pipeline, watchlist
-from .catalogue import SOURCE_SPECS
+from . import __version__, applicability, core, delivery, enrichment, feeds, inventory, pipeline, watchlist
+from .catalogue import NOTIFIER_SPECS, SOURCE_SPECS, NotifierSpec, SourceSpec
 from .config import (
     DEFAULT_THRESHOLDS,
     MIN_SECRET_LENGTH,
@@ -45,8 +50,9 @@ from .config import (
     load_document,
     secret_values,
 )
-from .http import Http, json_text, private_destination, resolve_host, urllib_http
-from .notifiers import NOTIFIER_BUILDERS
+from .http import Http, json_text, log_safe, private_destination, resolve_host, urllib_http
+from .notifiers import delivery_test_entry
+from .plugins import Notifier
 from .runtime import Runtime
 from .settings import (
     SECRET_KEYS,
@@ -238,6 +244,7 @@ _NAV = (
     ("/config", "Config"),
     ("/sources", "Sources"),
     ("/watchlist", "Watchlist"),
+    ("/inventory", "Inventory"),
     ("/runs", "Runs"),
 )
 
@@ -454,7 +461,7 @@ def _day_text(value: object) -> str:
 #: One page of /alerts: a screenful of rows, and small enough to stay fast on a phone.
 ALERT_PAGE_SIZE = 50
 #: The filters /alerts keeps in the URL. One tuple, so the form and the pagination links cannot disagree.
-ALERT_FILTERS = ("tag", "source", "outcome", "q", "since", "until")
+ALERT_FILTERS = ("tag", "source", "outcome", "q", "since", "until", "inventory")
 #: The outcomes a seen record can carry. A filter value outside this list matches nothing.
 SEEN_OUTCOMES = ("delivered", "dropped", "filtered", "suppressed", "backlog", "alias", "not-security")
 #: The states one inbox row can carry, most current first. ``open`` is a filter over the queue states, never a
@@ -1435,6 +1442,7 @@ def _seen_advisory(
     record: Mapping,
     delivery: Mapping | None = None,
     events: Sequence[tuple[str, Mapping]] = (),
+    evidence: tuple[str, str] | None = None,
 ) -> str:
     """The detail page for an identifier the state has seen: the snapshot, or only what the seen record holds.
 
@@ -1465,7 +1473,7 @@ def _seen_advisory(
         return (
             "<p>The state holds this identifier, but only its outcome and when it was recorded.</p>"
             + explanation
-            + _facts(facts)
+            + _facts([*facts, *([evidence] if evidence else [])])
             # A suppressed CVE gets no snapshot, so its original record is minimal -- but a later escalation
             # still added an event, and the page must show it rather than hide the only explanation.
             + _notification_history(events, exclude=reference if isinstance(reference, str) else None)
@@ -1490,6 +1498,8 @@ def _seen_advisory(
         ("CVEs in this message", _identifier_list(record.get("cves"))),
         ("KEV-only (not scored here)", _identifier_list(record.get("kev_only"))),
         ("Matched products", _identifier_list(record.get("products"))),
+        # Confirmed applicability sits under the text relevance it is kept apart from.
+        *([evidence] if evidence else []),
         ("Accepted by", delivered),
         ("Advisory", _external_link(record.get("link")) or "<span class='muted'>not recorded</span>"),
     ]
@@ -1503,7 +1513,12 @@ def _seen_advisory(
     )
 
 
-def _queued_advisory(state_label: str, entry: Mapping, events: Sequence[tuple[str, Mapping]] = ()) -> str:
+def _queued_advisory(
+    state_label: str,
+    entry: Mapping,
+    events: Sequence[tuple[str, Mapping]] = (),
+    evidence: tuple[str, str] | None = None,
+) -> str:
     """The detail page for a pending or parked message: everything the queued entry itself holds.
 
     ``events`` is the identifier's delivery history, if it has one: an escalation about an already-delivered
@@ -1528,6 +1543,7 @@ def _queued_advisory(state_label: str, entry: Mapping, events: Sequence[tuple[st
         ("CVEs in this message", _identifier_list(entry.get("cves"))),
         ("KEV-only (not scored here)", _identifier_list(entry.get("kev_only"))),
         ("Matched products", _identifier_list(entry.get("products"))),
+        *([evidence] if evidence else []),
         ("Accepted by", _identifier_list(accepted)),
         ("Delivery attempts", attempts_text),
         ("First attempt (UTC)", esc(first) or "<span class='muted'>not attempted yet</span>"),
@@ -1723,6 +1739,9 @@ def _parked_bulk_form(action: str, csrf: str, digest: str, label: str, css: str 
 LOGIN_BODY_LIMIT = 8 * 1024
 #: The form field and the header that carry the per-session token; a state-changing POST needs one of them.
 CSRF_FIELD = "csrf"
+#: What a /config form submits besides its input: the token and the state it was rendered from. A page drawn again
+#: after a refusal carries fresh ones, so these are never part of what is given back.
+FORM_STATE_FIELDS = (CSRF_FIELD, "fingerprint", "revision")
 CSRF_HEADER = "x-csrf-token"
 #: A settings form carries one row per configured plugin; still a bounded read, and the CSRF dependency
 #: hands the body to the handler that edits it.
@@ -1731,36 +1750,219 @@ FORM_BODY_LIMIT = 64 * 1024
 #: written, and the document is pasted by a browser session: a bound keeps one request from becoming thousands of
 #: lookups, and a larger list is imported in parts.
 OPML_FEED_LIMIT = 100
-#: Notifier keys the /config form edits. None of them carries a credential: a secret-bearing key is
-#: written only as an environment reference, and ``headers`` is not writable at all.
-NOTIFIER_FORM_KEYS = ("topic", "priority", "host", "port", "from", "to", "username", "use_tls", "implicit_tls")
-#: Credential-bearing notifier keys the form edits as an environment reference, beside the one required
-#: reference the "new notifier" row fills. ``secret`` signs a generic webhook's requests; a value that is not a
-#: whole ``${NAME}``/``${NAME_FILE}`` reference is refused when the overlay is saved.
+
+
+def notifier_form_keys(spec: NotifierSpec) -> tuple[str, ...]:
+    """The keys the /config form edits as plain text for one notifier type, in the catalogue's order.
+
+    Not a credential (those are references, ``secret_keys``), not a key only the YAML writes (``yaml_only``) and
+    not structure (``enabled`` has its own checkbox): a catalogue key left over is a value with no secrecy in it.
+    """
+    skipped = {"id", "type", "enabled", *spec.secret_keys, *spec.yaml_only}
+    return tuple(key for key in (*spec.required, *spec.optional) if key not in skipped)
+
+
+#: The one credential-bearing key a configured notifier's row edits, as an environment reference: ``secret`` signs
+#: a generic webhook's requests, and a value that is not a whole ``${NAME}``/``${NAME_FILE}`` reference is refused
+#: when the overlay is saved. It is the only one because the overlay merge carries the YAML's ``secret`` over by
+#: id, so an empty field cannot strip a credential the file owns; ``url``, ``password``, ``token`` and ``key`` have
+#: no such carry-over, so they are collected only when a notifier is added, never re-submitted by a row.
 NOTIFIER_REFERENCE_KEYS = ("secret",)
-#: Every editable key of a built-in source kind, so the "new source" block offers one field per key rather than
-#: one form per kind. Which of them the chosen kind actually reads comes from the catalogue.
-SOURCE_FORM_KEYS = tuple(
-    sorted(
-        {key for spec in SOURCE_SPECS.values() for key in (*spec.required, *spec.optional)}
-        - {"id", "type", "enabled", "tag"}
+
+
+def notifier_row_references(spec: NotifierSpec) -> tuple[str, ...]:
+    """The reference keys the row of a configured notifier of this type edits: ``secret``, on the one type with it."""
+    return tuple(key for key in NOTIFIER_REFERENCE_KEYS if key in spec.secret_keys)
+
+
+def notifier_reference_field(spec: NotifierSpec, key: str) -> str:
+    """The form field one reference key of a *new* notifier is posted under.
+
+    The first reference key keeps the name ``new:reference`` the form has always used for the credential a type
+    needs first, so a page rendered before this one still posts what the handler reads; every other reference key
+    is named for the key it fills.
+    """
+    return "new:reference" if key == spec.secret_keys[0] else f"new:{key}"
+
+
+def notifier_catalogue_table() -> str:
+    """Every notifier type with what it needs, before anything is submitted: one row and one Add link per type."""
+    rows = "".join(
+        f"<tr><td><b>{esc(spec.kind)}</b></td><td>{esc(spec.summary)}</td>"
+        f"<td>{esc(', '.join(spec.required) or '(none)')}</td>"
+        f"<td>{esc(', '.join(spec.secret_keys) or '(none)')}</td>"
+        f"<td>{esc(', '.join(spec.yaml_only) or '(none)')}</td>"
+        f"<td><a href='/config?add_notifier={esc(spec.kind)}#new-notifier'>Add</a></td></tr>"
+        for spec in NOTIFIER_SPECS.values()
     )
-)
+    return (
+        "<div class='scroll'><table><tr><th scope='col'>Type</th><th scope='col'>What it does</th>"
+        "<th scope='col'>Needs</th><th scope='col'>Reference keys</th><th scope='col'>YAML only</th>"
+        f"<th scope='col' class='narrow'>Add</th></tr>{rows}</table></div>"
+    )
+
+
+def new_notifier_form(spec: NotifierSpec, draft: Mapping[str, str] | None = None) -> str:
+    """The inputs that add one notifier of one type: that type's keys only, each marked required or optional.
+
+    The enclosing form carries the CSRF token and the stale-edit state. A reference input is posted as
+    ``new:reference`` for the type's first credential, the name the handler has always read, and as ``new:<key>``
+    for each further one. ``draft`` is what the person typed before a refusal; a reference input gets its value
+    back only when it is a whole reference, so a literal that was refused is never sent back to the page.
+    """
+    draft = draft or {}
+
+    def field(key: str, name: str, *, reference: bool = False) -> str:
+        marks = ["required" if key in spec.required else "optional"]
+        if reference:
+            marks.append("environment reference")
+        value = draft.get(name, "")
+        if reference and not is_reference(value):
+            value = ""
+        placeholder = " placeholder='${NAME}'" if reference else ""
+        return (
+            f"<label>{esc(key)} <span class='muted small'>({esc(', '.join(marks))})</span>"
+            f"<input type='text' name='{esc(name)}' value='{esc(value)}'{placeholder}></label>"
+        )
+
+    structure = {"id", "type", "enabled", *spec.yaml_only}
+    fields = [
+        "<label>id <span class='muted small'>(required)</span>"
+        f"<input type='text' name='new:id' value='{esc(draft.get('new:id', ''))}'></label>"
+    ]
+    for key in (*spec.required, *spec.optional):
+        if key in structure:
+            continue
+        if key in spec.secret_keys:
+            fields.append(field(key, notifier_reference_field(spec, key), reference=True))
+        else:
+            fields.append(field(key, f"new:{key}"))
+    yaml_notes = "".join(
+        f"<p class='muted small'><code>{esc(key)}</code> is set in the YAML file: this page never writes it, because "
+        "it can carry a credential. Add it there after saving; saving on this page keeps what the file holds.</p>"
+        for key in spec.yaml_only
+    )
+    reference_note = (
+        "<p class='muted small'>A reference field takes <code>${NAME}</code> or <code>${NAME_FILE}</code>: the "
+        "name of an environment variable, never the secret itself. The variable has to be listed under "
+        "<code>overlay_references</code> in the YAML file, and a literal value is refused and never shown again.</p>"
+        if spec.secret_keys
+        else ""
+    )
+    example = yaml.safe_dump(spec.example, sort_keys=False)
+    return (
+        f"<h3 id='new-notifier'>New {esc(spec.kind)} notifier</h3>"
+        f"<p class='muted small'>{esc(spec.summary)}</p>"
+        f"<input type='hidden' name='new:type' value='{esc(spec.kind)}'>"
+        f"<div class='fields'>{''.join(fields)}</div>{yaml_notes}{reference_note}"
+        f"<p class='muted small'>The same notifier in the YAML file:</p><pre>{esc(example)}</pre>"
+        f"<p class='muted small'><a href='/config#notifiers'>Choose another type</a> · documented in "
+        f"<code>{esc(spec.docs_anchor)}</code></p>"
+    )
+
+
+def source_keys(spec: SourceSpec) -> tuple[str, ...]:
+    """The keys the /config form edits for one source type: what the catalogue lists, minus structure and the tag.
+
+    ``tag`` is a column of every row (it scopes a changedetection.io poll), not a field of the type.
+    """
+    return tuple(key for key in (*spec.required, *spec.optional) if key not in ("id", "type", "enabled", "tag"))
+
+
+#: Every editable key of a built-in source kind, so a submission is recognised as a "new source" whichever kind it
+#: names. Which of them the chosen kind actually reads comes from the catalogue.
+SOURCE_FORM_KEYS = tuple(sorted({key for spec in SOURCE_SPECS.values() for key in source_keys(spec)}))
 #: Keys every source kind accepts, whether or not the catalogue names them: a per-source poll pace is not a
 #: property of a kind, so it is offered once rather than repeated in every ``SourceSpec``.
 SOURCE_UNIVERSAL_KEYS = ("interval",)
-#: The one secret-bearing key the "new notifier" row fills, per type; ``None`` for a kind that carries no
-#: credential (``log``), which the row adds from its id and type alone. ``apprise`` (url+password) and
-#: ``gotify`` (url+token) need two references each, so they are added by editing the YAML. A webhook's
-#: optional signing ``secret`` has its own field instead.
-NEW_NOTIFIER_REFERENCE = {
-    "discord_webhook": "url",
-    "matrix_webhook": "url",
-    "ntfy": "url",
-    "webhook": "url",
-    "smtp": "password",
-    "log": None,
-}
+#: What a sources form submits for its rows. A submission that carries any of them rendered the rows; one that
+#: carries none (the probe page's "Add this source" form posts the new block alone) did not, so an absent row is
+#: not an unticked one.
+SOURCE_ROW_FIELD_PREFIXES = ("enabled:", "tag:", "interval:", "remove:", "added_")
+
+
+def source_catalogue_table() -> str:
+    """Every source type with what it needs, before anything is submitted: one row and one Add link per type."""
+    rows = "".join(
+        f"<tr><td><b>{esc(spec.kind)}</b></td><td>{esc(spec.summary)}</td>"
+        f"<td>{esc(', '.join(spec.required) or '(none)')}</td>"
+        f"<td>{esc(', '.join(spec.secret_keys) or '(none)')}</td>"
+        f"<td><a href='/config?add_source={esc(spec.kind)}#new-source'>Add</a></td></tr>"
+        for spec in SOURCE_SPECS.values()
+    )
+    return (
+        "<div class='scroll'><table><tr><th scope='col'>Type</th><th scope='col'>What it does</th>"
+        "<th scope='col'>Needs</th><th scope='col'>Reference keys</th>"
+        f"<th scope='col' class='narrow'>Add</th></tr>{rows}</table></div>"
+    )
+
+
+def new_source_form(spec: SourceSpec, draft: Mapping[str, str] | None = None) -> str:
+    """The inputs that add one source of one type: that type's keys only, each marked required or optional.
+
+    The enclosing form carries the CSRF token and the stale-edit state, and the buttons. ``draft`` is what the
+    person typed before a refusal; a reference input gets its value back only when it is a whole reference, so a
+    literal that was refused is never sent back to the page.
+    """
+    draft = draft or {}
+
+    def field(label: str, name: str, marks: list[str], *, reference: bool = False, placeholder: str = "") -> str:
+        value = draft.get(name, "")
+        if reference and not is_reference(value):
+            value = ""
+        hint = " placeholder='${NAME}'" if reference else (f" placeholder='{esc(placeholder)}'" if placeholder else "")
+        return (
+            f"<label>{esc(label)} <span class='muted small'>({esc(', '.join(marks))})</span>"
+            f"<input type='text' name='{esc(name)}' value='{esc(value)}'{hint}></label>"
+        )
+
+    keys = source_keys(spec)
+    fields = [field("id", "new:id", ["optional, taken from the url host when empty" if "url" in keys else "required"])]
+    for key in keys:
+        marks = ["required" if key in spec.required else "optional"]
+        if key in spec.secret_keys:
+            marks.append("environment reference")
+        fields.append(field(key, f"new:{key}", marks, reference=key in spec.secret_keys))
+    fields.extend(
+        field(key, f"new:{key}", ["optional, every type"], placeholder="15m") for key in SOURCE_UNIVERSAL_KEYS
+    )
+    reference_note = (
+        "<p class='muted small'>A reference field takes <code>${NAME}</code> or <code>${NAME_FILE}</code>: the "
+        "name of an environment variable, never the secret itself. The variable has to be listed under "
+        "<code>overlay_references</code> in the YAML file, and a literal value is refused and never shown again.</p>"
+        if spec.secret_keys
+        else ""
+    )
+    url_note = (
+        "<p class='muted small'>The url is fetched as written. It may be one whole <code>${NAME}</code> "
+        "reference, and a url that embeds a variable is set in the YAML file. An address on a private network is "
+        "refused unless the YAML sets <code>allow_private_sources</code>.</p>"
+        if "url" in keys
+        else "<p class='muted small'>This type has no address to read: items are pushed to "
+        "<code>/webhooks/&lt;id&gt;</code>, so the id is what names it.</p>"
+    )
+    example = yaml.safe_dump(spec.example, sort_keys=False)
+    return (
+        f"<h3 id='new-source'>New {esc(spec.kind)} source</h3>"
+        f"<p class='muted small'>{esc(spec.summary)}</p>"
+        f"<input type='hidden' name='new:type' value='{esc(spec.kind)}'>"
+        f"<div class='fields'>{''.join(fields)}</div>{reference_note}{url_note}"
+        f"<p class='muted small'>The same source in the YAML file:</p><pre>{esc(example)}</pre>"
+        f"<p class='muted small'><a href='/config#sources'>Choose another type</a> · documented in "
+        f"<code>{esc(spec.docs_anchor)}</code></p>"
+    )
+
+
+def sentence(text: str) -> str:
+    """``text`` ended as a sentence, for a reason spliced into a notice: the checks word theirs without a stop."""
+    return text if text[-1:] in (".", "!", "?") else f"{text}."
+
+
+def form_draft(form: Mapping[str, list[str]]) -> dict[str, str]:
+    """What a refused /config form held, one value per field: the state the page itself adds is not part of it."""
+    return {name: values[0] for name, values in form.items() if values and name not in FORM_STATE_FIELDS}
+
+
 #: Every page is server-rendered HTML with one inline stylesheet: no scripts, no fonts, no external origins.
 #: A page that needs any of those widens this deliberately, in the same change that adds it.
 CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
@@ -1771,6 +1973,10 @@ LOGIN_MAX_FAILURES = 5
 #: Peers the throttle remembers. Bounded because a rotating-address attacker must not turn it into unbounded
 #: memory; see LoginThrottle for why the oldest peer is evicted rather than a new peer refused.
 LOGIN_MAX_PEERS = 1024
+#: Test messages one notifier may be sent inside the window. Each one is a real message to a real channel, so the
+#: button is not a free probe. The sign-in throttle's mechanics serve, counting sends instead of failures.
+TEST_SEND_WINDOW_SECONDS = 60
+TEST_SEND_MAX = 3
 #: How long /readyz and /metrics reuse one read of the state document. Both are unauthenticated and each request
 #: used to read and parse the whole document; readiness is judged in minutes (``READY_MIN_AGE_SECONDS``), so a view a
 #: few seconds old cannot change an answer, and a scrape interval shorter than this costs nothing.
@@ -1836,6 +2042,22 @@ class LoginThrottle:
         self._failures.pop(peer, None)
 
 
+class RunningNotifier(NamedTuple):
+    """The notifier a test message goes through, read from one snapshot of the live configuration.
+
+    The confirmation page and the send both use it, so they describe and reach the same notifier: ``live`` is the
+    expanded entry ``notifier`` was built from, ``cfg`` the configuration it runs under (the message language, the
+    values to keep off a page) and ``binding`` what a confirmation form carries to say which notifier it was shown
+    for.
+    """
+
+    id: str
+    notifier: Notifier
+    live: dict
+    cfg: Config
+    binding: str
+
+
 class BodyTooLarge(Exception):
     """The request body exceeded the endpoint's limit; it is refused before it is fully read."""
 
@@ -1853,6 +2075,258 @@ async def _body(request: Request, limit: int) -> bytes:
             raise BodyTooLarge
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+# --- the installed-software inventory ----------------------------------------------------------------------
+
+#: What an inventory upload carries besides the file: the form token and the multipart framing.
+UPLOAD_OVERHEAD_BYTES = 64 * 1024
+#: The whole request body an upload may have. A larger one is refused while it streams, before it is held in full.
+MAX_INVENTORY_UPLOAD_BYTES = inventory.MAX_INVENTORY_BYTES + UPLOAD_OVERHEAD_BYTES
+_UPLOAD_PARTS = frozenset({CSRF_FIELD, "file"})
+_BOUNDARY = re.compile(r"[0-9A-Za-z'()+_,\-./:=?]{1,70}")
+_PART_HEAD_LIMIT = 2048
+
+
+class UploadRefused(ValueError):
+    """An upload body that is not the one form this page offers. The message is fixed text, never request content."""
+
+
+def _header_text(value: object) -> str | None:
+    """A multipart header parameter as text, or ``None`` when it is not plain text (an RFC 2231 tuple, or absent)."""
+    return value if isinstance(value, str) else None
+
+
+def parse_upload(body: bytes, content_type: str) -> tuple[bytes, str, bytes]:
+    """The form token, the file name and the file content of an inventory upload, read strictly.
+
+    Exactly two parts are accepted, ``csrf`` and ``file``, once each, with nothing before the first boundary and
+    nothing after the last. This reads the one form the Inventory page offers, not multipart in general, and it
+    needs no third-party parser.
+    """
+    header = Message()
+    header["content-type"] = content_type
+    boundary = header.get_boundary()
+    if header.get_content_type() != "multipart/form-data" or not boundary or not _BOUNDARY.fullmatch(boundary):
+        raise UploadRefused("the upload is not a multipart form")
+    chunks = (b"\r\n" + body).split(b"\r\n--" + boundary.encode("ascii"))
+    closing = chunks[-1]
+    if len(chunks) < 3 or chunks[0] or not closing.startswith(b"--") or closing[2:].strip(b" \t\r\n"):
+        raise UploadRefused("the multipart body is malformed")
+    fields: dict[str, tuple[str | None, bytes]] = {}
+    for part in chunks[1:-1]:
+        head, found, content = part[2:].partition(b"\r\n\r\n")
+        if not part.startswith(b"\r\n") or not found or len(head) > _PART_HEAD_LIMIT:
+            raise UploadRefused("the multipart body is malformed")
+        # A browser sends a file name as raw UTF-8. Decoded here, the email parser sees text and keeps it; handed
+        # the bytes, it would replace every non-ASCII character of the name.
+        headers = HeaderParser().parsestr(head.decode("utf-8", "replace"))
+        name = _header_text(headers.get_param("name", header="content-disposition"))
+        if headers.get_content_disposition() != "form-data" or name not in _UPLOAD_PARTS or name in fields:
+            raise UploadRefused("the form carries a part this page does not offer")
+        fields[name] = (_header_text(headers.get_filename()), content)
+    uploaded = fields.get("file")
+    if uploaded is None or uploaded[0] is None:
+        raise UploadRefused("the form carries no file")
+    return fields.get(CSRF_FIELD, (None, b""))[1], uploaded[0], uploaded[1]
+
+
+#: The sentence of each verdict: ``(label, tone, text)``. The label is what the filter and the page call it.
+def _evidence_text(found: applicability.Evidence, max_age_days: int) -> tuple[str, str, str]:
+    installed = found.installed or "no version"
+    package = found.package
+    match found.reason:
+        case "affected":
+            fix = f"fixed in {found.fixed}" if found.fixed else "no fixed version recorded"
+            return "applies", "critical", f"installed {found.installed or 'version not recorded'}, {fix} ({package})"
+        case "fixed":
+            return "not affected", "ok", f"installed {installed} is at or after the fix, {found.fixed} ({package})"
+        case "outside":
+            return "not affected", "ok", f"installed {installed} is outside the affected versions ({package})"
+        case "no_component":
+            return (
+                "unknown",
+                "neutral",
+                f"no matching component in the inventory for {package}: an SBOM or a scan can omit packages",
+            )
+        case "unknown_version":
+            return (
+                "unknown",
+                "neutral",
+                f"the inventory lists {package} without a version that can be compared ({installed})",
+            )
+        case "unsupported":
+            ecosystem = package.split(" ", 1)[0]
+            return "unknown", "neutral", f"versions of {ecosystem} packages are not compared ({package}, {installed})"
+        case "partial":
+            return (
+                "unknown",
+                "neutral",
+                "the inventory is a scan, which lists only the packages it found something in, so it cannot rule out "
+                f"another installed version ({package}, installed {installed})",
+            )
+        case "stale":
+            return (
+                "unknown",
+                "warning",
+                f"the inventory is {found.age_days} days old (limit {max_age_days}): it can no longer confirm that "
+                f"this advisory does not apply ({package}, installed {installed})",
+            )
+        case _:
+            return (
+                "unknown",
+                "neutral",
+                "no comparable affected-version data is recorded for this advisory, or not for every vulnerability "
+                "it names",
+            )
+
+
+@dataclass(frozen=True)
+class _InventoryView:
+    """The stored inventory as one request sees it: loaded once, or the reason it could not be."""
+
+    stored: inventory.Inventory | None
+    problem: str
+    now: int
+    max_age_days: int
+
+    @property
+    def active(self) -> bool:
+        return self.stored is not None or bool(self.problem)
+
+    def evidence(self, state: Mapping, ids: Sequence[str]) -> applicability.Evidence | None:
+        if self.stored is None:
+            return None
+        return applicability.evidence_for(state, self.stored, ids, self.now, self.max_age_days)
+
+    def matches(self, state: Mapping, ids: Sequence[str], status: str) -> bool:
+        if self.stored is None:
+            # The page says "unknown" for an inventory that cannot be read, so the filter lists it as unknown too.
+            return self.active and status == "unknown"
+        found = self.evidence(state, ids)
+        return found is not None and found.status == status
+
+    def row(self, state: Mapping, ids: Sequence[str]) -> tuple[str, str] | None:
+        """The advisory page's fact row, or ``None`` when no inventory was ever imported."""
+        if not self.active:
+            return None
+        label = "Inventory evidence"
+        if self.stored is None:
+            return label, (
+                f"{_badge('unknown')} no evidence can be shown because the stored inventory cannot be read "
+                f"({esc(self.problem)}). <a href='/inventory'>Open Inventory</a>."
+            )
+        found = self.evidence(state, ids)
+        assert found is not None
+        name, tone, text = _evidence_text(found, self.max_age_days)
+        extra = ""
+        if found.status == "applies" and self.stored.format == "osv-scanner":
+            # A scan that ran no call analysis for this finding (or for its language) says nothing: unknown, never
+            # "not called".
+            reach = "unknown" if found.called is None else "called" if found.called else "not called"
+            extra = f" Reachability (scanner call analysis): {reach}, extra evidence only."
+        if found.stale and found.reason != "stale":
+            extra += f" The inventory is {found.age_days} days old (limit {self.max_age_days})."
+        source = f"{self.stored.format} {self.stored.name}, imported {_when(self.stored.imported_at)} UTC"
+        return label, (
+            f"{_badge(name, tone)} {esc(text)}.{esc(extra)}"
+            f"<br><span class='muted small'>From {esc(source)}. Text relevance is shown separately above.</span>"
+        )
+
+
+def _evidence_ids(identifier: str, *records: object) -> list[str]:
+    """The identifiers an advisory goes by: the one asked for, and every id its records name."""
+    ids = [identifier]
+    for record in records:
+        if isinstance(record, Mapping):
+            ids += _stored_strings(record.get("ids"))
+    return list(dict.fromkeys(ids))
+
+
+def _inventory_body(view: _InventoryView, directory: Path | None, drop: object, csrf: str, notice: str = "") -> str:
+    """The Inventory page: what is stored, how to replace it, and where the drop directory stands."""
+    if view.stored is not None:
+        stored = view.stored
+        age = max(0, view.now - stored.imported_at)
+        stale = age > view.max_age_days * 86400
+        facts = [
+            ("Format", _badge(stored.format)),
+            ("File name", esc(stored.name)),
+            ("SHA-256", f"<code>{esc(stored.sha256)}</code>"),
+            ("Size", f"{stored.size:,} bytes"),
+            ("Imported (UTC)", esc(_when(stored.imported_at))),
+            ("Imported by", "web upload" if stored.origin == "upload" else "drop directory"),
+            ("Document time", esc(stored.created) or "<span class='muted'>not stated</span>"),
+            ("Components", str(len(stored.components))),
+        ]
+        if stored.format == "osv-scanner":
+            facts.append(("Scan findings", str(len(stored.findings))))
+        if stored.skipped:
+            facts.append(("Skipped", f"{stored.skipped} without a package URL of a supported type"))
+        facts.append(
+            (
+                "Lists",
+                "every component the SBOM declares"
+                if stored.complete
+                else "only the packages the scan found something in; an absent package says nothing",
+            )
+        )
+        facts.append(
+            (
+                "Age",
+                f"{_age_text(age)} "
+                + (
+                    _badge(f"stale after {view.max_age_days} days", "warning")
+                    if stale
+                    else f"<span class='muted'>fresh for {view.max_age_days} days</span>"
+                ),
+            )
+        )
+        current = _facts(facts)
+    elif view.problem:
+        current = _notice(f"<strong>The stored inventory cannot be read.</strong> {esc(view.problem)}.", "critical")
+    else:
+        current = _empty(
+            "No inventory has been imported. Advisories are matched on text only, and no applicability evidence "
+            "is shown until one is."
+        )
+    if directory is None:
+        drop_text = (
+            "<p class='muted'>No drop directory is configured. Set <code>inventory.dir</code> in the YAML "
+            "configuration to pick up a file a scanner or a CI job writes there.</p>"
+        )
+    else:
+        look = drop if isinstance(drop, Mapping) else {}
+        outcome = _field(look.get("outcome"))
+        last = (
+            f"Last file looked at: {esc(_field(look.get('name')))}, {esc(outcome)} at {esc(_when(look.get('at')))} UTC"
+            + (f" ({esc(_field(look.get('error')))})" if look.get("error") else "")
+            + "."
+            if outcome
+            else "No file has been picked up yet."
+        )
+        drop_text = (
+            f"<p>Drop directory: <code>{esc(directory)}</code>. The newest <code>*.json</code> file is read at the "
+            f"start of each pass and replaces the inventory when its content changed. {last}</p>"
+        )
+    limit = inventory.MAX_INVENTORY_BYTES // (1024 * 1024)
+    form = (
+        '<form method="post" action="/inventory/upload" enctype="multipart/form-data">'
+        f'<input type="hidden" name="{CSRF_FIELD}" value="{esc(csrf)}">'
+        "<label>OSV-Scanner JSON, CycloneDX JSON or SPDX 2.x JSON "
+        '<input type="file" name="file" accept=".json,application/json" required></label> '
+        '<button class="btn btn-primary">Import</button></form>'
+    )
+    return (
+        notice
+        + current
+        + "<h2>Replace the inventory</h2>"
+        + form
+        + f"<p class='muted small'>Up to {limit} MiB and {inventory.MAX_ENTRIES:,} components. The file is read as "
+        "data only: nothing in it is run, fetched or followed. A file that is refused leaves the current inventory "
+        "in place, and an import replaces the previous inventory as a whole.</p>"
+        "<h2>Drop directory</h2>" + drop_text
+    )
 
 
 class InboxFull(Exception):
@@ -2322,6 +2796,11 @@ def create_app(
             raise HTTPException(status_code=403, detail="invalid form token; reload the page and try again")
 
     throttle = LoginThrottle()
+    test_throttle = LoginThrottle(window=TEST_SEND_WINDOW_SECONDS, attempts=TEST_SEND_MAX, clock=clock)
+    test_throttle_lock = threading.Lock()
+    #: Made when the app starts, kept in memory and shown to nobody: it keys the digest a test confirmation carries
+    #: (see ``confirmation_binding``). One process serves the page, as its throttles above assume.
+    confirmation_key = token_bytes(32)
 
     def require_auth(request: Request) -> bool:
         return auth.valid(request)
@@ -2637,6 +3116,7 @@ def create_app(
         before = _cursor_decode(request.query_params["before"]) if request.query_params.get("before") else None
         deliveries = state.get("deliveries")
         deliveries = deliveries if isinstance(deliveries, dict) else {}
+        held = inventory_view()
 
         def resolved(record: dict) -> dict:
             """The snapshot a seen record points at; the record's own time and outcome stay authoritative.
@@ -2655,6 +3135,9 @@ def create_app(
                 continue
             view = resolved(record)
             if _matches_seen(identifier, view, filters, since, until):
+                wanted = filters["inventory"]
+                if wanted and not held.matches(state, _evidence_ids(identifier, view), wanted):
+                    continue  # confirmed applicability is a separate filter from the text ones above
                 rows.append((_position(identifier, view), view))
         window, previous, following = _alert_page(rows, cursor, before)
 
@@ -2671,6 +3154,10 @@ def create_app(
         outcome_values = SEEN_OUTCOMES
         if filters["outcome"] and filters["outcome"] not in SEEN_OUTCOMES:
             outcome_values = (*SEEN_OUTCOMES, filters["outcome"])
+        inventory_options = "".join(option(value, filters["inventory"]) for value in ("", *applicability.STATUSES))
+        inventory_select = (
+            f"<label>Inventory<select name='inventory'>{inventory_options}</select></label>" if held.active else ""
+        )
         filter_form = (
             "<form class='toolbar' method='get' action='/alerts'>"
             f"<label>Tag<select name='tag'>{''.join(option(value, filters['tag']) for value in ('', *TAGS))}"
@@ -2678,6 +3165,7 @@ def create_app(
             f"<label>Source id<input type='text' name='source' value='{esc(filters['source'])}'></label>"
             f"<label>Outcome<select name='outcome'>"
             f"{''.join(option(value, filters['outcome']) for value in ('', *outcome_values))}</select></label>"
+            f"{inventory_select}"
             f"<label>Text<input type='text' name='q' value='{esc(filters['q'])}'></label>"
             f"<label>Since<input type='date' name='since' value='{esc(filters['since'])}'></label>"
             f"<label>Until<input type='date' name='until' value='{esc(filters['until'])}'></label>"
@@ -2891,9 +3379,12 @@ def create_app(
                 snapshot = (
                     deliveries.get(reference) if isinstance(deliveries, dict) and isinstance(reference, str) else None
                 )
-                body = _seen_advisory(record, snapshot if isinstance(snapshot, dict) else None, events)
+                evidence = inventory_view().row(state, _evidence_ids(identifier, record, snapshot))
+                body = _seen_advisory(record, snapshot if isinstance(snapshot, dict) else None, events, evidence)
             else:
-                body = _queued_advisory(label, record, events)
+                body = _queued_advisory(
+                    label, record, events, inventory_view().row(state, _evidence_ids(identifier, record))
+                )
             return page(f"Advisory {identifier}", body, active="/alerts", actions=sign_out_form(request))
         if events:
             # An Adobe bulletin is recorded only as its delivery event: it never had a seen record, so the
@@ -2903,6 +3394,77 @@ def create_app(
         # The detail is display text and a JSON encoder cannot write a raw surrogate, so it is escaped here;
         # the identifier itself was already compared exactly above.
         raise HTTPException(status_code=404, detail=f"no advisory {_response_text(identifier)} is recorded")
+
+    def inventory_view() -> _InventoryView:
+        """The stored inventory for one request, loaded once; an unreadable one carries its reason, not silence."""
+        cfg = runtime.cfg
+        try:
+            stored, problem = inventory.load(inventory.inventory_path(cfg.state_path)), ""
+        except inventory.InventoryError as exc:
+            stored, problem = None, str(exc)
+        return _InventoryView(stored, problem, int(clock()), cfg.inventory_max_age_days)
+
+    def inventory_page(request: Request, *, status: int = 200, notice: str = ""):
+        try:
+            drop = load_state().get("inventory_drop")
+        except (SourceError, StoreUnavailable):
+            drop = None  # the page is still the way to replace an inventory while the store is unreadable
+        body = _inventory_body(inventory_view(), runtime.cfg.inventory_dir, drop, csrf_token(request), notice)
+        return page("Inventory", body, active="/inventory", actions=sign_out_form(request), status_code=status)
+
+    @app.get("/inventory", response_class=HTMLResponse)
+    def inventory_get(request: Request):
+        """What is imported, with its provenance, and the form that replaces it."""
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        done = request.query_params.get("imported") == "1"
+        notice = (
+            _notice("<strong>Imported.</strong> The inventory below replaced the previous one.", "ok") if done else ""
+        )
+        return inventory_page(request, notice=notice)
+
+    async def require_upload(request: Request) -> None:
+        """Refuse an inventory upload in the order that costs least: session, size, framing, then the form token.
+
+        ``require_csrf`` cannot serve here: its body is a 64 KiB urlencoded form, and the token of this form is a
+        part of the multipart body. The body is read once, bounded while it streams, and kept on the request.
+        """
+        if not auth.valid(request):  # the endpoint itself redirects an unauthenticated caller
+            return
+        try:
+            raw = await _body(request, MAX_INVENTORY_UPLOAD_BYTES)
+        except BodyTooLarge:
+            raise HTTPException(status_code=413, detail="the upload is too large") from None
+        try:
+            supplied, filename, content = parse_upload(raw, request.headers.get("content-type", ""))
+        except UploadRefused as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        sent = request.headers.get(CSRF_HEADER, "").encode("utf-8", "surrogatepass") or supplied
+        if not sent or not hmac.compare_digest(csrf_token(request).encode(), sent):
+            raise HTTPException(status_code=403, detail="invalid form token; reload the page and try again")
+        request.state.upload = (filename, content)
+
+    @app.post("/inventory/upload", dependencies=[Depends(require_upload)])
+    def inventory_upload(request: Request):
+        """Import the uploaded file as the inventory, or refuse it whole and keep the current one."""
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        filename, content = request.state.upload
+        try:
+            document = inventory.parse(content, name=filename, now=int(clock()), origin="upload")
+        except inventory.InventoryError as exc:
+            # The message names a limit or a field, never the offending value; it is escaped all the same.
+            refusal = _notice(
+                f"<strong>Not imported.</strong> {esc(exc)}. The current inventory is unchanged.", "critical"
+            )
+            return inventory_page(request, status=400, notice=refusal)
+        try:
+            inventory.save(inventory.inventory_path(runtime.cfg.state_path), document)
+        except OSError:
+            LOG.exception("the inventory could not be stored")
+            failed = _notice("<strong>Not imported.</strong> The inventory could not be stored.", "critical")
+            return inventory_page(request, status=500, notice=failed)
+        return RedirectResponse("/inventory?imported=1", status_code=303)
 
     @app.get("/parked", response_class=HTMLResponse)
     def parked_page(request: Request):
@@ -3156,39 +3718,115 @@ def create_app(
             notes.append("headers set in the YAML (not shown)")
         return esc(", ".join(notes))
 
-    def notifier_form_entries(entries) -> str:
-        """One block per configured notifier: enabled, its non-secret keys, and its secret references."""
+    def notifier_spec(entry: dict) -> NotifierSpec | None:
+        """The catalogue entry for a configured notifier, or None for a type the catalogue does not know."""
+        kind = entry.get("type")
+        return NOTIFIER_SPECS.get(kind) if isinstance(kind, str) else None
+
+    def notifier_form_entries(
+        entries, running: Mapping[str, tuple[Notifier, dict]] | None = None, draft: Mapping[str, str] | None = None
+    ) -> str:
+        """One block per configured notifier: enabled, the keys its type reads, and its secret reference.
+
+        ``running`` is what runs now, by id (see :func:`running_notifiers`); an enabled row it does not run as the row
+        is saved is marked, because a test message would not reach it: the id is not running, or its notifier was
+        built from an entry that has been edited or saved since. ``None`` (a runtime with no configuration file)
+        marks nothing. ``draft`` is the refused submission of this very form: every row shows what was typed in it,
+        the way the save would have read it (a box missing from the submission is unchecked), and a reference field
+        gets only a whole reference back.
+        """
         rows = []
         for entry in entries:
             if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
                 continue
             identifier = entry["id"]
-            checked = " checked" if entry.get("enabled", True) is not False else ""
-            # Every optional field is rendered, not only those the entry already carries: a defaulted value
-            # must be settable, and a value cleared in one save must be settable again in the next.
+            spec = notifier_spec(entry)
+            enabled = entry.get("enabled", True) is not False if draft is None else f"enabled:{identifier}" in draft
+            checked = " checked" if enabled else ""
+            # Only the keys the type reads are rendered, but every one of them, not only those the entry already
+            # carries: a defaulted value must be settable, and a value cleared in one save must be settable
+            # again in the next. A key the type does not read is not the form's to change, so it stays as written.
             fields = " ".join(
                 f"<label>{key}<input type='text' name='field:{esc(identifier)}:{key}' "
-                f"value='{esc(entry.get(key, ''))}' "
+                f"value='{esc(entry.get(key, '') if draft is None else draft.get(f'field:{identifier}:{key}', ''))}' "
                 f"aria-label='{esc(key)} for {esc(identifier)}'></label>"
-                for key in NOTIFIER_FORM_KEYS
+                for key in (notifier_form_keys(spec) if spec else ())
             )
             # A credential position is shown only when it is a reference: echoing a literal value into the page
             # would publish the secret the field exists to keep out of the configuration file.
             references = " ".join(
                 f"<label>{key} reference<input type='text' name='field:{esc(identifier)}:{key}' "
-                f"value='{esc(entry.get(key, '')) if is_reference(entry.get(key)) else ''}' "
+                f"value='{esc(shown) if is_reference(shown) else ''}' "
                 f"placeholder='${{NAME}}' aria-label='{esc(key)} reference for {esc(identifier)}'></label>"
-                for key in NOTIFIER_REFERENCE_KEYS
+                for key in (notifier_row_references(spec) if spec else ())
+                for shown in [entry.get(key, "") if draft is None else draft.get(f"field:{identifier}:{key}", "")]
+            )
+            unknown = "" if spec else "a type outside the catalogue: only its enabled flag can be changed here"
+            note = "; ".join(part for part in (notifier_notes(entry), esc(unknown)) if part)
+            pending = (
+                " " + _badge("not live yet", "warning")
+                if checked and running is not None and not runs_as_saved(entry, running)
+                else ""
+            )
+            # The button submits this form's body to the confirmation page through ``formaction``, as a source's
+            # Test button does; the page asks before anything is sent, and only an enabled notifier can send.
+            test_button = (
+                "<button class='btn' type='submit' formaction='/config/notifiers/test' name='id' "
+                f"value='{esc(identifier)}' title='asks first, then sends one real message through the running "
+                "notifier'>Send test message</button>"
+                if checked
+                else ""
             )
             rows.append(
                 "<div class='notifier'><div class='notifier-head'>"
-                f"<b>{esc(identifier)}</b><span class='muted'>{esc(entry.get('type', ''))}</span>"
+                f"<b>{esc(identifier)}</b><span class='muted'>{esc(entry.get('type', ''))}</span>{pending}"
                 f"<label class='check'><input type='checkbox' name='enabled:{esc(identifier)}' value='1'{checked} "
-                f"aria-label='Enabled {esc(identifier)}'>enabled</label>"
+                f"aria-label='Enabled {esc(identifier)}'>enabled</label>{test_button}"
                 f"</div><div class='field-grid'>{fields} {references}</div>"
-                f"<p class='muted small'>{notifier_notes(entry) or 'no secret reference recorded'}</p></div>"
+                f"<p class='muted small'>{note or 'no secret reference recorded'}</p></div>"
             )
         return "".join(rows)
+
+    def new_notifier_from_form(form: dict[str, list[str]]) -> tuple[dict | None, str]:
+        """The notifier the form's "new" block describes, or why it cannot be saved: ``(None, "")`` when unused.
+
+        The block is posted whole with its type hidden, so one nobody filled in is not an error. A filled block
+        has to name an id and carry every key its type requires: a builder raises a bare ``KeyError`` for a
+        missing one, which tells the person at the form nothing. The type's reference keys are read from the
+        fields the catalogue names; whether a value is a whole ``${NAME}`` reference, and whether the variable
+        may be named at all, is the overlay validator's to judge, so a literal is refused there and never echoed.
+        """
+        filled = any(
+            value.strip()
+            for name, values in form.items()
+            if name.startswith("new:") and name != "new:type"
+            for value in values
+        )
+        if not filled:
+            return None, ""
+        identifier = first(form, "new:id").strip()
+        if not identifier:
+            return None, "A new notifier needs an id."
+        kind = first(form, "new:type").strip()
+        spec = NOTIFIER_SPECS.get(kind)
+        if spec is None:
+            known = ", ".join(NOTIFIER_SPECS)
+            if not kind:
+                return None, f"A new notifier needs a type: {known}."
+            return None, f"{kind} is not a notifier type: {known}."
+        new = {"id": identifier, "type": kind}
+        for key in notifier_form_keys(spec):
+            value = first(form, f"new:{key}").strip()
+            if value:
+                new[key] = value
+        for key in spec.secret_keys:
+            value = first(form, notifier_reference_field(spec, key)).strip()
+            if value:
+                new[key] = value
+        missing = [key for key in spec.required if key not in new]
+        if missing:
+            return None, f"{kind} needs {', '.join(missing)}."
+        return new, ""
 
     def source_spec(entry: dict):
         """The catalogue entry for a configured source, or None for a type the catalogue does not know."""
@@ -3201,10 +3839,6 @@ def create_app(
         if not isinstance(added, list):
             return set()
         return {entry["id"] for entry in added if isinstance(entry, dict) and isinstance(entry.get("id"), str)}
-
-    def source_keys(spec) -> tuple[str, ...]:
-        """The editable keys of one kind: everything it declares except the id, type, enable flag and tag."""
-        return tuple(key for key in (*spec.required, *spec.optional) if key not in ("id", "type", "enabled", "tag"))
 
     def saved_source_entries(overlay: dict) -> list[dict]:
         """The merged source list the forms edit: every YAML entry plus every entry the overlay adds."""
@@ -3241,6 +3875,46 @@ def create_app(
     def effective_id(entry: dict) -> str:
         """The id this configured entry occupies once its references are expanded."""
         return expand_text(entry["id"]) or entry["id"]
+
+    def running_notifiers() -> tuple[Config, dict[str, tuple[Notifier, dict]]]:
+        """The live configuration and, by id, each notifier it runs with the expanded entry it was built from.
+
+        One read of the snapshot: ``cfg.notifiers`` and the built notifiers are the same list twice, so a reload
+        landing between two separate reads could pair an entry with another configuration's notifier. A runtime
+        made from a bare ``Config`` builds none, so nothing there is running.
+        """
+        cfg, _, built = runtime.snapshot()
+        return cfg, {notifier.id: (notifier, live) for live, notifier in zip(cfg.notifiers, built, strict=False)}
+
+    def runs_as_saved(entry: dict, running: Mapping[str, tuple[Notifier, dict]]) -> bool:
+        """Whether the live snapshot runs this saved entry as it stands: the id is there, built from the same keys.
+
+        The saved entry is compared as the loader would expand it, so a type, a topic or a reference changed in the
+        YAML or the overlay and not reloaded yet is not running as saved. An entry whose references cannot be
+        resolved cannot have been built, so it is not running either.
+        """
+        found = running.get(effective_id(entry))
+        if found is None:
+            return False
+        try:
+            return expand_entry(entry, runtime.environment) == found[1]
+        except ConfigError:
+            return False
+
+    def confirmation_binding(live: dict, language: str) -> str:
+        """What a test confirmation is bound to: the entry the running notifier was built from, and the language.
+
+        A confirmation is good for the notifier it was shown for, so a reload that replaces that notifier before
+        the button is pressed is refused instead of sending through the new one, whatever it changed: a topic, a
+        variable, a literal URL or what a ``${NAME}_FILE`` secret holds. The entry carries its credentials, and
+        the destination is usually one of them, so the digest is an HMAC under ``confirmation_key``: a page holds
+        a value nobody can reverse or check a guess at a credential against without that key, and a restart, which
+        makes a new key, refuses the confirmation it outlived.
+        """
+        canonical = json.dumps(
+            {"notifier": live, "language": language}, sort_keys=True, separators=(",", ":"), default=str
+        )
+        return hmac.new(confirmation_key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
 
     def source_entry_by_id(overlay: dict, identifier: str, *, effective: bool) -> dict | None:
         """The configured entry the submitted id names, looked up the way the page that submitted it renders.
@@ -3336,12 +4010,14 @@ def create_app(
             for name in ("new:id", *(f"new:{key}" for key in (*SOURCE_FORM_KEYS, *SOURCE_UNIVERSAL_KEYS)))
         )
 
-    def added_source_fields(entry: dict, spec) -> str:
+    def added_source_fields(entry: dict, spec, draft: Mapping[str, str] | None = None) -> str:
         """The editable keys of one added source, as inline inputs.
 
         The stored value is shown, not the origin: an operator fixing a feed path needs the whole URL. A URL
         may hold a reference only as the whole value, and only for a variable the YAML lists under
-        ``overlay_references``; a URL that embeds a credential is configured in the YAML.
+        ``overlay_references``; a URL that embeds a credential is configured in the YAML. ``draft`` is the
+        refused submission of this form: a field it carried shows what was typed, one it did not shows what is
+        stored, and a credential field shows only a whole reference, never a literal that was refused.
         """
         if spec is None:
             return "<span class='muted small'>unknown type</span>"
@@ -3349,6 +4025,10 @@ def create_app(
         for key in source_keys(spec):
             reference = " placeholder='${NAME}'" if key in spec.secret_keys else ""
             value = str(entry.get(key, "") or "")
+            if draft is not None:
+                value = draft.get(f"added_{key}:{entry['id']}", value)
+                if key in spec.secret_keys and not is_reference(value):
+                    value = ""
             cells.append(
                 f"<label class='inline'>{esc(key)}"
                 f"<input type='text' name='added_{esc(key)}:{esc(entry['id'])}' value='{esc(value)}'"
@@ -3356,27 +4036,36 @@ def create_app(
             )
         return "".join(cells)
 
-    def source_row(entry: dict, *, added: bool) -> str:
+    def source_row(entry: dict, *, added: bool, draft: Mapping[str, str] | None = None) -> str:
         """One configured source: id, kind, origin, enable flag, watch tag, its keys and a probe button.
 
         The row's fields belong to the save form; its ``Test`` button submits the same body to the probe endpoint
-        through ``formaction``, so one form serves both and no nested form is needed.
+        through ``formaction``, so one form serves both and no nested form is needed. ``draft`` is the refused
+        submission of the form: the row shows the flags and text that were typed, the way the save would have
+        read them (a box missing from the submission is unticked).
         """
         identifier = entry["id"]
         spec = source_spec(entry)
-        checked = " checked" if entry.get("enabled", True) is not False else ""
+        if draft is None:
+            enabled = entry.get("enabled", True) is not False
+            tag, interval, removing = str(entry.get("tag") or ""), str(entry.get("interval") or ""), False
+        else:
+            enabled = f"enabled:{identifier}" in draft
+            tag, interval = draft.get(f"tag:{identifier}", ""), draft.get(f"interval:{identifier}", "")
+            removing = f"remove:{identifier}" in draft
+        checked = " checked" if enabled else ""
         # The origin only, redacted: a source URL can carry a token in its userinfo, query, path or host, and
         # a runtime built from a bare Config renders the document it was given, which is already expanded.
         public = redacted_origin(entry.get("url", ""), secret_values(runtime.cfg))
         origin = f"<br><span class='muted small'>{esc(public)}</span>" if public else ""
         badge = f"{_badge('added', 'neutral')} " if added else ""
         editable = (
-            f"<td>{added_source_fields(entry, spec)}</td>"
+            f"<td>{added_source_fields(entry, spec, draft)}</td>"
             if added
             else "<td><span class='muted small'>keys in the YAML</span></td>"
         )
         remove = (
-            f"<td><input type='checkbox' name='remove:{esc(identifier)}' value='1' "
+            f"<td><input type='checkbox' name='remove:{esc(identifier)}' value='1'{' checked' if removing else ''} "
             f"aria-label='Remove {esc(identifier)}'></td>"
             if added
             else "<td></td>"
@@ -3386,10 +4075,10 @@ def create_app(
             f"{origin}</td>"
             f"<td><input type='checkbox' name='enabled:{esc(identifier)}' value='1'{checked} "
             f"aria-label='Enabled {esc(identifier)}'></td>"
-            f"<td><input type='text' name='tag:{esc(identifier)}' value='{esc(str(entry.get('tag') or ''))}' "
+            f"<td><input type='text' name='tag:{esc(identifier)}' value='{esc(tag)}' "
             f"aria-label='Watch tag for {esc(identifier)}'></td>"
             f"<td><input type='text' name='interval:{esc(identifier)}' "
-            f"value='{esc(str(entry.get('interval') or ''))}' placeholder='15m' "
+            f"value='{esc(interval)}' placeholder='15m' "
             f"aria-label='Poll interval for {esc(identifier)}'></td>"
             f"{editable}{remove}"
             f"<td><button class='btn' type='submit' formaction='/config/sources/probe' "
@@ -3397,32 +4086,12 @@ def create_app(
             f"Test</button></td></tr>"
         )
 
-    def source_form_entries(entries, added_ids: set[str]) -> str:
+    def source_form_entries(entries, added_ids: set[str], draft: Mapping[str, str] | None = None) -> str:
         """One row per configured source, marking the ones the overlay adds as editable there."""
         return "".join(
-            source_row(entry, added=entry["id"] in added_ids)
+            source_row(entry, added=entry["id"] in added_ids, draft=draft)
             for entry in entries
             if isinstance(entry, dict) and isinstance(entry.get("id"), str)
-        )
-
-    def new_source_fields() -> str:
-        """The "new source" inputs: one per editable key, labelled with the kinds that read it."""
-        readers: dict[str, list[str]] = {}
-        secret: set[str] = set()
-        for spec in SOURCE_SPECS.values():
-            for key in source_keys(spec):
-                readers.setdefault(key, []).append(spec.kind)
-                if key in spec.secret_keys:
-                    secret.add(key)
-        universal = "".join(
-            f"<label>{esc(key)} <span class='muted small'>(every kind, optional)</span>"
-            f"<input type='text' name='new:{esc(key)}' placeholder='15m'></label>"
-            for key in SOURCE_UNIVERSAL_KEYS
-        )
-        return universal + "".join(
-            f"<label>{esc(key)} <span class='muted small'>({esc(', '.join(sorted(readers[key])))})</span>"
-            f"<input type='text' name='new:{esc(key)}'{' placeholder=${{NAME}}' if key in secret else ''}></label>"
-            for key in sorted(readers)
         )
 
     def submitted_fields(form: dict[str, list[str]], prefix: str) -> str:
@@ -3472,7 +4141,19 @@ def create_app(
             if window.truncated
             else ""
         )
-        return _notice(f"Answered with {len(items)} entr{'y' if len(items) == 1 else 'ies'}.", "ok") + truncated + table
+        # What the source could not read is a window fact like truncation: the probe still answered, and the same
+        # lines turn the source red in a pass. Redacted and cut like a title, one line each.
+        unread = (
+            _notice(
+                "<b>This source could not read all that it offers:</b><br>"
+                + "<br>".join(_short(pipeline.redact(problem, secrets), 300) for problem in window.problems),
+                "warning",
+            )
+            if window.problems
+            else ""
+        )
+        answered = _notice(f"Answered with {len(items)} entr{'y' if len(items) == 1 else 'ies'}.", "ok")
+        return answered + unread + truncated + table
 
     def reference_refusal(entry: dict) -> str:
         """Why this source entry may not use the references it carries, or "" when it may.
@@ -3582,7 +4263,14 @@ def create_app(
         return True, probe_window(window, secrets)
 
     def probe_result(request: Request, form: dict[str, list[str]], *, active: str) -> HTMLResponse:
-        """The probe result page: one configured source by id, or the fields of a source that is not saved yet."""
+        """The probe result page: one configured source by id, or the fields of a source that is not saved yet.
+
+        A source that is not saved yet is described by the form's "new source" block. When it cannot be probed, or
+        the probe fails, the answer is the configuration page with that block as it was typed and the reason, so
+        the person corrects it in place instead of retyping it. Only that block is given back: a probe does not
+        check the stale-form fingerprint, so the rows are drawn from the saved document, never from the submission.
+        A probe that works keeps its own page, which carries the same values into an "Add this source" save.
+        """
         back = active if active in ("/config", "/sources") else "/config"
         identifier = first(form, "id").strip()
         add_form = ""
@@ -3625,16 +4313,34 @@ def create_app(
             title = page_title(f"{identifier} probe")
         else:
             entry, problem = new_source_from_form(form)
+            # Only the new block comes back. The answer is drawn with the form state of the saved document as it
+            # is now, so a row drawn from this submission would be a page that may be older than a save, wearing
+            # the state that lets it overwrite that save. The rows were not what the test was about.
+            draft = {name: value for name, value in form_draft(form).items() if name.startswith("new:")}
             if entry is None:
-                return page(
-                    "Source probe",
-                    _notice(esc(problem[:1].upper() + problem[1:]), "warning") + f"<p><a href='{back}'>Back</a></p>",
-                    active=active,
-                    actions=sign_out_form(request),
+                return render_config(
+                    request,
+                    draft=draft,
+                    draft_section="sources",
+                    result=_notice(
+                        f"Cannot test the new source: {esc(sentence(problem))} <a href='#sources'>Go to the form</a>.",
+                        "warning",
+                    ),
                     status_code=400,
                 )
             ok, detail = probe_source(entry, adding=True)
-            tone = _badge("answered", "ok") if ok else _badge("failed", "critical")
+            if not ok:
+                return render_config(
+                    request,
+                    draft=draft,
+                    draft_section="sources",
+                    result=(
+                        f"<p>Test of the new {safe_text(display_type(entry))} source, which is not saved: it was "
+                        "fetched with the values from the form below. <a href='#sources'>Go to the form</a>.</p>"
+                        f"{detail}"
+                    ),
+                )
+            tone = _badge("answered", "ok")
             heading = (
                 f"<h2>New {safe_text(display_type(entry))} source {tone}</h2>"
                 "<p class='muted small'>Not saved yet: the probe fetched it with the values from the form.</p>"
@@ -3759,7 +4465,9 @@ def create_app(
             "enabled notifier. <a href='/thresholds?kind=escalation'>Preview where an escalation goes.</a></p>"
         )
 
-    def commit_overlay(request: Request, overlay: dict, *, notice: str = ""):
+    def commit_overlay(
+        request: Request, overlay: dict, *, notice: str = "", refuse: Callable[[str], HTMLResponse] | None = None
+    ):
         """Validate, build, save and apply one overlay; nothing is written when any step refuses.
 
         Building the plugins here is what makes a saved overlay safe: it is the same build the next
@@ -3769,7 +4477,9 @@ def create_app(
         refused with ``409`` instead of overwriting it; the handler's fingerprint check stays the broader
         one, because a YAML edit moves no revision. ``notice`` turns a save that has something to report --
         an OPML import counted what it added and skipped -- into a rendered page; every other caller keeps
-        the redirect that leaves a reloadable form.
+        the redirect that leaves a reloadable form. ``refuse`` takes the redacted reason an overlay was refused
+        for -- validation, a build, or the file's own rules -- and draws the page the caller wants instead of the
+        bare "Not saved" one, so a form can give itself back with what was typed.
         """
         if runtime.config_path is None or runtime.overlay_path is None:
             return page(
@@ -3799,6 +4509,8 @@ def create_app(
             pipeline.build_plugins(candidate, runtime.environment)
         except (ConfigError, ValueError, KeyError) as exc:
             # Redacted before rendering: a builder error can carry a value expanded from the environment.
+            if refuse is not None:
+                return refuse(pipeline.redact(str(exc), values))
             message = esc(pipeline.redact(str(exc), values))
             return page(
                 "Not saved",
@@ -3819,6 +4531,8 @@ def create_app(
                 status_code=409,
             )
         except ConfigError as exc:
+            if refuse is not None:
+                return refuse(pipeline.redact(str(exc), values))
             return page(
                 "Not saved",
                 f"<p>{esc(pipeline.redact(str(exc), values))}</p>",
@@ -3963,6 +4677,10 @@ def create_app(
             save_source_thresholds(overlay, base, form)
             return commit_overlay(request, overlay)
 
+    def refuse_sources(request: Request, form: dict[str, list[str]], message: str):
+        """The configuration page again, with the sources form as it was submitted and the reason it was refused."""
+        return render_config(request, draft=form_draft(form), draft_section="sources", problem=message, status_code=400)
+
     @app.post("/config/sources", dependencies=[Depends(require_csrf)])
     def save_sources_form(request: Request):
         if not require_auth(request):
@@ -3978,7 +4696,7 @@ def create_app(
             # field, even when the box is unchecked and the text is cleared. The probe result page's "Add this
             # source" form carries only the new block, and reconciling from it would read every row's absence as
             # a deliberate disable and clear.
-            whole = any(name.startswith(("enabled:", "tag:", "interval:", "remove:", "added_")) for name in form)
+            whole = any(name.startswith(SOURCE_ROW_FIELD_PREFIXES) for name in form)
             owned = added_source_ids(overlay)
             if whole:
                 changes = {}
@@ -4067,18 +4785,12 @@ def create_app(
                     if not error:
                         added.append(candidate)
             if error:
-                return page(
-                    "Not saved",
-                    _notice(esc(error), "critical") + "<p><a href='/config'>Back to configuration</a></p>",
-                    active="/config",
-                    actions=sign_out_form(request),
-                    status_code=400,
-                )
+                return refuse_sources(request, form, error)
             if added:
                 overlay["sources_added"] = added
             else:
                 overlay.pop("sources_added", None)
-            return commit_overlay(request, overlay)
+            return commit_overlay(request, overlay, refuse=lambda message: refuse_sources(request, form, message))
 
     @app.post("/config/sources/opml", dependencies=[Depends(require_csrf)])
     def import_opml(request: Request):
@@ -4208,6 +4920,140 @@ def create_app(
                 return stale
             return _save_notifiers(request, overlay, base, form)
 
+    def notifier_test_page(request: Request, body: str, *, status_code: int = 200, headers=None):
+        return page(
+            "Test message",
+            f"{body}<p><a href='/config#notifiers'>Back to the notifiers</a></p>",
+            active="/config",
+            actions=sign_out_form(request),
+            status_code=status_code,
+            headers=headers,
+        )
+
+    def running_notifier(request: Request, form: dict[str, list[str]]):
+        """The notifier a test button named as it runs now, and the page refusing when it cannot be tested.
+
+        The button submits a raw id, as ``/config`` renders it, which is looked up in the saved document. What
+        sends is the notifier in the live snapshot under the id that entry expands to, and only when it was built
+        from the very entry the row shows: one that is disabled, was saved after the last reload or has been edited
+        since is not the notifier the row describes, and a test is refused rather than sent through anything but
+        what the row says. The notifier, the entry it was built from and the configuration come from one snapshot,
+        so the confirmation and the send cannot describe one notifier and use another.
+        """
+        identifier = first(form, "id").strip()
+        document, _ = form_document(saved_overlay()[0])
+        entry = next(
+            (
+                item
+                for item in document.get("notifiers") or []
+                if isinstance(item, dict) and item.get("id") == identifier
+            ),
+            None,
+        )
+        if entry is None:
+            notice = _notice(f"No configured notifier has id {safe_text(identifier)}.", "critical")
+            return None, notifier_test_page(request, notice, status_code=404)
+        cfg, running = running_notifiers()
+        found = None if entry.get("enabled", True) is False else running.get(effective_id(entry))
+        if found is None:
+            notice = _notice(
+                f"{safe_text(identifier)} is not running: it is disabled, or it was saved after the last reload. "
+                "Nothing was sent.",
+                "warning",
+            )
+            return None, notifier_test_page(request, notice, status_code=409)
+        if not runs_as_saved(entry, running):
+            notice = _notice(
+                f"{safe_text(identifier)} is not running as saved: the notifier that runs now was built from an entry "
+                "that has been edited or saved since the last reload. Reload the configuration, then test it. "
+                "Nothing was sent.",
+                "warning",
+            )
+            return None, notifier_test_page(request, notice, status_code=409)
+        notifier, live = found
+        return RunningNotifier(entry["id"], notifier, live, cfg, confirmation_binding(live, cfg.language)), None
+
+    @app.post("/config/notifiers/test", dependencies=[Depends(require_csrf)])
+    def ask_notifier_test(request: Request):
+        """Show what a test would send and through which notifier. Nothing is sent: the person confirms here."""
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        running, refusal = running_notifier(request, form_body(request))
+        if refusal is not None:
+            return refusal
+        message = delivery_test_entry(running.cfg.language)
+        return page(
+            "Send a test message",
+            f"<h2>{safe_text(running.id)} <span class='muted'>{safe_text(running.live.get('type', ''))}</span></h2>"
+            "<p>This sends one real message through the notifier that is running now, to the destination it is "
+            "configured with. It uses the saved and applied configuration, never unsaved edits, and stores "
+            "nothing.</p>"
+            f"<pre>{esc(message['title'])}\n{esc(message['body'])}</pre>"
+            f'<form method="post" action="/config/notifiers/test/confirm">{csrf_field(request)}'
+            f"<input type='hidden' name='id' value='{esc(running.id)}'>"
+            f"<input type='hidden' name='live' value='{esc(running.binding)}'>"
+            "<button class='btn btn-primary'>Send the test message</button> "
+            "<a class='btn btn-quiet' href='/config#notifiers'>Cancel</a></form>",
+            active="/config",
+            actions=sign_out_form(request),
+        )
+
+    @app.post("/config/notifiers/test/confirm", dependencies=[Depends(require_csrf)])
+    def send_notifier_test(request: Request):
+        """Send one test message through a running notifier and show what the destination answered; store nothing.
+
+        The confirmation form says which notifier it was shown for, and only a form that carries the binding of the
+        notifier running now is sent: a form for another one, one that lost the field and a request that never came
+        from the confirmation page are refused before anything is counted or sent.
+        """
+        if not require_auth(request):
+            return RedirectResponse("/login", status_code=303)
+        form = form_body(request)
+        running, refusal = running_notifier(request, form)
+        if refusal is not None:
+            return refusal
+        # A missing field reads as empty and fails the comparison. It runs on bytes, like the form token's: a field is
+        # attacker-supplied and a non-ASCII str is a TypeError.
+        if not hmac.compare_digest(first(form, "live").encode("utf-8", "surrogatepass"), running.binding.encode()):
+            notice = _notice(
+                f"{safe_text(running.id)} changed after this confirmation was shown, so it is not the notifier you "
+                "confirmed. Nothing was sent; ask for the test again to confirm the notifier that is running now.",
+                "warning",
+            )
+            return notifier_test_page(request, notice, status_code=409)
+        with test_throttle_lock:
+            wait = test_throttle.refusal(running.notifier.id)
+            if wait is None:
+                # Counted before the send: one that raises or hangs may still have reached the destination.
+                test_throttle.failed(running.notifier.id)
+        if wait is not None:
+            notice = _notice(
+                f"{safe_text(running.id)} takes at most {TEST_SEND_MAX} test messages in "
+                f"{TEST_SEND_WINDOW_SECONDS} seconds. Nothing was sent; try again in {wait} seconds.",
+                "warning",
+            )
+            return notifier_test_page(request, notice, status_code=429, headers={"Retry-After": str(wait)})
+        try:
+            status = running.notifier.send(delivery_test_entry(running.cfg.language), http)
+        except Exception as exc:  # an unreachable destination is the answer, not a traceback
+            LOG.warning("test message through %s raised %s", log_safe(running.notifier.id), type(exc).__name__)
+            detail = pipeline.redact(f"{type(exc).__name__}: {exc}", secret_values(running.cfg))
+            return notifier_test_page(request, _notice(f"Not delivered: {esc(detail)}", "critical"))
+        LOG.info("test message sent through %s: status %s", log_safe(running.notifier.id), status)
+        if 200 <= status < 300:
+            notice = _notice(f"Accepted: the destination answered {esc(status)}.", "ok")
+        elif status == 0:
+            notice = _notice("Not delivered: the destination did not answer.", "critical")
+        else:
+            notice = _notice(f"Not delivered: the destination answered {esc(status)}.", "critical")
+        return notifier_test_page(request, f"<h2>{safe_text(running.id)}</h2>{notice}")
+
+    def refuse_notifier(request: Request, form: dict[str, list[str]], message: str):
+        """The configuration page again, with the notifier form as it was submitted and the reason it was refused."""
+        return render_config(
+            request, draft=form_draft(form), draft_section="notifiers", problem=message, status_code=400
+        )
+
     def _save_notifiers(request: Request, overlay: dict, base: dict, form: dict):
         entries = []
         for entry in base.get("notifiers") or []:
@@ -4219,58 +5065,34 @@ def create_app(
             # are carried over by id when the overlay is merged.
             updated.pop("headers", None)
             updated["enabled"] = f"enabled:{identifier}" in form
-            for key in NOTIFIER_FORM_KEYS:
-                value = first(form, f"field:{identifier}:{key}").strip()
-                if value:
-                    updated[key] = value
-                else:
-                    updated.pop(key, None)
-            for key in NOTIFIER_REFERENCE_KEYS:
-                value = first(form, f"field:{identifier}:{key}").strip()
-                if value:
-                    updated[key] = value
-                else:
-                    # An empty field stores no key: the merge carries a YAML secret over by id, so this form
-                    # cannot strip a credential the file owns, exactly as it cannot delete a YAML header.
-                    updated.pop(key, None)
+            spec = notifier_spec(entry)
+            if spec is not None:
+                # Only a key the row rendered is the form's to set or clear; any other key stays as written.
+                for key in notifier_form_keys(spec):
+                    value = first(form, f"field:{identifier}:{key}").strip()
+                    if value:
+                        updated[key] = value
+                    else:
+                        updated.pop(key, None)
+                for key in notifier_row_references(spec):
+                    value = first(form, f"field:{identifier}:{key}").strip()
+                    if value:
+                        updated[key] = value
+                    else:
+                        # An empty field stores no key: the merge carries a YAML secret over by id, so this form
+                        # cannot strip a credential the file owns, exactly as it cannot delete a YAML header.
+                        updated.pop(key, None)
+                missing = [key for key in spec.required if key not in updated] if updated["enabled"] else []
+                if missing:
+                    return refuse_notifier(request, form, f"{identifier} ({spec.kind}) needs {', '.join(missing)}.")
             entries.append(updated)
-        identifier = first(form, "new:id").strip()
-        if identifier:
-            kind = first(form, "new:type").strip()
-            reference = first(form, "new:reference").strip()
-            secret_key = NEW_NOTIFIER_REFERENCE.get(kind)
-            if kind and kind in NOTIFIER_BUILDERS and kind not in NEW_NOTIFIER_REFERENCE:
-                return page(
-                    "Not saved",
-                    f"<p>A {esc(kind)} notifier needs more than one reference; this form collects one. "
-                    "Add it by editing the YAML. A secret stays in the environment and is only referenced.</p>",
-                    active="/config",
-                    actions=sign_out_form(request),
-                    status_code=400,
-                )
-            new = {"id": identifier, "type": kind}
-            if secret_key is not None:
-                if not reference:
-                    return page(
-                        "Not saved",
-                        f"<p>A {esc(kind)} needs a reference here: enter ${{NAME}} or ${{NAME_FILE}}. "
-                        "The secret itself stays in the environment.</p>",
-                        active="/config",
-                        actions=sign_out_form(request),
-                        status_code=400,
-                    )
-                new[secret_key] = reference
-            for key in NOTIFIER_FORM_KEYS:
-                value = first(form, f"new:{key}").strip()
-                if value:
-                    new[key] = value
-            for key in NOTIFIER_REFERENCE_KEYS:
-                value = first(form, f"new:{key}").strip()
-                if value:
-                    new[key] = value
+        new, problem = new_notifier_from_form(form)
+        if problem:
+            return refuse_notifier(request, form, problem)
+        if new is not None:
             entries.append(new)
         overlay["notifiers"] = entries
-        return commit_overlay(request, overlay)
+        return commit_overlay(request, overlay, refuse=lambda message: refuse_notifier(request, form, message))
 
     @app.post("/config/routes", dependencies=[Depends(require_csrf)])
     def save_routes_form(request: Request):
@@ -4380,8 +5202,27 @@ def create_app(
             )
         return RedirectResponse("/config", status_code=303)
 
-    @app.get("/config", response_class=HTMLResponse)
-    def config_page(request: Request, saved: int | None = None):
+    def render_config(
+        request: Request,
+        saved: int | None = None,
+        add_notifier: str = "",
+        add_source: str = "",
+        *,
+        draft: Mapping[str, str] | None = None,
+        draft_section: str = "",
+        problem: str = "",
+        result: str = "",
+        status_code: int = 200,
+    ):
+        """The one configuration page: five anchored sections, each form carrying the state it was rendered from.
+
+        ``add_notifier`` and ``add_source`` name the type whose form is open; an unknown name opens none and is
+        never echoed. ``draft`` is a refused submission of the form in ``draft_section`` and ``problem`` says why
+        it was refused: the page is drawn again, with the state the forms carry as it is now, and that form shows
+        what was typed. What it shows is only ever what was typed (a reference stays a reference), and a
+        credential position gets back a whole reference or nothing. ``result`` is a notice already rendered, such
+        as what a test of an unsaved source answered, shown above the sections.
+        """
         if not require_auth(request):
             return RedirectResponse("/login", status_code=303)
         cfg = runtime.cfg
@@ -4434,9 +5275,6 @@ def create_app(
         defaults = document.get("default")
         defaults = defaults if isinstance(defaults, list) else []
         added_ids = added_source_ids(dict(saved_document["settings"]))
-        source_type_options = "".join(
-            f"<option value='{esc(kind)}'>{esc(kind)}</option>" for kind in sorted(SOURCE_SPECS)
-        )
         # Compared as the loader will see them: routing matches expanded values, and so does the warning.
         configured_source_ids = {
             effective_id(entry) for entry in sources if isinstance(entry, dict) and isinstance(entry.get("id"), str)
@@ -4469,6 +5307,13 @@ def create_app(
                 )
         if overlay_error:
             banner += _notice(f"The overlay cannot be read: {overlay_error}", "critical")
+        if problem:
+            banner += _notice(
+                f"Not saved: {esc(sentence(problem))} Nothing was written and the live configuration is unchanged. "
+                f"<a href='#{esc(draft_section)}'>Go to the form</a>.",
+                "critical",
+            )
+        banner += result
         status_tone = "ok" if live_now and saved_revision else ("warning" if saved_revision else "neutral")
         poll_text = document.get("poll_interval")
         # What the *saved* document means, not what the process is running: a save that landed while a pass
@@ -4529,13 +5374,52 @@ def create_app(
         digest_checked = " checked" if digest_text.strip().lower() in {"1", "true", "yes", "on"} else ""
         raw_quiet_hours = document.get("quiet_hours", "")
         quiet_hours_text = raw_quiet_hours if isinstance(raw_quiet_hours, str) else ""
-        type_options = "".join(
-            f"<option value='{esc(kind)}'>{esc(kind)}</option>" for kind in sorted(NOTIFIER_BUILDERS)
+        running = running_notifiers()[1] if runtime.config_path is not None else None
+        draft_notifiers = draft if draft_section == "notifiers" else None
+        if draft_notifiers is not None:
+            add_notifier = draft_notifiers.get("new:type", add_notifier)
+        draft_sources = draft if draft_section == "sources" else None
+        if draft_sources is not None:
+            add_source = draft_sources.get("new:type", add_source)
+        # The rows come from the draft only when the refused form rendered rows, so an absent row is not read as an
+        # unticked one.
+        row_draft = (
+            draft_sources
+            if draft_sources is not None and any(name.startswith(SOURCE_ROW_FIELD_PREFIXES) for name in draft_sources)
+            else None
         )
-        new_fields = " ".join(f"<label>{key}<input type='text' name='new:{key}'></label>" for key in NOTIFIER_FORM_KEYS)
-        new_reference_fields = " ".join(
-            f"<label>{key} reference<input type='text' name='new:{key}' placeholder='${{NAME}}'></label>"
-            for key in NOTIFIER_REFERENCE_KEYS
+        chosen_source = SOURCE_SPECS.get(add_source)
+        new_source = (
+            new_source_form(chosen_source, draft_sources)
+            if chosen_source is not None
+            else "<h3>New source</h3><p class='muted small'>Choose a type in the table above: its form opens "
+            "here with only the keys that type reads.</p>"
+        )
+        test_new_source = (
+            "<button class='btn' type='submit' formaction='/config/sources/probe'>Test the new source</button>"
+            if chosen_source is not None
+            else ""
+        )
+        chosen = NOTIFIER_SPECS.get(add_notifier)
+        new_notifier = (
+            new_notifier_form(chosen, draft_notifiers)
+            if chosen is not None
+            else "<h3>New notifier</h3><p class='muted small'>Choose a type in the table above: its form opens "
+            "here with only the keys that type reads.</p>"
+        )
+        jump = (
+            "<p class='muted small'>Jump to: "
+            + " · ".join(
+                f"<a href='#{anchor}'>{label}</a>"
+                for anchor, label in (
+                    ("settings", "Settings"),
+                    ("thresholds", "Risk thresholds"),
+                    ("sources", "Sources"),
+                    ("notifiers", "Notifiers"),
+                    ("routes", "Routes"),
+                )
+            )
+            + "</p>"
         )
         csrf = csrf_field(request)
         fingerprint = form_fingerprint(document)
@@ -4558,8 +5442,8 @@ def create_app(
             f"</p>"
             f'<form method="post" action="/reload">{csrf}<button class="btn">Reload configuration</button></form>'
             "</div>"
-            f"<p class='notice notice-{status_tone}'>Settings overlay: {status}</p>{banner}"
-            "<h2><span class='sec-num'>01</span>Settings</h2>"
+            f"<p class='notice notice-{status_tone}'>Settings overlay: {status}</p>{banner}{jump}"
+            "<h2 id='settings'><span class='sec-num'>01</span>Settings</h2>"
             f'<form method="post" action="/config/settings">{csrf}{form_state}'
             "<div class='fields'>"
             "<label class='poll'>Poll interval"
@@ -4576,7 +5460,7 @@ def create_app(
             "group, capped so every channel accepts it. Quiet hours hold non-critical messages until the window "
             "ends and never hold a critical one; an empty field means off.</p>"
             "<button class='btn btn-primary'>Save settings</button></form>"
-            "<h2><span class='sec-num'>02</span>Risk thresholds</h2>"
+            "<h2 id='thresholds'><span class='sec-num'>02</span>Risk thresholds</h2>"
             f'<form method="post" action="/config/thresholds">{csrf}{form_state}'
             "<div class='fields'>"
             "<label>Critical at CVSS"
@@ -4603,12 +5487,17 @@ def create_app(
             "terms: the form cannot delete a number the file owns, but it can override it.</p>"
             "<button class='btn btn-primary'>Save thresholds</button> "
             "<a class='btn btn-quiet' href='/thresholds'>Preview a decision</a></form>"
-            "<h2><span class='sec-num'>03</span>Sources</h2>"
+            "<h2 id='sources'><span class='sec-num'>03</span>Sources</h2>"
             "<p class='muted small'>A source defined in the YAML keeps its keys there: this page edits its enable "
             "flag, its watch tag and its poll interval, and can test it. A source added here is stored whole in "
             "the settings overlay, so it needs no edit to a read-only config mount. The watch tag scopes a "
             "changedetection.io poll and is ignored by the other kinds. An interval of 30m thins this source's "
             "polling; an empty field uses the global poll interval, and alerts are never delayed by it.</p>"
+            "<p class='muted small'>Every type can be added here. A <b>reference</b> key holds the name of an "
+            "environment variable, written ${NAME} or ${NAME_FILE}, never the secret itself, and the variable has "
+            "to be listed under <code>overlay_references</code> in the YAML file. Choose a type to open its form: "
+            "it asks for that type's keys only and marks which are required.</p>"
+            f"{source_catalogue_table()}"
             f'<form method="post" action="/config/sources">{csrf}{form_state}'
             "<div class='scroll'><table><tr><th scope='col'>Source</th>"
             "<th scope='col' class='narrow'>Enabled</th>"
@@ -4617,17 +5506,9 @@ def create_app(
             "<th scope='col'>Keys</th>"
             "<th scope='col' class='narrow'>Remove</th>"
             "<th scope='col' class='narrow'>Test</th>"
-            f"</tr>{source_form_entries(sources, added_ids)}</table></div>"
-            "<h3>New source</h3>"
-            "<div class='fields'><label>id <span class='muted small'>(optional)</span>"
-            "<input type='text' name='new:id'></label>"
-            f"<label>type<select name='new:type'>{source_type_options}</select></label></div>"
-            f"<div class='fields'>{new_source_fields()}</div>"
-            "<p class='muted small'>An id is derived from the URL host when it is empty. A field another kind "
-            "reads is ignored. A secret key takes a ${NAME} or ${NAME_FILE} reference and is stored instead of "
-            "the value.</p>"
-            "<button class='btn btn-primary'>Save sources</button> "
-            "<button class='btn' type='submit' formaction='/config/sources/probe'>Test the new source</button>"
+            f"</tr>{source_form_entries(sources, added_ids, row_draft)}</table></div>"
+            f"{new_source}"
+            f"<button class='btn btn-primary'>Save sources</button> {test_new_source}"
             "</form>"
             "<h3>Import OPML</h3>"
             f'<form method="post" action="/config/sources/opml">{csrf}{form_state}'
@@ -4637,23 +5518,22 @@ def create_app(
             "A feed already configured, or repeated in the document, is skipped and counted. A feed URL is "
             "checked exactly as a single add is, and nothing is written when the document cannot be read.</p>"
             "<button class='btn'>Add feeds from OPML</button></form>"
-            "<h2><span class='sec-num'>04</span>Notifiers</h2>"
+            "<h2 id='notifiers'><span class='sec-num'>04</span>Notifiers</h2>"
+            "<p class='muted small'>Every type can be added here, and only a header has to be written in the YAML "
+            "file. A <b>reference</b> key holds the name of an environment variable, written ${NAME} or "
+            "${NAME_FILE}, never the secret itself, and the variable has to be listed under "
+            "<code>overlay_references</code> in the YAML file. A <b>YAML only</b> key is never written by this "
+            "page. A row below edits its plain keys and a webhook's signing secret; its url and its other "
+            "references are set when the notifier is added, so to point one elsewhere add a new notifier and "
+            "disable the old one, or edit the YAML. An smtp notifier whose password the YAML holds keeps its "
+            "host, port and TLS flags from the YAML too, so a saved edit cannot send that password "
+            "elsewhere.</p>"
+            f"{notifier_catalogue_table()}"
             f'<form method="post" action="/config/notifiers">{csrf}{form_state}'
-            f"{notifier_form_entries(notifiers)}"
-            "<h3>New notifier</h3>"
-            "<p class='muted small'>Secrets stay in the environment: a reference field takes ${NAME} or "
-            "${NAME_FILE} and is stored instead of the value. A webhook's optional signing secret is one of "
-            "them. A type that needs two references, or a header, is added by editing the YAML. A form may name "
-            "only a variable the YAML lists under <code>overlay_references</code>. An smtp notifier whose "
-            "password the YAML holds keeps its host, port and TLS flags from the YAML too, so a saved edit "
-            "cannot send that password elsewhere.</p>"
-            "<div class='fields'>"
-            "<label>id<input type='text' name='new:id'></label>"
-            f"<label>type<select name='new:type'>{type_options}</select></label>"
-            "<label>reference <input type='text' name='new:reference' placeholder='${NAME}'></label>"
-            f"{new_reference_fields}{new_fields}</div>"
+            f"{notifier_form_entries(notifiers, running, draft_notifiers)}"
+            f"{new_notifier}"
             "<button class='btn btn-primary'>Save notifiers</button></form>"
-            "<h2><span class='sec-num'>05</span>Routes</h2>"
+            "<h2 id='routes'><span class='sec-num'>05</span>Routes</h2>"
             f'<form method="post" action="/config/routes">{csrf}{form_state}'
             f"{route_form_entries(routes, defaults, notifier_choices(notifiers))}"
             "<button class='btn btn-primary'>Save routes</button></form>"
@@ -4661,7 +5541,11 @@ def create_app(
             "<p class='muted small'>The YAML file stays the source of every other setting; environment changes "
             "still need a restart.</p>"
         )
-        return page("Configuration", body, active="/config", actions=sign_out_form(request))
+        return page("Configuration", body, active="/config", actions=sign_out_form(request), status_code=status_code)
+
+    @app.get("/config", response_class=HTMLResponse)
+    def config_page(request: Request, saved: int | None = None, add_notifier: str = "", add_source: str = ""):
+        return render_config(request, saved, add_notifier, add_source)
 
     # --- the watchlist: the scope document, edited where it lives ------------------------------------------
 

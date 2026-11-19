@@ -66,8 +66,9 @@ _AMBIGUOUS_TARGET = (
     "userinfo, with a literal / or @ percent-encoded (for example %2F or %40)"
 )
 
-#: A SQLite document must not be written at the path of a file that lives beside ``state_path``: the KEV cache
-#: and the settings overlay are replaced atomically by their own writers, so the first pass would destroy one.
+#: A SQLite document must not be written at the path of a file that lives beside ``state_path``: the KEV cache,
+#: the settings overlay, the default watchlist and the imported inventory are replaced atomically by their own
+#: writers, so the first pass or import would destroy one.
 #: The refusal names the file's role, never the path, so a log line and the message cannot disagree about it.
 _RESERVED_NEIGHBOUR_REFUSAL = (
     "unsupported state store: the SQLite file is the {role} beside state_path, which this program replaces; "
@@ -78,20 +79,22 @@ _RESERVED_NEIGHBOUR_REFUSAL = (
 def _refuse_reserved_neighbour(path: Path, state_path: Path) -> None:
     """Refuse a SQLite document at a file another owner keeps beside ``state_path``.
 
-    That is the KEV cache, the settings overlay and the default watchlist: each is written by its own owner, so a
-    document there destroys one of them -- and a watchlist that is really a SQLite database would be read as an
-    unreadable scope, failing every pass. The comparison is on resolved absolute paths, because
-    ``sqlite:///data/kev.json`` is relative to the working directory while ``sqlite:////data/kev.json`` is absolute
-    and both can name the same file. The neighbour names come from the owners that write those files, so a rename
-    cannot leave this check behind; they are imported here because two of them reach ``storage`` through ``config``.
+    That is the KEV cache, the settings overlay, the default watchlist and the imported inventory: each is written by
+    its own owner, so a document there destroys one of them -- an upload or a dropped file replaces ``inventory.json``
+    whole, and a watchlist that is really a SQLite database would be read as an unreadable scope, failing every
+    pass. The comparison is on resolved absolute paths, because ``sqlite:///data/kev.json`` is relative to the
+    working directory while ``sqlite:////data/kev.json`` is absolute and both can name the same file. The neighbour
+    names come from the owners that write those files, so a rename cannot leave this check behind; they are imported
+    here because two of them reach ``storage`` through ``config``.
     """
-    from . import pipeline, settings, watchlist  # lazy: two of them import storage (through config)
+    from . import inventory, pipeline, settings, watchlist  # lazy: two of them import storage (through config)
 
     resolved = path.resolve()
     for role, neighbour in (
         ("KEV cache", state_path.with_name(pipeline.KEV_CACHE_NAME)),
         ("settings overlay", settings.settings_path(state_path)),
         ("default watchlist", state_path.with_name(watchlist.WATCHLIST_NAME)),
+        ("imported inventory", inventory.inventory_path(state_path)),
     ):
         if resolved == neighbour.resolve():
             raise ValueError(_RESERVED_NEIGHBOUR_REFUSAL.format(role=role))

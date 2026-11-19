@@ -23,6 +23,7 @@ import yaml
 from .budget import DEFAULT_PASS_BUDGET_SECONDS, MAX_PASS_BUDGET_SECONDS, MIN_PASS_BUDGET_SECONDS
 from .catalogue import SOURCE_SPECS
 from .delivery import QuietHours, parse_quiet_hours
+from .inventory import INVENTORY_NAME
 from .messages import DEFAULT_LANGUAGE, LANGUAGES
 from .routing import MATCH_KEYS, SEVERITY_TAGS
 from .storage import Store, store_for
@@ -284,6 +285,11 @@ class Config:
     #: Where the document lives: empty is the JSON file at ``state_path``, or a ``sqlite:///`` / ``postgresql://``
     #: URL. YAML-only -- the overlay cannot move the store, exactly as it cannot move ``state_path``.
     storage: str = ""
+    #: The directory a dropped SBOM or scan result is picked up from, or ``None``. YAML-only, and always inside the
+    #: directory of the state file or of this configuration: a browser session never chooses a file to read.
+    inventory_dir: Path | None = None
+    #: How old an imported inventory may be before it can no longer confirm that an advisory does not apply.
+    inventory_max_age_days: int = 30
     hidden_source_hosts: frozenset[str] = frozenset()
     adobe_commerce: bool = False
     #: A free NVD API key: raises the anonymous 5-per-30 s limit to 50 and shortens the pace in ``core.Intel``.
@@ -380,6 +386,7 @@ _TOP_KEYS = {
     "pass_budget",
     "state_path",
     "storage",
+    "inventory",
     "hidden_source_hosts",
     "adobe_commerce",
     "nvd_api_key",
@@ -577,6 +584,51 @@ def _credential_names(document: dict) -> set[str]:
     names |= _reference_names(document.get("storage"))
     names |= _reference_names(document.get("nvd_api_key"))
     return names
+
+
+#: The default for ``inventory.max_age_days``; the largest accepted value is 3650 (ten years).
+INVENTORY_MAX_AGE_DAYS = 30
+_INVENTORY_KEYS = frozenset({"dir", "max_age_days"})
+
+
+def _inventory_options(value: object, config_path: Path, state_path: Path) -> tuple[Path | None, int]:
+    """The ``inventory`` block: the drop directory and the age after which an inventory is stale.
+
+    ``dir`` is read from the data volume or the configuration directory and never from anywhere else, so a
+    typo cannot point the importer at a system directory. A relative name is relative to the directory of the
+    state file. The directory must lie strictly inside one of the two and must not contain the state file's own
+    directory, so no document this program writes can ever be mistaken for a file dropped there.
+    """
+    if value is None:
+        return None, INVENTORY_MAX_AGE_DAYS
+    _require(isinstance(value, dict), "inventory must be a mapping")
+    _require(not set(value) - _INVENTORY_KEYS, f"unknown inventory keys {sorted(set(value) - _INVENTORY_KEYS)}")
+    age = value.get("max_age_days", INVENTORY_MAX_AGE_DAYS)
+    _require(
+        isinstance(age, int) and not isinstance(age, bool) and 1 <= age <= 3650,
+        "inventory.max_age_days must be an integer in 1..3650",
+    )
+    raw = value.get("dir")
+    if raw is None:
+        return None, age
+    _require(isinstance(raw, str) and bool(raw) and "\x00" not in raw, "inventory.dir must be a directory path")
+    try:
+        state_dir = state_path.resolve().parent
+        config_dir = config_path.resolve().parent
+        chosen = Path(raw)
+        resolved = (chosen if chosen.is_absolute() else state_dir / chosen).resolve()
+    except (OSError, RuntimeError) as exc:  # a link loop
+        raise ConfigError("inventory.dir is not a usable path") from exc
+    inside = any(root in resolved.parents for root in (state_dir, config_dir))
+    _require(
+        inside,
+        "inventory.dir must be a directory inside the directory of state_path or of the configuration file",
+    )
+    _require(
+        state_dir != resolved and resolved not in state_dir.parents,
+        "inventory.dir must not contain the directory of state_path",
+    )
+    return resolved, age
 
 
 def _bool_option(value: object, name: str) -> bool:
@@ -1055,6 +1107,12 @@ def config_from_document(
         f"state_path must not be named {WATCHLIST_NAME}: that is the default watchlist's filename beside the "
         "state file",
     )
+    _require(
+        state_path.name != INVENTORY_NAME,
+        f"state_path must not be named {INVENTORY_NAME}: that is the imported inventory's filename beside the "
+        "state file",
+    )
+    inventory_dir, inventory_max_age_days = _inventory_options(document.get("inventory"), path, state_path)
     # A malformed value must fail here with every other bad key, not at the first pass: ``store_for`` is the
     # one parser, and its refusal names the accepted forms without quoting the value (a URL can carry a
     # password). The store itself is built later, from an already validated value.
@@ -1098,6 +1156,8 @@ def config_from_document(
         pass_budget_seconds=pass_budget,
         state_path=state_path,
         storage=storage,
+        inventory_dir=inventory_dir,
+        inventory_max_age_days=inventory_max_age_days,
         hidden_source_hosts=hidden,
         adobe_commerce=_bool_option(document.get("adobe_commerce", False), "adobe_commerce"),
         allow_private_sources=_bool_option(document.get("allow_private_sources", False), "allow_private_sources"),

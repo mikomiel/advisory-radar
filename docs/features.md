@@ -8,7 +8,7 @@ turns critical, and never re-sends what you already received.
 
 ## Capabilities
 
-- Configurable source plugins: RSS/Atom/JSON Feed, FreshRSS (GReader API), changedetection.io (API poll + inbound webhook), generic inbound webhook; vendor enrichment for Debian DSA, php.net ChangeLog, Node.js security blog, Adobe APSB bulletins
+- Configurable source plugins: RSS/Atom/JSON Feed, FreshRSS (GReader API), changedetection.io (API poll + inbound webhook), generic inbound webhook, CSAF 2.0 provider directories (schema-checked vendor statements, first provider Red Hat); vendor enrichment for Debian DSA, php.net ChangeLog, Node.js security blog, Adobe APSB bulletins
 - Enrichment plugins: CVE.org, NVD, FIRST EPSS, CISA KEV, OSV, Debian security tracker
 - Notifier plugins: Discord webhook, Matrix (Hookshot), ntfy, Gotify, Apprise, generic webhook
   (optionally signed), SMTP, and `log` (writes each message to the application log and delivers
@@ -38,6 +38,11 @@ turns critical, and never re-sends what you already received.
 - The CVEs a message named beyond the lookup cap are durable work, not forgotten ones: each pass measures a few, one
   source in turn, inside the same budget; KEV evidence escalates at once; the dashboard and `/metrics` count the
   CVEs by state and show the oldest wait, and a CVE with enrichment outstanding stays watched for up to 30 days
+- Installed-software evidence: import an SBOM (CycloneDX or SPDX 2.x JSON) or an OSV-Scanner v2 result
+  by upload on `/inventory` or from a drop directory, and the advisory page says whether the
+  installed version applies (with the fix), is not affected, or is unknown, kept apart from text
+  relevance, with the file, digest and time it came from; bounded, never executed, and with no
+  effect on routing or notifications ([details](inventory.md))
 - Web UI + REST API, in-process scheduler (default every 15 min), atomic state on a volume:
   a JSON file by default, SQLite or PostgreSQL when `storage` says so
 - Per-entry release/drop on the parked queue, next to the bulk actions: each row shows its

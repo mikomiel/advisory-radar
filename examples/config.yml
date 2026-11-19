@@ -58,6 +58,9 @@ sources:
   # - id: inbox
   #   type: webhook          # receives POST /webhooks/inbox (set ADVISORY_RADAR_WEBHOOK_SECRET or
   #                          # ADVISORY_RADAR_WEBHOOK_SECRET_FILE; at least 24 characters)
+  # - id: redhat-csaf
+  #   type: csaf             # a vendor's CSAF 2.0 directory (docs/sources.md#csaf-directories)
+  #   url: https://security.access.redhat.com/data/csaf/v2/advisories/
 
 # The environment variables the /config overlay may reference as ${NAME} or ${NAME_FILE}.
 # With no list the overlay can reference none: a browser session must not be able to send
@@ -71,6 +74,14 @@ sources:
 # but not saved from the browser). Format in docs/configuration.md#watchlist; without a document
 # every advisory that arrives is judged.
 # watchlist: /data/watchlist.json
+
+# Installed software: an SBOM (CycloneDX or SPDX 2.x JSON) or an OSV-Scanner v2 JSON result adds version-aware
+# evidence to the advisory page and a filter to /alerts; it changes no routing or notification. Upload a file on
+# /inventory, or name a directory a scanner or CI job writes into (inside the directory of state_path or of this
+# file; the newest *.json file is read at the start of each pass). YAML-only. See docs/inventory.md.
+# inventory:
+#   dir: /data/inventory
+#   max_age_days: 30        # 1..3650: after this an inventory can no longer clear an advisory
 
 # The one notifier below ships disabled, so a fresh copy of this file starts with only ADVISORY_RADAR_AUTH_TOKEN set.
 # While every notifier is disabled nothing is sent: advisories stay queued (the dashboard and /metrics show the
