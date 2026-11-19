@@ -705,12 +705,26 @@ addresses is tried address by address inside what is left, and the TLS handshake
 dead or slow addresses cannot stretch one request past its stage. Two waits are not cut at what is left: resolving the
 host name, which the system resolver does not allow, and sending the request, which keeps its 30-second limit. The
 requests of a pass are made one after another, so the budget bounds the sum of their waits, and it adds no parallel
-requests.
+requests. The KEV catalogue has an allowance of its own inside the first stage: see The catalogue's allowance, below.
 
 **Stages.** One slow part must not use up what the parts after it need, so each stage has to end by a share of the
 budget: the KEV catalogue and the re-evaluation by one fifth, the source fetches by three quarters, and the
 classification of what was fetched, with the Adobe Commerce pass, by the whole budget. With the default that is 2,
 7.5 and 10 minutes after the pass has the lock.
+
+**The catalogue's allowance.** The KEV catalogue is one request at the head of the first stage, ahead of the re-scores
+and the drain that share the stage with it. A server that sends it a few bytes at a time could keep it for the whole
+stage on every pass: at the default budget the stage is as long as one request may take ([Sources](sources.md)), and
+the re-scores and the drain would never begin. So the catalogue may spend at most half of what the stage has left when
+its request starts, and never more than the 120 seconds any request may take: about 60 seconds at the default budget,
+about 6 seconds at `1m`, and 120 seconds from `20m` up. The rest of the stage is left for the re-scores and the
+drain. The allowance is not a setting.
+
+A download the allowance cuts is a failed fetch like any other. The cached copy (`kev.json`, beside `state_path`)
+still escalates the CVEs it lists, but the catalogue does not count as read in that pass, so nothing is suppressed on
+its strength; with no cached copy, nothing is escalated on its account. A cut never replaces the cached copy, and the
+next pass asks again. It does not make the pass `incomplete`: the log carries the loader's warning, which starts
+`kev: fetch failed`.
 
 **What it defers.** Work the budget stops is deferred, never dropped, and it is stored in the state document:
 
@@ -779,8 +793,9 @@ again on the next pass, but behind the CVEs that were waiting, and its source co
 re-scores, and the drain, each ask EPSS for the scores of all their CVEs in one request, so when that request
 spends the budget (it is cut, or it answers with nothing left) each of those CVEs has had its turn. One the
 budget ended later, behind the lookup of another CVE, keeps its place. A CVE whose lookup always outlasts the
-budget, or a batch whose EPSS request does, therefore cannot hold the pass while the others never start. A CVE
-that turns out critical is escalated once, like a CVE that a daily re-score finds critical.
+budget, or a batch whose EPSS request does, therefore cannot hold the pass while the others never start, and neither
+can the KEV catalogue, which has an allowance of its own ([The catalogue's allowance](#the-pass-budget)). A CVE that
+turns out critical is escalated once, like a CVE that a daily re-score finds critical.
 
 What bounds the lookups of one pass is therefore explicit, and none of it is a setting:
 

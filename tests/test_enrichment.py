@@ -289,6 +289,56 @@ def test_a_drain_batch_whose_epss_request_spends_the_budget_takes_its_turn_and_t
     assert not capped(stored(tmp_path)) & behind, "the CVEs that waited behind the batch are measured next"
 
 
+def test_a_catalogue_that_keeps_using_its_whole_allowance_leaves_the_re_scores_and_the_drain_their_share(tmp_path):
+    """The catalogue is one request at the head of the refresh stage, which is 120 s at the default budget. A response
+    that keeps trickling in, or any request that costs more than the stage, took all of it on every pass: no re-score
+    and no drain lookup could begin, so the work that was owed never moved. The catalogue may take half of what the
+    stage has left, and the other half goes to the work behind it."""
+    due = {f"CVE-2026-{6000 + n}": aged(3) for n in range(25)}
+    waiting = {
+        f"CVE-2026-{7000 + n}": aged(3, kev_only=True, source_id="ab"[n % 2], last_eval=NOW - 60) for n in range(25)
+    }
+    prepare(tmp_path, watch={**due, **waiting})
+    clock = Clock()
+    net = Scored(clock)
+    net.cost[core.KEV_URL] = 500  # longer than the whole stage, so every pass cuts it
+    cfg = config(tmp_path, ids=("a", "b"))  # the default budget: ten minutes, and a refresh stage of two
+    rescored = drained = 0
+    for per_pass in (10, 10, 5):  # the caps of one pass, until nothing is left of either kind of work
+        start, before = len(net.calls), clock.now
+        assert run(cfg, net, clock) == 0
+        assert len(looked_up(net, start)) == 2 * per_pass, "a batch of re-scores and a batch of the drain both began"
+        assert net.calls[start:].count(core.KEV_URL) == 1, "and the catalogue is still asked for on every pass"
+        assert clock.now - before == pytest.approx(60, abs=1), "it was cut at half of the stage, not at its end"
+        state = stored(tmp_path)
+        assert "outcome" not in state["runs"][-1], "a catalogue that was cut does not make the pass incomplete"
+        rescored, drained = rescored + per_pass, drained + per_pass
+        assert sum(state["watch"][cve]["last_eval"] > NOW - DAY for cve in due) == rescored, "the due CVEs advanced"
+        assert len(capped(state)) == 25 - drained, "and so did the capped ones"
+        if drained < 25:
+            assert state["enrich_cursor"] == "b", "the drain took its turn"
+
+
+def test_a_catalogue_that_is_cut_still_promotes_from_its_cached_copy(tmp_path):
+    """The allowance cuts the request at half of the stage, and a cut is a failed fetch like any other. The copy that
+    an earlier pass cached still escalates what it lists, and a failed fetch never replaces it."""
+    from advisory_radar.kev import KEV_CACHE_SCHEMA
+
+    cve = "CVE-2026-9001"  # listed by the cached copy only: the fake catalogue lists CVE-2020-0001
+    prepare(tmp_path, watch={cve: aged(1, kev_only=True, last_eval=NOW - 60)})
+    cache = tmp_path / "kev.json"
+    save_state(cache, {"schema": KEV_CACHE_SCHEMA, "etag": "e0", "last_modified": "", "cves": [cve]})
+    kept = cache.read_bytes()
+    clock = Clock()
+    net = Scored(clock)
+    net.cost[core.KEV_URL] = 500
+    assert run(config(tmp_path, ids=("a",)), net, clock) == 0
+    assert net.calls.count(core.KEV_URL) == 1, "the catalogue was asked for once"
+    assert clock.now - NOW == pytest.approx(60, abs=1), "and cut at half of the stage, not at its end"
+    assert [(post["ids"], post["tag"]) for post in net.posts if post["kind"] == "escalation"] == [([cve], "critical")]
+    assert cache.read_bytes() == kept, "the cut request did not replace the cached copy"
+
+
 def test_a_failed_lookup_is_recorded_waits_a_day_and_does_not_hold_the_others_back(tmp_path):
     cfg, net, clock = delivered_advisories(tmp_path)
     target = sorted(capped(stored(tmp_path), "a"))[3]

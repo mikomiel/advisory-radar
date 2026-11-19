@@ -6,20 +6,24 @@ liked. The budget bounds the whole upstream part of a pass: a request never outl
 left the remaining work is deferred, never dropped (``pipeline`` records what, and the next pass starts with it).
 
 The budget is divided into stages that each have to end by a share of it, so that one slow part cannot spend what the
-parts after it need. Delivery is not upstream work. It never goes through this module: ``pipeline`` hands it the plain
-``Http``, so a spent budget cannot hold back a message that is already queued.
+parts after it need. The first stage holds the KEV catalogue, one request that comes before the work it shares the stage
+with, so the catalogue has a share of the stage of its own (``KEV_SHARE``). Delivery is not upstream work. It never goes
+through this module: ``pipeline`` hands it the plain ``Http``, so a spent budget cannot hold back a message that is
+already queued.
 """
 
 from __future__ import annotations
 
+import contextlib
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 
 from .http import Http, request_ceiling
 
 DEFAULT_PASS_BUDGET_SECONDS = 600
-#: The smallest budget a configuration may name, and the largest. Below a minute the catalogue download alone
-#: could spend it; above an hour the budget stops bounding anything a scheduler would wait for.
+#: The smallest budget a configuration may name, and the largest. Below a minute the first stage, which holds the
+#: catalogue download, would be shorter than 12 seconds; above an hour the budget stops bounding anything a scheduler
+#: would wait for.
 MIN_PASS_BUDGET_SECONDS = 60
 MAX_PASS_BUDGET_SECONDS = 3600
 
@@ -29,6 +33,11 @@ MAX_PASS_BUDGET_SECONDS = 3600
 REFRESH_STAGE = 0.2
 FETCH_STAGE = 0.75
 CLASSIFY_STAGE = 1.0
+#: The share of what the first stage has left, when its request starts, that the KEV catalogue may spend. It is one
+#: request at the head of the stage, so a response that trickles in could take the whole stage (120 s at the default
+#: budget, which is also the longest one request may take) on every pass, and the re-scores and the drain behind it
+#: would never begin. What it leaves is theirs.
+KEV_SHARE = 0.5
 
 
 class PassBudget:
@@ -63,6 +72,21 @@ class BudgetedHttp:
 
     def expired(self) -> bool:
         return self.remaining() <= 0
+
+    @contextlib.contextmanager
+    def at_most(self, share: float) -> Iterator[None]:
+        """Cut every request made inside the block at ``share`` of what the stage has left as the block starts.
+
+        That is one instant for all of its requests, not a share of what is left as each one starts, and the stage's
+        own end still applies: a share of nothing is nothing, so a stage that is over stays over. A request the block
+        cuts is cut like one the stage cuts, with status 0, and it counts in ``refused``.
+        """
+        stage = self.stage
+        self.stage = stage - self._budget.remaining(stage) * (1 - share) / self._budget.seconds
+        try:
+            yield
+        finally:
+            self.stage = stage
 
     def __call__(
         self, method: str, url: str, headers: Mapping[str, str], body: bytes | None

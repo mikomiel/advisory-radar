@@ -273,7 +273,9 @@ def test_a_slow_catalogue_download_cannot_spend_more_than_the_refresh_share(tmp_
     assert run(config(tmp_path, ids=("a",)), net, clock) == 0
     assert net.fetched() == ["https://a.example.com/feed"], "the sources are still read after a slow catalogue"
     state = stored(tmp_path)
-    assert state["watch"]["CVE-2026-3001"]["last_eval"] == NOW - 2 * day, "a lookup the budget refused is not tried"
+    assert state["watch"]["CVE-2026-3001"]["last_eval"] == NOW, (
+        "the catalogue was cut at its allowance, so the due re-score still began"
+    )
     assert clock.now - NOW < 300, "the catalogue was cut at the refresh share, not waited for"
 
 
@@ -537,6 +539,74 @@ def test_the_request_ceiling_caps_the_timeout_and_the_deadline(monkeypatch):
     assert plain_timeout == http_module.HTTP_TIMEOUT and plain_window > http_module.HTTP_DEADLINE - 1
     assert capped_timeout == 7.0 and 6 < capped_window <= 7
     assert len(seen) == 2, "no request is started once nothing is left"
+
+
+def test_at_most_ends_a_request_at_a_share_of_what_the_stage_has_left_and_gives_the_stage_back():
+    from advisory_radar.budget import BudgetedHttp, PassBudget
+
+    clock = Clock()
+    seen: list[float | None] = []
+
+    def http(method, url, headers, body):
+        seen.append(http_module.ceiling_left())
+        return 200, {}, b""
+
+    upstream = BudgetedHttp(http, PassBudget(600, clock))
+    stage = upstream.stage
+
+    def ask():
+        return upstream("GET", "https://x.example.com/", {}, None)
+
+    clock.advance(20)  # the refresh stage is 120 s, so 100 s of it are left
+    with upstream.at_most(0.5):
+        ask()
+        clock.advance(10)
+        ask()
+    ask()
+    assert seen == pytest.approx([50, 40, 90]), "one end for the block, fixed as it starts; the stage's own after it"
+    assert upstream.stage == stage
+    clock.advance(1000)  # the stage is over
+    with upstream.at_most(0.5):
+        assert upstream.expired(), "a block never gives a stage that is over more time"
+        assert ask() == (0, {}, b"") and len(seen) == 3, "so nothing is started"
+    assert upstream.stage == stage
+
+
+def test_a_request_inside_at_most_is_still_bounded_by_the_request_deadline(monkeypatch):
+    from advisory_radar.budget import KEV_SHARE, BudgetedHttp, PassBudget
+
+    windows: list[float] = []
+
+    class Opener:
+        def open(self, request, timeout):
+            windows.append(request.deadline - time.monotonic())
+            raise urllib.error.URLError("stop here")
+
+    monkeypatch.setattr(http_module, "_OPENER", Opener())
+    for seconds in (600, 3600):  # the catalogue's share of the refresh stage is 60 s, then 360 s
+        upstream = BudgetedHttp(http_module.urllib_http, PassBudget(seconds))
+        with upstream.at_most(KEV_SHARE):
+            assert upstream("GET", "https://x.example.com/", {}, None) == (0, {}, b"")
+    assert windows == pytest.approx([60, http_module.HTTP_DEADLINE], abs=1), "the share, and never more than the limit"
+
+
+def test_a_catalogue_the_allowance_cuts_is_a_failed_fetch_to_load_kev(tmp_path):
+    from advisory_radar.budget import KEV_SHARE, BudgetedHttp, PassBudget
+    from advisory_radar.kev import KEV_CACHE_SCHEMA, load_kev
+
+    cache = tmp_path / "kev.json"
+    save_state(cache, {"schema": KEV_CACHE_SCHEMA, "etag": "e0", "last_modified": "", "cves": ["CVE-2026-1111"]})
+    kept = cache.read_bytes()
+    clock = Clock()
+    net = Net(clock)
+    net.cost[core.KEV_URL] = 500
+    upstream = BudgetedHttp(net, PassBudget(600, clock))
+    with upstream.at_most(KEV_SHARE):
+        cves, known = load_kev(upstream, cache, save=True)
+    assert (cves, known) == (frozenset({"CVE-2026-1111"}), False), "the cached copy promotes and suppresses nothing"
+    assert cache.read_bytes() == kept
+    assert clock.now - NOW == pytest.approx(60, abs=1), "it was cut at half of the stage"
+    assert upstream.remaining() == pytest.approx(60, abs=1), "and the other half is left for the work behind it"
 
 
 def test_nvd_pacing_never_sleeps_past_the_budget():

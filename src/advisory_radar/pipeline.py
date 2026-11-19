@@ -9,7 +9,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import replace
 
 from . import applicability, core, enrichment, inventory, retention, watchlist
-from .budget import CLASSIFY_STAGE, FETCH_STAGE, BudgetedHttp, PassBudget
+from .budget import CLASSIFY_STAGE, FETCH_STAGE, KEV_SHARE, BudgetedHttp, PassBudget
 from .config import Config, secret_values
 from .http import Http, RedactFilter, log_safe, urllib_http
 from .kev import load_kev
@@ -341,7 +341,11 @@ def _run_pass(
     live_guids: set[str] = set()
     gap = False
     source_ok = True
-    kev, kev_known = load_kev(upstream, cfg.state_path.with_name(KEV_CACHE_NAME), save=not dry_run)
+    # One request at the head of the refresh stage: left alone, one that trickles in would take the whole stage on
+    # every pass and leave nothing for the re-scores and the drain behind it. It gets a share of what the stage has
+    # left; a download that outlasts it is a failed fetch like any other, and ``load_kev`` uses the cached copy.
+    with upstream.at_most(KEV_SHARE):
+        kev, kev_known = load_kev(upstream, cfg.state_path.with_name(KEV_CACHE_NAME), save=not dry_run)
     intel = core.Intel(upstream, cache, clock, sleep, nvd_key=cfg.nvd_api_key, remaining=upstream.remaining)
     # Re-evaluate before classification: both share one NVD budget, and a busy news day must not starve a due
     # watch of the measurement that could escalate it. A watch created later this pass is evaluated next pass.
