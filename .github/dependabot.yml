@@ -39,12 +39,14 @@ updates:
         patterns:
           - "*"
     ignore:
-      # Hold the runtime image below Python 3.15. `pyproject.toml` caps
-      # `requires-python` at <3.15, and the builder stage's uv image tag pins
-      # its own Python, which Dependabot does not bump. Remove this hold in the
-      # change that moves both stages, the bound and the CI matrix together.
+      # Hold the runtime image on its current Python minor version. The builder
+      # stage's uv image tag pins its own Python, which Dependabot does not bump,
+      # so a runtime-only minor bump runs a venv built for another interpreter and
+      # the image never answers /healthz (#143, #155). Patch and digest updates
+      # still arrive. Move to a new minor in one change that updates both stages,
+      # the `requires-python` bound and the CI interpreter matrix together.
       - dependency-name: "python"
-        versions: [">= 3.15"]
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
   - package-ecosystem: "docker-compose"
     directory: "/"
     schedule:
