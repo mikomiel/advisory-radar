@@ -41,6 +41,7 @@ import time
 import urllib.parse
 from collections.abc import Callable
 
+from . import messages
 from .http import Http, log_safe
 
 #: The application logger: ``pipeline.attach_redaction`` installs the secret filter on it, and a logger
@@ -340,3 +341,23 @@ def build_notifier(cfg: dict, env: dict[str, str]):
         # No value in the message: `type` is expanded from the environment too, and the CLI logs this error.
         raise ValueError(f"unknown notifier type (id {cfg.get('id')!r}); built-ins: {builtins}")
     return builder(cfg, env)
+
+
+def delivery_test_entry(language: str) -> dict:
+    """The message a delivery test sends, in the configured language.
+
+    ``advisory-radar test-notify`` and the web UI's "send test message" send this one message, so what a person sees
+    on the confirmation page is what arrives. It is a ``warning``, so a route that selects on the tag treats it as
+    any other warning, and it names no source or advisory: ``TEST`` stands where an identifier would.
+    """
+    return {
+        "kind": "test",
+        "tag": "warning",
+        "title": messages.level_title(language, "warning", messages.text(language, "test.title")),
+        "body": "\n" + messages.text(language, "test.body"),
+        "ids": ["TEST"],
+        "cves": [],
+        "levels": {},
+        "source": "advisory-radar",
+        "link": "",
+    }
