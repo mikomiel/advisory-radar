@@ -1944,14 +1944,15 @@ def _is_history(item: Item, now: int, last_ok: int, trusted: Collection[str]) ->
     """Whether an item at first sight is old news: older than BACKLOG_AGE and not hidden by an outage.
 
     ``last_ok`` is the epoch of the source's last successful read, 0 when it never answered (or was removed or
-    disabled and came back: its health record is dropped while it does not run). A source that was down for
-    longer than BACKLOG_AGE returns, on recovery, the advisories published while it was down; age alone would
-    record every one of them as history and the operator would never hear of them. An item published after
-    ``last_ok`` less BACKLOG_OUTAGE_SLACK cannot have been in a window an earlier pass read, so it is news
-    however old it now is. The slack covers a publisher that dates an entry slightly before the pass that first
-    listed it. A ``last_ok`` of 0 keeps the age rule unchanged, and one in the future (a clock that stepped
-    back) is clamped to ``now``, so it can never turn history into news. A carried item (``trusted``) was
-    recent when it first arrived and is never history.
+    disabled and came back: its health record is dropped while it does not run). A source that answered but never
+    read clean has no successful read, and the pipeline passes the pass at which it first answered
+    (``pipeline._last_success``). A source that was down for longer than BACKLOG_AGE returns, on recovery, the
+    advisories published while it was down; age alone would record every one of them as history and the operator
+    would never hear of them. An item published after ``last_ok`` less BACKLOG_OUTAGE_SLACK cannot have been in a
+    window an earlier pass read, so it is news however old it now is. The slack covers a publisher that dates an
+    entry slightly before the pass that first listed it. A ``last_ok`` of 0 keeps the age rule unchanged, and one
+    in the future (a clock that stepped back) is clamped to ``now``, so it can never turn history into news. A
+    carried item (``trusted``) was recent when it first arrived and is never history.
     """
     if item.published is None or item.guid in trusted or now - item.published <= BACKLOG_AGE:
         return False

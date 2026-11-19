@@ -52,6 +52,9 @@ sources:
   # - id: inbox
   #   type: webhook          # receives POST /webhooks/inbox (set ADVISORY_RADAR_WEBHOOK_SECRET or
   #                          # ADVISORY_RADAR_WEBHOOK_SECRET_FILE; at least 24 characters)
+  # - id: redhat-csaf
+  #   type: csaf             # a vendor's CSAF 2.0 directory (docs/sources.md#csaf-directories)
+  #   url: https://security.access.redhat.com/data/csaf/v2/advisories/
 
 # The environment variables the /config overlay may reference as ${NAME} or ${NAME_FILE}.
 # With no list the overlay can reference none: a browser session must not be able to send

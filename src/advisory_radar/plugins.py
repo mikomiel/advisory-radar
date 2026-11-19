@@ -25,6 +25,9 @@ class SourceWindow:
     truncated: bool
     #: The host items from this source are attributed to when rendering (feed host).
     host: str
+    #: What the source could not read in this window, one line each. The items above are real and are classified;
+    #: a non-empty tuple turns the source's health red and fails the pass, so a partial read is never silent.
+    problems: tuple[str, ...] = ()
 
 
 class Source(Protocol):

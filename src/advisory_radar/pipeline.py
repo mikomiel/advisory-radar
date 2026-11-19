@@ -10,7 +10,7 @@ from dataclasses import replace
 
 from . import core, retention, watchlist
 from .config import Config, secret_values
-from .http import Http, RedactFilter, urllib_http
+from .http import Http, RedactFilter, log_safe, urllib_http
 from .kev import load_kev
 from .notifiers import build_notifier
 from .plugins import Source, SourceWindow
@@ -21,6 +21,10 @@ from .storage import Store, StoreUnavailable
 LOG = logging.getLogger("advisory_radar")
 
 KEV_CACHE_NAME = "kev.json"
+
+#: The longest ``source_health`` error a window's problems are stored as. A raised fault is one short line; the
+#: problems of a window are a few, each naming a document, and the page and the metrics show the start.
+HEALTH_ERROR_LIMIT = 1000
 
 #: ``run_pass`` exit code for "another pass held the lock, so nothing ran" on the non-blocking path. It is
 #: separate from 1 so a caller (the web UI's Run a pass now) can tell a skipped request from a failed one.
@@ -55,7 +59,7 @@ def _drop_removed_sources(
     else:
         for stale in [source_id for source_id in carried if source_id not in declared_ids]:
             carried.pop(stale, None)
-        for stored in (state.get("feeds"), state.get("changedetection")):
+        for stored in (state.get("feeds"), state.get("changedetection"), state.get("csaf")):
             if isinstance(stored, dict):
                 for stale in [source_id for source_id in stored if source_id not in declared_ids]:
                     stored.pop(stale, None)
@@ -81,11 +85,21 @@ def _fetch_due(record: object, now: int, interval: int) -> bool:
     return now - at >= interval
 
 
-def _record_health(state: dict, source_id: str, now: int, *, ok: bool, items: int = 0, error: str = "") -> None:
+def _epoch(value: object) -> int:
+    """``value`` when it is a plain positive integer, the form a stored epoch has; else 0: damage counts as absent."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def _record_health(
+    state: dict, source_id: str, now: int, *, ok: bool, items: int = 0, error: str = "", answered: bool = False
+) -> None:
     """Record this window's outcome for one source; the last success survives a later failure.
 
     This answers the question the run history cannot: *which* feed is broken right now. ``ok_at`` is preserved
     so a source that answered an hour ago and fails now shows both facts rather than looking dead since boot.
+    ``first_at`` is the pass at which the source first answered and it never moves. A clean window is an answer, and
+    so is a window with problems (``answered``), which is red and so never sets ``ok_at``; a fetch that raised is
+    neither. ``_last_success`` falls back to it for a source that has answered but never cleanly.
     The error text is the message a human needs, and the caller redacts it before it is stored.
     """
     health = state.setdefault("source_health", {})
@@ -96,22 +110,28 @@ def _record_health(state: dict, source_id: str, now: int, *, ok: bool, items: in
         "at": now,
         "ok": ok,
         "ok_at": ok_at if isinstance(ok_at, int) and not isinstance(ok_at, bool) else 0,
+        "first_at": _epoch(previous.get("first_at")) or (now if ok or answered else 0),
         "items": items,
         "error": error,
     }
 
 
 def _last_success(state: dict, source_id: str) -> int:
-    """The epoch of a source's last successful window, or 0 when no success is on record.
+    """The epoch an outage of a source is measured from, or 0 when it has neither a success nor an answer on record.
 
     Read before ``_record_health`` writes this pass's outcome, so it is the success *before* the one now being
-    classified: the point from which an outage is measured (see ``core.classify_new``). A removed or disabled
-    source has no record, and neither has one that never answered, so the plain age rule applies to both.
+    classified: the point from which an outage is measured (see ``core.classify_new``). A source that answered but
+    never read clean has no success, because a window with problems turns it red (a document it gave up on keeps it
+    red for a month). The pass at which it first answered stands in: what was published after that cannot have been
+    in a window an earlier pass read, and what was published before it is the history a first sight has always been.
+    A removed or disabled source has no record, and neither has one that never answered, so the plain age rule
+    applies to both.
     """
     health = state.get("source_health")
     record = health.get(source_id) if isinstance(health, dict) else None
-    ok_at = record.get("ok_at") if isinstance(record, dict) else 0
-    return ok_at if isinstance(ok_at, int) and not isinstance(ok_at, bool) and ok_at > 0 else 0
+    if not isinstance(record, dict):
+        return 0
+    return _epoch(record.get("ok_at")) or _epoch(record.get("first_at"))
 
 
 def _reset_validators_on_policy_change(state: dict, policy: object) -> None:
@@ -276,6 +296,7 @@ def _run_pass(
             tuple(_namespaced(item, source.id) for item in window.items),
             window.truncated,
             window.host,
+            window.problems,
         )
         previous = stored_windows.get(source.id)
         # Only a source that knows its own page size can prove it returned a complete window (a FreshRSS
@@ -401,7 +422,15 @@ def _run_pass(
             # Health follows the same rule as the validators: recorded only once this window's candidates are
             # durable, so a crash between fetch and classification cannot report a source healthy for work it
             # never queued.
-            _record_health(state, source.id, now, ok=True, items=len(window.items))
+            if window.problems:
+                # The window read what it could: its items were classified above and its cursor is committed
+                # below. What it could not read turns the source red and fails the pass until it can.
+                source_ok = False
+                error = redact("; ".join(window.problems), secret_values(cfg))[:HEALTH_ERROR_LIMIT]
+                LOG.error("source %s: %s", source.id, log_safe(error))
+                _record_health(state, source.id, now, ok=False, items=len(window.items), error=error, answered=True)
+            else:
+                _record_health(state, source.id, now, ok=True, items=len(window.items))
         # A source that tracks a cursor advances it only now: the same write carries the candidates, so a crash
         # between fetch and classification cannot skip an advisory forever.
         commit = getattr(source, "commit", None)
