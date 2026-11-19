@@ -12,12 +12,14 @@ empty digest while every string still looks right. That is the regression worth 
 
 from __future__ import annotations
 
+import importlib.util
 import re
 from pathlib import Path
 
 import yaml
 
 WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 # Anchored at the line: "statuses:" also contains "uses:", and a permission key is not an action reference.
 USES = re.compile(r"^[ \t]*(?:-[ \t]*)?uses:[ \t]*(\S+)", re.M)
 PINNED = re.compile(r"[^@\s]+@[0-9a-f]{40}")
@@ -37,6 +39,13 @@ def workflow_texts() -> list[tuple[str, str]]:
 
 def release() -> dict:
     return yaml.safe_load((WORKFLOWS / "release.yml").read_text())
+
+
+def merge_script():
+    spec = importlib.util.spec_from_file_location("automerge_loop", SCRIPTS / "automerge_loop.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_every_action_reference_is_a_pinned_commit():
@@ -64,20 +73,12 @@ def test_the_release_workflow_is_called_only_when_the_merge_landed():
     job = merge["jobs"]["merge"]
     assert job["outputs"] == {"merged": "${{ steps.merge.outputs.merged }}"}
     step = next(item for item in job["steps"] if item.get("id") == "merge")
-    # The shell owns the outcome, and the order matters: a default written before the loop, the
-    # true written at the merge itself. A later candidate's failure must not lose a landed merge,
-    # which is why the true is written before the branch cleanup and the comment can fail.
-    run = step["run"]
-    default_at = run.index('echo "merged=false" >> "$GITHUB_OUTPUT"')
-    loop_at = run.index("mapfile -t candidates")
-    merge_at = run.index('if gh pr merge "$pr"')
-    true_at = run.index('echo "merged=true" >> "$GITHUB_OUTPUT"')
-    cleanup_at = run.index("delete_merged_branch.py")
-    comment_at = run.index("gh pr comment")
-    assert default_at < loop_at, "the default must precede the loop"
-    assert merge_at < true_at < cleanup_at < comment_at, "write true at the merge, before cleanup"
-    assert run.count('echo "merged=true" >> "$GITHUB_OUTPUT"') == 1
-    assert run.count('echo "merged=false" >> "$GITHUB_OUTPUT"') == 1
+    # The script owns the outcome, and the order of its writes matters: a default before the queue is read, the true at
+    # the merge itself, so that a later candidate's failure cannot lose a landed merge, and neither can the branch
+    # cleanup or the comment. tests/test_automerge_loop.py runs the script and pins that order. The step is nothing
+    # but the call, so a second inline loop cannot grow back beside the tested one.
+    assert step["run"].strip() == "python3 scripts/automerge_loop.py"
+    assert (SCRIPTS / "automerge_loop.py").is_file()
 
     release_job = merge["jobs"]["release"]
     assert release_job["needs"] == "merge"
@@ -93,6 +94,19 @@ def test_the_release_workflow_is_called_only_when_the_merge_landed():
     assert "workflow_call" in declared
     assert "workflow_dispatch" in declared
     assert "workflow_run" not in declared
+
+
+def test_the_merge_step_provides_every_setting_the_script_reads():
+    """The script ends the run when a setting is missing, so a renamed variable would turn every sweep red.
+
+    ``GH_TOKEN`` is not read by the script itself; ``gh`` and the branch cleanup it starts read it from the environment.
+    """
+    merge = yaml.safe_load((WORKFLOWS / "automerge.yml").read_text())
+    job = merge["jobs"]["merge"]
+    step = next(item for item in job["steps"] if item.get("id") == "merge")
+    provided = {**merge.get("env", {}), **job.get("env", {}), **step.get("env", {})}
+    needed = {"GH_TOKEN", *merge_script().SETTINGS.values()}
+    assert needed <= provided.keys(), f"the merge step does not provide {sorted(needed - provided.keys())}"
 
 
 def test_every_job_runs_on_a_pinned_os_release():
