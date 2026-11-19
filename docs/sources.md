@@ -11,16 +11,27 @@ a problem was printed, or when the fetch failed. It sends no notification and wr
 state, so it is safe to run while the service is polling. A `webhook` source is read from an
 empty inbox, so it prints no items: the command checks configuration, not intake.
 
-The same probe is a button. `/config` can add a source without touching the file:
-pick a type, fill the keys it declares, and press **Test the new source** — the
-probe performs the fetch a pass performs, shows the entry count, the first entries
-or the error, a warning for any part of its input the source could not read, and writes
-nothing. A probe of an unsaved source reports a missing
-`${NAME}` by name, never its value, and offers to save the source it just fetched.
+The same probe is a button. `/config#sources` can add a source without touching the file,
+and every type in the table below can be added there. The section lists each type with what
+it needs before anything is submitted. Choose one (**Add**, or `/config?add_source=<type>`)
+and its form asks for that type's keys only: required keys are marked, and a reference key
+(`token`, `api_key`) takes a `${NAME}` or `${NAME_FILE}` reference that the YAML lists under
+`overlay_references`. A literal is refused and never shown again. Press **Test the new
+source**: the probe performs the fetch a pass performs, shows the entry count, the first
+entries or the error, a warning for any part of its input the source could not read, and
+writes nothing. A probe of an unsaved source reports a missing
+`${NAME}` by name, never its value. When the probe works it offers to save the source it
+just fetched. When it fails or cannot start, or a save is refused, the page comes back with
+the new-source form as you typed it and the reason, so nothing has to be typed again. After a
+refused save the rows above it come back as typed too. After a test they are drawn from what
+is saved, because the test was not about them and the page may be older than a save. A
+reference stays a reference there, and a credential field returns a whole reference or
+nothing.
 Every configured row has its own **Test** button, and `/sources` shows one health
 line per enabled source — the last attempt, the last success, the entries in that
 window and the error that attempt reported — with the same numbers exported as
-metrics (see `deployment.md`).
+metrics (see `deployment.md`). The notifier forms work the same way and are described in
+`notifiers.md`.
 
 An `rss` source is one URL and needs no format key. RSS 2.0, Atom, RSS 1.0 (RDF) and
 JSON Feed are recognised from the document itself, and JSON Feed is told apart from the

@@ -581,6 +581,30 @@ def test_test_notify_speaks_the_configured_language(tmp_path, language, title, b
     assert [(sent["tag"], sent["title"], sent["body"]) for sent in posted] == [("warning", title, body)]
 
 
+@pytest.mark.parametrize("language", ["en", "pl"])
+def test_the_web_ui_test_message_is_the_one_test_notify_sends(tmp_path, language):
+    """``delivery_test_entry`` (the /config "send test message") and ``test-notify`` post one and the same message."""
+    from advisory_radar.notifiers import WebhookNotifier, delivery_test_entry
+
+    path = write_config(tmp_path, f"language: {language}\n")
+    from_cli: list[dict] = []
+    from_ui: list[dict] = []
+
+    def record(into: list[dict]):
+        def http(method, url, headers, payload):
+            into.append(json.loads(payload))
+            return 204, {}, b""
+
+        return http
+
+    assert cli.main(["--config", str(path), "test-notify"], env={}, http=record(from_cli)) == 0
+    assert (
+        WebhookNotifier("ui", "https://hooks.example.net/x").send(delivery_test_entry(language), record(from_ui)) == 204
+    )
+    assert len(from_cli) == len(from_ui) == 1
+    assert from_ui == from_cli
+
+
 def test_the_routing_tag_stays_english_so_a_tag_route_still_matches(tmp_path):
     notifiers = (
         "notifiers:\n  - id: urgent\n    type: webhook\n    url: https://hooks.example.com/urgent\n"

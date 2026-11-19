@@ -522,6 +522,36 @@ Secrets stay in the environment. The overlay stores a notifier's `url`, `key`,
 refuses a literal value, and does not accept `headers` at all. Changing an environment
 variable still needs a restart, because the process reads the environment when it starts.
 
+### The configuration page
+
+`/config` is one page with five anchored sections: Settings, Risk thresholds, Sources, Notifiers
+and Routes (`#settings`, `#thresholds`, `#sources`, `#notifiers`, `#routes`). It needs no script.
+The Sources and Notifiers sections list every built-in type before anything is submitted: what
+the type does, the keys it needs, and which of them take a reference. These tables draw the same
+catalogue as `sources.md` and `notifiers.md`, and the test suite pins the three together, so a
+type added to the catalogue appears on the page without a separate edit.
+
+Choose a type (`/config?add_source=<type>#new-source` or `/config?add_notifier=<type>#new-notifier`)
+and the form that opens asks for that type's keys only. A required key is marked, a reference key
+takes `${NAME}` or `${NAME_FILE}`, and a key only the YAML can set, a `webhook` notifier's
+`headers`, is named as such. Every other key a configured entry carries stays as written when its
+row is saved.
+
+A refused save of the Sources or the Notifiers form gives the page back with that form as it was
+typed, the reason, fresh form state and nothing written. So does a test of an unsaved source that
+fails or cannot start, except that it gives back only the new-source block: the rows are drawn
+from what is saved, because the test was not about them and the page may be older than a save.
+Plain fields come back as typed. A credential field comes back only when it holds a whole
+`${NAME}` reference: a literal secret is refused and never shown again, and a reference is never
+replaced by the value it names. The Settings, Risk thresholds and Routes forms and the OPML
+import are not catalogue-driven and still answer a refusal with a short page that keeps nothing of
+what was typed. A form that went stale is still refused with `409`, on the page it always had.
+
+An enabled notifier row has **Send test message**. It asks first, then sends one real message
+through the notifier that is running now (see `notifiers.md`). It stores nothing. A row whose saved
+entry is not what is running, because it was edited or saved since the last reload, is marked
+**not live yet** and is not tested until a reload applies it.
+
 ### Which variables the overlay may reference
 
 `${NAME}` reads any variable of the process, and the overlay is written from a browser session.

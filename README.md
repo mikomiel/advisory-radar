@@ -73,6 +73,8 @@ Kubernetes.
   evidence it adds to an advisory.
 - [Sources](docs/sources.md) — the source catalogue, probe behaviour, intervals
   and OPML import.
+- [Notifiers](docs/notifiers.md) - the notifier catalogue, the settings form and
+  the test message.
 - [Deployment](docs/deployment.md) — compose, Podman, health and metrics.
 - [Features](docs/features.md) — the full capability list and the problem it
   solves.
