@@ -271,6 +271,58 @@ def test_the_fsync_probe_reports_a_time_and_leaves_nothing_behind(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+# --- a history with no delivery ---------------------------------------------------------------------------------
+
+#: The arguments of a history that holds no delivered advisory: none asked for, no history at all, and a few seen
+#: identifiers, where the default of a fifth of them rounds down to none. They are typed as a person types them, with
+#: the stores left at their default, so that the run is the one a reader of the deployment guide would make.
+NO_DELIVERY = {
+    "none asked for": ["--seen", "100", "--deliveries", "0"],
+    "no history at all": ["--seen", "0"],
+    "a fifth rounds down to none": ["--seen", "4"],
+}
+
+
+def table_rows(text: str, cells: int) -> list[list[str]]:
+    """The rows of the printed tables for the custom history that have this many cells."""
+    rows = [[cell.strip() for cell in line.strip("|").split("|")] for line in text.splitlines() if "custom" in line]
+    return [row for row in rows if len(row) == cells]
+
+
+@pytest.mark.parametrize("arguments", NO_DELIVERY.values(), ids=list(NO_DELIVERY))
+def test_a_history_with_no_delivery_is_measured_and_its_advisory_page_is_reported_unavailable(
+    arguments, tmp_path, monkeypatch
+):
+    """There is no delivered advisory to open, and that is the one number it cannot have, not a reason to crash."""
+    monkeypatch.setattr(bench, "_fsync_ms", lambda directory, samples=20: 1.0)
+
+    code, text = run_main([*arguments, "--repeat", "1", "--workdir", str(tmp_path)])
+
+    assert code == 0
+    sizes = table_rows(text, 11)  # profile, store, seen, live deliveries, MiB, MiB, load, save, three pages
+    assert [row[1] for row in sizes] == ["json", "sqlite"]
+    for row in sizes:
+        assert row[3] == "0", "the history holds no delivery"
+        assert all(float(cell) >= 0 for cell in row[6:10]), "the load, the save and the two lists were measured"
+        assert row[10] == "n/a", "the advisory page has nothing to open"
+    assert [row[2:3] for row in table_rows(text, 8)] == [["idle"], ["full"]] * 2, "both passes ran in both stores"
+    assert list(tmp_path.iterdir()) == [], "the stores it wrote are removed"
+
+
+def test_a_history_with_no_delivery_reports_the_advisory_page_as_null_and_the_rest_as_numbers(tmp_path, monkeypatch):
+    monkeypatch.setattr(bench, "_fsync_ms", lambda directory, samples=20: 1.0)
+
+    code, text = run_main(["--seen", "100", "--deliveries", "0", "--repeat", "1", "--json", "--workdir", str(tmp_path)])
+
+    assert code == 0
+    [row_json, row_sqlite] = stores(json.loads(text))
+    for row in (row_json, row_sqlite):
+        assert row["live_deliveries"] == 0
+        assert row["pages"]["advisory"] is None
+        assert row["pages"]["alerts"]["median"] > 0 and row["pages"]["alerts_filtered"]["median"] > 0
+        assert row["passes"]["full"]["delivered"] == core.DELIVERY_CAP, "the full pass still delivered what it may"
+
+
 # --- the report and the exit code -------------------------------------------------------------------------------
 
 

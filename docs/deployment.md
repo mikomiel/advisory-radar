@@ -523,12 +523,19 @@ first save, and the document drops them with that save. The file is written the 
 temporary file, synced, renamed, then the directory synced, with mode 0600. It holds the snapshots
 unchanged in a `deliveries` map, with the line it was cut at (`before`) and the time of the pass
 (`archived_at`). The name carries a digest of the content, so a pass that stops after the file was
-written and runs again the same day finds the same name and writes nothing twice; after midnight the
-day in the name changes, and a retry may write a second file with the same snapshots. No pass reads
-an archive file and nothing in the product does: to bring snapshots back, stop the service and merge
-the `deliveries` map into the state by hand. An archive that cannot be written (a full disk, a
-read-only volume) is logged as a warning and the snapshots stay in the state until a pass that can
-write it. A dry run moves nothing.
+written and runs again the same day finds the same name. It does not take the name on trust: it
+reads that one file, and it drops the snapshots only when the file is a regular file that declares
+the archive schema and holds every one of them unchanged, so it writes nothing twice. Anything else
+at that name (an empty or damaged file, an archive of other records, a directory, or a symbolic
+link, which is never followed) is left as it is and never replaced: the pass logs a warning and the
+snapshots stay in the state, because a copy that cannot be shown to exist is not one. Move what is
+in the way aside and the next pass writes the archive. Otherwise the day in the name changes after
+midnight, and the first pass of the next day, which finds nothing at its name, writes a file, so a
+retry after midnight may also write a second file with the same snapshots. Apart from that check, no
+pass reads an archive file and nothing in the product does: to bring snapshots back, stop the
+service and merge the `deliveries` map into the state by hand. An archive that cannot be written (a
+full disk, a read-only volume) is logged as a warning and the snapshots stay in the state until a
+pass that can write it. A dry run moves nothing.
 
 **What stays.** Seen records are never archived. They are the deduplication: a pass reports an
 identifier only when no record claims it, and an item with no date, an item whose date was changed
@@ -627,7 +634,9 @@ uv run python scripts/benchmark_state.py --check    # exit 1 when a row misses a
 ```
 
 The defaults measure the first three histories with both stores. `--json` prints every
-measurement, and `--alerts-budget` and `--save-budget` change the limits `--check` applies.
+measurement, and `--alerts-budget` and `--save-budget` change the limits `--check` applies. A
+history with no delivery (`--deliveries 0`, or a `--seen` below 5, whose default fifth is none) has
+no advisory page to open, so that column reads `n/a` (null with `--json`) and the rest is measured.
 
 ### The settings overlay
 

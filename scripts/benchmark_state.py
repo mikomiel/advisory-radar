@@ -7,7 +7,9 @@ script builds a synthetic history of a chosen size, puts it in each store and me
 * the size of the document and of what the store keeps on disk,
 * how long a load and a save take, and the Python memory each needs; the save is of a document with one more
   record in it each time, because SQLite writes nothing for a row whose text has not changed,
-* how long the Alerts list, the same list with a text filter and one advisory page take, over the real web app,
+* how long the Alerts list, the same list with a text filter and one advisory page take, over the real web app; a
+  history with no delivery (``--deliveries 0``, or a ``--seen`` below 5, whose default fifth is none) has no advisory
+  page to open, so that time is reported as unavailable: ``n/a`` in the tables, null with ``--json``,
 * what a pass writes: the number of saves, the bytes each one handed to the kernel as a multiple of the document,
   and what one acknowledgement wrote, for a pass with nothing to do and for a pass that delivers the most messages
   it may. SQLite writes nothing for a save whose text is the stored text, so the saves of a pass differ.
@@ -319,10 +321,13 @@ class _Client:
         return payload
 
 
-async def _measure_pages(app, token: str, repeat: int, advisory: str) -> dict:
+async def _measure_pages(app, token: str, repeat: int, advisory: str | None) -> dict:
+    """Time the pages; ``advisory`` is the token of the one to open, None for a history with no delivery to open."""
     client = _Client(app)
     await client.sign_in(token)
-    pages = {"alerts": "/alerts", "alerts_filtered": f"/alerts?q={FILTER_TEXT}", "advisory": f"/advisories/{advisory}"}
+    pages = {"alerts": "/alerts", "alerts_filtered": f"/alerts?q={FILTER_TEXT}"}
+    if advisory is not None:
+        pages["advisory"] = f"/advisories/{advisory}"
     result = {}
     for name, target in pages.items():
         await client.get(target)  # the first request pays for imports and caches nothing a later one reuses
@@ -333,6 +338,7 @@ async def _measure_pages(app, token: str, repeat: int, advisory: str) -> dict:
             await client.get(target)
             samples.append(time.perf_counter() - start)
         result[name] = _stats(samples)
+    result.setdefault("advisory", None)  # unavailable, which the report prints as n/a
     gc.collect()
     tracemalloc.start()
     try:
@@ -535,12 +541,12 @@ def _write_config(directory: Path, storage: str) -> Path:
     return path
 
 
-def _probe(state: dict) -> str:
-    """The newest delivered identifier: the advisory page that has a snapshot to read."""
+def _probe(state: dict) -> str | None:
+    """The newest delivered identifier: the advisory page that has a snapshot to read; None when none was delivered."""
     for identifier, record in reversed(state["seen"].items()):
         if record["outcome"] == "delivered":
             return identifier
-    raise ValueError("the history holds no delivered advisory to open")
+    return None
 
 
 def time_load_and_save(kept, state: dict, *, repeat: int, now: int) -> dict:
@@ -588,8 +594,9 @@ def measure_store(state: dict, store: str, directory: Path, *, repeat: int, now:
     }
     result |= time_load_and_save(kept, state, repeat=repeat, now=now)
     app = create_app(runtime, {"ADVISORY_RADAR_AUTH_TOKEN": token}, clock=lambda: float(now))
-    pages = asyncio.run(_measure_pages(app, token, repeat, _advisory_token(_probe(state))))
-    result["pages"] = pages
+    probe = _probe(state)
+    advisory = None if probe is None else _advisory_token(probe)
+    result["pages"] = asyncio.run(_measure_pages(app, token, repeat, advisory))
     result["passes"] = _measure_passes(runtime, store, now)
     return result
 
@@ -631,8 +638,8 @@ def _mib(value: float | None) -> str:
     return "n/a" if value is None else f"{value / 2**20:.1f}"
 
 
-def _seconds(stats: dict) -> str:
-    return f"{stats['median']:.3f}"
+def _seconds(stats: dict | None) -> str:
+    return "n/a" if stats is None else f"{stats['median']:.3f}"
 
 
 def _table(headers: list[str], rows: list[list[str]]) -> str:

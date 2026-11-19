@@ -618,6 +618,189 @@ def test_a_retry_after_midnight_may_write_a_second_file_with_the_same_snapshots(
     assert old not in stored(cfg)["deliveries"]
 
 
+# --- a name that is already taken ---------------------------------------------------------------------------------
+#
+# A retry on the same day calculates the name its first attempt wrote and finds something there. The cases play the
+# first attempt with the writer itself, on a copy of the state that is never saved, so the name is the one the code
+# calculated; each then puts a different thing at that exact name and runs the pass that follows. A name that is
+# taken is not an archive until it is shown to hold the snapshots: a pass that took it on trust would drop them from
+# the state, the next save would make that permanent, and no usable copy would be left.
+
+
+def _put_an_archive(path: Path, archive: dict) -> None:
+    path.write_text(json.dumps(archive), encoding="utf-8")
+
+
+def _empty(path: Path, archive: dict, elsewhere: Path) -> None:
+    path.write_bytes(b"")
+
+
+def _truncated(path: Path, archive: dict, elsewhere: Path) -> None:
+    written = path.read_bytes()
+    path.write_bytes(written[: len(written) // 2])
+
+
+def _not_utf8(path: Path, archive: dict, elsewhere: Path) -> None:
+    path.write_bytes(b"\xc3\x28")
+
+
+def _a_list(path: Path, archive: dict, elsewhere: Path) -> None:
+    path.write_text("[]", encoding="utf-8")
+
+
+def _another_schema(path: Path, archive: dict, elsewhere: Path) -> None:
+    _put_an_archive(path, {**archive, "schema": "advisory-radar-archive.v0"})
+
+
+def _nested_past_the_decoder(path: Path, archive: dict, elsewhere: Path) -> None:
+    path.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+
+
+def _deliveries_that_are_no_map(path: Path, archive: dict, elsewhere: Path) -> None:
+    """A list that names every snapshot: it holds each key, and still cannot be indexed by one."""
+    _put_an_archive(path, {**archive, "deliveries": list(archive["deliveries"])})
+
+
+def _missing_a_snapshot(path: Path, archive: dict, elsewhere: Path) -> None:
+    archive["deliveries"].popitem()
+    _put_an_archive(path, archive)
+
+
+def _with_a_snapshot_changed(path: Path, archive: dict, elsewhere: Path) -> None:
+    next(iter(archive["deliveries"].values()))["title"] = "a title the state never held"
+    _put_an_archive(path, archive)
+
+
+def _a_directory(path: Path, archive: dict, elsewhere: Path) -> None:
+    path.unlink()
+    path.mkdir()
+
+
+def _a_link_to_nothing(path: Path, archive: dict, elsewhere: Path) -> None:
+    elsewhere.parent.mkdir()  # the directory is there, so a writer that followed the link would create the target
+    path.unlink()
+    path.symlink_to(elsewhere)
+
+
+def _a_link_to_an_intact_archive(path: Path, archive: dict, elsewhere: Path) -> None:
+    elsewhere.parent.mkdir()
+    elsewhere.write_bytes(path.read_bytes())
+    path.unlink()
+    path.symlink_to(elsewhere)
+
+
+def _intact(path: Path, archive: dict, elsewhere: Path) -> None:
+    """Leaves the archive the first attempt wrote where it is."""
+
+
+#: What can be at the name instead of the archive a first attempt wrote: each takes the name, the archive that was
+#: there, and a file name in another directory, which only the cases with a link use.
+TAKEN = {
+    "empty file": _empty,
+    "truncated archive": _truncated,
+    "not utf-8": _not_utf8,
+    "nested past the decoder": _nested_past_the_decoder,
+    "json list": _a_list,
+    "another schema": _another_schema,
+    "deliveries that are no map": _deliveries_that_are_no_map,
+    "archive missing a snapshot": _missing_a_snapshot,
+    "archive with a snapshot changed": _with_a_snapshot_changed,
+    "directory": _a_directory,
+    "link to nothing": _a_link_to_nothing,
+    "link to an intact archive": _a_link_to_an_intact_archive,
+}
+
+
+def stuck_retry(tmp_path: Path, take_the_name, *, how_many: int = 2) -> tuple[Config, dict, Path, Path]:
+    """A state whose first attempt to archive ``how_many`` snapshots wrote a file, and then the file was replaced.
+
+    Returns the config, the snapshots the state still holds, the name the code calculated, and the file name that
+    a link may point at.
+    """
+    cfg = make_config(tmp_path)
+    state = core.new_state()
+    for number in range(how_many):
+        deliver(state, f"CVE-2024-91{number:02d}", NOW - 800 * DAY)
+    write_state(cfg, state)
+    snapshots = stored(cfg)["deliveries"]
+    assert retention.retire_deliveries(stored(cfg), cfg.state_path, NOW) == how_many  # the state is not saved
+    path = the_archive(tmp_path)
+    elsewhere = tmp_path / "elsewhere" / "copy.json"
+    take_the_name(path, read_archive(path), elsewhere)
+    return cfg, snapshots, path, elsewhere
+
+
+def observe(path: Path, elsewhere: Path) -> tuple:
+    """What is at the name and at the link target, read without following a link to get there."""
+    if path.is_symlink():
+        here = ("link", os.readlink(path))
+    elif path.is_dir():
+        here = ("directory", sorted(os.listdir(path)))
+    else:
+        here = ("file", path.read_bytes())
+    return here, elsewhere.read_bytes() if elsewhere.exists() else None
+
+
+@pytest.mark.parametrize("take_the_name", TAKEN.values(), ids=list(TAKEN))
+def test_a_retry_that_finds_anything_but_an_intact_archive_at_its_name_keeps_the_snapshots(
+    tmp_path, caplog, take_the_name
+):
+    cfg, snapshots, path, elsewhere = stuck_retry(tmp_path, take_the_name)
+    found = observe(path, elsewhere)
+    caplog.set_level(logging.WARNING, logger="advisory_radar")
+
+    code, _ = run_pass(cfg, clock=NOW + 60)
+
+    assert code == 0, "a name that cannot be trusted is not a failed pass"
+    assert stored(cfg)["deliveries"] == snapshots, "the snapshots are still in the state, and the save kept them"
+    assert observe(path, elsewhere) == found, "what was at the name is as the pass found it: not followed or replaced"
+    assert archives(tmp_path) == [path], "and no other archive was written"
+    warnings = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+    assert any("could not archive" in text and "stay in the state" in text and path.name in text for text in warnings)
+
+
+def test_a_retry_that_finds_an_intact_archive_of_several_snapshots_moves_them_and_writes_nothing(tmp_path):
+    """The control for the cases above: they hold because the check refuses what is not an archive, not everything."""
+    cfg, snapshots, path, _ = stuck_retry(tmp_path, _intact, how_many=3)
+    written = path.read_bytes()
+    assert set(snapshots) <= set(read_archive(path)["deliveries"]) and len(snapshots) == 3
+
+    code, _ = run_pass(cfg, clock=NOW + 60)
+
+    assert code == 0
+    assert archives(tmp_path) == [path] and path.read_bytes() == written
+    assert stored(cfg)["deliveries"] == {}, "the state no longer holds what the archive does"
+
+
+def test_the_next_utc_day_writes_a_new_file_and_the_snapshots_move_then(tmp_path):
+    """The name carries the day, so what is in the way of today's file is not in the way of tomorrow's."""
+    cfg, snapshots, path, _ = stuck_retry(tmp_path, _empty)
+    run_pass(cfg, clock=NOW + 60)
+    assert stored(cfg)["deliveries"] == snapshots
+
+    code, _ = run_pass(cfg, clock=(NOW // DAY + 1) * DAY + 60)
+
+    assert code == 0
+    tomorrows = the_archive(tmp_path, apart_from=path)
+    assert set(read_archive(tomorrows)["deliveries"]) == set(snapshots)
+    assert ARCHIVE_NAME.fullmatch(tomorrows.name).group(1) != ARCHIVE_NAME.fullmatch(path.name).group(1)
+    assert path.read_bytes() == b"", "what was in the way is left as it was"
+    assert stored(cfg)["deliveries"] == {}
+
+
+def test_moving_what_is_at_the_name_aside_lets_the_next_pass_of_the_day_write_the_archive(tmp_path):
+    cfg, snapshots, path, _ = stuck_retry(tmp_path, _empty)
+    run_pass(cfg, clock=NOW + 60)
+    assert stored(cfg)["deliveries"] == snapshots
+    path.rename(tmp_path / "moved-aside.txt")
+
+    code, _ = run_pass(cfg, clock=NOW + 120)
+
+    assert code == 0
+    assert set(read_archive(path)["deliveries"]) == set(snapshots)
+    assert stored(cfg)["deliveries"] == {}
+
+
 def test_a_dry_run_writes_no_archive_and_leaves_the_state_alone(tmp_path):
     cfg = make_config(tmp_path)
     state = core.new_state()

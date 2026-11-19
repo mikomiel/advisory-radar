@@ -1454,9 +1454,9 @@ def _seen_advisory(
     if not any(key in record for key in ("tag", "source", "title", "levels", "scores", "delivered_to")):
         explanation = (
             "<p class='muted'>The delivered message's details are no longer in the state: a pass moves the details "
-            "of a delivery older than two years into a state-archive file beside the state file, and no pass reads "
-            "that file again. The identifier, its outcome and when it was recorded stay here, so this advisory is "
-            "still known and is not reported again.</p>"
+            "of a delivery older than two years into a state-archive file beside the state file, and nothing reads "
+            "that file back into the state. The identifier, its outcome and when it was recorded stay here, so this "
+            "advisory is still known and is not reported again.</p>"
             if archived
             else "<p class='muted'>The delivered message's details were not recorded: this record was written by an "
             "older version of advisory-radar, or no message was delivered for this identifier. Nothing is "
