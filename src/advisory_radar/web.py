@@ -3783,7 +3783,19 @@ def create_app(
             if window.truncated
             else ""
         )
-        return _notice(f"Answered with {len(items)} entr{'y' if len(items) == 1 else 'ies'}.", "ok") + truncated + table
+        # What the source could not read is a window fact like truncation: the probe still answered, and the same
+        # lines turn the source red in a pass. Redacted and cut like a title, one line each.
+        unread = (
+            _notice(
+                "<b>This source could not read all that it offers:</b><br>"
+                + "<br>".join(_short(pipeline.redact(problem, secrets), 300) for problem in window.problems),
+                "warning",
+            )
+            if window.problems
+            else ""
+        )
+        answered = _notice(f"Answered with {len(items)} entr{'y' if len(items) == 1 else 'ies'}.", "ok")
+        return answered + unread + truncated + table
 
     def reference_refusal(entry: dict) -> str:
         """Why this source entry may not use the references it carries, or "" when it may.

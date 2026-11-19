@@ -330,12 +330,15 @@ language: pl                 # en (the default) or pl
 English is the wording the service has always used, so a configuration without the key sends
 exactly the messages earlier versions sent. Only text the service writes is translated. The
 heading and excerpt of an advisory come from its feed and stay as the publisher wrote them, apart
-from three things the service writes itself: the short excerpt for a PHP or Node.js release it
+from four things the service writes itself: the short excerpt for a PHP or Node.js release it
 read from the release page, the summary of a changed changedetection.io watch
-(`Page changed (last_changed=...)`), and the words of a native changedetection.io webhook payload
+(`Page changed (last_changed=...)`), the words of a native changedetection.io webhook payload
 that names neither a watch title nor a URL (the title `change`) or that carries no diff (the
-summary `page changed`). A watch title or a diff the sender supplies is the sender's text and is
-never translated, even when it reads the same. Identifiers and the names CVSS, EPSS, SSVC, KEV
+summary `page changed`), and the sentence that opens the summary of a CSAF item (`Vendor
+statements, revision ... of ...; not a check of your installed versions.`). A watch title or a
+diff the sender supplies is the sender's text and is never translated, even when it reads the
+same, and neither is the list of statements that follows the CSAF sentence: it is built from the
+vendor's CVE ids, status names and product names. Identifiers and the names CVSS, EPSS, SSVC, KEV
 and GHSA are never translated.
 
 The `tag` of a message (`critical` or `warning`) is a routing value, not text, so it stays
@@ -629,9 +632,11 @@ one of them as history. So the pass compares the item with the source's last suc
 an item is `backlog` only when it is older than 7 days **and** was published more than one day
 before that read. Anything newer was not in a window an earlier pass read, so it is alerted
 however old it now is. The day covers a publisher that dates an entry slightly before the pass
-that first listed it. A source that has never been read successfully, or that was removed or
+that first listed it. A source that has never answered, or that was removed or
 disabled and later brought back (its health record is dropped while it does not run), keeps the
-plain 7-day rule, and an item carried over from an earlier pass is never history.
+plain 7-day rule. A source that has answered but never read cleanly (a window with problems turns it
+red, and a `csaf` directory reports them) has no last read; it is measured from the pass at which it
+first answered instead. An item carried over from an earlier pass is never history.
 
 ## Gap detection
 
@@ -640,5 +645,7 @@ window, and the pass fails loudly when a full window shares nothing with the
 previous one — that is how silently missed advisories surface. An `rss` source is
 bounded by its publisher, and the changedetection.io source reports no
 truncation at all, so a skipped item there cannot be detected; poll those sources
-often enough that rotation is unlikely.
+often enough that rotation is unlikely. A `csaf` source reads by a cursor instead: a document it
+tried to read and could not is reported as a failure, and so is a backlog, once the oldest listed
+document it has not read yet was listed more than 12 hours ago ([CSAF directories](sources.md#csaf-directories)).
 

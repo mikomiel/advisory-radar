@@ -190,7 +190,8 @@ def _test_source(cfg: Config, args: argparse.Namespace, http: Http, environment:
 
     The empty state makes the fetch unconditional (no stored ``ETag``/cursor) and nothing is committed: no
     ``save_state``, no ``source.commit``, not even the state lock. A fault or a truncated window is the exit
-    code, because a full window proves the source held more than it returned.
+    code, because a full window proves the source held more than it returned, and so is a window that reports
+    documents it could not read.
     """
     from .sources import build_source
 
@@ -210,8 +211,10 @@ def _test_source(cfg: Config, args: argparse.Namespace, http: Http, environment:
         return 1
     for item in window.items[: args.limit]:
         print(f"{_terminal(item.guid)}\t{_terminal(item.title)}\t{_terminal(item.link)}")
+    for problem in window.problems:  # what the source could not read; the items above are real
+        print(f"problem: {_terminal(problem)}")
     print(f"{args.id}: {len(window.items)} item(s); truncated: {'yes' if window.truncated else 'no'}")
-    return 1 if window.truncated else 0
+    return 1 if window.truncated or window.problems else 0
 
 
 def _reload_blocking(runtime: Runtime) -> None:
