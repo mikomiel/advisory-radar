@@ -76,10 +76,11 @@ installed version.
 
 - **Versions are compared** for npm, Go modules and crates.io (semantic versioning) and PyPI (PEP
   440). Another ecosystem is listed but its versions are not compared. A version that does not parse
-  completely is unknown, not guessed. A range with no `introduced` event (no event at all, or only
-  fixes) is not read either, because it shows no version as outside it: it never clears an advisory,
-  and the advisory's stored data is marked incomplete, like a cut list of versions. Another range or a
-  listed version can still show that the installed version is affected.
+  completely is unknown, not guessed. Two things in an advisory's own data are not read either, because
+  neither shows a version as outside it: a range with no `introduced` event (no event at all, or only
+  fixes), and an affected version listed in text that does not parse, which may be the installed one.
+  Either never clears an advisory, and the advisory's stored data is marked incomplete, like a cut list
+  of versions. Another range or a listed version can still show that the installed version is affected.
 - **An advisory that names several packages** is judged by the strongest evidence: one installed
   affected version makes it "applies"; otherwise any version that cannot be compared keeps it
   "unknown". A package an SBOM does not list is taken as not installed only when the import skipped
@@ -180,10 +181,12 @@ next pass. A dry run does not look at the directory.
 
 The imported document is `inventory.json` beside `state_path`, mode `0600`, written atomically. Like
 `settings.json` and the KEV cache it is a file beside `state_path` and not part of the state
-document, so it is not shared between instances that share a database. The drop directory's last
-outcome (`inventory_drop`) and the advisory data above (`affected`) are in the state document.
-Deleting `inventory.json` returns the installation to text-only matching; the recorded advisory
-data stays in the state and is ignored.
+document, so it is not shared between instances that share a database. An import replaces the file
+whole, so the configuration is refused at start when `state_path` is named `inventory.json` or a
+`storage: sqlite:///` path resolves to that file, as it is for the KEV cache, the settings overlay and
+the default watchlist. The drop directory's last outcome (`inventory_drop`) and the advisory data
+above (`affected`) are in the state document. Deleting `inventory.json` returns the installation to
+text-only matching; the recorded advisory data stays in the state and is ignored.
 
 ## Keeping it fresh
 

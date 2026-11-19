@@ -328,6 +328,83 @@ def test_an_empty_range_beside_a_listed_version_still_says_applies():
     assert summary(found) == ("applies", "affected")
 
 
+def listed_only(*versions: str, name: str = PACKAGE) -> dict:
+    """An OSV ``affected`` entry that names affected versions one by one and has no range."""
+    return {"package": {"ecosystem": "npm", "name": name}, "versions": list(versions)}
+
+
+def recorded(raw: list[dict], at: int = NOW) -> dict:
+    """The state a pass keeps for an advisory whose OSV record carries ``raw`` as its affected list."""
+    state: dict = {}
+    applicability.record_facts(state, {GHSA: osv_facts(raw, CVE)}, at)
+    return state
+
+
+def test_an_affected_version_listed_in_text_that_does_not_parse_reads_unknown_never_not_affected():
+    """End to end, as the pass keeps the record: the only affected version it lists is spelled no way a comparator
+    reads, and a fresh SBOM lists the package at a version that the list does not name."""
+    state = recorded([listed_only("not-a-version")])
+    stored = sbom(sbom_component(PACKAGE, "2.3.0"))
+    assert summary(applicability.evidence_for(state, stored, [GHSA, CVE], NOW, 30)) == ("unknown", "no_facts")
+
+
+def test_a_readable_range_that_excludes_the_installed_version_cannot_clear_it_beside_an_unreadable_listed_version():
+    raw = [{**affected_entry(PACKAGE, {"introduced": "0"}, {"fixed": "2.0.0"}), "versions": ["not-a-version"]}]
+    state = recorded(raw)
+    stored = sbom(sbom_component(PACKAGE, "2.3.0"))
+    assert summary(applicability.evidence_for(state, stored, [GHSA, CVE], NOW, 30)) == ("unknown", "no_facts")
+    # The same record without the unreadable version clears it, so the listed text is what withholds the answer.
+    clean = recorded([affected_entry(PACKAGE, {"introduced": "0"}, {"fixed": "2.0.0"})])
+    assert summary(applicability.evidence_for(clean, stored, [GHSA, CVE], NOW, 30)) == ("not_affected", "fixed")
+
+
+def test_facts_stored_as_complete_with_an_unreadable_listed_version_still_cannot_clear_an_advisory():
+    """Facts recorded before this check hold such an entry as complete, so the judge must not trust the flag alone."""
+    listed = [{"ecosystem": "npm", "name": PACKAGE, "ranges": [], "versions": ["not-a-version"]}]
+    found = judged(sbom(sbom_component(PACKAGE, "2.3.0")), entries=listed, complete=True)
+    assert summary(found) == ("unknown", "no_facts")
+    ranged = [{**ENTRIES[0], "versions": ["not-a-version"]}]  # the range alone excludes 2.3.1
+    found = judged(sbom(sbom_component(PACKAGE, "2.3.1")), entries=ranged, complete=True)
+    assert summary(found) == ("unknown", "no_facts")
+
+
+@pytest.mark.parametrize(
+    "listed",
+    [
+        pytest.param("not-a-version", id="text that is no version"),
+        pytest.param("2.3", id="two numbers are no semantic version"),
+        pytest.param("", id="an empty version"),
+    ],
+)
+def test_a_listed_version_that_does_not_parse_is_kept_but_never_marked_complete(listed):
+    """Kept, because a sibling range or listed version can still establish that an advisory applies; incomplete,
+    because the text may name any installed version, so the entry can show none as outside it."""
+    raw = [{**affected_entry(PACKAGE, {"introduced": "0"}, {"fixed": "2.0.0"}), "versions": ["1.0.0", listed]}]
+    entries, complete = applicability.trim_affected(raw)
+    assert complete is False
+    assert [(item["name"], item["versions"]) for item in entries] == [(PACKAGE, ["1.0.0", listed])]
+    assert summary(judged(sbom(sbom_component(PACKAGE, "1.0.0")), entries=entries, complete=complete)) == (
+        "applies",
+        "affected",
+    )
+
+
+def test_an_unreadable_listed_version_beside_a_matching_version_or_range_still_says_applies():
+    ranged = {**affected_entry(PACKAGE, {"introduced": "0"}, {"fixed": "3.0.0"}), "versions": ["not-a-version"]}
+    for raw in (listed_only("not-a-version", "2.3.0"), listed_only("2.3.0", "not-a-version"), ranged):
+        entries, complete = applicability.trim_affected([raw])
+        found = judged(sbom(sbom_component(PACKAGE, "2.3.0")), entries=entries, complete=complete)
+        assert summary(found) == ("applies", "affected"), raw
+
+
+def test_a_listed_version_of_an_ecosystem_without_a_comparator_does_not_make_the_advisory_incomplete():
+    """Its versions are not unreadable text, they are not compared at all, and the package is "unsupported" anyway."""
+    maven = affected_entry("org.example:lib", {"introduced": "0"}, {"fixed": "2"}, ecosystem="Maven")
+    entries, complete = applicability.trim_affected([{**maven, "versions": ["1"]}])
+    assert complete is True
+    assert entries[0]["versions"] == ["1"]
+
+
 def test_incomplete_facts_can_still_confirm_that_an_advisory_applies():
     found = judged(sbom(sbom_component(PACKAGE, "2.3.0")), complete=False)
     assert summary(found) == ("applies", "affected")

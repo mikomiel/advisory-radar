@@ -603,8 +603,8 @@ one document between instances and needs the optional `postgres` extra
 (`uv sync --extra postgres` for a source install; the container image already installs it, so
 PostgreSQL needs no separate image build). The YAML owns the key: the overlay cannot move
 the store, and a reload refuses a changed `storage:` exactly as it refuses a changed
-`state_path`. `settings.json` and the KEV cache stay beside `state_path`; neither is part of
-the document.
+`state_path`. `settings.json`, the KEV cache and the imported `inventory.json` stay beside
+`state_path`; none of them is part of the document.
 
 `advisory-radar migrate --config config/config.yml --to sqlite:////data/state.db` copies the
 document read through the configured store into another one, and prints both stores — never

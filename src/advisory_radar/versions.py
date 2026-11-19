@@ -8,7 +8,8 @@ crates.io) and PEP 440 (PyPI). Every other ecosystem is unsupported on purpose. 
 The range logic follows the OSV schema: a range is a list of ``introduced``, ``fixed`` and ``last_affected``
 events, read in version order. ``GIT`` ranges name commits, not versions, and are never evaluated. A range that
 introduces no version (an empty list, or only fixes) is unreadable too: it never says which versions are affected,
-so it can never say that one is not.
+so it can never say that one is not. So is a listed affected version that does not parse: it may be the installed
+one, in a spelling no comparator here reads.
 """
 
 from __future__ import annotations
@@ -176,16 +177,19 @@ def evaluate(
 ) -> RangeVerdict:
     """Judge one installed ``version`` against one OSV ``affected`` entry's ``ranges`` and ``versions``.
 
-    Affected as soon as any range, or the explicit version list, says so. Unaffected only when every range
-    could be read and none applies. A range that cannot be read (a ``GIT`` range, an unparseable event, no
-    ``introduced`` event), an unparseable installed version and an entry that says nothing at all are all ``None``.
+    Affected as soon as any range, or the explicit version list, says so. Unaffected only when every range and
+    every listed version could be read and none applies. A range that cannot be read (a ``GIT`` range, an
+    unparseable event, no ``introduced`` event), a listed version that cannot be read (text that is no version, or
+    not text at all: it may be the installed one), an unparseable installed version and an entry that says nothing
+    at all are all ``None``.
     """
     key = version_key(ecosystem, version)
     if key is None:
         return RangeVerdict(None)
-    if any(version_key(ecosystem, listed) == key for listed in versions if isinstance(listed, str)):
+    listed = [version_key(ecosystem, item) for item in versions]
+    if key in listed:
         return RangeVerdict(True)
-    undecided = False
+    undecided = None in listed  # a listed version no comparator reads may be the installed one
     fixes: list[tuple[Key, str]] = []
     for entry in ranges:
         events = _events(ecosystem, entry.get("events")) if isinstance(entry, Mapping) else None

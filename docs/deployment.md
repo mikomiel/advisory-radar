@@ -471,7 +471,7 @@ that is, `/data/data/state.db`.
 
 The key is YAML-only. The overlay cannot move the store, and a reload refuses a changed
 `storage:` as it refuses a changed `state_path`, so moving it is a restart.
-`settings.json`, the KEV cache, the default `watchlist.json` and the
+`settings.json`, the KEV cache, the default `watchlist.json`, the imported `inventory.json` and the
 [state-archive files](#state-size-and-retention) stay beside `state_path` and are not part of the
 document, which is why `state_path` is still required when the document lives elsewhere.
 

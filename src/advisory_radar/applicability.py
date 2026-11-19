@@ -83,6 +83,8 @@ def trim_affected(affected: object) -> tuple[list[dict], bool]:
     its ranges stay; a cut range or event list could drop a ``fixed`` event and read as open, so that entry goes.
     A range that introduces no version (no event, or only fixes) stays too, since a sibling range or a listed version
     can still show that an advisory applies, but it marks the advisory incomplete: it shows no version as outside it.
+    So does a listed version that does not parse, in an ecosystem whose versions are compared: it may be the installed
+    one in a spelling no comparator reads.
     """
     if not isinstance(affected, list):
         return [], False
@@ -119,7 +121,13 @@ def trim_affected(affected: object) -> tuple[list[dict], bool]:
             for item in ranges
         ]
         # Judged on the reduced events: an ``introduced`` whose version is not text has been emptied by ``_event``.
-        complete = complete and len(listed) == len(versions) and all(has_introduced(item["events"]) for item in trimmed)
+        introduces = all(has_introduced(item["events"]) for item in trimmed)
+        # A listed version no comparator reads may be the installed one, so it withholds "not affected" as a range that
+        # introduces nothing does. An ecosystem with no comparator reads none, and its package is "unsupported"
+        # whatever is listed, so only a comparable ecosystem is held to it.
+        comparable = ecosystem in SUPPORTED_ECOSYSTEMS
+        readable = not comparable or all(version_key(ecosystem, item) is not None for item in listed)
+        complete = complete and len(listed) == len(versions) and introduces and readable
         kept.append({"ecosystem": ecosystem, "name": name, "ranges": trimmed, "versions": listed})
     return kept, complete
 

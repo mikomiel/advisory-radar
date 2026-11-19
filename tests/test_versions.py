@@ -217,6 +217,40 @@ def test_another_range_or_a_listed_version_still_establishes_that_a_version_is_a
     assert evaluate("npm", "1.2.3", [empty], ["1.2.3"]).affected is True
 
 
+@pytest.mark.parametrize(
+    ("ecosystem", "listed"),
+    [
+        pytest.param("npm", "not-a-version", id="text that is no version"),
+        pytest.param("npm", "2.3", id="two numbers are no semantic version"),
+        pytest.param("npm", "", id="an empty version"),
+        pytest.param("npm", "1" * (MAX_VERSION_CHARS + 1), id="an oversized version"),
+        pytest.param("npm", 230, id="a number"),
+        pytest.param("npm", None, id="nothing"),
+        pytest.param("PyPI", "1.0.x", id="no PEP 440 version"),
+        pytest.param("Go", "main", id="a branch"),
+    ],
+)
+def test_a_listed_version_that_cannot_be_read_never_lets_a_version_be_called_unaffected(ecosystem, listed):
+    """It may be the installed version in a spelling no comparator reads, so "outside" would be a guess."""
+    assert evaluate(ecosystem, "2.3.0", (), [listed]).affected is None
+    assert evaluate(ecosystem, "2.3.0", (), ["1.0.0", listed]).affected is None, "beside a readable one that differs"
+    assert evaluate(ecosystem, "2.3.0", (), ["1.0.0"]).affected is False, "while a list that is all readable clears"
+
+
+def test_a_readable_range_that_excludes_a_version_cannot_clear_it_beside_an_unreadable_listed_version():
+    assert evaluate("npm", "2.3.1", FIXED_IN_231, ["not-a-version"]).affected is None
+    assert evaluate("npm", "9.9.9", FIXED_IN_231, ["not-a-version"]).affected is None
+    assert evaluate("npm", "2.3.1", FIXED_IN_231, ["2.3.0", "not-a-version"]).affected is None
+    assert evaluate("npm", "2.3.1", FIXED_IN_231, ["2.3.0"]).affected is False, "a list that is all readable clears"
+
+
+def test_a_matching_listed_version_or_range_still_establishes_that_a_version_is_affected_beside_an_unreadable_one():
+    assert evaluate("npm", "2.3.0", (), ["not-a-version", "2.3.0"]).affected is True
+    assert evaluate("npm", "2.3.0", (), ["2.3.0", "not-a-version"]).affected is True
+    beside_a_range = evaluate("npm", "2.3.0", FIXED_IN_231, ["not-a-version"])
+    assert (beside_a_range.affected, beside_a_range.fixed) == (True, "2.3.1")
+
+
 def test_an_installed_version_that_cannot_be_compared_is_unknown():
     for installed in ("", "main", "2.3", "1" * (MAX_VERSION_CHARS + 1)):
         assert evaluate("npm", installed, FIXED_IN_231).affected is None
