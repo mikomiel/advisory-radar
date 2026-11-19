@@ -358,6 +358,9 @@ cannot change a verdict. Every page behind the login reads the state live.
 | `advisory_radar_seen_total` / `_watch_total` / `_runs_retained` | identities seen, CVEs under re-evaluation, passes retained (run history is trimmed to 200) |
 | `advisory_radar_last_pass_timestamp_seconds` | when the last pass finished (`0` = never) |
 | `advisory_radar_last_pass_exit` / `_sent` / `_parked` / `_pending` | what the last pass did |
+| `advisory_radar_last_pass_incomplete` / `_deferred` | `1` when the last pass ran out of its [pass budget](configuration.md#the-pass-budget), and how many units of work (sources, the Adobe Commerce pass, candidates) it left for the next pass; both `0` otherwise. An incomplete pass still has exit `0` |
+| `advisory_radar_enrichment_cves{state}` | watched CVEs by how their enrichment stands ([Capped CVEs](configuration.md#capped-cves)): `measured`, `kev_only` (named by a message and never measured), `deferred` (the time budget or the NVD allowance ended the lookup, which is not counted as a try) and `failed` (a provider did not answer in full). Every state has a sample, `0` included |
+| `advisory_radar_enrichment_oldest_age_seconds` | seconds the longest-waiting CVE with outstanding enrichment has waited; `0` when none is outstanding |
 | `advisory_radar_ready` | `1` when `/readyz` would answer `200` |
 | `advisory_radar_state_readable` | `1` when the state document could be read; `0` means the scrape answered with only these two gauges (every other number is unknown, not zero) |
 | `advisory_radar_source_up{source}` | `1` when that source's last fetch succeeded, `0` when it failed; absent until the source has been polled once. The label is the configured source id, which the validator keeps a name — a whole `${NAME}` reference in an id is refused |
@@ -370,6 +373,53 @@ exceeding a few poll intervals. A broken feed also fails the pass and shows up i
 `advisory_radar_last_pass_exit`, but that number says a pass failed, not which feed did:
 `advisory_radar_source_up{source}` is the per-source signal, and `/sources` shows the same
 state with the error text beside it.
+
+One `incomplete` pass is the pass budget doing its job: the work it left is stored and the next pass starts with it.
+`advisory_radar_last_pass_incomplete` staying `1` across several passes means an upstream that is too slow, or a
+`pass_budget` that is too small for the number of sources; `advisory_radar_source_up{source}` and `/sources` name the
+slow source first.
+
+## Passes, the state lock and shutdown
+
+One pass runs at a time per state document. A pass holds the state lock from when it starts reading the state until
+its last write: the fetches, the lookups, the delivery and the run record. The lock is an `flock` on a sidecar file
+beside the JSON file, a write lock on a sidecar database for SQLite and a session advisory lock for PostgreSQL, so
+a second instance on the same store waits behind the first in the same way. `dry-run` takes no lock and writes
+nothing.
+
+What waits behind a running pass, and how:
+
+- the scheduler and `advisory-radar once` wait for it, however long it takes;
+- *Run a pass now* answers at once that a pass is already running and does nothing;
+- `POST /webhooks/<id>` answers `503` with `Retry-After: 30` and queues nothing, so the sender retries;
+- releasing or dropping one parked message answers `409` and changes nothing, while the bulk actions wait for the
+  lock;
+- a configuration reload waits (`SIGHUP`) or answers `409` (the UI);
+- the pages, `/readyz` and `/metrics` read the state without the lock, and answer while a pass runs.
+
+The [pass budget](configuration.md#the-pass-budget) bounds how long the pass can wait on other people's servers:
+10 minutes by default. Delivery runs after that part, outside the budget, with the ordinary per-request limits and
+the cap on messages per pass, so the longest a pass holds the lock is its budget plus its delivery. The pass makes
+its requests one after another; the budget adds no parallel requests.
+
+Nothing cancels a running pass. The budget does not interrupt running code: it cuts each request at what is left,
+whether the request is connecting to one of the addresses of a host name, in its TLS handshake or waiting for the
+answer, and stops the next from starting. A pass can therefore overrun it only by work that is not a request, by
+resolving a host name, which the system resolver does not let anyone cut short, and by sending a request, which keeps
+its 30-second limit. `SIGTERM` and `SIGINT`
+stop the web server, then ask the scheduler to stop and wait 5 seconds for it. The scheduler checks that request
+between passes only, so a pass that is still running when the process exits is ended where it stands. That loses
+nothing the state had already recorded:
+
+- the lock is released with the process (the operating system drops an `flock`, SQLite rolls back and closes the
+  sidecar, PostgreSQL ends the session), so an interrupted pass never leaves it held;
+- the state is written after each source's candidates, once before the first notification and after each channel
+  accepts a notification, and the run record last. A source's cursor or validator moves in the same write as its
+  candidates, so a window that was read and not yet written is read again;
+- what the budget deferred (`fetch_deferred`, the carried candidates) is part of that document, so a restart
+  continues from it;
+- the one thing that can repeat is a notification a channel accepted just before the process ended, as the
+  acknowledgement had not been written yet: it is sent again to that channel at the next pass.
 
 ## Configuration
 

@@ -20,6 +20,7 @@ from pathlib import Path
 
 import yaml
 
+from .budget import DEFAULT_PASS_BUDGET_SECONDS, MAX_PASS_BUDGET_SECONDS, MIN_PASS_BUDGET_SECONDS
 from .catalogue import SOURCE_SPECS
 from .delivery import QuietHours, parse_quiet_hours
 from .inventory import INVENTORY_NAME
@@ -277,6 +278,9 @@ class Config:
     #: ``poll_interval_seconds``. The pipeline throttles the fetch only: re-evaluation, escalation and delivery
     #: keep running for every source every pass, so a slow feed never delays an alert about something else.
     source_intervals: Mapping[str, int] = field(default_factory=dict)
+    #: The seconds one pass may spend waiting on upstream servers (``budget.py``). YAML-only: it bounds how long the
+    #: state lock is held, which is a deployment decision rather than something to change from the settings form.
+    pass_budget_seconds: int = DEFAULT_PASS_BUDGET_SECONDS
     state_path: Path = Path("data/state.json")
     #: Where the document lives: empty is the JSON file at ``state_path``, or a ``sqlite:///`` / ``postgresql://``
     #: URL. YAML-only -- the overlay cannot move the store, exactly as it cannot move ``state_path``.
@@ -379,6 +383,7 @@ _TOP_KEYS = {
     "notifiers",
     "watchlist",
     "poll_interval",
+    "pass_budget",
     "state_path",
     "storage",
     "inventory",
@@ -1056,6 +1061,11 @@ def config_from_document(
 
     poll = document.get("poll_interval", "15m")
     seconds = _interval_seconds(poll, "poll_interval")
+    pass_budget = _interval_seconds(document.get("pass_budget", "10m"), "pass_budget")
+    _require(
+        MIN_PASS_BUDGET_SECONDS <= pass_budget <= MAX_PASS_BUDGET_SECONDS,
+        f"pass_budget must be between {MIN_PASS_BUDGET_SECONDS // 60}m and {MAX_PASS_BUDGET_SECONDS // 3600}h",
+    )
 
     # Delivery policy. ``digest`` accepts the documented boolean spellings after expansion, like every other
     # switch. ``quiet_hours`` is written as the window itself; an empty or absent value is no window, and the
@@ -1143,6 +1153,7 @@ def config_from_document(
         declared_source_ids_complete=declared_source_ids_complete,
         poll_interval_seconds=seconds,
         source_intervals=source_intervals,
+        pass_budget_seconds=pass_budget,
         state_path=state_path,
         storage=storage,
         inventory_dir=inventory_dir,

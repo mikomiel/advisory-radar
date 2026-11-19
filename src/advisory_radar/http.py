@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import functools
 import http.client
 import io
@@ -13,7 +15,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 
 USER_AGENT = "advisory-radar (+https://github.com/mikomiel/advisory-radar)"
 #: One Discord message holds 2000 characters; titles and bodies are capped below it.
@@ -29,16 +31,57 @@ Http = Callable[[str, str, Mapping[str, str], bytes | None], tuple[int, dict[str
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 #: The longest one socket operation (connect, send, a single receive) may wait.
 HTTP_TIMEOUT = 30
-#: How long a response may take to arrive, counted from just before the connection attempt. The timeout above
-#: bounds one operation, so a peer that sends a byte every few seconds never trips it and could hold a pass, and
-#: the state lock around it, for as long as it likes. Every receive is therefore capped at the time that is left
-#: (``_DeadlineReader``), whichever part of the response it belongs to: the status line, a header, a chunk-size
-#: line, a trailer or the body. The connection attempt (TCP connect and TLS handshake) and the send are not
-#: receives of the answer and keep ``HTTP_TIMEOUT`` alone; a connect that spends the whole budget ends the request
-#: at its first receive.
+#: How long a request may take, counted from just before the connection attempt. The timeout above bounds one
+#: operation, so a peer that sends a byte every few seconds never trips it, and a name with several unreachable
+#: addresses would take it once per address: either could hold a pass, and the state lock around it, for as long as
+#: it likes. The connect to each address and the TLS handshake (``_create_connection``) and every receive of the
+#: answer, whichever part of it: the status line, a header, a chunk-size line, a trailer or the body
+#: (``_DeadlineReader``), are therefore capped at the time that is left. The send keeps ``HTTP_TIMEOUT`` alone, and
+#: resolving the name cannot be capped at all.
 HTTP_DEADLINE = 120
+#: What the pass budget leaves for a request: set by ``request_ceiling`` around the calls a pass makes upstream, read
+#: when a request starts. A context variable, so ``urllib_http`` keeps the four-argument ``Http`` shape every
+#: plugin and test double is written against, and one thread's pass cannot cap another thread's request.
+_CEILING: contextvars.ContextVar[Callable[[], float] | None] = contextvars.ContextVar(
+    "advisory_radar_http_ceiling", default=None
+)
+
+
+@contextlib.contextmanager
+def request_ceiling(remaining: Callable[[], float]) -> Iterator[None]:
+    """Cap every request made inside the block at ``remaining()`` seconds, read as each request starts.
+
+    The request then ends ``min(HTTP_DEADLINE, remaining())`` after it starts: the connect to each address, the TLS
+    handshake and every wait for the answer are cut there, and none of them waits longer than ``min(HTTP_TIMEOUT,
+    remaining())``. None is started once nothing remains.
+    """
+    token = _CEILING.set(remaining)
+    try:
+        yield
+    finally:
+        _CEILING.reset(token)
+
+
+def ceiling_left() -> float | None:
+    """The seconds the innermost ``request_ceiling`` allows now, or ``None`` outside one."""
+    ceiling = _CEILING.get()
+    return None if ceiling is None else ceiling()
+
+
 #: One read of a body. Small enough that the deadline is checked often, large enough not to cost many calls.
 _READ_CHUNK = 64 * 1024
+
+
+def _arm(sock: socket.socket, deadline: float, timeout: float) -> None:
+    """Let the socket's next operation wait ``timeout`` seconds or what is left before ``deadline``, if less.
+
+    A socket timeout is relative: it starts again with every operation, so a deadline holds only if the timeout is set
+    again before each one. Raises ``TimeoutError`` when nothing is left.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("the request did not finish before the deadline")
+    sock.settimeout(min(timeout, remaining))
 
 
 #: Longest message one finished log record may carry. Identities come from a feed, so a publisher can otherwise
@@ -153,10 +196,7 @@ class _DeadlineReader(io.RawIOBase):
         return self._raw.fileno()
 
     def readinto(self, buffer) -> int | None:
-        remaining = self._deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("the response did not finish before the deadline")
-        self._sock.settimeout(min(HTTP_TIMEOUT, remaining))
+        _arm(self._sock, self._deadline, HTTP_TIMEOUT)
         return self._raw.readinto(buffer)
 
     def close(self) -> None:
@@ -176,12 +216,47 @@ class _DeadlineResponse(http.client.HTTPResponse):
         self.fp = io.BufferedReader(_DeadlineReader(self.fp.detach(), sock, deadline))
 
 
+def _create_connection(
+    deadline: float, address: tuple[str, int], timeout: float, source_address: tuple[str, int] | None = None
+) -> socket.socket:
+    """``socket.create_connection`` whose attempts share the request's deadline instead of one timeout each.
+
+    The standard one gives every address the name resolves to the whole ``timeout``, so a name with several
+    unreachable addresses holds a request for that long once per address. Here an attempt waits for the time that is
+    left if that is less, and none is made once nothing is. The socket that comes back is armed with what is left
+    again, because the TLS handshake takes its time from the socket's timeout, and the connect has used some of it.
+    Resolving the name is the one step this cannot bound: ``getaddrinfo`` has no timeout.
+    """
+    host, port = address
+    failure: OSError | None = None
+    for family, kind, protocol, _, target in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+        sock = None
+        try:
+            sock = socket.socket(family, kind, protocol)
+            _arm(sock, deadline, timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(target)
+            _arm(sock, deadline, timeout)
+            return sock
+        except OSError as exc:
+            failure = exc
+            if sock is not None:
+                sock.close()
+    if failure is None:
+        raise OSError("getaddrinfo returns an empty list")
+    raise failure
+
+
 class _BoundedConnection:
-    """Mixin for ``HTTPConnection`` and ``HTTPSConnection``: the response it reads is built under the deadline."""
+    """Mixin for ``HTTPConnection`` and ``HTTPSConnection``: connecting and the response it reads keep the deadline."""
 
     def __init__(self, *args, deadline: float, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.response_class = functools.partial(_DeadlineResponse, deadline=deadline)
+        # ``http.client`` keeps how it connects as an instance attribute so that a test can replace it; ``__init__``
+        # has just set it to ``socket.create_connection``.
+        self._create_connection = functools.partial(_create_connection, deadline)
 
 
 class _Connection(_BoundedConnection, http.client.HTTPConnection):
@@ -239,16 +314,22 @@ def urllib_http(
         # ``urllib`` opens its other handlers too -- ``file://`` would read a local file as a feed. Every source
         # and notifier this program talks to is HTTP(S), so any other scheme is a refused request, not a fetch.
         return 0, {}, b""
+    allowance, timeout = HTTP_DEADLINE, HTTP_TIMEOUT
+    left = ceiling_left()
+    if left is not None:
+        if left <= 0:
+            return 0, {}, b""  # the pass budget is spent: a request that could not finish is not started
+        allowance, timeout = min(allowance, left), min(timeout, left)
     # Taken before the connection is opened, so the time spent connecting counts against it; every receive after
     # that is capped at what is left of it (``_DeadlineReader``).
-    deadline = time.monotonic() + HTTP_DEADLINE
+    deadline = time.monotonic() + allowance
     try:
         # Built inside the guard: a malformed URL raises a ValueError whose text carries the URL, and a URL
         # can carry a token.
         request = _Request(
             url, data=body, headers={"User-Agent": USER_AGENT, **headers}, method=method, deadline=deadline
         )
-        with _OPENER.open(request, timeout=HTTP_TIMEOUT) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             status, response_headers = response.status, dict(response.headers)
             try:
                 payload = _read_within(response, MAX_RESPONSE_BYTES + 1, deadline)

@@ -32,6 +32,12 @@ turns critical, and never re-sends what you already received.
   classification, delivery record and later notification events. The source filter matches the
   configured source id,
   never the advisory heading
+- A wall-clock budget per pass (`pass_budget`, 10 minutes by default): the sources, candidates and Adobe Commerce read a
+  pass has no time for are deferred and handled first by the next pass, never dropped; such a pass exits 0, is marked
+  `incomplete` in `/runs` and `/metrics`, and delivery of queued messages is outside the budget
+- The CVEs a message named beyond the lookup cap are durable work, not forgotten ones: each pass measures a few, one
+  source in turn, inside the same budget; KEV evidence escalates at once; the dashboard and `/metrics` count the
+  CVEs by state and show the oldest wait, and a CVE with enrichment outstanding stays watched for up to 30 days
 - Installed-software evidence: import an SBOM (CycloneDX or SPDX 2.x JSON) or an OSV-Scanner v2 result
   by upload on `/inventory` or from a drop directory, and the advisory page says whether the
   installed version applies (with the fix), is not affected, or is unknown, kept apart from text

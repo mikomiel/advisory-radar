@@ -679,3 +679,149 @@ often enough that rotation is unlikely. A `csaf` source reads by a cursor instea
 tried to read and could not is reported as a failure, and so is a backlog, once the oldest listed
 document it has not read yet was listed more than 12 hours ago ([CSAF directories](sources.md#csaf-directories)).
 
+
+## The pass budget
+
+A pass holds the state lock while it waits on other people's servers. Every HTTP request has its own limits
+([Sources](sources.md)), but they bound one request and not the pass: enough slow servers one after another
+would hold the lock, and every action that waits for it, for as long as they liked. `pass_budget` bounds the whole
+upstream part of a pass:
+
+```yaml
+pass_budget: 10m   # <n><s|m|h>, at least 1m and at most 1h; default 10m
+```
+
+The key is YAML-only, because it decides how long the state lock can be held: `/config` does not edit it. A value
+outside the range, or one that is not a duration, is refused at start and on a reload, and a reload applies a new
+value to the next pass, never to one that already started. The budget is counted from the moment the pass has the
+lock, on a monotonic clock, so a wait for the lock does not spend it and a step of the wall clock neither shortens it
+nor stretches it.
+
+**What it covers.** The KEV catalogue, the re-evaluation of watched CVEs, every source fetch, every lookup made while
+classifying (CVE.org, NVD, EPSS, OSV, the Debian security tracker and the pages a release item names) and the
+Adobe Commerce pass. Each request takes the shorter of its own limits and what is left of the current stage, and
+none starts once the stage is over. The cut covers the connection too: a host name that resolves to several
+addresses is tried address by address inside what is left, and the TLS handshake gets what the connect left of it, so
+dead or slow addresses cannot stretch one request past its stage. Two waits are not cut at what is left: resolving the
+host name, which the system resolver does not allow, and sending the request, which keeps its 30-second limit. The
+requests of a pass are made one after another, so the budget bounds the sum of their waits, and it adds no parallel
+requests. The KEV catalogue has an allowance of its own inside the first stage: see The catalogue's allowance, below.
+
+**Stages.** One slow part must not use up what the parts after it need, so each stage has to end by a share of the
+budget: the KEV catalogue and the re-evaluation by one fifth, the source fetches by three quarters, and the
+classification of what was fetched, with the Adobe Commerce pass, by the whole budget. With the default that is 2,
+7.5 and 10 minutes after the pass has the lock.
+
+**The catalogue's allowance.** The KEV catalogue is one request at the head of the first stage, ahead of the re-scores
+and the drain that share the stage with it. A server that sends it a few bytes at a time could keep it for the whole
+stage on every pass: at the default budget the stage is as long as one request may take ([Sources](sources.md)), and
+the re-scores and the drain would never begin. So the catalogue may spend at most half of what the stage has left when
+its request starts, and never more than the 120 seconds any request may take: about 60 seconds at the default budget,
+about 6 seconds at `1m`, and 120 seconds from `20m` up. The rest of the stage is left for the re-scores and the
+drain. The allowance is not a setting.
+
+A download the allowance cuts is a failed fetch like any other. The cached copy (`kev.json`, beside `state_path`)
+still escalates the CVEs it lists, but the catalogue does not count as read in that pass, so nothing is suppressed on
+its strength; with no cached copy, nothing is escalated on its account. A cut never replaces the cached copy, and the
+next pass asks again. It does not make the pass `incomplete`: the log carries the loader's warning, which starts
+`kev: fetch failed`.
+
+**What it defers.** Work the budget stops is deferred, never dropped, and it is stored in the state document:
+
+| Left undone | What the state keeps | What the next pass does |
+|---|---|---|
+| A source that was due and not started | its id in `fetch_deferred` (no health is recorded for it) | reads it first, before the configured order |
+| The Adobe Commerce pass, when none of the budget was left to start it | `@adobe` in `fetch_deferred` | runs it first, before the sources |
+| A source whose fetch the budget ended | its health record says so (`ok` false, the budget as the error); no cursor or validator moves, so the same window is read again | reads it again, behind the deferred ones |
+| A candidate not yet classified, or one whose lookups the budget cut short | the candidate, in the carried queue, never acknowledged and with no retry clock started | classifies it ahead of the source's newer items |
+| A watched CVE whose lookup the budget never began | the watch entry, with `last_eval` unchanged and an `enrich` record in state `deferred` ([Capped CVEs](#capped-cves)) | looks it up again first: it is still due, or still waiting in the drain |
+| A watched CVE whose lookup began and the budget cut, or whose EPSS request spent the budget (the daily re-scores, and the drain, each ask EPSS for all their CVEs in one request) | the same record, with `at` and `last_eval` set to this pass's time; it is not counted as a try | asks again behind the others: a capped CVE on the next pass, a CVE due for its daily re-score after a day, as after a failed one |
+| An Adobe Commerce bulletin whose detail page the budget refused or cut | the bulletin stays outstanding in the `backlog` of the `adobe` state; a cut is no failure of the page, so it starts no retry clock | reads the page again; the message goes out without details only after the page itself has been failing for two hours |
+
+A source that reads no network (a `webhook` source reads its own inbox) is never deferred. A source that was never
+started is read before every other source in the next pass, ahead of one that was merely slow, so no source waits
+behind a slow one for ever.
+
+**The outcome.** A pass that deferred a source or the Adobe Commerce pass, cut a fetch short, or carried candidates it
+had no time to classify is `incomplete`. That is not a failure: it exits 0 when nothing else failed. Its run record
+carries `"outcome": "incomplete"` and `"deferred"`, the number of those units of work it left, and a pass that
+left none carries neither key. A watched CVE whose lookup the budget deferred is not one of those units: it stays
+outstanding enrichment, counted as `deferred` on the dashboard and in `/metrics` ([Capped CVEs](#capped-cves)),
+and it does not make a pass `incomplete`. `/runs` marks an incomplete pass with an `incomplete` badge and the count,
+the dashboard says so beside the last pass, and `/metrics` has
+`advisory_radar_last_pass_incomplete` and `advisory_radar_last_pass_deferred` ([Monitoring](deployment.md#monitoring-beszel-and-friends)).
+A source the budget cut also shows as not answering on `/sources`, with the reason as its error.
+
+**Delivery is outside the budget.** The messages already queued, a critical advisory among them, are sent after the
+upstream work in the same pass with the ordinary per-request limits, and a spent budget never holds one back.
+
+Raise `pass_budget` when `incomplete` passes become routine (many sources, or a slow upstream you depend on); that
+only lengthens the time the lock can be held. Lower it to shorten that time and accept more deferral.
+
+## Capped CVEs
+
+One message can name more CVEs than a pass will look up: when a message is queued, at most 10 of its CVEs are measured
+(CVE.org, NVD and EPSS), and the others are *capped*. The message claims all of them, so none alerts a second time, and
+every one is watched, but a capped CVE has only been read against the KEV catalogue. That is work the program owes, so
+the state keeps it and later passes do it inside the [pass budget](#the-pass-budget).
+
+**What the state keeps.** Each watched CVE is in one of four states. The dashboard counts them under "CVE enrichment"
+and `/metrics` has them as `advisory_radar_enrichment_cves{state}`
+([Monitoring](deployment.md#monitoring-beszel-and-friends)):
+
+| State | What it means | How it is kept |
+|---|---|---|
+| `measured` | nothing is known to be outstanding | no `enrich` record, `kev_only` false |
+| `kev_only` | never measured; only the KEV catalogue has been read against it | `kev_only` true in the watch entry |
+| `deferred` | a lookup was due and the pass's time budget or its NVD allowance ended it, before or after its request began; it is not counted as a try | `enrich` record: `state`, `since`, `tries`, `at` (when it last took its turn: a failed lookup, or one the budget cut) |
+| `failed` | a request was made and a provider did not answer in full | the same record; it is asked again after one day |
+
+The oldest wait, shown as "Oldest outstanding enrichment" and as `advisory_radar_enrichment_oldest_age_seconds`, is
+counted from the message that named the CVE for a capped one, and from its first deferred or failed lookup for any
+other. The state document also holds `enrich_cursor`, the source that was served last. Both keys are additive: a
+state written by an earlier release loads as it is, and every `kev_only` entry in it is simply waiting for its first
+lookup.
+
+**The drain.** Each pass looks up at most 10 capped CVEs, in the first stage of the pass budget, so they share that
+stage with the KEV catalogue and the daily re-scores. The lookups are made one after another, and they are served
+one source in turn: one CVE of each source that has capped CVEs, starting with the source after the one served
+last. A large advisory therefore cannot hold the pass while another source's advisory waits, and a pass the budget
+ended early does not move the cursor past a source it never served. Inside a source the CVE tried longest ago goes
+first, and a failed one is not asked again for a day. A lookup the budget ended before its request began keeps its
+place. One the budget cut after its request began has had its turn: it is no failure of a provider and is asked
+again on the next pass, but behind the CVEs that were waiting, and its source counts as served. The daily
+re-scores, and the drain, each ask EPSS for the scores of all their CVEs in one request, so when that request
+spends the budget (it is cut, or it answers with nothing left) each of those CVEs has had its turn. One the
+budget ended later, behind the lookup of another CVE, keeps its place. A CVE whose lookup always outlasts the
+budget, or a batch whose EPSS request does, therefore cannot hold the pass while the others never start, and neither
+can the KEV catalogue, which has an allowance of its own ([The catalogue's allowance](#the-pass-budget)). A CVE that
+turns out critical is escalated once, like a CVE that a daily re-score finds critical.
+
+What bounds the lookups of one pass is therefore explicit, and none of it is a setting:
+
+| Bound | Value |
+|---|---|
+| Time | the [pass budget](#the-pass-budget), by stage |
+| Capped CVEs drained | 10 |
+| CVEs re-scored, because they are due | 10 |
+| NVD requests, shared by the re-scores, the drain and the classification | 10 |
+| NVD requests the drain may make of those | 5, so a large advisory cannot leave the new items without a score |
+| Candidates classified, per source | 15, each looking up at most 10 CVEs |
+
+**KEV evidence does not wait.** A capped CVE is read against the KEV catalogue on every pass, whatever the budget
+left: the catalogue is a local set, so this costs no request. A CVE that is listed is escalated to critical in that
+pass, not on its daily clock, and an item that names a listed CVE is sent critical even when the pass budget is
+already spent. The CVEs of such a message that the budget kept from a lookup are watched as capped. This holds for
+a CVE the item itself names; one that only a lookup (an OSV advisory's aliases, a tracker page) would reveal waits
+for that lookup.
+
+**The window.** A watched CVE is re-evaluated for 14 days after its message. While its enrichment is outstanding
+(`kev_only`, `deferred` or `failed`) it is kept for up to 30 days instead, so a CVE the passes could not measure in
+time is not dropped unmeasured. It goes back to the 14-day rule once it is measured, and it is dropped at 30 days
+whatever its state. The dashboard states both numbers beside the counts.
+
+**What this does not do.** The state keeps one record per CVE, not one per provider: a lookup reads CVE.org, NVD and
+EPSS together and is complete only when all of them answered in full, so a partial answer is asked again as a
+whole. Incremental modification indexes of the providers are not used. A CVE whose lookup failed while its message
+was being classified is not capped, so it counts as `measured` until its first daily re-score is deferred or fails.
+`measured` means that nothing is known to be outstanding, which also holds for a CVE that has no CVSS score.
