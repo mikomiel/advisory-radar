@@ -8,7 +8,7 @@ import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import replace
 
-from . import applicability, core, inventory, watchlist
+from . import applicability, core, inventory, retention, watchlist
 from .config import Config, secret_values
 from .http import Http, RedactFilter, urllib_http
 from .kev import load_kev
@@ -219,6 +219,9 @@ def _run_pass(
     _reset_validators_on_policy_change(state, policy)
     state.setdefault("parked", [])
     core._prune(state, now)
+    if not dry_run:
+        # After ownership was settled above, which reads the snapshots it is about to move.
+        retention.retire_deliveries(state, cfg.state_path, now)
     # An imported inventory only adds evidence to a page: it is read here so the OSV records fetched below can be
     # kept for it, and it never changes what is classified, queued, routed or delivered. A dry run writes nothing,
     # so it does not look at the drop directory either.
